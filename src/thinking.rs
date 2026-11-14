@@ -856,9 +856,10 @@ impl ReasoningScan {
 }
 
 /// Whether a prompt's text ends inside a freshly opened reasoning block,
-/// the generation prompt the template writes with thinking on.
+/// the generation prompt the template writes with thinking on: `<think>\n`
+/// (Qwen, GLM) or `<think>` (DeepSeek V4).
 pub fn opens_thinking(prompt_tail: &str) -> bool {
-    prompt_tail.ends_with("<think>\n")
+    prompt_tail.ends_with("<think>\n") || prompt_tail.ends_with("<think>")
 }
 
 #[cfg(test)]

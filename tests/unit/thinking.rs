@@ -736,4 +736,7 @@ fn without_tool_call_tags_the_budget_still_closes() {
         matches!(c.decide_stop(), Action::Replace(_)),
         "an end of turn is replaced"
     );
+    // DeepSeek's generation prompt opens the block without a line end.
+    assert!(opens_thinking("<｜Assistant｜><think>") && opens_thinking("<think>\n"));
+    assert!(!opens_thinking("<｜Assistant｜></think>"));
 }
