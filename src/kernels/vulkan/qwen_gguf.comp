@@ -508,3 +508,17 @@ void main() {
     }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// dst[r][off + j] = src[r][j]: a part's GEMM output into its columns of a
+// stack's output (bfloat). Grid::Threads (n, rows). Buffers: 0 src [rows][n],
+// 1 dst. Params: 2 n, 3 dst row length, 4 off.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_qg_copy_cols_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint n = arg_u32(2), ld = arg_u32(3), off = arg_u32(4);
+    const uint j = gl_GlobalInvocationID.x, r = gl_GlobalInvocationID.y;
+    U16(arg(1) + 2u * (uint64_t(r) * ld + off)).v[j] = U16(arg(0) + 2u * uint64_t(r) * n).v[j];
+}
+#endif

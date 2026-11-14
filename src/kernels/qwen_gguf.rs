@@ -168,6 +168,36 @@ pub fn dequant_bf16(
     )
 }
 
+/// `dst[r][off..off + n] = src[r]` for the `rows` rows of a `[rows, n]`
+/// bfloat source into a `[rows, ld]` destination.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_cols_bf16(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    src: &Tensor,
+    dst: &Tensor,
+    rows: usize,
+    n: usize,
+    ld: usize,
+    off: usize,
+) -> Result<()> {
+    ensure!(
+        src.dtype() == DType::BF16 && dst.dtype() == DType::BF16,
+        "column copy dtypes"
+    );
+    ensure!(
+        src.numel() >= rows * n && dst.numel() >= rows * ld && off + n <= ld,
+        "column copy"
+    );
+    let pipeline = ctx.pipeline("qg_copy_cols_bf16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[src.binding(), dst.binding()],
+        &[&u32_bytes(n), &u32_bytes(ld), &u32_bytes(off)],
+        Grid::Threads { grid: (n, rows, 1), threadgroup: (256.min(n), 1, 1) },
+    )
+}
+
 /// `out[r] = table[ids[r]]` for `m` ids: rows of a BF16 embedding.
 pub fn embed_bf16(
     ctx: &MetalContext,

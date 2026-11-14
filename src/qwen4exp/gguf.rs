@@ -55,7 +55,15 @@ pub const ARCH: &str = "qwen4exp";
 const NGRAM_TABLE: &str = "per_layer_token_embd.weight";
 
 /// Tensors read and rearranged into owned buffers instead of mapped.
-const COPIED: &[&str] = &["attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"];
+const COPIED: &[&str] = &[
+    "attn_qkv.weight",
+    "attn_gate.weight",
+    "ssm_out.weight",
+    "ssm_alpha.weight",
+    "ssm_beta.weight",
+    "ffn_gate_inp.weight",
+    "ffn_gate_inp_shexp.weight",
+];
 
 /// Mapped regions of at most this many bytes (a tensor larger than it gets
 /// a region of its own).
@@ -306,6 +314,31 @@ fn exact_bf16(
     Tensor::from_bytes(ctx, bytemuck::cast_slice(&b), shape, DType::BF16)
 }
 
+/// F32 weight values as a BF16 GGUF weight (half the bytes a GEMV
+/// streams) when every one is a bfloat16 value, as the checkpoint's routers
+/// and GDN alpha/beta are (bf16 originals stored as F32); else as F32.
+fn exact_bf16_weight(
+    ctx: &MetalContext,
+    v: &[f32],
+    cols: usize,
+    rows: usize,
+) -> Result<QWeight> {
+    let b: Vec<bf16> = v.iter().map(|&x| bf16::from_f32(x)).collect();
+    if b.iter().zip(v).all(|(b, &x)| b.to_f32() == x) {
+        QWeight::from_bytes(ctx, bytemuck::cast_slice(&b), GgmlType::Bf16, cols, rows)
+    } else {
+        QWeight::from_bytes(ctx, bytemuck::cast_slice(v), GgmlType::F32, cols, rows)
+    }
+}
+
+/// A small F32 GGUF weight, as [`exact_bf16_weight`] gives it.
+fn small_weight(ctx: &MetalContext, g: &Gguf, name: &str) -> Result<LinearWeights> {
+    let (v, t) = f32s(g, name)?;
+    Ok(LinearWeights::Gguf(GgufLinear {
+        parts: vec![exact_bf16_weight(ctx, &v, t.row_len(), t.rows())?],
+    }))
+}
+
 /// A folded norm `1 + w` as lily's bfloat16 `w`.
 fn norm(ctx: &MetalContext, g: &Gguf, name: &str) -> Result<Tensor> {
     let (v, _) = f32s(g, name)?;
@@ -545,7 +578,7 @@ impl Load<'_> {
         let gate_up_proj = self.m.lin(&[&n("ffn_gate_shexp"), &n("ffn_up_shexp")])?;
         let i = self.cfg.shared_expert_intermediate_size;
         let w = Box::new(MoeWeights {
-            gate: self.m.lin(&[&n("ffn_gate_inp")])?,
+            gate: small_weight(self.ctx, self.g, &n("ffn_gate_inp"))?,
             expert_gate: self.m.lin(&[&n("ffn_gate_exps")])?,
             expert_up: self.m.lin(&[&n("ffn_up_exps")])?,
             expert_down: self.m.lin(&[&n("ffn_down_exps")])?,
@@ -557,7 +590,7 @@ impl Load<'_> {
                 gate_up_proj,
                 down_proj: self.m.lin(&[&n("ffn_down_shexp")])?,
             },
-            shared_gate: self.m.lin(&[&n("ffn_gate_inp_shexp")])?,
+            shared_gate: small_weight(self.ctx, self.g, &n("ffn_gate_inp_shexp"))?,
         });
         let (e, f, h) = (
             self.cfg.num_experts,

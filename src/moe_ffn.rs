@@ -275,9 +275,27 @@ fn gguf_project_mat(
         return gguf_gemv_sets(ctx, pass, a, &[(g, c)], m);
     }
     let (n, k) = (g.out_features(), g.in_features());
+    // A stack into bfloat output (the indexer's q | k): each part by the
+    // GEMM into the staging past its weights, then into its columns.
+    let largest = g.parts.iter().map(|p| p.rows * (k + m)).max().unwrap_or(0);
+    if g.parts.len() > 1 && c.dtype() == DType::BF16 && scratch.numel() >= largest {
+        let mut off = 0;
+        for p in &g.parts {
+            let staged = scratch.view(0, &[p.rows, k])?;
+            let out = scratch.view(p.rows * k, &[m, p.rows])?;
+            qwen_gguf::dequant_bf16(ctx, pass, p, &staged)?;
+            pass.level_barrier(&[&staged])?;
+            crate::kernels::gemm::gemm_bf16_nt(ctx, pass, a, &staged, &out)?;
+            pass.level_barrier(&[&out])?;
+            qwen_gguf::copy_cols_bf16(ctx, pass, &out, c, m, p.rows, n, off)?;
+            pass.level_barrier(&[c])?;
+            off += p.rows;
+        }
+        return Ok(());
+    }
     // The GEMM writes one part's whole bfloat16 rows from a staged copy:
-    // anything else (a stack, f32 output, a weight larger than the staging,
-    // the LM head of a batched step) goes by the GEMV, four rows at a time.
+    // anything else (f32 output, a weight larger than the staging, the LM
+    // head of a batched step) goes by the GEMV, four rows at a time.
     if g.parts.len() != 1 || c.dtype() != DType::BF16 || scratch.numel() < n * k {
         for r in (0..m).step_by(qwen_gguf::GEMV_MAX_ROWS) {
             let rows = (m - r).min(qwen_gguf::GEMV_MAX_ROWS);
