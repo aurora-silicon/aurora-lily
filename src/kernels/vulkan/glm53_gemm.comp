@@ -333,20 +333,25 @@ void main() {
 // quant_grouped.glsl, Qwen's grouped GEMM): tile y is tiles[y] = (expert,
 // first, count) of the expert-sorted pair list `pairs` (glm53_moe_group);
 // its rows are pairs[first ..], X row pairs[k] >> x_shift (the token for
-// gate/up, the pair for down), Y row pairs[k]. X is bfloat (glm53_to_bf16,
+// gate/up, the pair for down), Y row pairs[k]. X is f16 (glm53_to_f16,
 // glm53_moe_swiglu), read by each subgroup straight from device memory
-// (MAT_A_OF_ROWS). A threadgroup of four subgroups computes 64 rows x 64
+// (as MAT_A_OF_ROWS). A threadgroup of four subgroups computes 64 rows x 64
 // columns; a subgroup owns 16 rows (none past the tile's: no multiplies)
 // and all 64 columns, and every thread dequantizes 8 weights of 4 weight
 // rows a 64-deep K step into the tile in the lanes' order (one load per B
-// operand), two tiles in turn so one barrier a step. The decoded values are
-// glm53_decode's, rounded to bfloat as before.
-// Buffers: 0 X (bfloat), 1 W (the expert stack), 2 Y f32, 3 pairs u32,
+// operand), two tiles in turn so one barrier a step.
+// The operands are f16 (the dense GEMMs' are bfloat): the weights come out
+// of f16 multiplies (IQ2_XXS: f16(d (2 s + 1)) times the grid / 8; Q2_K:
+// f16(d sc) q - f16(dmin m), one fused rounding), which round in hardware
+// where bfloat's rounding took three instructions a weight, and keep three
+// more bits. The inputs stay well inside f16's range (normalized rows; the
+// down GEMM's are bounded by the SwiGLU clamp); glm53_to_f16 saturates.
+// Buffers: 0 X (f16), 1 W (the expert stack), 2 Y f32, 3 pairs u32,
 // 4 tiles u32 [3 per tile], 5 tile count u32. Params: 6 N (rows per
 // expert), 7 K (a multiple of 256), 8 row_bytes, 9 x_shift.
 // glm53_gemm_moe_gate_up_iq2_xxs computes gate (W) and up (buffer 6) of
 // 32 columns a tile, grid (N / 32, tiles), and writes the weighted clamped
-// SwiGLU of each pair (weights f32 at buffer 7) to Y as bfloat, the down
+// SwiGLU of each pair (weights f32 at buffer 7) to Y as f16, the down
 // GEMM's operand; its params are 8 N, 9 K, 10 row_bytes, 11 x_shift,
 // 12 limit.
 // ---------------------------------------------------------------------------
@@ -359,23 +364,28 @@ void main() {
 #define GM_P 6u
 #endif
 
-// Weights k .. k + 8 (k a multiple of 8) of `row`.
-void gm_decode8(uint64_t row, uint k, out float w[8]) {
+uvec4 glm53_iq2xxs_grid_h8[256] = uvec4[256](
+#include "glm53_iq2xxs_grid_h8.glsl"
+);
+float16_t gm_h(uint bits) { return uint16BitsToHalf(uint16_t(bits)); }
+
+// Weights k .. k + 8 (k a multiple of 8) of `row`, as f16.
+void gm_decode8h(uint64_t row, uint k, out float16_t w[8]) {
 #if defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(GM_GATE_UP)
     const uint t = k >> 5u, l = (k >> 3u) & 3u;
     const uint bw = (t >> 3u) * 33u;
     const uint qw = bw + 1u + 4u * (t & 7u);
-    const float d = glm53_h2f(uint(U16(row).v[bw]));
+    const float16_t d = gm_h(uint(U16(row).v[bw]));
     const uint aux0 = uint(U16(row).v[qw]) | (uint(U16(row).v[qw + 1u]) << 16u);
     const uint aux1 = uint(U16(row).v[qw + 2u]) | (uint(U16(row).v[qw + 3u]) << 16u);
-    const float scale = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
-    const uvec4 g = glm53_iq2xxs_grid_h[(aux0 >> (8u * l)) & 0xffu]
+    precise const float16_t scale = d * float16_t(2u * (aux1 >> 28u) + 1u);
+    const uvec4 g = glm53_iq2xxs_grid_h8[(aux0 >> (8u * l)) & 0xffu]
                   ^ glm53_iq2xxs_signs_h[(aux1 >> (7u * l)) & 127u];
     // Word p holds values p and p + 4.
     [[unroll]] for (uint p = 0u; p < 4u; p++) {
-        const vec2 v = unpackHalf2x16(g[p]);
-        w[p] = scale * v.x;
-        w[p + 4u] = scale * v.y;
+        precise const f16vec2 v = unpackFloat2x16(g[p]) * scale;
+        w[p] = v.x;
+        w[p + 4u] = v.y;
     }
 #else
     // Block k / 256, half h, shift j, bytes l .. l + 8 of the half's 32;
@@ -383,17 +393,43 @@ void gm_decode8(uint64_t row, uint k, out float w[8]) {
     const uint v = k & 255u, h = v >> 7u, j = (v >> 5u) & 3u, l = v & 31u;
     const uint64_t b = row + uint64_t(k >> 8u) * 84u;
     const uint dd = U32(b + 80u).v[0];
-    const float d = glm53_h2f(dd & 0xffffu);
-    const float dmin = glm53_h2f(dd >> 16u);
     const uint sc = uint(U8(b).v[8u * h + 2u * j + (l >> 4u)]);
-    const float scale = d * float(sc & 0xfu);
-    const float minv = dmin * float(sc >> 4u);
+    precise const float16_t scale = gm_h(dd & 0xffffu) * float16_t(sc & 0xfu);
+    precise const float16_t minv = gm_h(dd >> 16u) * float16_t(sc >> 4u);
     const uvec2 q = U32x2(b + 16u + 32u * h + l).v[0];
     [[unroll]] for (uint i = 0u; i < 8u; i++) {
-        w[i] = scale * float((q[i >> 2u] >> (8u * (i & 3u) + 2u * j)) & 3u) - minv;
+        precise const float16_t c = float16_t((q[i >> 2u] >> (8u * (i & 3u) + 2u * j)) & 3u);
+        w[i] = fma(scale, c, -minv);
     }
 #endif
 }
+
+uint gm_pair_h(float16_t lo, float16_t hi) { return packFloat2x16(f16vec2(lo, hi)); }
+// GM_STORE_TILE's layout for f16 weights.
+#define GM_STORE_TILE_H(at, w)                                                                \
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {                                               \
+        gm_tile[(at) + 16u * i] = uvec4(                                                      \
+            gm_pair_h(w[0][2u * i], w[1][2u * i]), gm_pair_h(w[2][2u * i], w[3][2u * i]),     \
+            gm_pair_h(w[0][2u * i + 1u], w[1][2u * i + 1u]),                                  \
+            gm_pair_h(w[2][2u * i + 1u], w[3][2u * i + 1u]));                                 \
+    }
+#define MatAh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MatBh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+// matmul.glsl's MAT_OF_WORDS and MAT_A_OF_ROWS for f16 operands.
+#define GM_LO_H(w) gm_h((w) & 0xffffu)
+#define GM_HI_H(w) gm_h((w) >> 16u)
+#define GM_OF_WORDS_H(m, v)                                                                   \
+    {                                                                                         \
+        uvec4 gm_v = v;                                                                       \
+        m[0] = GM_LO_H(gm_v[0]); m[1] = GM_HI_H(gm_v[0]); m[2] = GM_LO_H(gm_v[1]); m[3] = GM_HI_H(gm_v[1]); \
+        m[4] = GM_LO_H(gm_v[2]); m[5] = GM_HI_H(gm_v[2]); m[6] = GM_LO_H(gm_v[3]); m[7] = GM_HI_H(gm_v[3]); \
+    }
+#define GM_A_OF_ROWS_H(m, v0, v1, odd16)                                                      \
+    {                                                                                         \
+        uvec4 gm_v0 = (v0) >> (odd16), gm_v1 = (v1) >> (odd16);                               \
+        m[0] = GM_LO_H(gm_v0[0]); m[1] = GM_LO_H(gm_v0[1]); m[2] = GM_LO_H(gm_v0[2]); m[3] = GM_LO_H(gm_v0[3]); \
+        m[4] = GM_LO_H(gm_v1[0]); m[5] = GM_LO_H(gm_v1[1]); m[6] = GM_LO_H(gm_v1[2]); m[7] = GM_LO_H(gm_v1[3]); \
+    }
 
 void main() {
     if (gl_WorkGroupID.y >= U32(arg(5)).v[0]) return;
@@ -436,9 +472,9 @@ void main() {
     for (uint k0 = 0u; k0 < K; k0 += GM_STEP) {
         const uint tile_at = ((k0 / GM_STEP) & 1u) * (GM_STEP * 8u);
         {
-            float w[4][8];
-            [[unroll]] for (uint r = 0u; r < 4u; r++) gm_decode8(wr[r], k0 + 8u * k8, w[r]);
-            GM_STORE_TILE(tile_at + 64u * k8 + quad, w)
+            float16_t w[4][8];
+            [[unroll]] for (uint r = 0u; r < 4u; r++) gm_decode8h(wr[r], k0 + 8u * k8, w[r]);
+            GM_STORE_TILE_H(tile_at + 64u * k8 + quad, w)
         }
         barrier();
         if (working) {
@@ -448,16 +484,16 @@ void main() {
                 const uvec4 v0 = xa.v[a_at0 + at], v1 = xa.v[a_at1 + at];
                 const uvec4 b0 = gm_tile[b_at], b1 = gm_tile[b_at + 4u];
                 const uvec4 b2 = gm_tile[b_at + 8u], b3 = gm_tile[b_at + 12u];
-                MatA ma;
-                MatB mb;
-                MAT_A_OF_ROWS(ma, v0, v1, odd16)
-                MAT_OF_WORDS(mb, b0)
+                MatAh ma;
+                MatBh mb;
+                GM_A_OF_ROWS_H(ma, v0, v1, odd16)
+                GM_OF_WORDS_H(mb, b0)
                 acc0 = coopMatMulAdd(ma, mb, acc0);
-                MAT_OF_WORDS(mb, b1)
+                GM_OF_WORDS_H(mb, b1)
                 acc1 = coopMatMulAdd(ma, mb, acc1);
-                MAT_OF_WORDS(mb, b2)
+                GM_OF_WORDS_H(mb, b2)
                 acc2 = coopMatMulAdd(ma, mb, acc2);
-                MAT_OF_WORDS(mb, b3)
+                GM_OF_WORDS_H(mb, b3)
                 acc3 = coopMatMulAdd(ma, mb, acc3);
             }
         }
@@ -465,7 +501,7 @@ void main() {
     if (!working) return;
     const uint col = n0 + mat_lane_col();
 #ifdef GM_GATE_UP
-    // mid[p][j] = w[p] * silu(min(g, L)) * clamp(u, -L, L) as bfloat (the
+    // mid[p][j] = w[p] * silu(min(g, L)) * clamp(u, -L, L) as f16 (the
     // SwiGLU of glm53_moe_swiglu, from the same sums).
     const float limit = arg_f32(12);
     [[unroll]] for (uint h = 0u; h < 2u; h++) {
@@ -487,7 +523,7 @@ void main() {
                     precise float gu = g * u;
                     precise float e = exp2(-(g * uintBitsToFloat(0x3fb8aa3bu)));
                     precise float sv = we * (gu * (1.0 / (1.0 + e)));
-                    b[c] = glm53_bf16_bits(sv);
+                    b[c] = uint(halfBitsToUint16(float16_t(sv)));
                 }
                 const uint64_t at = arg(2) + 2u * (uint64_t(p) * N + col + 16u * half_);
                 U32x2(at).v[0] = uvec2(b[0] | (b[1] << 16u), b[2] | (b[3] << 16u));
@@ -510,9 +546,19 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
-// x as bfloat bits (glm53_bf16_bits), two values a word: the expert GEMM's
+// x as bfloat bits (glm53_bf16_bits), two values a word: the dense GEMMs'
 // operand. Grid::Threads (n / 2). Buffers: 0 x f32, 1 out (bfloat).
+// glm53_to_f16: the same as f16 (saturated to f16's range), the expert
+// GEMMs' operand.
 // ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_to_f16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint i = gl_GlobalInvocationID.x;
+    const vec2 v = clamp(vec2(F32(arg(0)).v[2u * i], F32(arg(0)).v[2u * i + 1u]), -65504.0, 65504.0);
+    U32(arg(1)).v[i] = packFloat2x16(f16vec2(v));
+}
+#endif
 #ifdef KERNEL_glm53_to_bf16
 void main() {
     if (!LILY_THREAD_IN_GRID) return;
@@ -568,7 +614,7 @@ void main() {
 // ---------------------------------------------------------------------------
 // mid[p][j] = w[p] * silu(min(g, L)) * clamp(u, -L, L) for every routed pair.
 // Grid::Threads (F, pairs). Buffers: 0 g [pairs][F], 1 u, 2 weights
-// [pairs], 3 mid (bfloat: the down GEMM's operand). Params: 4 F, 5 limit.
+// [pairs], 3 mid (f16: the down GEMM's operand). Params: 4 F, 5 limit.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_glm53_moe_swiglu
 void main() {
@@ -587,7 +633,7 @@ void main() {
     precise float gu = g * u;
     precise float e = exp2(-(g * uintBitsToFloat(0x3fb8aa3bu)));
     precise float sv = F32(arg(2)).v[p] * (gu * (1.0 / (1.0 + e)));
-    BF16(arg(3) + 2u * at).v[0] = uintBitsToBFloat16EXT(uint16_t(glm53_bf16_bits(sv)));
+    F16(arg(3) + 2u * at).v[0] = float16_t(sv);
 }
 #endif
 

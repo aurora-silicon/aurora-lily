@@ -92,8 +92,9 @@ or restore a snapshot taken before the step.
 - The MTP head attends at most the last 2 051 rows of its run (ds4: the whole
   run). This changes the drafts, not the sampling rule: drafts only decide
   which steps verify two rows (see the finite-precision caveat above).
-- Prefill GEMMs round both operands to bfloat16 (f32 accumulators); decode
-  works on f32 activations. Quality is close to ds4's (below).
+- Prefill GEMMs round both operands to bfloat16 (the weights to nearest,
+  ties away from zero), the routed experts' to f16 (f32 accumulators);
+  decode works on f32 activations. Quality is close to ds4's (below).
 - Prompt runs compute DSA attention on the matrix units: the f32 queries
   and attention weights are split into an f16 high part (the value with its
   mantissa cut to ten bits) and the f16 rounding of the rest, multiplied

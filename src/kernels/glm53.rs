@@ -427,11 +427,11 @@ pub struct MoeGroupScratch {
     pub pairs: Tensor,
     pub tiles: Tensor,
     pub tile_count: Tensor,
-    /// The run's input rows as bfloat (the gate/up GEMMs' operand).
+    /// The run's input rows as f16 (the gate/up GEMMs' operand).
     pub xb: Tensor,
     pub g: Tensor,
     pub u: Tensor,
-    /// BF16: the down GEMM's operand.
+    /// F16: the down GEMM's operand.
     pub mid: Tensor,
     pub down: Tensor,
 }
@@ -449,10 +449,10 @@ impl MoeGroupScratch {
             pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
             tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
             tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
-            xb: Tensor::zeros(ctx, &[pairs * hidden], DType::BF16)?,
+            xb: Tensor::zeros(ctx, &[pairs * hidden], DType::F16)?,
             g: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
             u: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
-            mid: Tensor::zeros(ctx, &[pairs * ff], DType::BF16)?,
+            mid: Tensor::zeros(ctx, &[pairs * ff], DType::F16)?,
             down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
         })
     }
@@ -527,13 +527,13 @@ fn moe_grouped_with(
         &[&u32_bytes(pairs), &u32_bytes(experts)],
         Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
     )?;
-    let to_bf16 = ctx.pipeline("glm53_to_bf16", SOURCE, MslVersion::V3_1)?;
+    let to_f16 = ctx.pipeline("glm53_to_f16", SOURCE, MslVersion::V3_1)?;
     ensure!(
         x.numel() >= m * hidden && sc.xb.numel() >= m * hidden,
         "grouped MoE input"
     );
     pass.dispatch_at(
-        &to_bf16,
+        &to_f16,
         &[x.binding(), sc.xb.binding()],
         &[],
         Grid::Threads { grid: (m * hidden / 2, 1, 1), threadgroup: (256, 1, 1) },
@@ -579,7 +579,7 @@ fn moe_grouped_with(
     let shift = used.trailing_zeros() as usize;
     if gate.ty == GgmlType::Iq2Xxs && fuse_gate_up {
         // Gate, up and the SwiGLU in one GEMM: a tile is 32 columns of
-        // each, written as the down GEMM's bfloat operand.
+        // each, written as the down GEMM's f16 operand.
         ensure!(
             gate.cols.is_multiple_of(256) && ff.is_multiple_of(32),
             "grouped expert GEMM of {ff} x {}",
