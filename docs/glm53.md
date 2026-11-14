@@ -61,7 +61,15 @@ GEMV kernels on f32 activations (up to four rows); prompts run in runs of
 layer. A pass of several rows rounds differently from a one-row decode step;
 where two experts tie at the top-8 boundary (seen to 1e-6 after a
 pseudo-random prompt) the two can route differently, so speculative decoding
-gives plain decoding's tokens only up to such ties.
+gives plain decoding's tokens only up to such ties. A different expert
+changes that token's hidden state and so the recurrent state after it:
+the two decodings can part many tokens later, at a token that is not
+itself a tie. `lily-glm53 spec-diff` finds the first parting of a text and
+its cause (on a raw C text: experts tied to 1.9e-6 at decode token 20,
+layer 24, under FFN-input differences of at most 5e-5 between the two
+paths; the outputs parted at token 119, where plain decoding's top two
+logits were 0.066 apart). The plain router itself meets margins below 1e-5
+about once every 14 tokens there.
 
 ## Differences from ds4
 
@@ -97,8 +105,9 @@ fork), sampled speculation against ordinary sampling (the same draws and
 penalty counts after a rejection and an acceptance), and cancelled prefill. `lily-glm53` (`src/bin/lily-glm53.rs`) compares
 the GPU with the CPU reference layer by layer (`compare`), scores ds4's
 official GLM 5.3 Flash continuations from its `gguf-tools/quality-testing`
-(`score`, `--legacy` for ds4's reference rendering), and measures prefill,
-decode and speculative decoding (`bench`, `spec`).
+(`score`, `--legacy` for ds4's reference rendering), measures prefill,
+decode and speculative decoding (`bench`, `spec`), and locates where
+speculative decoding first parts from plain decoding (`spec-diff`).
 
 Measured on the M5 Max, 2026-11-13: ds4's 100 official cases NLL 0.466 per
 token and 89/100 first tokens (ds4's own references 0.458 to 0.462 and 89 to

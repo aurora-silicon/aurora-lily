@@ -678,6 +678,20 @@ pub struct LayerTrace {
     pub h: Vec<f32>,
 }
 
+/// One layer of [`Glm53Model::step_layers`], row-major over the step's rows.
+#[derive(Default, Clone)]
+pub struct StepLayer {
+    pub attn_out: Vec<f32>,
+    /// The FFN's input (after the HC pre).
+    pub ffn_in: Vec<f32>,
+    pub ffn_out: Vec<f32>,
+    /// Routed layers: each row's selected experts, as the GPU chose them.
+    pub sel: Vec<u32>,
+    /// Routed layers: each row's 8th-best minus 9th-best selection score
+    /// (sigmoid(logit) + bias), from the GPU's router logits.
+    pub margin: Vec<f32>,
+}
+
 impl Glm53Model {
     /// Feeds `tokens` (at most [`MAX_ROWS`]) at the state's position and
     /// leaves the last row's logits in `scratch.logits` when `logits`.
@@ -691,6 +705,67 @@ impl Glm53Model {
     ) -> Result<()> {
         let l = if logits { Logits::Last } else { Logits::None };
         self.forward_inner(ctx, st, sc, tokens, l, None)
+    }
+
+    /// A decode/verify step of `tokens` (at most [`MAX_ROWS`]) through the
+    /// production kernels (`run_step`'s), one pass a layer, reading each
+    /// layer's intermediates back (diagnostics: `lily-glm53 spec-diff`).
+    /// Advances the state; returns the layers and every row's logits.
+    pub fn step_layers(
+        &self,
+        ctx: &MetalContext,
+        st: &mut Glm53State,
+        sc: &mut Scratch,
+        tokens: &[u32],
+    ) -> Result<(Vec<StepLayer>, Vec<f32>)> {
+        let cfg = &self.cfg;
+        let m = tokens.len();
+        ensure!((1..=MAX_ROWS).contains(&m), "step of {m} rows");
+        ensure!(st.pos + m <= st.capacity, "state capacity {}", st.capacity);
+        sc.stage_tokens(tokens)?;
+        let snap = (m > 1).then_some(0);
+        let mut out = Vec::with_capacity(cfg.n_trunk);
+        for il in 0..cfg.n_trunk {
+            let pass = self.begin(ctx)?;
+            let r = il..il + 1;
+            self.encode_layers(
+                ctx,
+                &pass,
+                st,
+                sc,
+                &sc.tokens,
+                m,
+                Logits::All,
+                snap,
+                r,
+            )?;
+            pass.commit_wait()?;
+            let mut l = StepLayer {
+                attn_out: read(&sc.attn_out, m * cfg.hidden)?,
+                ffn_in: read(&sc.xn, m * cfg.hidden)?,
+                ffn_out: read(&sc.ffn_out, m * cfg.hidden)?,
+                ..Default::default()
+            };
+            if let FfnW::Moe { bias, .. } = &self.layers[il].ffn {
+                let (e, k) = (cfg.n_expert, cfg.n_expert_used);
+                l.sel = sc.rsel.to_u32()?[..m * k].to_vec();
+                let logits = read(&sc.rlogits, m * e)?;
+                let bias = bias.to_f32()?;
+                for row in logits.chunks(e) {
+                    let mut sc: Vec<f32> = row
+                        .iter()
+                        .zip(&bias)
+                        .map(|(&x, &b)| 1.0 / (1.0 + (-x).exp()) + b)
+                        .collect();
+                    sc.sort_by(|a, b| b.total_cmp(a));
+                    l.margin.push(sc[k - 1] - sc[k]);
+                }
+            }
+            out.push(l);
+        }
+        let logits = read(&sc.logits, m * cfg.vocab)?;
+        st.pos += m;
+        Ok((out, logits))
     }
 
     /// [`Self::forward`] with the logits of every row.

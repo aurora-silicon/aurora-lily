@@ -111,6 +111,25 @@ enum Cmd {
         #[arg(long)]
         chat: Option<String>,
     },
+    /// Where greedy speculative decoding first parts from plain decoding:
+    /// replays the speculation to the verify pass that draws the first
+    /// differing token and compares, layer by layer with the production
+    /// kernels, that pass's row against one-row steps on the same state and
+    /// against plain decoding's own state (routed experts and their top-8
+    /// margin, sublayer outputs, logits, recurrent state).
+    SpecDiff {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, default_value_t = 256)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        /// Use the chat template around a question instead of raw text.
+        #[arg(long)]
+        chat: Option<String>,
+    },
     /// Step time by row count: after a prompt, forward passes of 1 to 4
     /// rows (every row's logits, as a verify pass), each from the prompt's
     /// state (restored); medians.
@@ -162,6 +181,9 @@ fn run() -> Result<()> {
         Cmd::Chat { model, prompt, n, think } => chat(&model, &prompt, n, think),
         Cmd::Spec { model, text, prompt_len, n, runs, chat } => {
             spec(&model, &text, prompt_len, n, runs, chat.as_deref())
+        }
+        Cmd::SpecDiff { model, text, prompt_len, n, chat } => {
+            spec_diff(&model, &text, prompt_len, n, chat.as_deref())
         }
         Cmd::Rows { model, text, prompt_len, n } => rows(&model, &text, prompt_len, n),
         Cmd::Bench { model, text, prompt_len, n, runs } => {
@@ -631,18 +653,14 @@ fn rows(
     Ok(())
 }
 
-fn spec(
-    path: &PathBuf,
+/// The prompt of `spec` and `spec-diff`: a chat question, or raw text.
+fn prompt_ids(
+    tok: &lily::tokenizer::Tokenizer,
     text: &PathBuf,
     prompt_len: usize,
-    n: usize,
-    runs: usize,
     chat: Option<&str>,
-) -> Result<()> {
-    use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions};
-    use lily::kernels::sample::SamplingParams;
-    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
-    let ids = match chat {
+) -> Result<Vec<u32>> {
+    Ok(match chat {
         Some(q) => {
             let messages = [serde_json::json!({"role": "user", "content": q})];
             tok.encode_chat(&lily::tokenizer::ChatRender {
@@ -659,7 +677,312 @@ fn spec(
             ids.extend_from_slice(&body[..prompt_len - ids.len()]);
             ids
         }
+    })
+}
+
+/// Relative L2 distance of `a` from `b`.
+fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
+    let (mut d, mut n) = (0f64, 0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        d += (f64::from(x) - f64::from(y)).powi(2);
+        n += f64::from(y).powi(2);
+    }
+    (d / n.max(1e-30)).sqrt()
+}
+
+/// The top token and its margin over the second.
+fn top2(l: &[f32]) -> (usize, f32) {
+    let t = argmax(l);
+    let second = l
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != t)
+        .map(|(_, &v)| v)
+        .fold(f32::NEG_INFINITY, f32::max);
+    (t, l[t] - second)
+}
+
+fn spec_diff(
+    path: &PathBuf,
+    text: &PathBuf,
+    prompt_len: usize,
+    n: usize,
+    chat: Option<&str>,
+) -> Result<()> {
+    use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions};
+    use lily::glm53::model::{LayerState, StepLayer};
+    use lily::kernels::sample::SamplingParams;
+    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
+    let ids = prompt_ids(&tok, text, prompt_len, chat)?;
+    let ctx = MetalContext::new()?;
+    let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
+    let model = <Glm53Model as LanguageModel>::load(&ctx, path, &options)?;
+    let cfg = model.cfg.clone();
+    let (vocab, hd, k) = (cfg.vocab, cfg.hidden, cfg.n_expert_used);
+    let greedy = SamplingParams::greedy();
+    let mut sc = LanguageModel::new_scratch_with_capacity(&model, &ctx, 0)?;
+    let cap = ids.len() + n + 8;
+    let fresh =
+        |sc: &mut lily::glm53::model::Scratch| -> Result<lily::glm53::Glm53State> {
+            let mut st = LanguageModel::new_state(&model, &ctx, cap)?;
+            LanguageModel::prefill(
+                &model,
+                &ctx,
+                &mut st,
+                sc,
+                &ids,
+                Some(Draw { params: &greedy, step: 0 }),
+            )?;
+            Ok(st)
+        };
+    // Routing of every fed row, by state position: per layer the sorted
+    // experts, the top-8 margin and the FFN input.
+    type Rec = Vec<(Vec<u32>, f32, Vec<f32>)>;
+    let rec = |l: &[StepLayer], r: usize| -> Rec {
+        l.iter()
+            .map(|x| {
+                let mut sel = if x.sel.is_empty() {
+                    vec![]
+                } else {
+                    x.sel[r * k..(r + 1) * k].to_vec()
+                };
+                sel.sort();
+                let m = x.margin.get(r).copied().unwrap_or(f32::NAN);
+                (sel, m, x.ffn_in[r * hd..(r + 1) * hd].to_vec())
+            })
+            .collect()
     };
+    let mut plain_rec: std::collections::BTreeMap<usize, Rec> = Default::default();
+    let mut spec_rec: std::collections::BTreeMap<usize, Rec> = Default::default();
+    // Plain greedy decoding (the production kernels, a pass a layer).
+    let mut st = fresh(&mut sc)?;
+    let mut plain = vec![sc.next_token.to_u32()?[0]];
+    while plain.len() < n {
+        let p = st.pos;
+        let (l, lg) =
+            model.step_layers(&ctx, &mut st, &mut sc, &[*plain.last().unwrap()])?;
+        plain_rec.insert(p, rec(&l, 0));
+        plain.push(argmax(&lg[..vocab]) as u32);
+    }
+    // Speculative decoding through the engine; each verify pass is also
+    // replayed a layer at a time first (from a snapshot) for its routing.
+    // A second run stops before the verify pass that draws the first token
+    // that differs.
+    let mut stop_at: Option<usize> = None;
+    let (st, pending, feed, row, d) = loop {
+        let mut st = fresh(&mut sc)?;
+        let mut out = vec![sc.next_token.to_u32()?[0]];
+        let mut proposals =
+            model.draft_initial(&ctx, &mut st, &mut sc, out[0], 1, &greedy, 1)?;
+        let mut found = None;
+        while out.len() < n {
+            let pending = *out.last().unwrap();
+            let l = out.len();
+            let feed: Vec<u32> =
+                std::iter::once(pending).chain(proposals.iter().copied()).collect();
+            if let Some(d) = stop_at
+                && d < l + feed.len()
+            {
+                found = Some((pending, feed, d - l, d));
+                break;
+            }
+            let pos0 = st.pos;
+            let layers = if stop_at.is_none() {
+                let snap = st.snapshot(&ctx)?;
+                let (layers, _) = model.step_layers(&ctx, &mut st, &mut sc, &feed)?;
+                st.restore(&ctx, &snap)?;
+                Some(layers)
+            } else {
+                None
+            };
+            let (draws, pend) = model
+                .verify(&ctx, &mut st, &mut sc, pending, &proposals, &greedy, l, 1)?;
+            let kept = proposals.first().map_or(0, |&p| usize::from(draws[0] == p));
+            if let Some(layers) = layers {
+                for r in 0..=kept {
+                    spec_rec.insert(pos0 + r, rec(&layers, r));
+                }
+            }
+            out.extend_from_slice(&draws[..=kept]);
+            proposals =
+                model.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pend)?;
+        }
+        if let Some((pending, feed, row, d)) = found {
+            break (st, pending, feed, row, d);
+        }
+        out.truncate(n);
+        match plain.iter().zip(&out).position(|(a, b)| a != b) {
+            Some(d) if stop_at.is_none() => {
+                println!("speculative output parts from plain at token {d} of {n}");
+                stop_at = Some(d);
+            }
+            _ => {
+                println!("speculative output equals plain decoding for {n} tokens");
+                return Ok(());
+            }
+        }
+    };
+    // Where the two runs first route a row differently.
+    let mut before = 0f64;
+    let mut first = None;
+    'pos: for (&p, pr) in &plain_rec {
+        let Some(srec) = spec_rec.get(&p) else { continue };
+        for (il, ((s1, m1, x1), (s2, m2, x2))) in pr.iter().zip(srec).enumerate() {
+            let r = rel_l2(x2, x1);
+            if s1 != s2 {
+                let gone: Vec<u32> =
+                    s1.iter().filter(|e| !s2.contains(e)).copied().collect();
+                let came: Vec<u32> =
+                    s2.iter().filter(|e| !s1.contains(e)).copied().collect();
+                println!(
+                    "first routing difference: position {p} (token {}), layer {il}: plain {gone:?} -> speculative {came:?}; top-8 margin plain {m1:.3e}, speculative {m2:.3e}; FFN input relative L2 {r:.2e}; largest FFN-input difference at all earlier rows and layers {before:.2e}",
+                    p - ids.len()
+                );
+                first = Some(p);
+                break 'pos;
+            }
+            before = before.max(r);
+        }
+    }
+    if first.is_none() {
+        println!(
+            "no routing difference before the parting; largest FFN-input difference {before:.2e}"
+        );
+    }
+    let small: Vec<(usize, usize, f32)> = plain_rec
+        .iter()
+        .flat_map(|(&p, r)| {
+            r.iter()
+                .enumerate()
+                .filter(|(_, x)| x.1 < 1e-5)
+                .map(move |(il, x)| (p, il, x.1))
+        })
+        .collect();
+    println!("plain rows with a top-8 margin below 1e-5: {small:?}");
+    println!(
+        "verify pass at position {} feeds {feed:?} (pending {pending}); its row {row} draws token {d}",
+        st.pos
+    );
+    let snap = st.snapshot(&ctx)?;
+    let mut st = st;
+    // (a) The verify pass; (b) one-row steps on the same state.
+    let (two, two_logits) = model.step_layers(&ctx, &mut st, &mut sc, &feed)?;
+    st.restore(&ctx, &snap)?;
+    let mut one = Vec::new();
+    let mut one_logits = Vec::new();
+    for &t in &feed[..=row] {
+        let (l, lg) = model.step_layers(&ctx, &mut st, &mut sc, &[t])?;
+        one = l;
+        one_logits = lg;
+    }
+    st.restore(&ctx, &snap)?;
+    // (c) Plain decoding's own state at the same position.
+    let mut ps = fresh(&mut sc)?;
+    let base = ps.pos;
+    for &t in &plain[..st.pos - base] {
+        model.forward(&ctx, &mut ps, &mut sc, &[t], true)?;
+    }
+    anyhow::ensure!(ps.pos == st.pos, "plain state at {} not {}", ps.pos, st.pos);
+    // Recurrent state and caches, speculative against plain.
+    let mut worst_kda = (0.0f64, 0usize);
+    let mut worst_lat = (0.0f64, 0usize);
+    // The trunk's layers (the MTP block's cache is the MTP head's own).
+    for (il, (a, b)) in st.layers.iter().zip(&ps.layers).enumerate().take(cfg.n_trunk) {
+        match (a, b) {
+            (
+                LayerState::Kda { s: sa, conv: ca, .. },
+                LayerState::Kda { s: sb, conv: cb, .. },
+            ) => {
+                let r = rel_l2(&sa.to_f32()?, &sb.to_f32()?)
+                    .max(rel_l2(&ca.to_f32()?, &cb.to_f32()?));
+                if r > worst_kda.0 {
+                    worst_kda = (r, il);
+                }
+            }
+            (
+                LayerState::Dsa { latent: la, .. },
+                LayerState::Dsa { latent: lb, .. },
+            ) => {
+                let rows = st.pos * cfg.kv_lora;
+                let r = rel_l2(&la.to_f32()?[..rows], &lb.to_f32()?[..rows]);
+                if r > worst_lat.0 {
+                    worst_lat = (r, il);
+                }
+            }
+            _ => anyhow::bail!("layer kinds differ"),
+        }
+    }
+    println!(
+        "state, speculative vs plain: KDA worst relative L2 {:.2e} (layer {}), DSA latent cache worst {:.2e} (layer {})",
+        worst_kda.0, worst_kda.1, worst_lat.0, worst_lat.1
+    );
+    let mut plain_layers = Vec::new();
+    let mut plain_logits = Vec::new();
+    for &t in &feed[..=row] {
+        let (l, lg) = model.step_layers(&ctx, &mut ps, &mut sc, &[t])?;
+        plain_layers = l;
+        plain_logits = lg;
+    }
+    let pick = |l: &StepLayer, r: usize| -> (Vec<f32>, Vec<f32>, Vec<u32>, f32) {
+        let h = |v: &Vec<f32>| v[r * hd..(r + 1) * hd].to_vec();
+        let mut sel =
+            if l.sel.is_empty() { vec![] } else { l.sel[r * k..(r + 1) * k].to_vec() };
+        sel.sort();
+        (
+            h(&l.attn_out),
+            h(&l.ffn_out),
+            sel,
+            l.margin.get(r).copied().unwrap_or(f32::NAN),
+        )
+    };
+    println!(
+        "layer  verify-vs-one-row: attn_out ffn_out experts   one-row-vs-plain: attn_out ffn_out experts   margins (verify / one-row / plain)"
+    );
+    for il in 0..cfg.n_trunk {
+        let (a2, f2, s2, m2) = pick(&two[il], row);
+        let (a1, f1, s1, m1) = pick(&one[il], 0);
+        let (ap, fp, sp, mp) = pick(&plain_layers[il], 0);
+        let diff = |x: &[u32], y: &[u32]| x.iter().filter(|e| !y.contains(e)).count();
+        println!(
+            "{il:5}  {:.2e} {:.2e} {:>2}   {:.2e} {:.2e} {:>2}   {m2:.2e} / {m1:.2e} / {mp:.2e}",
+            rel_l2(&a2, &a1),
+            rel_l2(&f2, &f1),
+            diff(&s2, &s1),
+            rel_l2(&a1, &ap),
+            rel_l2(&f1, &fp),
+            diff(&s1, &sp),
+        );
+    }
+    let lr = |l: &[f32], r: usize| l[r * vocab..(r + 1) * vocab].to_vec();
+    for (name, l) in [
+        ("verify row", lr(&two_logits, row)),
+        ("one-row, same state", lr(&one_logits, 0)),
+        ("plain state", lr(&plain_logits, 0)),
+    ] {
+        let (t, m) = top2(&l);
+        println!("{name:22} top token {t} margin {m:.4}");
+    }
+    println!(
+        "logits relative L2: verify vs one-row {:.2e}, one-row vs plain {:.2e}",
+        rel_l2(&lr(&two_logits, row), &lr(&one_logits, 0)),
+        rel_l2(&lr(&one_logits, 0), &lr(&plain_logits, 0))
+    );
+    println!("plain token {d}: {}", plain[d]);
+    Ok(())
+}
+
+fn spec(
+    path: &PathBuf,
+    text: &PathBuf,
+    prompt_len: usize,
+    n: usize,
+    runs: usize,
+    chat: Option<&str>,
+) -> Result<()> {
+    use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions};
+    use lily::kernels::sample::SamplingParams;
+    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
+    let ids = prompt_ids(&tok, text, prompt_len, chat)?;
     let ctx = MetalContext::new()?;
     let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
     let model = <Glm53Model as LanguageModel>::load(&ctx, path, &options)?;
