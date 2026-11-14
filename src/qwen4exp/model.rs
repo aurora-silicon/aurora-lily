@@ -1660,7 +1660,14 @@ impl Qwen4ExpModel {
             config.indexer.head_dim
         );
         let weights = if gguf_file {
-            super::gguf::load(ctx, dir.as_ref(), &config, with_mtp, ngram_checkpoint)?
+            super::gguf::load(
+                ctx,
+                dir.as_ref(),
+                &config,
+                with_mtp,
+                ngram_checkpoint,
+                memory_limit,
+            )?
         } else {
             weights::load(
                 ctx,

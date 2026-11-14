@@ -706,6 +706,7 @@ pub fn load(
     config: &Qwen4ExpConfig,
     with_mtp: bool,
     ngram_checkpoint: Option<&Path>,
+    memory_limit: Option<u64>,
 ) -> Result<ModelWeights> {
     crate::instance::acquire()?;
     let recording = ctx.record_buffers()?;
@@ -752,7 +753,9 @@ pub fn load(
         expert_cache: None,
         buffers,
         planned_memory: super::weights::physical_memory(),
-        memory_limit: None,
+        // `--memory-limit-gb` as is: the GGUF has no expert cache to plan,
+        // so the limit caps the server's session cache (allocated + cache).
+        memory_limit,
         session_reserve: None,
     })
 }
