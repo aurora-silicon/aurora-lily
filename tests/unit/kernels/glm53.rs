@@ -1935,6 +1935,44 @@ fn gemm_k_widths() {
     }
 }
 
+/// The GEMM over the input's bfloat copy gives the f32-input GEMM's
+/// results bit for bit (both round the input to bfloat, to nearest even):
+/// Q8_0 and Q4_K, row counts and widths with partial tiles, inputs with
+/// values at rounding ties.
+#[test]
+fn gemm_bx_matches_gemm() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(78);
+    for (ty, cols, rows, m) in [
+        (GgmlType::Q8_0, 256usize, 96usize, 70usize),
+        (GgmlType::Q8_0, 512, 40, 130),
+        (GgmlType::Q4K, 512, 72, 65),
+        (GgmlType::Q4K, 256, 64, 33),
+    ] {
+        let raw = random_blocks(&mut rng, ty, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+        let mut x = f32s(&mut rng, m * cols, -3.0, 3.0);
+        // Every fifth value exactly halfway between two bfloats.
+        for v in x.iter_mut().step_by(5) {
+            *v = f32::from_bits((v.to_bits() & 0xffff_0000) | 0x8000);
+        }
+        let tx = tensor(&ctx, &x);
+        let xb = Tensor::zeros(&ctx, &[m * cols], DType::BF16).unwrap();
+        let (y, yb) = (zeros(&ctx, m * rows), zeros(&ctx, m * rows));
+        run(&ctx, |p| {
+            gemm(&ctx, p, &w, &tx, &y, m).unwrap();
+            to_bf16(&ctx, p, &tx, &xb, m * cols).unwrap();
+            p.memory_barrier().unwrap();
+            gemm_bx(&ctx, p, &w, &xb, &yb, m).unwrap();
+        });
+        let (a, b) = (y.to_f32().unwrap(), yb.to_f32().unwrap());
+        assert!(
+            a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+            "{ty:?} {rows} x {cols}, {m} rows"
+        );
+    }
+}
+
 #[test]
 fn gemm_batched_matches_grouped_gemv() {
     // attn_k_b's shape for 4 heads, 70 rows: per head a 512 x 256 block.
@@ -2043,8 +2081,13 @@ fn moe_grouped_timing() {
     let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
-    // Rows such that pairs per expert = 256 * 8 / 288 and 4096 * 8 / 288.
-    for (label, m) in [("256-token density", 57), ("4K-token density", 910)] {
+    // Rows such that pairs per expert = n * 8 / 288 for prompts of 256, 1K
+    // and 4K tokens.
+    for (label, m) in [
+        ("256-token density", 57),
+        ("1K-token density", 228),
+        ("4K-token density", 910),
+    ] {
         let sel: Vec<u32> = (0..m)
             .flat_map(|i| {
                 let start = (i * 37) % experts;
@@ -2097,21 +2140,30 @@ fn gemm_timing() {
         let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
         let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
         let y = zeros(&ctx, m * rows);
-        let mut best = f64::MAX;
-        for _ in 0..3 {
-            let pass = ctx.begin().unwrap();
-            for _ in 0..4 {
-                gemm(&ctx, &pass, &w, &x, &y, m).unwrap();
+        let xb = Tensor::zeros(&ctx, &[m * cols], DType::BF16).unwrap();
+        run(&ctx, |p| to_bf16(&ctx, p, &x, &xb, m * cols).unwrap());
+        for bx in [false, true] {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let pass = ctx.begin().unwrap();
+                for _ in 0..4 {
+                    if bx {
+                        gemm_bx(&ctx, &pass, &w, &xb, &y, m).unwrap();
+                    } else {
+                        gemm(&ctx, &pass, &w, &x, &y, m).unwrap();
+                    }
+                }
+                let t = std::time::Instant::now();
+                pass.commit_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64() / 4.0);
             }
-            let t = std::time::Instant::now();
-            pass.commit_wait().unwrap();
-            best = best.min(t.elapsed().as_secs_f64() / 4.0);
+            println!(
+                "gemm {label:24} m {m}{}: {:8.1} us  {:5.1} TFLOP/s",
+                if bx { " bx" } else { "" },
+                best * 1e6,
+                2.0 * (m * rows * cols) as f64 / best / 1e12
+            );
         }
-        println!(
-            "gemm {label:24} m {m}: {:8.1} us  {:5.1} TFLOP/s",
-            best * 1e6,
-            2.0 * (m * rows * cols) as f64 / best / 1e12
-        );
     }
 }
 

@@ -276,7 +276,90 @@ pub fn gemm_with(
     n: usize,
     l: GemmLayout,
 ) -> Result<()> {
-    check_f32(&[x, y])?;
+    check_f32(&[x])?;
+    gemm_any(ctx, pass, w, x, y, m, n, l, gemm_name(w.ty)?, 64, 128)
+}
+
+/// [`gemm`] over `xb`, the input's rows as bfloat ([`to_bf16`]'s rounding:
+/// the results are [`gemm`]'s bit for bit) for Q8_0 and Q4_K weights: the
+/// f32 kernel rounds every element in every column tile (about a third of
+/// a 1 024-row call; 2026-11-14).
+pub fn gemm_bx(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w: &QWeight,
+    xb: &Tensor,
+    y: &Tensor,
+    m: usize,
+) -> Result<()> {
+    ensure!(xb.dtype() == DType::BF16, "bfloat GEMM input is {:?}", xb.dtype());
+    ensure!(w.cols.is_multiple_of(8), "bfloat GEMM rows of {} values", w.cols);
+    let name = match w.ty {
+        GgmlType::Q8_0 => "glm53_gemm_q8_0_bx",
+        GgmlType::Q4K => "glm53_gemm_q4_k_bx",
+        other => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
+    };
+    let l = GemmLayout {
+        ldx: w.cols,
+        ldy: w.rows,
+        batches: 1,
+        x_batch: 0,
+        w_batch: 0,
+        y_batch: 0,
+    };
+    gemm_any(ctx, pass, w, xb, y, m, w.rows, l, name, GEMM_BX_ROWS, GEMM_BX_THREADS)
+}
+
+/// Rows of X a threadgroup of the bfloat-input GEMM takes (the kernel's
+/// 4 GM_BX_SUB).
+const GEMM_BX_ROWS: usize = 256;
+/// Threads a threadgroup of it (32 a subgroup of the kernel's GM_BX_SG).
+const GEMM_BX_THREADS: usize = 256;
+
+/// Whether [`gemm_bx`] takes weights of this type.
+pub fn gemm_bx_takes(w: &QWeight) -> bool {
+    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K) && w.cols.is_multiple_of(8)
+}
+
+/// `out` = the first `n` values of `x` as bfloat (rounded to nearest even),
+/// `n` even.
+pub fn to_bf16(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    out: &Tensor,
+    n: usize,
+) -> Result<()> {
+    check_f32(&[x])?;
+    ensure!(out.dtype() == DType::BF16, "bfloat copy into {:?}", out.dtype());
+    ensure!(
+        n.is_multiple_of(2) && x.numel() >= n && out.numel() >= n,
+        "bfloat copy of {n} values"
+    );
+    let to_bf16 = ctx.pipeline("glm53_to_bf16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &to_bf16,
+        &[x.binding(), out.binding()],
+        &[],
+        Grid::Threads { grid: (n / 2, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_any(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w: &QWeight,
+    x: &Tensor,
+    y: &Tensor,
+    m: usize,
+    n: usize,
+    l: GemmLayout,
+    name: &'static str,
+    tile_rows: usize,
+    threads: usize,
+) -> Result<()> {
+    check_f32(&[y])?;
     // The kernel walks K in 64-deep steps with no tail.
     ensure!(
         w.cols.is_multiple_of(64),
@@ -297,7 +380,7 @@ pub fn gemm_with(
         y.numel() >= (l.batches - 1) * l.y_batch + (m - 1) * l.ldy + n,
         "GEMM output"
     );
-    let pipeline = ctx.pipeline(gemm_name(w.ty)?, SOURCE, MslVersion::V3_1)?;
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[x.binding(), w.t.binding(), y.binding()],
@@ -313,8 +396,8 @@ pub fn gemm_with(
             &u32_bytes(l.y_batch),
         ],
         Grid::Threadgroups {
-            groups: (n.div_ceil(64), m.div_ceil(64), l.batches),
-            threadgroup: (128, 1, 1),
+            groups: (n.div_ceil(64), m.div_ceil(tile_rows), l.batches),
+            threadgroup: (threads, 1, 1),
         },
     )
 }
@@ -1141,7 +1224,11 @@ fn kda_prepare(
         None if chunks > 1 => anyhow::bail!("KDA run of {rows} rows without edges"),
         _ => conv_state,
     };
-    let name = if cumulative { "glm53_kda_chunk_prepare" } else { "glm53_kda_prefill_prepare" };
+    let name = if cumulative {
+        "glm53_kda_chunk_prepare"
+    } else {
+        "glm53_kda_prefill_prepare"
+    };
     let prepare = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &prepare,
