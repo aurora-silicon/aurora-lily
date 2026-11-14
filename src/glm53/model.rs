@@ -613,6 +613,7 @@ impl Scratch {
                     cfg.ff_dense,
                     cfg.ff_expert,
                     cfg.n_head * cfg.value_dim,
+                    cfg.q_lora,
                 ]
                 .into_iter()
                 .max()
@@ -1502,9 +1503,10 @@ impl Glm53Model {
                 }
                 pass.memory_barrier()?;
                 // Level 3: the queries.
-                self.proj(ctx, pass, &[(&w.q_b, &sc.q)], &sc.qr, None, m)?;
+                let xb = self.bf16_input(ctx, pass, sc, &sc.qr, cfg.q_lora, m)?;
+                self.proj(ctx, pass, &[(&w.q_b, &sc.q)], &sc.qr, xb, m)?;
                 if let (true, Some(ix)) = (sparse, &w.indexer) {
-                    self.proj(ctx, pass, &[(&ix.q_b, &sc.iq)], &sc.qr, None, m)?;
+                    self.proj(ctx, pass, &[(&ix.q_b, &sc.iq)], &sc.qr, xb, m)?;
                 }
                 pass.memory_barrier()?;
                 // Level 4: absorbed queries, pool scores.

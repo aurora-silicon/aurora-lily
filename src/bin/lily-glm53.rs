@@ -565,9 +565,11 @@ fn bench(
     for run in 0..runs {
         let mut st = model.new_state(&ctx, prompt_len + n + 8)?;
         let _ = lily::metal::profile::take();
+        let busy0 = lily::metal::gpu_busy_ns();
         let t = Instant::now();
         model.prefill(&ctx, &mut st, &mut sc, &ids)?;
         let pf = t.elapsed().as_secs_f64();
+        let pf_busy = (lily::metal::gpu_busy_ns() - busy0) as f64 * 1e-9;
         if ctx.profiling() {
             eprintln!("prefill of {prompt_len} tokens, per prefill:");
             profile_report(1);
@@ -590,7 +592,7 @@ fn bench(
         }
         steps.sort_by(f64::total_cmp);
         println!(
-            "run {run}: prompt {prompt_len}: prefill {pf:.2} s = {:.1} tok/s; decode {n} tokens {dt:.2} s = {:.2} tok/s; step median {:.2} ms p10 {:.2} ms; digest {digest:016x}",
+            "run {run}: prompt {prompt_len}: prefill {pf:.2} s = {:.1} tok/s (GPU busy {pf_busy:.2} s); decode {n} tokens {dt:.2} s = {:.2} tok/s; step median {:.2} ms p10 {:.2} ms; digest {digest:016x}",
             prompt_len as f64 / pf,
             n as f64 / dt,
             steps[n / 2],
