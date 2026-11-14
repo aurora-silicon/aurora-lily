@@ -297,6 +297,27 @@ fn moe_two_rows_match_one_row_exactly() {
     }
 }
 
+/// glm53_top_prob against the CPU softmax maximum.
+#[test]
+fn top_prob_matches_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(58);
+    for (n, spread) in [(154_880usize, 12.0f32), (1000, 1.0), (5, 40.0)] {
+        let l = f32s(&mut rng, n, -spread, spread);
+        let tl = tensor(&ctx, &l);
+        let out = zeros(&ctx, 1);
+        run(&ctx, |p| top_prob(&ctx, p, &tl, &out, n).unwrap());
+        let mx = l.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let z: f64 = l.iter().map(|&v| f64::from(v - mx).exp()).sum();
+        let got = out.to_f32().unwrap()[0];
+        assert!(
+            (f64::from(got) - 1.0 / z).abs() <= 1e-5 / z,
+            "n={n}: {got} vs {}",
+            1.0 / z
+        );
+    }
+}
+
 #[test]
 fn router_matches_cpu() {
     let ctx = ctx();

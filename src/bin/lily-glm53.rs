@@ -722,7 +722,7 @@ fn spec(
             &greedy,
             out.len(),
         )?;
-        let (mut steps, mut accepted) = (0usize, 0usize);
+        let (mut steps, mut accepted, mut proposed) = (0usize, 0usize, 0usize);
         let (mut t_verify, mut t_finish) = (0f64, 0f64);
         while out.len() < n {
             let pending = *out.last().unwrap();
@@ -737,9 +737,11 @@ fn spec(
                 out.len(),
                 1,
             )?;
-            let kept = usize::from(draws[0] == proposals[0]);
+            // No proposal (an unlikely draft): a one-row step.
+            let kept = proposals.first().map_or(0, |&d| usize::from(draws[0] == d));
             out.extend_from_slice(&draws[..=kept]);
             accepted += kept;
+            proposed += proposals.len();
             steps += 1;
             let tf = Instant::now();
             t_verify += (tf - tv).as_secs_f64();
@@ -762,10 +764,10 @@ fn spec(
             );
         }
         println!(
-            "run {run}: plain {:.2} tok/s; speculative {:.2} tok/s, {steps} steps, accepted {accepted}/{steps} ({:.0}%); same first {same}/{n} tokens; pos {}; per step: verify {:.2} ms, finish {:.2} ms; plain step {:.2} ms",
+            "run {run}: plain {:.2} tok/s; speculative {:.2} tok/s, {steps} steps, accepted {accepted}/{proposed} proposed ({:.0}%); same first {same}/{n} tokens; pos {}; per step: verify {:.2} ms, finish {:.2} ms; plain step {:.2} ms",
             n as f64 / plain_s,
             n as f64 / spec_s,
-            100.0 * accepted as f64 / steps as f64,
+            100.0 * accepted as f64 / proposed.max(1) as f64,
             st.pos(),
             t_verify / steps as f64 * 1e3,
             t_finish / steps as f64 * 1e3,

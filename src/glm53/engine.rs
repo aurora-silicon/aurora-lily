@@ -253,6 +253,25 @@ impl Glm53Model {
     }
 }
 
+/// A draft whose probability under the MTP head is below this is not
+/// proposed. A verify pass of two rows costs about 37 ms against 28 for one
+/// row (M5 Max, 2026-11-14), so a draft pays when it is accepted more than
+/// about 30% of the time; drafts of probability 0.2-0.3 were accepted 34%
+/// of the time, below 0.2 20%, from 0.5 up more than half. Skipping the
+/// drafts below 0.3 (two interleaved runs): raw Italian 36.7 -> 38.7
+/// tok/s, raw English 37.2 -> 37.9, raw C 45.2 -> 45.8, chat prose 43.1 ->
+/// 44.0, chat code unchanged (48.1).
+const DRAFT_MIN_PROB: f32 = 0.3;
+
+impl Glm53Model {
+    /// The MTP step's draft as a proposal list: empty when its probability
+    /// is below [`Self::draft_min_prob`].
+    fn proposal(&self, scratch: &Scratch, draft: u32) -> Result<Vec<u32>> {
+        let p = scratch.mtp_prob.to_f32()?[0];
+        Ok(if p >= self.draft_min_prob { vec![draft] } else { Vec::new() })
+    }
+}
+
 impl LanguageModel for Glm53Model {
     type State = Glm53State;
     type Scratch = Scratch;
@@ -262,6 +281,7 @@ impl LanguageModel for Glm53Model {
     fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
         let mut model = Glm53Model::load(ctx, path)?;
         model.mtp = options.mtp_drafts > 0;
+        model.draft_min_prob = DRAFT_MIN_PROB;
         Ok(model)
     }
 
@@ -289,7 +309,7 @@ impl LanguageModel for Glm53Model {
             state.mtp_min = Some(p);
         }
         let draft = self.mtp_step(ctx, state, scratch, first, 0, p, true)?;
-        Ok(vec![draft])
+        self.proposal(scratch, draft)
     }
 
     fn verify<'a>(
@@ -397,7 +417,7 @@ impl LanguageModel for Glm53Model {
             }
             pass.commit_wait()?;
             state.mtp_next = Some(pos0 + accepted + 1);
-            proposals.push(scratch.mtp_io.to_u32()?[1]);
+            proposals = self.proposal(scratch, scratch.mtp_io.to_u32()?[1])?;
         } else {
             state.mtp_next = None;
         }

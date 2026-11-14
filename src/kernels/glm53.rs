@@ -679,6 +679,25 @@ pub fn router_topk(
     )
 }
 
+/// `out[0]` = the largest softmax probability of the `n` logits.
+pub fn top_prob(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    logits: &Tensor,
+    out: &Tensor,
+    n: usize,
+) -> Result<()> {
+    check_f32(&[logits, out])?;
+    ensure!(logits.numel() >= n && n > 0, "top probability of {n} logits");
+    let pipeline = ctx.pipeline("glm53_top_prob", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[logits.binding(), out.binding()],
+        &[&u32_bytes(n)],
+        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
+    )
+}
+
 /// RMSNorm of `m` rows of `n`, times `w` when given; `out` may be `x`.
 #[allow(clippy::too_many_arguments)]
 pub fn rmsnorm(

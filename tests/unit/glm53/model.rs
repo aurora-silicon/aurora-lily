@@ -77,12 +77,15 @@ fn speculative_cycle_after_a_long_prefill() {
     let path = std::env::var("LILY_GLM53_GGUF").expect("LILY_GLM53_GGUF");
     let ctx = MetalContext::new().expect("context");
     let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
-    let model = <Glm53Model as LanguageModel>::load(
+    let mut model = <Glm53Model as LanguageModel>::load(
         &ctx,
         std::path::Path::new(&path),
         &options,
     )
     .expect("load");
+    // Every draft proposed (unlikely_drafts_are_not_proposed covers the
+    // threshold).
+    model.draft_min_prob = 0.0;
     let mut st = LanguageModel::new_state(&model, &ctx, 64).expect("state");
     let mut sc =
         LanguageModel::new_scratch_with_capacity(&model, &ctx, 0).expect("scratch");
@@ -138,6 +141,69 @@ fn real_model(ctx: &MetalContext) -> Glm53Model {
     let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
     <Glm53Model as LanguageModel>::load(ctx, std::path::Path::new(&path), &options)
         .expect("load")
+}
+
+/// The engine proposes no draft below `draft_min_prob`: the verify pass is
+/// then one row, whose draw is ordinary decoding's; at 0 every step
+/// proposes its draft.
+#[test]
+#[ignore = "needs the GLM 5.3 GGUF (LILY_GLM53_GGUF)"]
+fn unlikely_drafts_are_not_proposed() {
+    use crate::engine::{DecodeStateApi, LanguageModel};
+    use crate::kernels::sample::SamplingParams;
+    let ctx = MetalContext::new().expect("context");
+    let mut m = real_model(&ctx);
+    let greedy = SamplingParams::greedy();
+    let p = prompt(64);
+    let n = 8;
+    let mut want = Vec::new();
+    {
+        let mut st = m.new_state(&ctx, p.len() + n + 8).unwrap();
+        let mut sc = m.new_scratch(&ctx).unwrap();
+        m.prefill(&ctx, &mut st, &mut sc, &p).unwrap();
+        want.push(argmax(&sc.logits_last.to_f32().unwrap()));
+        while want.len() < n {
+            let last = *want.last().unwrap();
+            m.forward(&ctx, &mut st, &mut sc, &[last], true).unwrap();
+            want.push(argmax(&sc.logits_last.to_f32().unwrap()));
+        }
+    }
+    for (gate, every) in [(1.5f32, false), (0.0, true)] {
+        m.draft_min_prob = gate;
+        let mut st = LanguageModel::new_state(&m, &ctx, p.len() + n + 8).unwrap();
+        let mut sc = m.new_scratch(&ctx).unwrap();
+        m.prefill(&ctx, &mut st, &mut sc, &p).unwrap();
+        let mut out = vec![want[0]];
+        let mut proposals =
+            m.draft_initial(&ctx, &mut st, &mut sc, want[0], 1, &greedy, 1).unwrap();
+        while out.len() < n {
+            assert_eq!(proposals.len(), usize::from(every), "gate {gate}");
+            let pos = st.pos();
+            let pending = *out.last().unwrap();
+            let (draws, pend) = m
+                .verify(
+                    &ctx,
+                    &mut st,
+                    &mut sc,
+                    pending,
+                    &proposals,
+                    &greedy,
+                    out.len(),
+                    1,
+                )
+                .unwrap();
+            assert_eq!(draws.len(), 1 + proposals.len(), "gate {gate}");
+            let kept = proposals.first().map_or(0, |&d| usize::from(draws[0] == d));
+            out.extend_from_slice(&draws[..=kept]);
+            proposals =
+                m.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pend).unwrap();
+            assert_eq!(st.pos(), pos + 1 + kept, "gate {gate}");
+        }
+        if !every {
+            // One-row steps are ordinary decoding's steps.
+            assert_eq!(&out[..n], &want[..], "gate {gate}");
+        }
+    }
 }
 
 /// A prompt of `n` ordinary text tokens.

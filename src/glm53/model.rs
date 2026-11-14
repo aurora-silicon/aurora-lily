@@ -191,6 +191,10 @@ pub struct Glm53Model {
     output_norm: Tensor,
     /// Whether the engine speculates with the MTP block (`--mtp-drafts`).
     pub mtp: bool,
+    /// The engine proposes the MTP block's draft only when its softmax
+    /// probability is at least this; otherwise the next verify pass is a
+    /// one-row step.
+    pub draft_min_prob: f32,
 }
 
 impl Glm53Model {
@@ -317,6 +321,7 @@ impl Glm53Model {
             output,
             output_norm,
             mtp: false,
+            draft_min_prob: 0.0,
         })
     }
 
@@ -531,6 +536,8 @@ pub struct Scratch {
     mtp_h1: Tensor,
     /// U32[S]: the cache rows the MTP head attends.
     mtp_sel: Tensor,
+    /// F32[1]: the MTP draft's softmax probability.
+    pub mtp_prob: Tensor,
 }
 
 /// Writes `words` to the start of the U32 tensor `t` and zeroes the rest:
@@ -640,6 +647,7 @@ impl Scratch {
             mtp_x: f(cfg.hidden)?,
             mtp_h1: f(cfg.hidden)?,
             mtp_sel: u(s)?,
+            mtp_prob: f(1)?,
         })
     }
 
@@ -1140,6 +1148,7 @@ impl Glm53Model {
             0,
             &out,
         )?;
+        k::top_prob(ctx, pass, &sc.logits_last, &sc.mtp_prob, cfg.vocab)?;
         pass.memory_barrier()
     }
 
