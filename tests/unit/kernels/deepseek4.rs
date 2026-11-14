@@ -620,3 +620,72 @@ fn out_collapse_matches_cpu() {
         .collect();
     assert_close(&out.to_f32().unwrap(), &want, 1e-5, 1e-4);
 }
+
+/// The fused HC post + control projection with F16 controls (GLM's
+/// kernels, f16 weights) against the CPU HC collapse, with and without the
+/// previous sublayer's post.
+#[test]
+fn hc_post_mix_f16_matches_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(411);
+    let (hidden, m, n) = (4096usize, 3usize, 4usize);
+    let h0 = f32s(&mut rng, m * n * hidden, -1.0, 1.0);
+    let block = f32s(&mut rng, m * hidden, -1.0, 1.0);
+    let (fw, cpu_fn) =
+        f16_weight(&ctx, &f32s(&mut rng, 24 * n * hidden, -0.02, 0.02), n * hidden);
+    let scale = [0.3f32, 0.4, 0.5];
+    let base = f32s(&mut rng, 24, -0.5, 0.5);
+    let norm = f32s(&mut rng, hidden, 0.5, 1.5);
+    let prev_split: Vec<f32> =
+        (0..m).flat_map(|_| f32s(&mut rng, 24, 0.0, 1.0)).collect();
+    for with_post in [false, true] {
+        let th = tensor(&ctx, &h0);
+        let tb = tensor(&ctx, &block);
+        let split = tensor(&ctx, &prev_split);
+        let part = zeros(&ctx, m * g::hc_mix_groups(hidden) * 25, DType::F32);
+        let xn = zeros(&ctx, m * hidden, DType::F32);
+        let (ts, tbase, tn) =
+            (tensor(&ctx, &scale), tensor(&ctx, &base), tensor(&ctx, &norm));
+        run(&ctx, |p| {
+            g::hc_post_mix(
+                &ctx,
+                p,
+                &th,
+                with_post.then_some((&tb, &split)),
+                &fw,
+                &part,
+                m,
+                hidden,
+            )
+            .unwrap();
+            p.memory_barrier().unwrap();
+            g::hc_pre2(
+                &ctx, p, &part, &ts, &tbase, &th, &tn, &split, &xn, m, hidden, 20,
+                1e-6, 1e-6,
+            )
+            .unwrap();
+        });
+        let gx = xn.to_f32().unwrap();
+        let gs = split.to_f32().unwrap();
+        for i in 0..m {
+            let mut h = h0[i * n * hidden..(i + 1) * n * hidden].to_vec();
+            if with_post {
+                let sp = &prev_split[i * 24..(i + 1) * 24];
+                h = r::hc_post(
+                    &h,
+                    &block[i * hidden..(i + 1) * hidden],
+                    &sp[4..8],
+                    &sp[8..24],
+                    n,
+                );
+            }
+            let (x, post, comb) = crate::refops::hc_collapse(
+                &h, &cpu_fn, &scale, &base, n, 20, 1e-6, 1e-6,
+            );
+            let want = crate::refops::rmsnorm(&x, Some(&norm), 1e-6);
+            assert_close(&gx[i * hidden..(i + 1) * hidden], &want, 1e-4, 1e-3);
+            assert_close(&gs[i * 24 + 4..i * 24 + 8], &post, 1e-5, 1e-4);
+            assert_close(&gs[i * 24 + 8..i * 24 + 24], &comb, 1e-5, 1e-4);
+        }
+    }
+}

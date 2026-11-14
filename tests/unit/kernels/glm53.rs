@@ -2293,9 +2293,20 @@ fn gemm_batched_matches_grouped_gemv() {
 
 #[test]
 fn moe_grouped_matches_per_pair_kernels() {
+    moe_grouped_case(8);
+}
+
+/// DeepSeek V4's six slots a row: the pair's row is a division, not a
+/// shift.
+#[test]
+fn moe_grouped_six_slots_matches_per_pair_kernels() {
+    moe_grouped_case(6);
+}
+
+fn moe_grouped_case(used: usize) {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(71);
-    let (experts, hidden, ff, used, m) = (12, 512, 256, 8, 70);
+    let (experts, hidden, ff, m) = (12, 512, 256, 70);
     let g_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
     let u_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
     let d_raw = random_blocks(&mut rng, GgmlType::Q2K, experts * hidden * ff);

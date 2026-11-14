@@ -581,8 +581,14 @@ fn moe_grouped_with(
                 },
             )
         };
-    ensure!(used.is_power_of_two(), "experts used {used}");
-    let shift = used.trailing_zeros() as usize;
+    ensure!((1..1 << 31).contains(&used), "experts used {used}");
+    // The pair's row: a shift for a power of two, else a division (the
+    // kernels' x_shift with bit 31 set).
+    let shift = if used.is_power_of_two() {
+        used.trailing_zeros() as usize
+    } else {
+        0x8000_0000 | used
+    };
     if gate.ty == GgmlType::Iq2Xxs && fuse_gate_up {
         // Gate, up and the SwiGLU in one GEMM: a tile is 32 columns of
         // each, written as the down GEMM's bfloat operand.
@@ -907,13 +913,20 @@ pub fn hc_post_mix(
 ) -> Result<()> {
     check_f32(&[streams, partial])?;
     ensure!(
-        fn_w.ty == GgmlType::Bf16 && fn_w.rows == 24 && fn_w.cols == 4 * hidden,
+        matches!(fn_w.ty, GgmlType::Bf16 | GgmlType::F16)
+            && fn_w.rows == 24
+            && fn_w.cols == 4 * hidden,
         "HC fn shape"
     );
     ensure!(hidden.is_multiple_of(64), "hidden {hidden}");
     ensure!(partial.numel() >= m * hc_mix_groups(hidden) * 25, "partials");
     let (block, split) = post.unwrap_or((streams, streams));
-    let pipeline = ctx.pipeline("glm53_hc_post_mix", SOURCE, MslVersion::V3_1)?;
+    let name = if fn_w.ty == GgmlType::F16 {
+        "glm53_hc_post_mix_f16"
+    } else {
+        "glm53_hc_post_mix"
+    };
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[

@@ -23,7 +23,7 @@ use crate::tensor::{DType, Tensor};
 pub const MAX_ROWS: usize = k::GEMV_MAX_ROWS;
 
 /// Rows a forward run takes at most.
-pub const PREFILL_ROWS: usize = 256;
+pub const PREFILL_ROWS: usize = 2048;
 
 /// The indexer's selection width (`indexer_top_k`).
 const TOP_K: usize = 512;
@@ -278,7 +278,7 @@ pub struct Scratch {
     /// The HC streams `[m][4][hidden]`.
     pub h: Tensor,
     flat: Tensor,
-    mix: Tensor,
+    hc_partial: Tensor,
     split: Tensor,
     pub xn: Tensor,
     pub attn_out: Tensor,
@@ -306,6 +306,7 @@ pub struct Scratch {
     pub rsel: Tensor,
     rw: Tensor,
     moe_mid: Tensor,
+    moe_group: k::MoeGroupScratch,
     opre: Tensor,
     pub hidden: Tensor,
     hidden_norm: Tensor,
@@ -323,7 +324,7 @@ impl Scratch {
             tokens: u(m)?,
             h: f(m * cfg.hc_dim())?,
             flat: f(m * cfg.hc_dim())?,
-            mix: f(m * cfg.hc_mix())?,
+            hc_partial: f(m * k::hc_mix_groups(cfg.hidden) * 25)?,
             split: f(m * cfg.hc_mix())?,
             xn: f(m * cfg.hidden)?,
             attn_out: f(m * cfg.hidden)?,
@@ -350,7 +351,14 @@ impl Scratch {
             rlogits: f(m * cfg.n_expert)?,
             rsel: u(m * cfg.n_expert_used)?,
             rw: f(m * cfg.n_expert_used)?,
-            moe_mid: f(m * cfg.n_expert_used * cfg.ff_expert)?,
+            moe_mid: f(MAX_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
+            moe_group: k::MoeGroupScratch::new(
+                ctx,
+                m * cfg.n_expert_used,
+                cfg.n_expert,
+                cfg.ff_expert,
+                cfg.hidden,
+            )?,
             opre: f(m * cfg.n_hc)?,
             hidden: f(m * cfg.hidden)?,
             hidden_norm: f(m * cfg.hidden)?,
@@ -488,7 +496,7 @@ impl Ds4Model {
         for il in 0..cfg.n_layer {
             let l = &self.layers[il];
             if trace.is_some() {
-                self.hc_pre(ctx, &pass, sc, &l.hc[0], &l.attn_norm, m)?;
+                self.hc_pre(ctx, &pass, sc, &l.hc[0], &l.attn_norm, m, None)?;
                 pass.commit_wait()?;
                 pass = ctx.begin_concurrent()?;
                 let attn_in = read(&sc.xn, m * cfg.hidden)?;
@@ -504,7 +512,7 @@ impl Ds4Model {
                     cfg.hidden,
                 )?;
                 pass.memory_barrier()?;
-                self.hc_pre(ctx, &pass, sc, &l.hc[1], &l.ffn_norm, m)?;
+                self.hc_pre(ctx, &pass, sc, &l.hc[1], &l.ffn_norm, m, None)?;
                 pass.commit_wait()?;
                 pass = ctx.begin_concurrent()?;
                 let ffn_in = read(&sc.xn, m * cfg.hidden)?;
@@ -536,35 +544,29 @@ impl Ds4Model {
                 });
                 continue;
             }
-            self.hc_pre(ctx, &pass, sc, &l.hc[0], &l.attn_norm, m)?;
+            // Each HC pre applies the HC post of the sublayer before it.
+            let prev = (il > 0).then_some(&sc.ffn_out);
+            self.hc_pre(ctx, &pass, sc, &l.hc[0], &l.attn_norm, m, prev)?;
             self.attention(ctx, &pass, st, sc, l, il, r)?;
-            k::hc_post(
-                ctx,
-                &pass,
-                &sc.h,
-                &sc.attn_out,
-                &sc.split,
-                &sc.h,
-                m,
-                cfg.hidden,
-            )?;
-            pass.memory_barrier()?;
-            self.hc_pre(ctx, &pass, sc, &l.hc[1], &l.ffn_norm, m)?;
+            self.hc_pre(ctx, &pass, sc, &l.hc[1], &l.ffn_norm, m, Some(&sc.attn_out))?;
             self.ffn(ctx, &pass, sc, l, m)?;
-            k::hc_post(
-                ctx,
-                &pass,
-                &sc.h,
-                &sc.ffn_out,
-                &sc.split,
-                &sc.h,
-                m,
-                cfg.hidden,
-            )?;
-            pass.memory_barrier()?;
-            // A pass every few layers keeps a command buffer's GPU time
-            // short (the driver times one from its submission).
-            if il % 8 == 7 {
+            if il + 1 == cfg.n_layer {
+                k::hc_post(
+                    ctx,
+                    &pass,
+                    &sc.h,
+                    &sc.ffn_out,
+                    &sc.split,
+                    &sc.h,
+                    m,
+                    cfg.hidden,
+                )?;
+                pass.memory_barrier()?;
+            }
+            // A pass every few layers (every layer for a prompt run) keeps
+            // a command buffer's GPU time short: the driver times one from
+            // its submission.
+            if il % 8 == 7 || m > MAX_ROWS {
                 pass.commit_wait()?;
                 pass = ctx.begin_concurrent()?;
             }
@@ -585,6 +587,14 @@ impl Ds4Model {
         x: &Tensor,
         m: usize,
     ) -> Result<()> {
+        if m > MAX_ROWS {
+            // A prompt run: the matrix units (operands rounded to bfloat,
+            // f32 accumulation).
+            for &(w, y) in sets {
+                k::gemm(ctx, pass, w, x, y, m)?;
+            }
+            return Ok(());
+        }
         let cols = sets[0].0.cols;
         for c0 in (0..m).step_by(MAX_ROWS) {
             let rows = (m - c0).min(MAX_ROWS);
@@ -603,6 +613,7 @@ impl Ds4Model {
     /// HC pre of a sublayer: the control projection of the normalized
     /// streams, the Sinkhorn split into `sc.split` and the normalized
     /// sublayer input `sc.xn`.
+    #[allow(clippy::too_many_arguments)]
     fn hc_pre(
         &self,
         ctx: &MetalContext,
@@ -611,16 +622,31 @@ impl Ds4Model {
         hc: &HcW,
         norm: &Tensor,
         m: usize,
+        post: Option<&Tensor>,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        k::rmsnorm(ctx, pass, &sc.h, None, &sc.flat, m, cfg.hc_dim(), cfg.rms_eps)?;
-        pass.memory_barrier()?;
-        self.proj(ctx, pass, &[(&hc.fn_w, &sc.mix)], &sc.flat, m)?;
-        pass.memory_barrier()?;
-        k::hc_pre(
+        // GLM's fused kernels: the previous sublayer's HC post (when `post`
+        // gives its output; its weights are still in `sc.split`) with the
+        // partial sums of the control projection over f32 streams, then
+        // the Sinkhorn split and the normalized input. (The projection as
+        // a bfloat GEMM at prefill cost the official-continuation score
+        // 6 first-token matches, 2026-11-14.)
+        let post = post.map(|block| (block, &sc.split));
+        k::hc_post_mix(
             ctx,
             pass,
-            &sc.mix,
+            &sc.h,
+            post,
+            &hc.fn_w,
+            &sc.hc_partial,
+            m,
+            cfg.hidden,
+        )?;
+        pass.memory_barrier()?;
+        k::hc_pre2(
+            ctx,
+            pass,
+            &sc.hc_partial,
             &hc.scale,
             &hc.base,
             &sc.h,
@@ -854,7 +880,20 @@ impl Ds4Model {
         pass.memory_barrier()?;
         // The grouped output projection.
         let group_in = cfg.o_group_heads() * cfg.head_dim;
-        for c0 in (0..m).step_by(MAX_ROWS) {
+        debug_assert_eq!(l.out_a.cols, group_in);
+        if m > MAX_ROWS {
+            // Per group: low[i][g] (1024) = out_a[g] (1024 x 4096) . heads[i][g].
+            let gl = k::GemmLayout {
+                ldx: cfg.q_dim(),
+                ldy: l.out_a.rows,
+                batches: cfg.o_groups,
+                x_batch: group_in,
+                w_batch: cfg.o_lora,
+                y_batch: cfg.o_lora,
+            };
+            k::gemm_with(ctx, pass, &l.out_a, &sc.heads, &sc.low, m, cfg.o_lora, gl)?;
+        }
+        for c0 in (0..m).step_by(MAX_ROWS).take_while(|_| m <= MAX_ROWS) {
             let rows = (m - c0).min(MAX_ROWS);
             let x = sc.heads.view(c0 * cfg.q_dim(), &[rows * cfg.q_dim()])?;
             let y = sc.low.view(c0 * l.out_a.rows, &[rows * l.out_a.rows])?;
@@ -871,7 +910,6 @@ impl Ds4Model {
                     y_row_stride: l.out_a.rows,
                 },
             )?;
-            debug_assert_eq!(l.out_a.cols, group_in);
         }
         pass.memory_barrier()?;
         self.proj(ctx, pass, &[(&l.out_b, &sc.attn_out)], &sc.low, m)?;
@@ -909,6 +947,31 @@ impl Ds4Model {
         )?;
         k::swiglu(ctx, pass, &sc.fg, &sc.fu, &sc.fmid, m * cfg.ff_expert, lim)?;
         pass.memory_barrier()?;
+        if m > MAX_ROWS {
+            // A prompt run: the shared expert, then the routed experts
+            // grouped by expert on the matrix units (adding to it).
+            self.proj(ctx, pass, &[(&l.sh_down, &sc.ffn_out)], &sc.fmid, m)?;
+            pass.memory_barrier()?;
+            k::moe_grouped(
+                ctx,
+                pass,
+                &l.gate,
+                &l.up,
+                &l.down,
+                cfg.ff_expert,
+                cfg.hidden,
+                &sc.xn,
+                &sc.rsel,
+                &sc.rw,
+                &sc.ffn_out,
+                &sc.moe_group,
+                m,
+                used,
+                cfg.n_expert,
+                lim,
+            )?;
+            return pass.memory_barrier();
+        }
         k::moe_gate_up(
             ctx,
             pass,
@@ -952,9 +1015,17 @@ impl Ds4Model {
         logits: Logits,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        k::rmsnorm(ctx, pass, &sc.h, None, &sc.flat, m, cfg.hc_dim(), cfg.rms_eps)?;
+        let (first, rows) = match logits {
+            Logits::None => return Ok(()),
+            Logits::Last => (m - 1, 1),
+            Logits::All => (0, m),
+        };
+        ensure!(rows <= MAX_ROWS, "logits of {rows} rows");
+        // Only the rows whose logits are asked for, through the f32 GEMVs.
+        let h = sc.h.view(first * cfg.hc_dim(), &[rows * cfg.hc_dim()])?;
+        k::rmsnorm(ctx, pass, &h, None, &sc.flat, rows, cfg.hc_dim(), cfg.rms_eps)?;
         pass.memory_barrier()?;
-        self.proj(ctx, pass, &[(&self.out_hc.fn_w, &sc.opre)], &sc.flat, m)?;
+        self.proj(ctx, pass, &[(&self.out_hc.fn_w, &sc.opre)], &sc.flat, rows)?;
         pass.memory_barrier()?;
         d::out_collapse(
             ctx,
@@ -962,23 +1033,17 @@ impl Ds4Model {
             &sc.opre,
             &self.out_hc.scale,
             &self.out_hc.base,
-            &sc.h,
+            &h,
             &sc.hidden,
-            m,
+            rows,
             cfg.hidden,
             cfg.hc_eps,
         )?;
         pass.memory_barrier()?;
-        let (first, rows) = match logits {
-            Logits::None => return Ok(()),
-            Logits::Last => (m - 1, 1),
-            Logits::All => (0, m),
-        };
-        let hid = sc.hidden.view(first * cfg.hidden, &[rows * cfg.hidden])?;
         k::rmsnorm(
             ctx,
             pass,
-            &hid,
+            &sc.hidden,
             Some(&self.output_norm),
             &sc.hidden_norm,
             rows,

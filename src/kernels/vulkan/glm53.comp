@@ -1898,9 +1898,10 @@ void main() {
 // use, so a row at a time waited for memory 24 times (29 us a call; 2026-11-14).
 // Grid (hidden / 64, m), 32 threads. Buffers: 0 H [m][4][hidden], 1 block
 // [m][hidden], 2 split [m][24], 3 fn bf16, 4 partial [m][groups][25].
-// Params: 5 hidden, 6 has_post.
+// Params: 5 hidden, 6 has_post. glm53_hc_post_mix_f16 reads fn as f16
+// (DeepSeek V4's HC controls).
 // ---------------------------------------------------------------------------
-#ifdef KERNEL_glm53_hc_post_mix
+#if defined(KERNEL_glm53_hc_post_mix) || defined(KERNEL_glm53_hc_post_mix_f16)
 void main() {
     const uint hidden = arg_u32(5);
     const bool has_post = arg_u32(6) != 0u;
@@ -1939,8 +1940,14 @@ void main() {
     float mine = subgroupAdd(ss);
     [[unroll]] for (uint r = 0u; r < 24u; r++) {
         float acc = 0.0;
-        [[unroll]] for (uint s = 0u; s < 4u; s++)
+        [[unroll]] for (uint s = 0u; s < 4u; s++) {
+#ifdef KERNEL_glm53_hc_post_mix_f16
+            const vec2 wf = unpackHalf2x16(w[r][s]);
+            acc += wf.x * h[s].x + wf.y * h[s].y;
+#else
             acc += uintBitsToFloat(w[r][s] << 16u) * h[s].x + uintBitsToFloat(w[r][s] & 0xffff0000u) * h[s].y;
+#endif
+        }
         acc = subgroupAdd(acc);
         mine = lane == r ? acc : mine;
     }

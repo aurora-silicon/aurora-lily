@@ -59,6 +59,21 @@ enum Cmd {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Prefill and greedy decode speed: BOS and the first `prompt_len`
+    /// tokens of a text, then `n` decoded tokens, `runs` times on fresh
+    /// state.
+    Bench {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, default_value_t = 1024)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -95,6 +110,9 @@ fn run() -> Result<()> {
             generate(&model, &parse_tokens(&tokens)?, n)
         }
         Cmd::Score { model, fixture, limit } => score(&model, &fixture, limit),
+        Cmd::Bench { model, text, prompt_len, n, runs } => {
+            bench(&model, &text, prompt_len, n, runs)
+        }
     }
 }
 
@@ -379,5 +397,50 @@ fn score(path: &PathBuf, fixture: &PathBuf, limit: Option<usize>) -> Result<()> 
         total_lcp as f64 / cases as f64,
         100.0 * tot_agree as f64 / tot_n as f64
     );
+    Ok(())
+}
+
+fn bench(
+    path: &PathBuf,
+    text: &PathBuf,
+    prompt_len: usize,
+    n: usize,
+    runs: usize,
+) -> Result<()> {
+    let prompt = text_tokens(path, text, prompt_len)?;
+    let ctx = MetalContext::new()?;
+    let model = Ds4Model::load(&ctx, path)?;
+    let vocab = model.cfg.vocab;
+    let sc = model.new_scratch(&ctx)?;
+    let mut st = model.new_state(&ctx, prompt.len() + n + 8)?;
+    for run in 0..runs {
+        st.reset();
+        let t = Instant::now();
+        model.forward(&ctx, &mut st, &sc, &prompt, Logits::Last)?;
+        let pf = t.elapsed().as_secs_f64();
+        let mut next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+        let mut out = Vec::with_capacity(n);
+        let mut steps = Vec::with_capacity(n);
+        let t = Instant::now();
+        for _ in 0..n {
+            out.push(next);
+            let s = Instant::now();
+            model.forward(&ctx, &mut st, &sc, &[next], Logits::Last)?;
+            next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+            steps.push(s.elapsed().as_secs_f64() * 1e3);
+        }
+        let dt = t.elapsed().as_secs_f64();
+        steps.sort_by(f64::total_cmp);
+        let digest = out.iter().fold(0xcbf29ce484222325u64, |h, &t| {
+            (h ^ u64::from(t)).wrapping_mul(0x100000001b3)
+        });
+        println!(
+            "run {run}: prompt {} prefill {pf:.2} s ({:.1} tok/s), decode {n} in {dt:.2} s ({:.2} tok/s, median {:.2} ms/step), digest {digest:016x}",
+            prompt.len(),
+            prompt.len() as f64 / pf,
+            n as f64 / dt,
+            steps[steps.len() / 2]
+        );
+    }
     Ok(())
 }

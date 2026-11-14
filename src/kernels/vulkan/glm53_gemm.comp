@@ -367,7 +367,8 @@ void main() {
 // quant_grouped.glsl, Qwen's grouped GEMM): tile y is tiles[y] = (expert,
 // first, count) of the expert-sorted pair list `pairs` (glm53_moe_group);
 // its rows are pairs[first ..], X row pairs[k] >> x_shift (the token for
-// gate/up, the pair for down), Y row pairs[k]. X is bfloat (glm53_to_bf16,
+// gate/up, the pair for down; x_shift with bit 31 set divides by its low
+// bits instead, for a slot count that is not a power of two), Y row pairs[k]. X is bfloat (glm53_to_bf16,
 // glm53_moe_swiglu), read by each subgroup straight from device memory
 // (MAT_A_OF_ROWS). A threadgroup of four subgroups computes 64 rows x 64
 // columns (128 rows, 32 a subgroup, in the _r128 variants); a subgroup
@@ -465,7 +466,8 @@ void main() {
     uint a_at[GM_SUB / 8u];
     [[unroll]] for (uint h = 0u; h < GM_SUB / 8u; h++) {
         const uint r = row0 + 16u * (h >> 1u) + lane_row + (h & 1u);
-        a_at[h] = (U32(arg(3)).v[first + min(r, rows - 1u)] >> x_shift) * words;
+        const uint pr = U32(arg(3)).v[first + min(r, rows - 1u)];
+        a_at[h] = (x_shift >= 0x80000000u ? pr / (x_shift & 0x7fffffffu) : pr >> x_shift) * words;
     }
     U32x4 xa = U32x4(arg(0));
     const uint lane_at = lane_row * 8u + mat_lane_col() / 4u;
