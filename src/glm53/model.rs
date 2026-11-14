@@ -897,10 +897,7 @@ impl Glm53Model {
     ) -> Result<()> {
         let n = self.cfg.n_trunk;
         if m <= MAX_ROWS {
-            let pass = self.begin(ctx)?;
-            self.encode(ctx, &pass, st, sc, &sc.tokens, m, logits, None)?;
-            tail(&pass)?;
-            return pass.commit_wait();
+            return self.run_step(ctx, st, sc, &sc.tokens, m, logits, None, tail);
         }
         let mut pending: std::collections::VecDeque<crate::metal::PendingPass<'_>> =
             std::collections::VecDeque::new();
@@ -934,6 +931,57 @@ impl Glm53Model {
             p.wait()?;
         }
         Ok(())
+    }
+
+    /// Runs a decode or verify step of `m` <= [`MAX_ROWS`] rows (tokens
+    /// read from `tokens` on the GPU), `tail` encoded at its end, and waits.
+    /// The step goes to the GPU in four passes, the first after two layers
+    /// are encoded, so the GPU works while the host encodes the rest: in a
+    /// speculative loop the host waits for every pass and its CPU slows
+    /// down, and one pass a step left the GPU idle for its whole encoding.
+    /// Verify pass on code (2026-11-14): one pass 39.1-39.2 ms, halves
+    /// 37.7-37.9, thirds 36.9-37.6, layers 0-2 then thirds 36.86-36.90.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_step(
+        &self,
+        ctx: &MetalContext,
+        st: &Glm53State,
+        sc: &Scratch,
+        tokens: &Tensor,
+        m: usize,
+        logits: Logits,
+        snap: Option<usize>,
+        tail: impl FnOnce(&ComputePass<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let n = self.cfg.n_trunk;
+        let cuts = [0, 2.min(n), n / 3, 2 * n / 3];
+        let mut pending = Vec::with_capacity(cuts.len());
+        for w in cuts.windows(2) {
+            if w[1] > w[0] {
+                let pass = self.begin(ctx)?;
+                self.encode_layers(
+                    ctx,
+                    &pass,
+                    st,
+                    sc,
+                    tokens,
+                    m,
+                    logits,
+                    snap,
+                    w[0]..w[1],
+                )?;
+                pending.push(pass.commit()?);
+            }
+        }
+        let pass = self.begin(ctx)?;
+        let last = cuts[cuts.len() - 1].max(cuts[1]);
+        self.encode_layers(ctx, &pass, st, sc, tokens, m, logits, snap, last..n)?;
+        tail(&pass)?;
+        let r = pass.commit_wait();
+        for p in pending {
+            p.wait()?;
+        }
+        r
     }
 
     fn encode_head(

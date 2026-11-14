@@ -308,36 +308,37 @@ impl LanguageModel for Glm53Model {
         ensure!(state.spec.is_none(), "a verify pass is already pending");
         state.ensure_capacity(ctx, state.pos + rows)?;
         scratch.stage_spec_tokens(pending, drafts)?;
-        let pass = self.begin(ctx)?;
         // KDA keeps the state after row 0 aside: the rollback if row 1's
         // draft is rejected.
         let snap = (rows > 1).then_some(0);
-        self.encode(
+        let vocab = self.cfg.vocab;
+        let sc: &Scratch = scratch;
+        self.run_step(
             ctx,
-            &pass,
             state,
-            scratch,
-            &scratch.spec_tokens,
+            sc,
+            &sc.spec_tokens,
             rows,
             Logits::All,
             snap,
+            |pass| {
+                for r in 0..rows {
+                    let logits = sc.logits.view(r * vocab, &[vocab])?;
+                    let out = sc.draws.view(r, &[1])?;
+                    sample_f32(
+                        ctx,
+                        pass,
+                        &logits,
+                        sc.sampler(),
+                        params,
+                        step0 + r,
+                        &out,
+                    )?;
+                    pass.memory_barrier()?;
+                }
+                Ok(())
+            },
         )?;
-        let vocab = self.cfg.vocab;
-        for r in 0..rows {
-            let logits = scratch.logits.view(r * vocab, &[vocab])?;
-            let out = scratch.draws.view(r, &[1])?;
-            sample_f32(
-                ctx,
-                &pass,
-                &logits,
-                scratch.sampler(),
-                params,
-                step0 + r,
-                &out,
-            )?;
-            pass.memory_barrier()?;
-        }
-        pass.commit_wait()?;
         let draws = scratch.draws.to_u32()?[..rows].to_vec();
         state.spec = Some((state.pos, rows, draws.clone()));
         state.pos += rows;
