@@ -351,10 +351,16 @@ fn spec(path: &PathBuf, ids: &[u32], prompt_len: usize, n: usize, runs: usize) -
     st.reset();
     LanguageModel::prefill(&model, &ctx, &mut st, &mut sc, prompt, Some(Draw { params: &greedy, step: 0 }))?;
     let mut plain = vec![sc.next_token.to_u32()?[0]];
+    // Top-2 logit margin of each plain draw past the first.
+    let mut margins = vec![f32::NAN];
     let t0 = Instant::now();
     while plain.len() < n {
         model.forward(&ctx, &mut st, &mut sc, &[*plain.last().expect("one")], Logits::Last)?;
-        plain.push(argmax(&sc.logits_last.to_f32()?) as u32);
+        let l = sc.logits_last.to_f32()?;
+        let a = argmax(&l);
+        let second = l.iter().enumerate().filter(|&(i, _)| i != a).fold(f32::NEG_INFINITY, |m, (_, &x)| m.max(x));
+        margins.push(l[a] - second);
+        plain.push(a as u32);
     }
     let plain_dt = t0.elapsed().as_secs_f64();
     for run in 0..runs {
@@ -385,12 +391,17 @@ fn spec(path: &PathBuf, ids: &[u32], prompt_len: usize, n: usize, runs: usize) -
         out.truncate(n);
         let same = out.iter().zip(&plain).take_while(|(a, b)| a == b).count();
         println!(
-            "run {run}: spec {} tokens {:.2}s = {:.1} tok/s ({steps} steps, accepted {accepted}/{drafted} = {:.0}%); plain {:.1} tok/s; same tokens for {same}/{n}",
+            "run {run}: spec {} tokens {:.2}s = {:.1} tok/s ({steps} steps, accepted {accepted}/{drafted} = {:.0}%); plain {:.1} tok/s; same tokens for {same}/{n}{}",
             n - 1,
             dt,
             (n - 1) as f64 / dt,
             100.0 * accepted as f64 / drafted.max(1) as f64,
             (n - 1) as f64 / plain_dt,
+            if same < n {
+                format!(" (plain's top-2 margin there {:.4})", margins[same])
+            } else {
+                String::new()
+            },
         );
     }
     Ok(())

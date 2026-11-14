@@ -914,18 +914,29 @@ impl Qwen36Model {
         let scale = 1.0 / (d as f32).sqrt();
         let q = sc.qb.view(0, &[m, nq, d])?;
         let out = sc.attn.view(0, &[m, nq, d])?;
-        if m == 1 {
-            attn::sdpa_decode(
-                ctx,
-                pass,
-                &q,
-                kc,
-                vc,
-                &out,
-                pos0 + 1,
-                scale,
-                Some((&sc.split_partials, &sc.split_stats)),
-            )?;
+        if m <= MAX_ROWS {
+            // Decode and verify rows through the decode kernel, row by row
+            // (a verify row then attends as a decode step would: the prompt
+            // kernel rounds in another order, and speculation parted from
+            // plain greedy decoding at near ties).
+            for r in 0..m {
+                if r > 0 {
+                    pass.memory_barrier()?;
+                }
+                let qr = sc.qb.view(r * nq * d, &[nq, d])?;
+                let or = sc.attn.view(r * nq * d, &[nq, d])?;
+                attn::sdpa_decode(
+                    ctx,
+                    pass,
+                    &qr,
+                    kc,
+                    vc,
+                    &or,
+                    pos0 + r + 1,
+                    scale,
+                    Some((&sc.split_partials, &sc.split_stats)),
+                )?;
+            }
         } else {
             ensure!(self.kv_format == KvFormat::Bf16, "prompt attention reads bf16 caches");
             attn::sdpa_prefill(ctx, pass, &q, &kc.values, &vc.values, &out, pos0, scale)?;
