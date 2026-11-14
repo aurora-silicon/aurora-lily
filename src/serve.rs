@@ -268,6 +268,8 @@ pub struct ServeOptions {
     pub kv_format: Option<KvFormat>,
     pub max_sessions: usize,
     pub ngram_storage: NgramStorage,
+    /// A Qwen GGUF's n-gram table checkpoint (`--ngram-checkpoint`).
+    pub ngram_checkpoint: Option<std::path::PathBuf>,
     pub ngram_preload: bool,
     /// Pin the preloaded table in memory (`mlock`).
     pub ngram_lock: bool,
@@ -950,6 +952,7 @@ impl<M: LanguageModel> Engine<M> {
             model_dir,
             &LoadOptions {
                 ngram_storage: options.ngram_storage,
+                ngram_checkpoint: options.ngram_checkpoint.clone(),
                 mtp_drafts: options.mtp_drafts,
                 vision: options.vision,
                 expert_slots: None,

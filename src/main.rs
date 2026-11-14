@@ -184,6 +184,13 @@ struct Cli {
     #[arg(long, default_value = "paged")]
     ngram_table: NgramStorage,
 
+    /// With a Qwen3.8-Flash-Next GGUF (ds4's): a lily checkpoint directory
+    /// of the model whose 4-bit n-gram table is paged in place of the
+    /// file's BF16 one, which lily does not read yet (default:
+    /// `LILY_NGRAM_TABLE`).
+    #[arg(long)]
+    ngram_checkpoint: Option<PathBuf>,
+
     /// Read the whole paged n-gram table into the page cache after every load
     /// (32 GB, evictable), in a background thread at low CPU and I/O priority
     /// while the server already answers requests; rows a request needs
@@ -439,6 +446,7 @@ fn run() -> Result<()> {
         durable_min_tokens: cli.durable_min_tokens,
         decode_checkpoint_tokens: cli.decode_checkpoint_tokens,
         ngram_storage: cli.ngram_table,
+        ngram_checkpoint: cli.ngram_checkpoint.clone(),
         ngram_preload: cli.ngram_preload,
         ngram_lock: cli.ngram_lock,
         mtp_drafts: cli.mtp_drafts,

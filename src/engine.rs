@@ -378,6 +378,10 @@ pub struct LoadOptions {
     pub session_context: Option<crate::qwen4exp::weights::SessionContext>,
     /// The attention K/V caches' element format (`--kv-cache`).
     pub kv_format: crate::kernels::attention::KvFormat,
+    /// For a Qwen3.8-Flash-Next GGUF: a lily checkpoint of the model whose
+    /// 4-bit n-gram table is paged in place of the file's BF16 one
+    /// (`--ngram-checkpoint`; `LILY_NGRAM_TABLE` when `None`).
+    pub ngram_checkpoint: Option<std::path::PathBuf>,
 }
 
 /// Which draw a decode pass ends with.

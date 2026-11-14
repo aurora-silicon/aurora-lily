@@ -1613,6 +1613,7 @@ impl Qwen4ExpModel {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1632,6 +1633,7 @@ impl Qwen4ExpModel {
         memory_limit: Option<u64>,
         expert_usage_out: Option<std::path::PathBuf>,
         session_context: Option<weights::SessionContext>,
+        ngram_checkpoint: Option<&Path>,
     ) -> Result<Self> {
         let gguf_file = super::gguf::is_qwen_gguf(dir.as_ref());
         let config = if gguf_file {
@@ -1657,7 +1659,7 @@ impl Qwen4ExpModel {
             config.indexer.head_dim
         );
         let weights = if gguf_file {
-            super::gguf::load(ctx, dir.as_ref(), &config, with_mtp)?
+            super::gguf::load(ctx, dir.as_ref(), &config, with_mtp, ngram_checkpoint)?
         } else {
             weights::load(
                 ctx,
@@ -4968,6 +4970,7 @@ impl LanguageModel for Qwen4ExpModel {
             options.memory_limit,
             expert_usage_out,
             session_context,
+            options.ngram_checkpoint.as_deref(),
         )
         .map(|mut model| {
             model.set_kv_format(kv_format);

@@ -663,12 +663,13 @@ fn ngram_table(dir: &Path, ple: &PleConfig) -> Result<NgramTable> {
     Ok(NgramTable::Paged(Arc::new(table)))
 }
 
-/// Where the n-gram table comes from: `LILY_NGRAM_TABLE` (a q4-xl
-/// checkpoint directory).
-pub fn ngram_table_dir() -> Result<PathBuf> {
-    std::env::var_os("LILY_NGRAM_TABLE").map(PathBuf::from).context(
-        "the GGUF's BF16 n-gram table is not read yet: set LILY_NGRAM_TABLE to a lily \
-         Qwen3.8-Flash-Next checkpoint directory, whose 4-bit table is paged instead",
+/// Where the n-gram table comes from: `given`, else `LILY_NGRAM_TABLE` (a
+/// q4-xl checkpoint directory).
+pub fn ngram_table_dir(given: Option<&Path>) -> Result<PathBuf> {
+    given.map(Path::to_path_buf).or_else(|| std::env::var_os("LILY_NGRAM_TABLE").map(PathBuf::from)).context(
+        "the GGUF's BF16 n-gram table is not read yet: pass --ngram-checkpoint (or set \
+         LILY_NGRAM_TABLE) to a lily Qwen3.8-Flash-Next checkpoint directory, whose \
+         4-bit table is paged instead",
     )
 }
 
@@ -679,6 +680,7 @@ pub fn load(
     path: &Path,
     config: &Qwen4ExpConfig,
     with_mtp: bool,
+    ngram_checkpoint: Option<&Path>,
 ) -> Result<ModelWeights> {
     crate::instance::acquire()?;
     let recording = ctx.record_buffers()?;
@@ -686,7 +688,7 @@ pub fn load(
     let mapped = Mapped::map(ctx, &g, path)?;
     let l = Load { ctx, g: &g, m: &mapped, cfg: config };
     let table = match &config.ple {
-        Some(p) => Some(ngram_table(&ngram_table_dir()?, p)?),
+        Some(p) => Some(ngram_table(&ngram_table_dir(ngram_checkpoint)?, p)?),
         None => None,
     };
     let mut table = table;
