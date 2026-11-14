@@ -396,6 +396,10 @@ impl PrefillMoeScratch {
         // Tail chunks have S < E: bounding the partial-tile term by min(E, S)
         // keeps the sentinel share sane on short tails.
         let cap = s_total.div_ceil(alloc_tile.rows()) + e.min(s_total);
+        // GGUF experts take their own grouped GEMMs (`gguf`) or the gathers:
+        // the affine route's staging is one row each (~0.6 GB less at a
+        // 4096-row chunk).
+        let slots = if dims.gguf_down_cols.is_some() { 1 } else { s_total };
         Ok(Self {
             router_logits: Tensor::zeros(ctx, &[m, e], bf)?,
             shared_out: Tensor::zeros(ctx, &[m, h], bf)?,
@@ -411,11 +415,11 @@ impl PrefillMoeScratch {
             slot_of: Tensor::zeros(ctx, &[m, k], u32t)?,
             blocks_gu: Tensor::zeros(ctx, &[cap * (mi / 64) * 4], u32t)?,
             blocks_dn: Tensor::zeros(ctx, &[cap * (h / 64) * 4], u32t)?,
-            gx: Tensor::zeros(ctx, &[s_total, h], bf)?,
-            eg: Tensor::zeros(ctx, &[s_total, mi], bf)?,
-            eu: Tensor::zeros(ctx, &[s_total, mi], bf)?,
+            gx: Tensor::zeros(ctx, &[slots, h], bf)?,
+            eg: Tensor::zeros(ctx, &[slots, mi], bf)?,
+            eu: Tensor::zeros(ctx, &[slots, mi], bf)?,
             ea: Tensor::zeros(ctx, &[s_total, mi], bf)?,
-            ed: Tensor::zeros(ctx, &[s_total, h], bf)?,
+            ed: Tensor::zeros(ctx, &[slots, h], bf)?,
             tile_capacity: cap,
             tile: alloc_tile,
             gguf: dims
@@ -444,7 +448,7 @@ impl PrefillMoeScratch {
             quant::MoeRoute::SmallmGemv => policy.alloc_tile(),
         };
         let cap = s_total.div_ceil(tile.rows()) + e.min(s_total);
-        let slot_rows = |t: &Tensor| prefix_rows(t, s_total);
+        let slot_rows = |t: &Tensor| prefix_rows(t, s_total.min(t.shape()[0]));
         let block_view = |t: &Tensor| {
             let words_per_tile = t.numel() / self.tile_capacity;
             t.view(0, &[cap * words_per_tile])
