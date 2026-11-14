@@ -458,6 +458,116 @@ fn sampled_speculation_matches_ordinary_sampling() {
     }
 }
 
+/// Sampled speculation that follows the engine's own proposal lists, both
+/// empty (the draft below `draft_min_prob`: a one-row step) and not (the
+/// threshold alternates between 1.5 and 0 from step to step), emits what
+/// ordinary sampled decoding emits: the same draws at the same request
+/// steps, the same penalty counts after every step, positions advancing by
+/// the kept rows, and ordinary steps after it giving ordinary decoding's
+/// logits. (A routing tie that the two paths' rounding decides differently
+/// can part the two; this prompt and seed have none in these steps.)
+#[test]
+#[ignore = "requires LILY_GLM53_GGUF"]
+fn sampled_speculation_follows_its_proposals() {
+    use crate::engine::{DecodeStateApi, Draw, LanguageModel, ScratchApi};
+    use crate::kernels::sample::SamplingParams;
+    let ctx = MetalContext::new().expect("context");
+    let mut m = real_model(&ctx);
+    let params = SamplingParams {
+        temperature: 1.0,
+        top_k: 40,
+        top_p: 0.95,
+        presence_penalty: 0.5,
+        frequency_penalty: 0.5,
+        repetition_penalty: 1.1,
+        seed: 777,
+        ..SamplingParams::greedy()
+    };
+    let (steps, after) = (24, 3);
+    // Text: drafts are accepted at times and draws leave the argmax.
+    let path = std::env::var("LILY_GLM53_GGUF").expect("LILY_GLM53_GGUF");
+    let tok =
+        crate::tokenizer::Tokenizer::from_gguf(std::path::Path::new(&path)).unwrap();
+    let mut p = tok.encode("[gMASK]<sop>").unwrap();
+    p.extend(
+        tok.encode(
+            "The river rises in the hills north of the town, runs past the old mill \
+             and the market square, and reaches the sea after a journey of",
+        )
+        .unwrap(),
+    );
+    let total = steps + 2 + after;
+    // Ordinary: the draws and the counts after each.
+    let mut st = LanguageModel::new_state(&m, &ctx, p.len() + total + 8).unwrap();
+    let mut sc = m.new_scratch(&ctx).unwrap();
+    sc.begin_request();
+    let draw = Some(Draw { params: &params, step: 0 });
+    LanguageModel::prefill(&m, &ctx, &mut st, &mut sc, &p, draw).unwrap();
+    let mut toks = vec![sc.next_token.to_u32().unwrap()[0]];
+    let mut counts = vec![sc.sampler().counts().unwrap()];
+    let mut logits = vec![sc.logits_last.to_f32().unwrap()];
+    let mut off_argmax = 0;
+    for k in 1..total {
+        let t = sampled_step(&m, &ctx, &mut st, &sc, toks[k - 1], &params, k);
+        off_argmax +=
+            usize::from(k < steps && t != argmax(&sc.logits_last.to_f32().unwrap()));
+        toks.push(t);
+        counts.push(sc.sampler().counts().unwrap());
+        logits.push(sc.logits_last.to_f32().unwrap());
+    }
+    eprintln!("ordinary: {toks:?}, {off_argmax} draws off the argmax");
+    assert!(off_argmax > 0, "the run never left the argmax");
+    drop((st, sc));
+    // Speculative, as the engine's loop runs it.
+    let mut st = LanguageModel::new_state(&m, &ctx, p.len() + total + 8).unwrap();
+    let mut sc = m.new_scratch(&ctx).unwrap();
+    sc.begin_request();
+    LanguageModel::prefill(&m, &ctx, &mut st, &mut sc, &p, draw).unwrap();
+    let mut out = vec![sc.next_token.to_u32().unwrap()[0]];
+    m.draft_min_prob = 0.0;
+    let mut proposals =
+        m.draft_initial(&ctx, &mut st, &mut sc, out[0], 1, &params, 1).unwrap();
+    let (mut empty, mut proposed, mut accepted) = (0, 0, 0);
+    let mut i = 0;
+    while out.len() < steps {
+        if proposals.is_empty() {
+            empty += 1;
+        } else {
+            proposed += 1;
+        }
+        let (step0, pos) = (out.len(), st.pos());
+        let pending = *out.last().unwrap();
+        let (draws, pend) = m
+            .verify(&ctx, &mut st, &mut sc, pending, &proposals, &params, step0, 1)
+            .unwrap();
+        assert_eq!(draws.len(), 1 + proposals.len(), "step {i}: rows");
+        let kept = proposals.first().map_or(0, |&d| usize::from(draws[0] == d));
+        accepted += kept;
+        out.extend_from_slice(&draws[..=kept]);
+        m.draft_min_prob = if i % 2 == 0 { 1.5 } else { 0.0 };
+        proposals =
+            m.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pend).unwrap();
+        assert_eq!(st.pos(), pos + 1 + kept, "step {i}: position");
+        assert_eq!(&out[..], &toks[..out.len()], "step {i}: draws");
+        let c = &counts[out.len() - 1];
+        assert_eq!(&sc.sampler().counts().unwrap(), c, "step {i}: penalty counts");
+        i += 1;
+    }
+    eprintln!(
+        "speculative: {empty} one-row steps, {proposed} drafts, {accepted} accepted"
+    );
+    assert!(empty > 0 && proposed > 0, "both kinds of step");
+    // Ordinary steps continue from the speculative state.
+    for k in out.len()..out.len() + after {
+        let t = sampled_step(&m, &ctx, &mut st, &sc, toks[k - 1], &params, k);
+        let r = rel(&sc.logits_last.to_f32().unwrap(), &logits[k]);
+        eprintln!("step {k} after speculation: relative L2 {r:.2e}");
+        assert!(r < 5e-3, "step {k} logits differ (relative L2 {r:.2e})");
+        assert_eq!(t, toks[k], "step {k} after speculation");
+        assert_eq!(sc.sampler().counts().unwrap(), counts[k], "step {k} counts");
+    }
+}
+
 /// prefill_until stops at a run boundary before committing it and reports
 /// what it fed; the rest fed afterwards gives exactly what one prefill of
 /// the whole prompt gives.

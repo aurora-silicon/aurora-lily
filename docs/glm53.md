@@ -102,7 +102,9 @@ The ignored tests load the real file: the header against the schema,
 speculative steps against ordinary decoding (accepted and rejected drafts,
 rollback across an indexer pool past the sparse window, snapshot restore and
 fork), sampled speculation against ordinary sampling (the same draws and
-penalty counts after a rejection and an acceptance), and cancelled prefill. `lily-glm53` (`src/bin/lily-glm53.rs`) compares
+penalty counts after a rejection and an acceptance, and following the
+engine's own proposals with and without a draft), the draft threshold, and
+cancelled prefill. `lily-glm53` (`src/bin/lily-glm53.rs`) compares
 the GPU with the CPU reference layer by layer (`compare`), scores ds4's
 official GLM 5.3 Flash continuations from its `gguf-tools/quality-testing`
 (`score`, `--legacy` for ds4's reference rendering), measures prefill,
