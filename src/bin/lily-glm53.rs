@@ -130,6 +130,48 @@ enum Cmd {
         #[arg(long)]
         chat: Option<String>,
     },
+    /// Teacher-forced MTP acceptance: after the prompt (prefill, or with
+    /// --decode-prompt one decode step a token), a fixed continuation is fed
+    /// token by token; at each position the MTP block takes the true next
+    /// token and drafts the one after, which is compared with the true token
+    /// there and with the main model's greedy token. The continuation is the
+    /// text's (raw text) or read from --cont (one token id a line); --save-cont
+    /// writes this build's greedy continuation of the prompt instead.
+    Mtpacc {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, default_value_t = 512)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 160)]
+        n: usize,
+        #[arg(long)]
+        chat: Option<String>,
+        #[arg(long)]
+        cont: Option<PathBuf>,
+        #[arg(long)]
+        save_cont: Option<PathBuf>,
+        #[arg(long)]
+        decode_prompt: bool,
+        /// Write the prompt's state (final hidden row, logits, every
+        /// layer's KDA state and conv window or DSA latent, pooled keys and
+        /// tails), the first MTP latent row and a per-position TSV here.
+        #[arg(long)]
+        dump: Option<PathBuf>,
+    },
+    /// The f16 expert route's ranges on a checkpoint: the MoE layers'
+    /// largest ffn_norm gain, the expert input's largest magnitude over a
+    /// prompt (raw text, traced forward), and the decoded IQ2_XXS / Q2_K
+    /// scale factors against f16's normal range.
+    Ranges {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, default_value_t = 512)]
+        prompt_len: usize,
+    },
     /// Step time by row count: after a prompt, forward passes of 1 to 4
     /// rows (every row's logits, as a verify pass), each from the prompt's
     /// state (restored); medians.
@@ -186,6 +228,28 @@ fn run() -> Result<()> {
             spec_diff(&model, &text, prompt_len, n, chat.as_deref())
         }
         Cmd::Rows { model, text, prompt_len, n } => rows(&model, &text, prompt_len, n),
+        Cmd::Ranges { model, text, prompt_len } => ranges(&model, &text, prompt_len),
+        Cmd::Mtpacc {
+            model,
+            text,
+            prompt_len,
+            n,
+            chat,
+            cont,
+            save_cont,
+            decode_prompt,
+            dump,
+        } => mtpacc(
+            &model,
+            &text,
+            prompt_len,
+            n,
+            chat.as_deref(),
+            cont.as_deref(),
+            save_cont.as_deref(),
+            decode_prompt,
+            dump.as_deref(),
+        ),
         Cmd::Bench { model, text, prompt_len, n, runs } => {
             bench(&model, &text, prompt_len, n, runs)
         }
@@ -599,6 +663,299 @@ fn bench(
             steps[n / 10],
         );
     }
+    Ok(())
+}
+
+fn ranges(
+    path: &std::path::Path,
+    text: &std::path::Path,
+    prompt_len: usize,
+) -> Result<()> {
+    use half::f16;
+    let g = lily::gguf::Gguf::open(path)?;
+    let n_layer = g.u64(&format!("{}.block_count", g.architecture()?))? as usize;
+    let tiny = f16::MIN_POSITIVE.to_f32();
+    let mut norm_max = 0f32;
+    // Scale factors of the f16 decode: count, below f16's normal range,
+    // smallest and largest nonzero magnitude.
+    #[derive(Default)]
+    struct R {
+        n: u64,
+        sub: u64,
+        min: f32,
+        max: f32,
+    }
+    impl R {
+        fn add(&mut self, v: f32, tiny: f32) {
+            let a = v.abs();
+            self.n += 1;
+            if a == 0.0 {
+                return;
+            }
+            if a < tiny {
+                self.sub += 1;
+            }
+            if self.min == 0.0 || a < self.min {
+                self.min = a;
+            }
+            self.max = self.max.max(a);
+        }
+    }
+    let (mut iq2, mut q2s, mut q2m) = (R::default(), R::default(), R::default());
+    let h =
+        |b: &[u8], at: usize| f16::from_bits(u16::from_le_bytes([b[at], b[at + 1]]));
+    for il in 0..n_layer {
+        let Some(gate) = g.tensor(&format!("blk.{il}.ffn_gate_exps.weight")) else {
+            continue;
+        };
+        let nw = g.require(&format!("blk.{il}.ffn_norm.weight"))?;
+        let w = g.read_rows_f32(nw, 0..nw.rows())?;
+        norm_max = w.iter().fold(norm_max, |m, v| m.max(v.abs()));
+        let up = g.require(&format!("blk.{il}.ffn_up_exps.weight"))?;
+        let down = g.require(&format!("blk.{il}.ffn_down_exps.weight"))?;
+        for t in [gate, up, down] {
+            let bb = t.ty.block_bytes() as u64;
+            let chunk = bb * 1_000_000;
+            let mut at = 0u64;
+            while at < t.bytes {
+                let len = chunk.min(t.bytes - at);
+                let b = g.read_bytes(t.offset + at, len as usize)?;
+                for blk in b.chunks_exact(bb as usize) {
+                    if t.ty == lily::gguf::GgmlType::Iq2Xxs {
+                        let d = h(blk, 0);
+                        for j in 0..8 {
+                            let o = 2 + 8 * j + 4;
+                            let aux1 = u32::from_le_bytes([
+                                blk[o],
+                                blk[o + 1],
+                                blk[o + 2],
+                                blk[o + 3],
+                            ]);
+                            let sc = d * f16::from_f32((2 * (aux1 >> 28) + 1) as f32);
+                            iq2.add(sc.to_f32(), tiny);
+                        }
+                    } else {
+                        let (d, dmin) = (h(blk, 80), h(blk, 82));
+                        for &sc in &blk[..16] {
+                            q2s.add(
+                                (d * f16::from_f32((sc & 15) as f32)).to_f32(),
+                                tiny,
+                            );
+                            q2m.add(
+                                (dmin * f16::from_f32((sc >> 4) as f32)).to_f32(),
+                                tiny,
+                            );
+                        }
+                    }
+                }
+                at += len;
+            }
+        }
+    }
+    let show = |name: &str, r: &R| {
+        println!(
+            "{name}: {} factors, {} below f16's normal range ({:.4}%), nonzero |x| in [{:e}, {:e}]",
+            r.n,
+            r.sub,
+            100.0 * r.sub as f64 / r.n as f64,
+            r.min,
+            r.max
+        )
+    };
+    println!(
+        "MoE layers' largest |ffn_norm| gain {norm_max} (f16-safe bound 65504 / 64 = 1023.5)"
+    );
+    show("IQ2_XXS f16(d (2s+1)) (weights are it x 1, 3.125, 5.375)", &iq2);
+    show("Q2_K f16(d sc)", &q2s);
+    show("Q2_K f16(dmin m)", &q2m);
+    // The expert input over a real prompt.
+    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
+    let mut ids = tok.encode("[gMASK]<sop>")?;
+    let body = tok.encode(&std::fs::read_to_string(text)?)?;
+    ids.extend_from_slice(&body[..prompt_len - ids.len()]);
+    let ctx = MetalContext::new()?;
+    let model = Glm53Model::load(&ctx, path)?;
+    let mut sc = model.new_scratch(&ctx)?;
+    let mut st = model.new_state(&ctx, prompt_len + 8)?;
+    let mut trace = Vec::new();
+    model.forward_traced(&ctx, &mut st, &mut sc, &ids, &mut trace)?;
+    let first_moe = model.cfg.n_leading_dense;
+    let mx = trace[first_moe..]
+        .iter()
+        .flat_map(|t| t.ffn_in.iter())
+        .fold(0f32, |m, v| m.max(v.abs()));
+    println!("expert input over a {prompt_len}-token prompt: largest |x| {mx}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mtpacc(
+    path: &std::path::Path,
+    text: &std::path::Path,
+    prompt_len: usize,
+    n: usize,
+    chat: Option<&str>,
+    cont: Option<&std::path::Path>,
+    save_cont: Option<&std::path::Path>,
+    decode_prompt: bool,
+    dump: Option<&std::path::Path>,
+) -> Result<()> {
+    use lily::engine::{Draw, LanguageModel, LoadOptions};
+    use lily::glm53::model::LayerState;
+    let write = |name: &str, v: &[f32]| -> Result<()> {
+        if let Some(d) = dump {
+            std::fs::create_dir_all(d)?;
+            std::fs::write(d.join(name), bytemuck::cast_slice(v))?;
+        }
+        Ok(())
+    };
+    let margin = |l: &[f32]| -> f32 {
+        let top = argmax(l);
+        let second = l
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != top)
+            .map(|(_, &v)| v)
+            .fold(f32::NEG_INFINITY, f32::max);
+        l[top] - second
+    };
+    use lily::kernels::sample::SamplingParams;
+    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
+    let mut body = Vec::new();
+    let prompt = match chat {
+        Some(q) => {
+            let messages = [serde_json::json!({"role": "user", "content": q})];
+            tok.encode_chat(&lily::tokenizer::ChatRender {
+                messages: &messages,
+                tools: None,
+                enable_thinking: false,
+                reasoning_effort: None,
+                preserve_thinking: None,
+            })?
+        }
+        None => {
+            let mut ids = tok.encode("[gMASK]<sop>")?;
+            body = tok.encode(&std::fs::read_to_string(text)?)?;
+            anyhow::ensure!(body.len() + ids.len() >= prompt_len + n, "text too short");
+            let used = prompt_len - ids.len();
+            ids.extend_from_slice(&body[..used]);
+            body = body[used..used + n].to_vec();
+            ids
+        }
+    };
+    let ctx = MetalContext::new()?;
+    let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
+    let model = <Glm53Model as LanguageModel>::load(&ctx, path, &options)?;
+    let vocab = model.cfg.vocab;
+    let greedy = SamplingParams::greedy();
+    let mut sc = LanguageModel::new_scratch_with_capacity(&model, &ctx, 0)?;
+    let mut st = LanguageModel::new_state(&model, &ctx, prompt.len() + n + 8)?;
+    if decode_prompt {
+        for &t in &prompt {
+            model.forward(&ctx, &mut st, &mut sc, &[t], true)?;
+        }
+    } else {
+        LanguageModel::prefill(
+            &model,
+            &ctx,
+            &mut st,
+            &mut sc,
+            &prompt,
+            Some(Draw { params: &greedy, step: 0 }),
+        )?;
+    }
+    // The main model's greedy token after the prompt.
+    let mut greedy_next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+    if dump.is_some() {
+        let h = model.cfg.hidden;
+        write("hidden", &sc.hidden.to_f32()?[..h])?;
+        write("logits", &sc.logits.to_f32()?[..vocab])?;
+        let pos = st.pos;
+        for (il, l) in st.layers.iter().enumerate() {
+            match l {
+                LayerState::Kda { conv, s, .. } => {
+                    write(&format!("l{il:02}_kda_s"), &s.to_f32()?)?;
+                    write(&format!("l{il:02}_kda_conv"), &conv.to_f32()?)?;
+                }
+                LayerState::Dsa { latent, pooled, tail_k, tail_g } => {
+                    write(
+                        &format!("l{il:02}_dsa_latent"),
+                        &latent.to_f32()?[..pos * 512],
+                    )?;
+                    let pd = pooled.numel() / (st.capacity / 4).max(1);
+                    write(
+                        &format!("l{il:02}_dsa_pooled"),
+                        &pooled.to_f32()?[..(pos / 4) * pd],
+                    )?;
+                    write(&format!("l{il:02}_dsa_tail_k"), &tail_k.to_f32()?)?;
+                    write(&format!("l{il:02}_dsa_tail_g"), &tail_g.to_f32()?)?;
+                }
+            }
+        }
+    }
+    let mut tsv = String::from("j\ttrue\tdraft\tgreedy\tmain_margin\tmtp_margin\n");
+    if let Some(f) = save_cont {
+        let mut out = vec![greedy_next];
+        while out.len() < n {
+            model.forward(&ctx, &mut st, &mut sc, &[*out.last().unwrap()], true)?;
+            out.push(argmax(&sc.logits.to_f32()?[..vocab]) as u32);
+        }
+        let lines: Vec<String> = out.iter().map(|t| t.to_string()).collect();
+        std::fs::write(f, lines.join("\n") + "\n")?;
+        println!("saved {} tokens", out.len());
+        return Ok(());
+    }
+    let seq: Vec<u32> = match cont {
+        Some(f) => std::fs::read_to_string(f)?
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.trim().parse::<u32>())
+            .collect::<std::result::Result<_, _>>()?,
+        None => body,
+    };
+    anyhow::ensure!(seq.len() >= 2, "continuation of {} tokens", seq.len());
+    let seq = &seq[..seq.len().min(n)];
+    // At position p (the last fed token), the MTP block takes seq[j] (the
+    // token at p + 1) and drafts the token at p + 2, seq[j + 1]; then
+    // seq[j] is fed.
+    let (mut hit_true, mut hit_greedy, mut total) = (0usize, 0usize, 0usize);
+    let mut main_true = 0usize;
+    let mut digest = 0xcbf29ce484222325u64;
+    for j in 0..seq.len() - 1 {
+        let draft = LanguageModel::draft_initial(
+            &model, &ctx, &mut st, &mut sc, seq[j], 1, &greedy, 0,
+        )?[0];
+        let mtp_margin = margin(&sc.logits.to_f32()?[..vocab]);
+        if j == 0 && dump.is_some() {
+            // The MTP block's first latent row (position pos - 1).
+            if let LayerState::Dsa { latent, .. } = &st.layers[model.cfg.mtp_layer()] {
+                let p = st.pos - 1;
+                write("mtp_latent0", &latent.to_f32()?[p * 512..(p + 1) * 512])?;
+            }
+        }
+        main_true += usize::from(greedy_next == seq[j]);
+        model.forward(&ctx, &mut st, &mut sc, &[seq[j]], true)?;
+        greedy_next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+        let main_margin = margin(&sc.logits.to_f32()?[..vocab]);
+        tsv += &format!(
+            "{j}\t{}\t{draft}\t{greedy_next}\t{main_margin}\t{mtp_margin}\n",
+            seq[j + 1]
+        );
+        total += 1;
+        hit_true += usize::from(draft == seq[j + 1]);
+        hit_greedy += usize::from(draft == greedy_next);
+        digest = (digest ^ u64::from(draft)).wrapping_mul(0x100000001b3);
+    }
+    if let Some(d) = dump {
+        std::fs::write(d.join("steps.tsv"), tsv)?;
+    }
+    println!(
+        "mtpacc: prompt {} ({}), {total} drafts: draft = true next {hit_true} ({:.1}%), draft = main greedy {hit_greedy} ({:.1}%), main greedy = true {main_true}/{total}; drafts digest {digest:016x}",
+        prompt.len(),
+        if decode_prompt { "decode" } else { "prefill" },
+        100.0 * hit_true as f64 / total as f64,
+        100.0 * hit_greedy as f64 / total as f64,
+    );
     Ok(())
 }
 
