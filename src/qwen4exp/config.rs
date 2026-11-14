@@ -581,6 +581,9 @@ pub struct Qwen4ExpConfig {
     pub mtp: Option<MtpConfig>,
     /// The vision tower, when the checkpoint includes it.
     pub vision: Option<VisionConfig>,
+    /// A GGUF checkpoint's routed down rows' stored width (ds4 pads 640 to
+    /// 768 values); `None` for lily's checkpoints.
+    pub gguf_down_cols: Option<usize>,
 }
 
 impl Qwen4ExpConfig {
@@ -787,6 +790,7 @@ impl Qwen4ExpConfig {
             storage,
             mtp,
             vision,
+            gguf_down_cols: None,
         };
         config.validate_flash_next()?;
         config.validate_vision()?;

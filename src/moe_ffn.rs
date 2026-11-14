@@ -21,6 +21,9 @@ pub(crate) struct MoeDims {
     pub moe_intermediate: usize,
     pub hidden: usize,
     pub norm_topk_prob: bool,
+    /// GGUF experts: the down rows' stored width (ds4 pads 640 to 768),
+    /// which sizes the grouped prefill's activations; `None` for affine.
+    pub gguf_down_cols: Option<usize>,
 }
 
 /// GEMVs of GGUF stacks over `m` (<= 4) rows of the same bfloat16 input
@@ -361,6 +364,8 @@ pub(crate) struct PrefillMoeScratch {
     /// policy's alloc tile for the backing scratch (the sizing bound), the
     /// policy's per-chunk answer for a chunk view.
     pub tile: quant::MoeTile,
+    /// The grouped prefill of GGUF experts (`qwen_gguf::moe_grouped`).
+    pub gguf: Option<qwen_gguf::MoeGroupScratch>,
     /// The chunk's grouped-MoE execution route: block-mapped grouped GEMM at
     /// `tile`, or the small-m GEMV fast path. Set together with
     /// `tile`/`tile_capacity` in [`Self::chunk`]; `prefill_moe` re-checks it
@@ -413,6 +418,10 @@ impl PrefillMoeScratch {
             ed: Tensor::zeros(ctx, &[s_total, h], bf)?,
             tile_capacity: cap,
             tile: alloc_tile,
+            gguf: dims
+                .gguf_down_cols
+                .map(|cols| qwen_gguf::MoeGroupScratch::new(ctx, s_total, e, cols, h))
+                .transpose()?,
             route: quant::MoeRoute::Grouped(alloc_tile),
         })
     }
@@ -463,6 +472,7 @@ impl PrefillMoeScratch {
             tile_capacity: cap,
             tile,
             route,
+            gguf: self.gguf.clone(),
         })
     }
 }
@@ -1046,6 +1056,10 @@ fn gguf_decode_moe(
     )
 }
 
+/// Rows from which GGUF experts in prefill take the grouped GEMMs on the
+/// matrix units rather than the gathers.
+const GGUF_GROUPED_MIN_ROWS: usize = 16;
+
 /// [`prefill_moe`] over GGUF weights: the router and the shared expert by
 /// [`project_mat`], the routed experts of every row through the decode
 /// gathers (one expert walk per (row, slot) pair; grouped GEMMs on the
@@ -1070,6 +1084,36 @@ fn gguf_prefill_moe(
     silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?;
     pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;
     project_mat(ctx, pass, io.mlp_act, &shared.down_proj, &ms.shared_out, io.dequant)?;
+    let (gate, up, down) = (
+        expert_part(&moe_w.expert_gate)?,
+        expert_part(&moe_w.expert_up)?,
+        expert_part(&moe_w.expert_down)?,
+    );
+    if let Some(sc) = &ms.gguf
+        && m >= GGUF_GROUPED_MIN_ROWS
+        && gate.ty == crate::gguf::GgmlType::Iq2Xxs
+        && down.ty == crate::gguf::GgmlType::Q2K
+    {
+        pass.level_barrier(&[&ms.shared_out])?;
+        return qwen_gguf::moe_grouped(
+            ctx,
+            pass,
+            gate,
+            up,
+            down,
+            inter,
+            dims.hidden,
+            io.x,
+            &ms.indices,
+            &ms.scores,
+            qwen_gguf::SharedAdd { out: &ms.shared_out, gate: &ms.shared_gate },
+            io.out,
+            sc,
+            m,
+            k,
+            dims.num_experts,
+        );
+    }
     qwen_gguf::moe_gate_up(
         ctx,
         pass,

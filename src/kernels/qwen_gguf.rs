@@ -325,6 +325,197 @@ pub fn moe_down(
     )
 }
 
+/// Scratch of [`moe_grouped`] for runs of up to `pairs` (row, slot) pairs.
+#[derive(Clone)]
+pub struct MoeGroupScratch {
+    pub pairs: Tensor,
+    pub tiles: Tensor,
+    pub tile_count: Tensor,
+    /// `[pairs][down_cols]` bfloat activations; the columns past the
+    /// experts' `ff` stay zero (the padding the down rows' tail multiplies).
+    pub act: Tensor,
+    /// `[pairs][hidden]` bfloat down outputs.
+    pub down: Tensor,
+    capacity: usize,
+}
+
+impl MoeGroupScratch {
+    pub fn new(
+        ctx: &MetalContext,
+        pairs: usize,
+        experts: usize,
+        down_cols: usize,
+        hidden: usize,
+    ) -> Result<Self> {
+        let max_tiles = pairs.div_ceil(64) + experts;
+        Ok(Self {
+            pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
+            tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
+            tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
+            act: Tensor::zeros(ctx, &[pairs * down_cols], DType::BF16)?,
+            down: Tensor::zeros(ctx, &[pairs * hidden], DType::BF16)?,
+            capacity: pairs,
+        })
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+/// Routed experts over a run of `m` rows grouped by expert, on the matrix
+/// units (`vulkan/qwen_gguf_gemm.comp`, GLM's grouped GEMMs): the same
+/// output as [`moe_gate_up`] then [`moe_down`] with the shared expert,
+/// up to the operands' rounding to bfloat. IQ2_XXS gate/up and Q2_K down
+/// (the draft head's types take the gathers).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    hidden: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    scores: &Tensor,
+    shared: SharedAdd<'_>,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+) -> Result<()> {
+    ensure!(
+        gate.ty == GgmlType::Iq2Xxs
+            && up.ty == GgmlType::Iq2Xxs
+            && down.ty == GgmlType::Q2K,
+        "grouped Qwen experts are IQ2_XXS gate/up and Q2_K down"
+    );
+    let pairs = m * used;
+    ensure!(pairs <= sc.capacity, "grouped MoE scratch for {} pairs", sc.capacity);
+    ensure!(experts <= 512, "grouping of {experts} experts");
+    ensure!(
+        gate.cols.is_multiple_of(256)
+            && down.cols.is_multiple_of(256)
+            && ff.is_multiple_of(32)
+            && hidden.is_multiple_of(64)
+            && ff <= down.cols,
+        "grouped expert GEMMs of {ff} x {} and {hidden} x {}",
+        gate.cols,
+        down.cols
+    );
+    ensure!(
+        x.dtype() == DType::BF16 && x.numel() >= m * gate.cols,
+        "grouped MoE input"
+    );
+    ensure!(sc.act.numel() >= pairs * down.cols, "grouped MoE activations");
+    ensure!(
+        out.dtype() == DType::BF16 && out.numel() >= m * hidden,
+        "grouped MoE output"
+    );
+    // Tiles of up to 128 rows once an expert averages 48 pairs or more
+    // (GLM's rule; the sums are the same either way).
+    let r128 = pairs >= 48 * experts;
+    let tile_rows = if r128 { 128 } else { 64 };
+    let group = ctx.pipeline("glm53_moe_group", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &group,
+        &[
+            sel.binding(),
+            sc.pairs.binding(),
+            sc.tiles.binding(),
+            sc.tile_count.binding(),
+        ],
+        &[&u32_bytes(pairs), &u32_bytes(experts), &u32_bytes(tile_rows)],
+        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
+    )?;
+    pass.memory_barrier()?;
+    let max_tiles = pairs.div_ceil(tile_rows) + experts;
+    let gate_up = ctx.pipeline(
+        if r128 {
+            "qg_gemm_moe_gate_up_iq2_xxs_r128"
+        } else {
+            "qg_gemm_moe_gate_up_iq2_xxs"
+        },
+        SOURCE,
+        MslVersion::V3_1,
+    )?;
+    pass.dispatch_at(
+        &gate_up,
+        &[
+            x.binding(),
+            gate.t.binding(),
+            sc.act.binding(),
+            sc.pairs.binding(),
+            sc.tiles.binding(),
+            sc.tile_count.binding(),
+            up.t.binding(),
+        ],
+        &[
+            &u32_bytes(ff),
+            &u32_bytes(gate.cols),
+            &u32_bytes(gate.row_bytes),
+            &u32_bytes(used),
+            &u32_bytes(gate.cols),
+            &u32_bytes(down.cols),
+        ],
+        Grid::Threadgroups {
+            groups: (ff / 32, max_tiles, 1),
+            threadgroup: (128, 1, 1),
+        },
+    )?;
+    pass.memory_barrier()?;
+    let down_k = ctx.pipeline(
+        if r128 { "qg_gemm_moe_down_q2_k_r128" } else { "qg_gemm_moe_down_q2_k" },
+        SOURCE,
+        MslVersion::V3_1,
+    )?;
+    pass.dispatch_at(
+        &down_k,
+        &[
+            sc.act.binding(),
+            down.t.binding(),
+            sc.down.binding(),
+            sc.pairs.binding(),
+            sc.tiles.binding(),
+            sc.tile_count.binding(),
+        ],
+        &[
+            &u32_bytes(hidden),
+            &u32_bytes(down.cols),
+            &u32_bytes(down.row_bytes),
+            &u32_bytes(1),
+            &u32_bytes(down.cols),
+            &u32_bytes(hidden),
+        ],
+        Grid::Threadgroups {
+            groups: (hidden / 64, max_tiles, 1),
+            threadgroup: (128, 1, 1),
+        },
+    )?;
+    pass.memory_barrier()?;
+    let gate_bf16 = match shared.gate.dtype() {
+        DType::BF16 => 1,
+        DType::F32 => 0,
+        other => anyhow::bail!("shared expert gate of {other:?}"),
+    };
+    let combine = ctx.pipeline("qg_moe_combine", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &combine,
+        &[
+            sc.down.binding(),
+            scores.binding(),
+            shared.out.binding(),
+            shared.gate.binding(),
+            out.binding(),
+        ],
+        &[&u32_bytes(hidden), &u32_bytes(used), &u32_bytes(gate_bf16)],
+        Grid::Threads { grid: (hidden, m, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/qwen_gguf.rs"]
 mod tests;

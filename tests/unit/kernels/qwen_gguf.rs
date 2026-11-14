@@ -303,3 +303,100 @@ fn routed_experts_match_cpu_with_padded_down_rows() {
         }
     }
 }
+
+/// The grouped GEMMs give the gathers' output up to their bfloat operands,
+/// with the padded down rows (garbage in the padding proves it is unread).
+#[test]
+fn grouped_experts_match_the_gathers() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(43);
+    let (h, ff, d_cols, experts, used) =
+        (2560usize, 640usize, 768usize, 12usize, 10usize);
+    let raw_g = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * h);
+    let raw_u = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * h);
+    let raw_d = random_blocks(&mut rng, GgmlType::Q2K, experts * h * d_cols);
+    let wg =
+        QWeight::from_bytes(&ctx, &raw_g, GgmlType::Iq2Xxs, h, experts * ff).unwrap();
+    let wu =
+        QWeight::from_bytes(&ctx, &raw_u, GgmlType::Iq2Xxs, h, experts * ff).unwrap();
+    let wd =
+        QWeight::from_bytes(&ctx, &raw_d, GgmlType::Q2K, d_cols, experts * h).unwrap();
+    for m in [5usize, 40, 130] {
+        let (_, tx) = bf16_input(&ctx, &mut rng, m * h);
+        // Distinct experts per row, as the router picks them.
+        let sel: Vec<u32> = (0..m)
+            .flat_map(|_| {
+                let mut e: Vec<u32> = (0..experts as u32).collect();
+                for i in 0..used {
+                    let j = rng.gen_range(i..experts);
+                    e.swap(i, j);
+                }
+                e.truncate(used);
+                e
+            })
+            .collect();
+        let scores: Vec<f32> = (0..m * used).map(|_| rng.gen_range(0.0..0.2)).collect();
+        let (_, tso) = bf16_input(&ctx, &mut rng, m * h);
+        let sg: Vec<f32> = (0..m).map(|_| rng.gen_range(-2.0..2.0)).collect();
+        let tsel = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&sel),
+            &[sel.len()],
+            DType::U32,
+        )
+        .unwrap();
+        let tsc = Tensor::from_f32(&ctx, &scores, &[scores.len()]).unwrap();
+        let tsg = Tensor::from_f32_as_bf16(&ctx, &sg, &[m]).unwrap();
+        let act = Tensor::zeros(&ctx, &[m * used * ff], DType::BF16).unwrap();
+        let want = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
+        let got = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
+        let sc = MoeGroupScratch::new(&ctx, m * used, experts, d_cols, h).unwrap();
+        run(&ctx, |p| {
+            moe_gate_up(&ctx, p, &wg, &wu, ff, &tx, &tsel, &act, m, used).unwrap();
+            p.memory_barrier().unwrap();
+            moe_down(
+                &ctx,
+                p,
+                &wd,
+                ff,
+                h,
+                &act,
+                &tsel,
+                &tsc,
+                Some(SharedAdd { out: &tso, gate: &tsg }),
+                &want,
+                m,
+                used,
+            )
+            .unwrap();
+            moe_grouped(
+                &ctx,
+                p,
+                &wg,
+                &wu,
+                &wd,
+                ff,
+                h,
+                &tx,
+                &tsel,
+                &tsc,
+                SharedAdd { out: &tso, gate: &tsg },
+                &got,
+                &sc,
+                m,
+                used,
+                experts,
+            )
+            .unwrap();
+        });
+        let (w, g) = (want.to_f32().unwrap(), got.to_f32().unwrap());
+        let scale = w.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let err = w.iter().zip(&g).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let rms =
+            (w.iter().zip(&g).map(|(a, b)| f64::from(a - b).powi(2)).sum::<f64>()
+                / w.len() as f64)
+                .sqrt();
+        eprintln!("m {m}: max |diff| {err} of max |value| {scale}, rms {rms:.3e}");
+        assert!(err <= 0.02 * scale, "m {m}: {err} of {scale}");
+    }
+}

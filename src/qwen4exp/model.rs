@@ -316,6 +316,7 @@ fn moe_dims(cfg: &Qwen4ExpConfig) -> MoeDims {
         moe_intermediate: cfg.moe_intermediate_size,
         hidden: cfg.hidden_size,
         norm_topk_prob: cfg.norm_topk_prob,
+        gguf_down_cols: cfg.gguf_down_cols,
     }
 }
 

@@ -197,6 +197,9 @@ pub fn config_from_gguf(g: &Gguf) -> Result<Qwen4ExpConfig> {
         storage: StoragePolicy::Q4,
         mtp: (nextn > 0).then_some(MtpConfig { layers: nextn, rope_theta: theta }),
         vision: None,
+        gguf_down_cols: Some(
+            g.require("blk.0.ffn_down_exps.weight")?.row_len(),
+        ),
     };
     config.validate_flash_next()?;
     Ok(config)
