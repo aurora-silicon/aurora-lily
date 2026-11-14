@@ -389,3 +389,24 @@ fn moe_grouped_q4_k_q8_0_match_per_pair_kernels() {
         }
     }
 }
+
+#[test]
+fn moe_down_matches_glm53() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(43);
+    let (experts, hidden, used, m) = (10, 512, 8, 3);
+    for (ty, ff) in [(GgmlType::Q4K, 512), (GgmlType::Q8_0, 512), (GgmlType::Q4K, 256)] {
+        let raw = random_blocks(&mut rng, ty, experts * hidden * ff);
+        let dw = QWeight::from_bytes(&ctx, &raw, ty, ff, experts * hidden).unwrap();
+        let mid = tensor(&ctx, &f32s(&mut rng, m * used * ff, -1.0, 1.0));
+        let sel: Vec<u32> = (0..m * used).map(|p| ((p * 7 + 3) % experts) as u32).collect();
+        let tsel = u32s(&ctx, &sel);
+        let (a, b) = (zeros(&ctx, m * hidden, DType::F32), zeros(&ctx, m * hidden, DType::F32));
+        run(&ctx, |p| {
+            moe_down(&ctx, p, &dw, hidden, &mid, &tsel, &a, m, used).unwrap();
+            crate::kernels::glm53::moe_down(&ctx, p, &dw, hidden, &mid, &tsel, None, &b, m, used)
+                .unwrap();
+        });
+        assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-5, 1e-4);
+    }
+}

@@ -6,6 +6,7 @@
 // ops), whose converter defined the file's layout.
 #include "common.glsl"
 #include "glm53_quant.glsl"
+#extension GL_KHR_shader_subgroup_clustered : require
 
 float qwen36_sigmoid(float x) { return 1.0 / (1.0 + exp(-x)); }
 float qwen36_silu(float x) { return x / (1.0 + exp(-x)); }
@@ -410,5 +411,46 @@ void main() {
     const uint t = gl_GlobalInvocationID.y;
     const uint i = t * H + c;
     F32(arg(2)).v[i] = F32(arg(0)).v[i] * qwen36_sigmoid(F32(arg(1)).v[t]);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Routed experts' down projection summed over each row's slots (as
+// glm53_moe_down: out[i][r] = sum_s down[sel[i][s]][r] . mid[i * used + s]),
+// for rows of K = 32 * L values, L = 8 or 16 tasks: a subgroup takes 32 / L
+// output rows, L lanes each (glm53's kernel leaves the lanes past L idle:
+// Qwen3.6's down rows are 512 values, 16 tasks). Grid (ceil(H / (8 * 32 /
+// L)), m), 256 threads. Buffers: 0 down experts, 1 mid, 2 sel, 3 out [m][H].
+// Params: 4 K, 5 H, 6 row_bytes, 7 used.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qwen36_moe_down_q4_k) || defined(KERNEL_qwen36_moe_down_q8_0)
+#ifdef KERNEL_qwen36_moe_down_q4_k
+#define MOE_TYPE GLM53_Q4_K
+#else
+#define MOE_TYPE GLM53_Q8_0
+#endif
+void main() {
+    const uint K = arg_u32(4);
+    const uint H = arg_u32(5);
+    const uint row_bytes = arg_u32(6);
+    const uint used = arg_u32(7);
+    const uint L = K / GLM53_TASK;
+    const uint per_sg = 32u / L;
+    const uint i = gl_WorkGroupID.y;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint r = (gl_WorkGroupID.x * 8u + gl_SubgroupID) * per_sg + lane / L;
+    const uint t = lane % L;
+    const uint rr = min(r, H - 1u);
+    float acc = 0.0;
+    for (uint s = 0u; s < used; s++) {
+        const uint slot = i * used + s;
+        const uint e = U32(arg(2)).v[slot];
+        const uint64_t row = arg(0) + (uint64_t(e) * H + rr) * row_bytes;
+        float w[32];
+        glm53_decode(MOE_TYPE, row, t, w);
+        acc += glm53_task_dot(w, arg(1) + 4u * (uint64_t(slot) * K + t * GLM53_TASK));
+    }
+    acc = L == 16u ? subgroupClusteredAdd(acc, 16u) : subgroupClusteredAdd(acc, 8u);
+    if (t == 0u && r < H) F32(arg(3)).v[i * H + r] = acc;
 }
 #endif

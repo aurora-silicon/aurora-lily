@@ -539,7 +539,7 @@ impl Qwen36Model {
         let x = sc.x.view(first * cfg.hidden, &[rows * cfg.hidden])?;
         g::rmsnorm(ctx, pass, &x, Some(&self.output_norm), &sc.hidden_norm, rows, cfg.hidden, cfg.rms_eps)?;
         pass.memory_barrier()?;
-        g::gemv(ctx, pass, &self.output, &sc.hidden_norm, &sc.logits, rows)?;
+        self.proj(ctx, pass, &[(&self.output, &sc.logits)], &sc.hidden_norm, None, rows)?;
         pass.memory_barrier()
     }
 
@@ -771,18 +771,7 @@ impl Qwen36Model {
         let xb = self.bf16_input(ctx, pass, sc, &sc.sfm, cfg.ff_shared, m)?;
         self.proj(ctx, pass, &[(&f.sh_down, &sc.sout)], &sc.sfm, xb, m)?;
         pass.memory_barrier()?;
-        g::moe_down(
-            ctx,
-            pass,
-            &f.down,
-            cfg.hidden,
-            &sc.moe_mid,
-            &sc.rsel,
-            None,
-            &sc.moe_out,
-            m,
-            used,
-        )?;
+        k::moe_down(ctx, pass, &f.down, cfg.hidden, &sc.moe_mid, &sc.rsel, &sc.moe_out, m, used)?;
         pass.memory_barrier()?;
         k::ffn_residual(ctx, pass, &sc.x, &sc.moe_out, &sc.sout, &sc.shg, m, cfg.hidden)?;
         pass.memory_barrier()
