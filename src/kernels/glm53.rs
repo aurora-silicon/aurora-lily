@@ -17,6 +17,19 @@ const SOURCE: &str = "";
 /// Rows of activations a GEMV takes at once.
 pub const GEMV_MAX_ROWS: usize = 4;
 
+/// Rows a Q8_0 or F16 GEMV takes at once (DeepSeek V4's verify passes and
+/// draft blocks); other types take [`GEMV_MAX_ROWS`].
+pub const GEMV_MAX_ROWS_WIDE: usize = 8;
+
+/// Rows a GEMV over weights of `ty` takes at once.
+pub fn gemv_max_rows(ty: GgmlType) -> usize {
+    if matches!(ty, GgmlType::Q8_0 | GgmlType::F16) {
+        GEMV_MAX_ROWS_WIDE
+    } else {
+        GEMV_MAX_ROWS
+    }
+}
+
 /// A GGUF weight on the GPU: `rows` rows of `cols` values of `ty`, read in
 /// place (`t` is a byte view, I8, over the mapped file or a test upload).
 #[derive(Clone)]
@@ -78,6 +91,25 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
         rows!("f32"),
         rows!("f16"),
     ];
+    if m > GEMV_MAX_ROWS {
+        const WIDE: [[&str; 4]; 2] = [
+            [
+                "glm53_gemv_q8_0_m5",
+                "glm53_gemv_q8_0_m6",
+                "glm53_gemv_q8_0_m7",
+                "glm53_gemv_q8_0_m8",
+            ],
+            [
+                "glm53_gemv_f16_m5",
+                "glm53_gemv_f16_m6",
+                "glm53_gemv_f16_m7",
+                "glm53_gemv_f16_m8",
+            ],
+        ];
+        ensure!(m <= gemv_max_rows(ty), "GEMV of {m} rows over {ty:?}");
+        let t = usize::from(ty == GgmlType::F16);
+        return Ok(WIDE[t][m - GEMV_MAX_ROWS - 1]);
+    }
     ensure!((1..=GEMV_MAX_ROWS).contains(&m), "GEMV of {m} rows");
     let t = match ty {
         GgmlType::Q8_0 => 0,
@@ -181,8 +213,8 @@ fn gemv_dispatch(
     l: GemvLayout,
 ) -> Result<()> {
     ensure!((1..=4).contains(&sets.len()), "GEMV of {} sets", sets.len());
-    ensure!((1..=GEMV_MAX_ROWS).contains(&m), "GEMV of {m} rows");
     let w0 = sets[0].0;
+    ensure!((1..=gemv_max_rows(w0.ty)).contains(&m), "GEMV of {m} rows");
     check_f32(&[x])?;
     let tasks = w0.cols / 32;
     ensure!(

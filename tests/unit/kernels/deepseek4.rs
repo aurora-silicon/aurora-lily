@@ -69,7 +69,7 @@ fn gemv_f16_matches_cpu() {
     let mut rng = StdRng::seed_from_u64(401);
     for (cols, rows) in [(4096usize, 256usize), (16384, 24), (1024, 520), (4096, 64)] {
         let (w, cpu) = f16_weight(&ctx, &f32s(&mut rng, rows * cols, -0.1, 0.1), cols);
-        for m in 1..=g::GEMV_MAX_ROWS {
+        for m in 1..=g::GEMV_MAX_ROWS_WIDE {
             let x = f32s(&mut rng, m * cols, -1.0, 1.0);
             let tx = tensor(&ctx, &x);
             let out = zeros(&ctx, m * rows, DType::F32);
@@ -120,7 +120,7 @@ fn grouped_output_matches_cpu() {
     let mut wf = vec![0f32; groups * rank * cols];
     crate::gguf::dequantize(GgmlType::Q8_0, &raw, &mut wf).unwrap();
     let cpu = Mat { rows: groups * rank, cols, w: wf };
-    for m in [1usize, 4] {
+    for m in [1usize, 4, 6, 8] {
         let x = f32s(&mut rng, m * groups * cols, -1.0, 1.0);
         let tx = tensor(&ctx, &x);
         let out = zeros(&ctx, m * groups * rank, DType::F32);
@@ -472,8 +472,21 @@ fn attention_matches_cpu() {
             }
         };
         run(&ctx, |p| {
-            attend(&ctx, p, &tq, &trun, &tring, rows_arg, &tsinks, &out, m, heads, pos0)
-                .unwrap()
+            attend(
+                &ctx,
+                p,
+                &tq,
+                &trun,
+                &tring,
+                rows_arg,
+                &tsinks,
+                &out,
+                m,
+                heads,
+                pos0,
+                RawWindow::MODEL,
+            )
+            .unwrap()
         });
         let got = out.to_f32().unwrap();
         for i in 0..m {
@@ -688,4 +701,120 @@ fn hc_post_mix_f16_matches_cpu() {
             assert_close(&gs[i * 24 + 8..i * 24 + 24], &comb, 1e-5, 1e-4);
         }
     }
+}
+
+/// DSpark's block attention: every draft row sees the support rows (ring,
+/// valid from `lo`) and the whole block, against the reference.
+#[test]
+fn noncausal_block_attention_matches_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(412);
+    let heads = 64;
+    let sinks = f32s(&mut rng, heads, -1.0, 2.0);
+    let tsinks = tensor(&ctx, &sinks);
+    for (fp, lo) in [(3usize, 0usize), (200, 0), (200, 150), (1000, 990)] {
+        let pos0 = fp + 1;
+        let m = 5;
+        let rows: Vec<Vec<f32>> = (0..pos0 + m)
+            .map(|_| {
+                f32s(&mut rng, 512, -1.0, 1.0).iter().map(|&v| round_f16(v)).collect()
+            })
+            .collect();
+        let ring: Vec<f32> = (0..128)
+            .flat_map(|slot| {
+                (0..pos0)
+                    .rev()
+                    .find(|p| p % 128 == slot)
+                    .map_or(vec![0.0; 512], |p| rows[p].clone())
+            })
+            .collect();
+        let q = f32s(&mut rng, m * heads * 512, -0.2, 0.2);
+        let (tq, tring, trun) = (
+            tensor(&ctx, &q),
+            f16_tensor(&ctx, &ring),
+            f16_tensor(&ctx, &rows[pos0..].concat()),
+        );
+        let out = zeros(&ctx, m * heads * 512, DType::F32);
+        let at = fp + m;
+        let raw = RawWindow { at: Some(at), window: 128 + m, lo };
+        run(&ctx, |p| {
+            attend(
+                &ctx,
+                p,
+                &tq,
+                &trun,
+                &tring,
+                CompRows::None,
+                &tsinks,
+                &out,
+                m,
+                heads,
+                pos0,
+                raw,
+            )
+            .unwrap()
+        });
+        let first = lo.max((at + 1).saturating_sub(128 + m));
+        let vis: Vec<&[f32]> = (first..=at).map(|x| rows[x].as_slice()).collect();
+        let got = out.to_f32().unwrap();
+        for i in 0..m {
+            let want = r::sink_attention(
+                &q[i * heads * 512..(i + 1) * heads * 512],
+                &vis,
+                &sinks,
+                512,
+            );
+            assert_close(
+                &got[i * heads * 512..(i + 1) * heads * 512],
+                &want,
+                2e-5,
+                1e-4,
+            );
+        }
+    }
+}
+
+#[test]
+fn feature_capture_and_markov_prep() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(413);
+    let (hidden, m) = (4096usize, 3usize);
+    let h = f32s(&mut rng, (m + 2) * 4 * hidden, -1.0, 1.0);
+    let th = tensor(&ctx, &h);
+    let out = zeros(&ctx, m * 3 * hidden, DType::F32);
+    run(&ctx, |p| {
+        for slot in 0..3 {
+            hc_capture(&ctx, p, &th, &out, 2, m, slot, 3, hidden).unwrap();
+        }
+    });
+    let got = out.to_f32().unwrap();
+    for i in 0..m {
+        for slot in 0..3 {
+            for d in (0..hidden).step_by(97) {
+                let s = &h[(2 + i) * 4 * hidden..];
+                let want: f32 = (0..4).map(|k| s[k * hidden + d] * 0.25).sum();
+                assert_eq!(got[(i * 3 + slot) * hidden + d], want);
+            }
+        }
+    }
+    // Markov: w1 rows of 256 (Q8_0), the previous token from a buffer.
+    let (vocab, rank) = (50usize, 256usize);
+    let mut raw: Vec<u8> = (0..vocab * rank / 32 * 34).map(|_| rng.r#gen()).collect();
+    for blk in raw.chunks_exact_mut(34) {
+        blk[..2].copy_from_slice(
+            &f16::from_f32(rng.gen_range(0.001..0.02)).to_bits().to_le_bytes(),
+        );
+    }
+    let w1 = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, rank, vocab).unwrap();
+    let mut wf = vec![0f32; vocab * rank];
+    crate::gguf::dequantize(GgmlType::Q8_0, &raw, &mut wf).unwrap();
+    let hid = f32s(&mut rng, hidden, -1.0, 1.0);
+    let toks = u32s(&ctx, &[7, 41, 3]);
+    let feat = zeros(&ctx, hidden + rank, DType::F32);
+    run(&ctx, |p| {
+        markov_prep(&ctx, p, &w1, &toks, 1, &tensor(&ctx, &hid), &feat, hidden).unwrap()
+    });
+    let f = feat.to_f32().unwrap();
+    bits_eq(&f[..hidden], &hid, "features: hidden");
+    bits_eq(&f[hidden..], &wf[41 * rank..42 * rank], "features: w1 row");
 }

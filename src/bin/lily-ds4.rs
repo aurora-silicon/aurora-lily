@@ -74,6 +74,25 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         runs: usize,
     },
+    /// Speculative decoding with the DSpark drafter (support file beside the
+    /// model or LILY_DS4_DSPARK) against plain greedy decoding: the same
+    /// tokens, acceptance, speed.
+    Spec {
+        #[arg(long)]
+        model: PathBuf,
+        /// A raw text (its first `prompt_len` tokens after BOS), unless
+        /// `--chat` gives a user message.
+        #[arg(long)]
+        text: Option<PathBuf>,
+        #[arg(long, default_value_t = 256)]
+        prompt_len: usize,
+        #[arg(long)]
+        chat: Option<String>,
+        #[arg(long, default_value_t = 256)]
+        n: usize,
+        #[arg(long, default_value_t = 1)]
+        runs: usize,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -110,6 +129,9 @@ fn run() -> Result<()> {
             generate(&model, &parse_tokens(&tokens)?, n)
         }
         Cmd::Score { model, fixture, limit } => score(&model, &fixture, limit),
+        Cmd::Spec { model, text, prompt_len, chat, n, runs } => {
+            spec(&model, text.as_ref(), prompt_len, chat.as_deref(), n, runs)
+        }
         Cmd::Bench { model, text, prompt_len, n, runs } => {
             bench(&model, &text, prompt_len, n, runs)
         }
@@ -441,6 +463,117 @@ fn bench(
             n as f64 / dt,
             steps[steps.len() / 2]
         );
+    }
+    Ok(())
+}
+
+fn spec(
+    path: &PathBuf,
+    text: Option<&PathBuf>,
+    prompt_len: usize,
+    chat: Option<&str>,
+    n: usize,
+    runs: usize,
+) -> Result<()> {
+    use lily::engine::{Draw, LanguageModel, LoadOptions};
+    use lily::kernels::sample::SamplingParams;
+    let tok = lily::tokenizer::Tokenizer::from_model_dir(path)?;
+    let ids = match (chat, text) {
+        (Some(q), _) => {
+            let messages = [serde_json::json!({"role": "user", "content": q})];
+            tok.encode_chat(&lily::tokenizer::ChatRender {
+                messages: &messages,
+                tools: None,
+                enable_thinking: false,
+                reasoning_effort: None,
+                preserve_thinking: None,
+            })?
+        }
+        (None, Some(f)) => text_tokens(path, f, prompt_len)?,
+        (None, None) => anyhow::bail!("--chat or --text"),
+    };
+    let ctx = MetalContext::new()?;
+    let options = LoadOptions { mtp_drafts: 5, ..Default::default() };
+    let model = <Ds4Model as LanguageModel>::load(&ctx, path, &options)?;
+    let k = model.max_drafts();
+    let greedy = SamplingParams::greedy();
+    let mut sc = LanguageModel::new_scratch_with_capacity(&model, &ctx, 0)?;
+    let vocab = model.cfg.vocab;
+    for run in 0..runs {
+        // Plain greedy reference.
+        let mut st = LanguageModel::new_state(&model, &ctx, ids.len() + n + 16)?;
+        let draw = Some(Draw { params: &greedy, step: 0 });
+        LanguageModel::prefill(&model, &ctx, &mut st, &mut sc, &ids, draw)?;
+        let mut plain = vec![sc.next_token.to_u32()?[0]];
+        let t = Instant::now();
+        while plain.len() < n {
+            let last = *plain.last().unwrap();
+            model.forward(&ctx, &mut st, &sc, &[last], Logits::Last)?;
+            plain.push(argmax(&sc.logits.to_f32()?[..vocab]) as u32);
+        }
+        let plain_s = t.elapsed().as_secs_f64();
+        // Speculative.
+        let mut st = LanguageModel::new_state(&model, &ctx, ids.len() + n + 16)?;
+        let draw = Some(Draw { params: &greedy, step: 0 });
+        LanguageModel::prefill(&model, &ctx, &mut st, &mut sc, &ids, draw)?;
+        let mut out = vec![sc.next_token.to_u32()?[0]];
+        let t = Instant::now();
+        let mut proposals = model.draft_initial(
+            &ctx,
+            &mut st,
+            &mut sc,
+            out[0],
+            k,
+            &greedy,
+            out.len(),
+        )?;
+        let (mut steps, mut accepted, mut proposed) = (0usize, 0usize, 0usize);
+        let mut hist = vec![0usize; k + 1];
+        let (mut t_verify, mut t_finish) = (0f64, 0f64);
+        while out.len() < n {
+            let pending = *out.last().unwrap();
+            let tv = Instant::now();
+            let (draws, pend) = model.verify(
+                &ctx,
+                &mut st,
+                &mut sc,
+                pending,
+                &proposals,
+                &greedy,
+                out.len(),
+                k,
+            )?;
+            let kept = proposals.iter().zip(&draws).take_while(|(p, d)| p == d).count();
+            out.extend_from_slice(&draws[..=kept]);
+            accepted += kept;
+            proposed += proposals.len();
+            hist[kept] += 1;
+            steps += 1;
+            let tf = Instant::now();
+            t_verify += (tf - tv).as_secs_f64();
+            proposals =
+                model.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pend)?;
+            t_finish += tf.elapsed().as_secs_f64();
+        }
+        let spec_s = t.elapsed().as_secs_f64();
+        out.truncate(n);
+        let same = plain.iter().zip(&out).take_while(|(a, b)| a == b).count();
+        println!(
+            "run {run}: plain {:.2} tok/s; speculative {:.2} tok/s, {steps} steps, {:.2} tokens a step, accepted {accepted}/{proposed} drafts ({:.0}%), kept per step {hist:?}; same first {same}/{n} tokens; per step: verify {:.2} ms, finish+draft {:.2} ms; plain step {:.2} ms",
+            n as f64 / plain_s,
+            n as f64 / spec_s,
+            (n - 1) as f64 / steps as f64,
+            100.0 * accepted as f64 / proposed.max(1) as f64,
+            t_verify / steps as f64 * 1e3,
+            t_finish / steps as f64 * 1e3,
+            plain_s / (n - 1) as f64 * 1e3,
+        );
+        if run == 0 {
+            println!("speculative text: {:?}", tok.decode(&out, false)?);
+            if same < n {
+                println!("plain text:       {:?}", tok.decode(&plain, false)?);
+            }
+        }
     }
     Ok(())
 }

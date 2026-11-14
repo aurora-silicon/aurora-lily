@@ -22,6 +22,11 @@ use crate::tensor::{DType, Tensor};
 /// Rows a GEMV takes at once; longer runs go through it in chunks.
 pub const MAX_ROWS: usize = k::GEMV_MAX_ROWS;
 
+/// Runs of up to this many rows (decode, DSpark's verify passes of up to six
+/// rows, the drafter's block of five) take the f32 GEMVs in chunks of
+/// [`MAX_ROWS`]; longer runs the matrix units.
+pub const EXACT_ROWS: usize = 8;
+
 /// Rows a forward run takes at most.
 pub const PREFILL_ROWS: usize = 2048;
 
@@ -83,6 +88,73 @@ pub struct Ds4Model {
     output: QWeight,
     output_norm: Tensor,
     out_hc: HcW,
+    /// The DSpark drafter, when loaded (`load_dspark`).
+    pub(crate) dspark: Option<dspark::Dspark>,
+}
+
+#[path = "dspark.rs"]
+pub(crate) mod dspark;
+
+/// One layer's weights, named `{prefix}.{tensor}` (`blk.N` in the model,
+/// `mtp.N` in the DSpark support file): its compressors when `ratio` is not
+/// 0, the indexer when `indexer`, the hash table or the router bias.
+fn load_layer(
+    mapped: &Mapped,
+    prefix: &str,
+    ratio: usize,
+    indexer: bool,
+    hash: bool,
+) -> Result<LayerW> {
+    let n = |s: &str| format!("{prefix}.{s}");
+    let q = |s: &str| mapped.q(&n(s));
+    let f = |s: &str| mapped.f32(&n(s));
+    let side = |p: &str| -> Result<HcW> {
+        Ok(HcW {
+            fn_w: q(&format!("hc_{p}_fn.weight"))?,
+            scale: f(&format!("hc_{p}_scale.weight"))?,
+            base: f(&format!("hc_{p}_base.weight"))?,
+        })
+    };
+    let comp = |p: &str| -> Result<CompW> {
+        Ok(CompW {
+            kv: q(&format!("{p}_kv.weight"))?,
+            gate: q(&format!("{p}_gate.weight"))?,
+            ape: f16_view(mapped, &n(&format!("{p}_ape.weight")))?,
+            norm: f(&format!("{p}_norm.weight"))?,
+        })
+    };
+    Ok(LayerW {
+        attn_norm: f("attn_norm.weight")?,
+        ffn_norm: f("ffn_norm.weight")?,
+        hc: [side("attn")?, side("ffn")?],
+        q_a: q("attn_q_a.weight")?,
+        q_a_norm: f("attn_q_a_norm.weight")?,
+        q_b: q("attn_q_b.weight")?,
+        kv: q("attn_kv.weight")?,
+        kv_norm: f("attn_kv_a_norm.weight")?,
+        sinks: f("attn_sinks.weight")?,
+        out_a: q("attn_output_a.weight")?,
+        out_b: q("attn_output_b.weight")?,
+        comp: (ratio != 0).then(|| comp("attn_compressor")).transpose()?,
+        indexer: if indexer {
+            Some(IndexerW {
+                comp: comp("indexer_compressor")?,
+                q_b: q("indexer.attn_q_b.weight")?,
+                proj: q("indexer.proj.weight")?,
+            })
+        } else {
+            None
+        },
+        router: q("ffn_gate_inp.weight")?,
+        bias: (!hash).then(|| f("exp_probs_b.bias")).transpose()?,
+        hash: hash.then(|| q("ffn_gate_tid2eid.weight")).transpose()?,
+        gate: q("ffn_gate_exps.weight")?,
+        up: q("ffn_up_exps.weight")?,
+        down: q("ffn_down_exps.weight")?,
+        sh_gate: q("ffn_gate_shexp.weight")?,
+        sh_up: q("ffn_up_shexp.weight")?,
+        sh_down: q("ffn_down_shexp.weight")?,
+    })
 }
 
 /// An F16 tensor view of a mapped F16 weight (the compressors' position
@@ -113,62 +185,17 @@ impl Ds4Model {
         let cfg = Config::from_gguf(&gguf)?;
         super::schema::validate(&gguf, &cfg)?;
         let mapped = Mapped::map(ctx, &gguf)?;
-        let mut layers = Vec::with_capacity(cfg.n_layer);
-        for il in 0..cfg.n_layer {
-            let n = |s: &str| format!("blk.{il}.{s}");
-            let q = |s: &str| mapped.q(&n(s));
-            let f = |s: &str| mapped.f32(&n(s));
-            let side = |p: &str| -> Result<HcW> {
-                Ok(HcW {
-                    fn_w: q(&format!("hc_{p}_fn.weight"))?,
-                    scale: f(&format!("hc_{p}_scale.weight"))?,
-                    base: f(&format!("hc_{p}_base.weight"))?,
-                })
-            };
-            let comp = |p: &str| -> Result<CompW> {
-                Ok(CompW {
-                    kv: q(&format!("{p}_kv.weight"))?,
-                    gate: q(&format!("{p}_gate.weight"))?,
-                    ape: f16_view(&mapped, &n(&format!("{p}_ape.weight")))?,
-                    norm: f(&format!("{p}_norm.weight"))?,
-                })
-            };
-            let hash = cfg.is_hash_layer(il);
-            layers.push(LayerW {
-                attn_norm: f("attn_norm.weight")?,
-                ffn_norm: f("ffn_norm.weight")?,
-                hc: [side("attn")?, side("ffn")?],
-                q_a: q("attn_q_a.weight")?,
-                q_a_norm: f("attn_q_a_norm.weight")?,
-                q_b: q("attn_q_b.weight")?,
-                kv: q("attn_kv.weight")?,
-                kv_norm: f("attn_kv_a_norm.weight")?,
-                sinks: f("attn_sinks.weight")?,
-                out_a: q("attn_output_a.weight")?,
-                out_b: q("attn_output_b.weight")?,
-                comp: (cfg.ratio(il) != 0)
-                    .then(|| comp("attn_compressor"))
-                    .transpose()?,
-                indexer: if cfg.has_indexer(il) {
-                    Some(IndexerW {
-                        comp: comp("indexer_compressor")?,
-                        q_b: q("indexer.attn_q_b.weight")?,
-                        proj: q("indexer.proj.weight")?,
-                    })
-                } else {
-                    None
-                },
-                router: q("ffn_gate_inp.weight")?,
-                bias: (!hash).then(|| f("exp_probs_b.bias")).transpose()?,
-                hash: hash.then(|| q("ffn_gate_tid2eid.weight")).transpose()?,
-                gate: q("ffn_gate_exps.weight")?,
-                up: q("ffn_up_exps.weight")?,
-                down: q("ffn_down_exps.weight")?,
-                sh_gate: q("ffn_gate_shexp.weight")?,
-                sh_up: q("ffn_up_shexp.weight")?,
-                sh_down: q("ffn_down_shexp.weight")?,
-            });
-        }
+        let layers = (0..cfg.n_layer)
+            .map(|il| {
+                load_layer(
+                    &mapped,
+                    &format!("blk.{il}"),
+                    cfg.ratio(il),
+                    cfg.has_indexer(il),
+                    cfg.is_hash_layer(il),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let embed = mapped.q("token_embd.weight")?;
         let output = mapped.q("output.weight")?;
         let output_norm = mapped.f32("output_norm.weight")?;
@@ -177,20 +204,42 @@ impl Ds4Model {
             scale: mapped.f32("output_hc_scale.weight")?,
             base: mapped.f32("output_hc_base.weight")?,
         };
-        Ok(Self { cfg, gguf, mapped, layers, embed, output, output_norm, out_hc })
+        Ok(Self {
+            cfg,
+            gguf,
+            mapped,
+            layers,
+            embed,
+            output,
+            output_norm,
+            out_hc,
+            dspark: None,
+        })
     }
 
     /// The buffers holding the mapped file.
     pub fn weight_buffers(&self) -> Vec<Buffer> {
-        self.mapped.buffers()
+        let mut b = self.mapped.buffers();
+        if let Some(ds) = &self.dspark {
+            b.extend(ds.weight_buffers());
+        }
+        b
     }
 
     pub fn new_state(&self, ctx: &MetalContext, capacity: usize) -> Result<Ds4State> {
-        Ds4State::new(ctx, &self.cfg, capacity)
+        let mut st = Ds4State::new(ctx, &self.cfg, capacity)?;
+        if let Some(ds) = &self.dspark {
+            st.ds = Some(ds.new_state(ctx)?);
+        }
+        Ok(st)
     }
 
     pub fn new_scratch(&self, ctx: &MetalContext) -> Result<Scratch> {
-        Scratch::new(ctx, &self.cfg)
+        let mut sc = Scratch::new(ctx, &self.cfg)?;
+        if let Some(ds) = &self.dspark {
+            sc.ds = Some(ds.new_scratch(ctx, &self.cfg)?);
+        }
+        Ok(sc)
     }
 }
 
@@ -241,6 +290,15 @@ pub struct Ds4State {
     /// step encoded while the one before runs writes nothing the GPU reads.
     pub(crate) rope_plain: Tensor,
     pub(crate) rope_yarn: Tensor,
+    /// The DSpark drafter's per-session state, when the model has one.
+    pub(crate) ds: Option<dspark::DsState>,
+    /// A verify pass that fed rows from this position and the draws of its
+    /// rows, until `finish_speculation` decides what stays.
+    pub(crate) spec: Option<(usize, usize, Vec<u32>)>,
+    /// Drafts the next block may propose (the verify pass's `next_drafts`).
+    pub(crate) spec_k: usize,
+    /// The drafting schedule (`engine::Schedule`).
+    pub(crate) sched: super::engine::Schedule,
 }
 
 /// The RoPE tables of positions `0..n`.
@@ -285,6 +343,10 @@ impl Ds4State {
             score_cap,
             rope_plain,
             rope_yarn,
+            ds: None,
+            spec: None,
+            spec_k: 0,
+            sched: Default::default(),
         })
     }
 
@@ -293,6 +355,11 @@ impl Ds4State {
     /// by position.
     pub fn reset(&mut self) {
         self.pos = 0;
+        self.spec = None;
+        self.sched = Default::default();
+        if let Some(ds) = self.ds.as_mut() {
+            ds.invalidate();
+        }
     }
 }
 
@@ -332,13 +399,64 @@ pub struct Scratch {
     opre: Tensor,
     pub hidden: Tensor,
     hidden_norm: Tensor,
-    /// `[MAX_ROWS][vocab]`.
+    /// `[EXACT_ROWS][vocab]`.
     pub logits: Tensor,
     /// The last (or only) row's logits: `logits[0..vocab]`.
     pub logits_last: Tensor,
     pub(crate) sampler: crate::kernels::sample::SamplerScratch,
     /// U32[2]: the ping-pong slots the in-graph sampler draws into.
     pub next_token: Tensor,
+    /// Per layer, a verify pass's KV rows and compressor projections (it
+    /// writes no ring; see `Run::defer`).
+    pub(crate) verify: Vec<VerifyBufs>,
+    /// U32[EXACT_ROWS]: tokens a verify pass feeds, and its draws.
+    pub(crate) spec_tokens: Tensor,
+    pub(crate) draws: Tensor,
+    /// The DSpark drafter's buffers, when the model has one.
+    pub(crate) ds: Option<dspark::DsScratch>,
+}
+
+/// A verify pass's per-layer rows (see [`Scratch::verify`]).
+pub(crate) struct VerifyBufs {
+    kv_run: Tensor,
+    ckv: Tensor,
+    csc: Tensor,
+    ikv: Tensor,
+    isc: Tensor,
+}
+
+/// The buffers a layer's attention writes its KV rows and compressor
+/// projections to.
+struct Bufs<'a> {
+    kv_run: &'a Tensor,
+    ckv: &'a Tensor,
+    csc: &'a Tensor,
+    ikv: &'a Tensor,
+    isc: &'a Tensor,
+}
+
+impl VerifyBufs {
+    fn new(ctx: &MetalContext, cfg: &Config) -> Result<Self> {
+        let m = EXACT_ROWS;
+        let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
+        Ok(Self {
+            kv_run: Tensor::zeros(ctx, &[m * cfg.head_dim], DType::F16)?,
+            ckv: f(m * 2 * cfg.head_dim)?,
+            csc: f(m * 2 * cfg.head_dim)?,
+            ikv: f(m * 2 * cfg.indexer_dim)?,
+            isc: f(m * 2 * cfg.indexer_dim)?,
+        })
+    }
+
+    fn bufs(&self) -> Bufs<'_> {
+        Bufs {
+            kv_run: &self.kv_run,
+            ckv: &self.ckv,
+            csc: &self.csc,
+            ikv: &self.ikv,
+            isc: &self.isc,
+        }
+    }
 }
 
 impl Scratch {
@@ -347,7 +465,7 @@ impl Scratch {
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let u = |n: usize| Tensor::zeros(ctx, &[n], DType::U32);
         let hd = cfg.head_dim;
-        let logits = f(MAX_ROWS * cfg.vocab)?;
+        let logits = f(EXACT_ROWS * cfg.vocab)?;
         Ok(Self {
             tokens: u(m)?,
             h: f(m * cfg.hc_dim())?,
@@ -377,7 +495,7 @@ impl Scratch {
             rlogits: f(m * cfg.n_expert)?,
             rsel: u(m * cfg.n_expert_used)?,
             rw: f(m * cfg.n_expert_used)?,
-            moe_mid: f(MAX_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
+            moe_mid: f(EXACT_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
             moe_group: k::MoeGroupScratch::new(
                 ctx,
                 m * cfg.n_expert_used,
@@ -392,12 +510,39 @@ impl Scratch {
             logits,
             sampler: crate::kernels::sample::SamplerScratch::new(ctx, cfg.vocab)?,
             next_token: u(2)?,
+            verify: (0..cfg.n_layer)
+                .map(|_| VerifyBufs::new(ctx, cfg))
+                .collect::<Result<_>>()?,
+            spec_tokens: u(EXACT_ROWS)?,
+            draws: u(EXACT_ROWS)?,
+            ds: None,
         })
+    }
+
+    fn shared_bufs(&self) -> Bufs<'_> {
+        Bufs {
+            kv_run: &self.kv_run,
+            ckv: &self.ckv,
+            csc: &self.csc,
+            ikv: &self.ikv,
+            isc: &self.isc,
+        }
     }
 
     pub(crate) fn stage_tokens(&self, tokens: &[u32]) -> Result<()> {
         crate::glm53::model::write_words(&self.tokens, tokens)
     }
+}
+
+/// What a run encodes besides the layers.
+#[derive(Clone, Copy)]
+pub struct Enc {
+    pub logits: Logits,
+    /// A verify pass: its rows write no ring until `commit_rows`.
+    pub defer: bool,
+    /// Capture DSpark's target features and seed its support rows (when the
+    /// drafter is loaded).
+    pub capture: bool,
 }
 
 /// Which rows' logits a run computes into `Scratch::logits`.
@@ -406,7 +551,7 @@ pub enum Logits {
     None,
     /// The last row's, at `logits[0..vocab]`.
     Last,
-    /// Every row's (at most [`MAX_ROWS`] rows), row `i` at `logits[i * vocab..]`.
+    /// Every row's (at most [`EXACT_ROWS`] rows), row `i` at `logits[i * vocab..]`.
     All,
 }
 
@@ -433,6 +578,8 @@ struct Run<'t> {
     pos0: usize,
     m: usize,
     tokens: &'t Tensor,
+    /// A verify pass: no ring writes (see `Scratch::verify`).
+    defer: bool,
 }
 
 fn read(t: &Tensor, n: usize) -> Result<Vec<f32>> {
@@ -453,7 +600,7 @@ impl Ds4Model {
     ) -> Result<()> {
         ensure!(!tokens.is_empty(), "forward of no tokens");
         ensure!(
-            logits != Logits::All || tokens.len() <= MAX_ROWS,
+            logits != Logits::All || tokens.len() <= EXACT_ROWS,
             "logits of every row"
         );
         let n = tokens.len();
@@ -513,27 +660,22 @@ impl Ds4Model {
             return Ok(());
         }
         let n = cfg.n_layer;
-        if m <= MAX_ROWS {
+        let enc = Enc { logits, defer: false, capture: self.dspark.is_some() };
+        if m <= EXACT_ROWS {
             let pass = ctx.begin_concurrent()?;
-            self.encode_layers(ctx, &pass, st, sc, &sc.tokens, m, 0..n, logits)?;
+            self.encode_layers(ctx, &pass, st, sc, &sc.tokens, m, 0..n, enc)?;
             pass.commit_wait()?;
         } else {
             // A pass a layer keeps a command buffer's GPU time short: the
             // driver times one from its submission.
             for il in 0..n {
                 let pass = ctx.begin_concurrent()?;
-                self.encode_layers(
-                    ctx,
-                    &pass,
-                    st,
-                    sc,
-                    &sc.tokens,
-                    m,
-                    il..il + 1,
-                    logits,
-                )?;
+                self.encode_layers(ctx, &pass, st, sc, &sc.tokens, m, il..il + 1, enc)?;
                 pass.commit_wait()?;
             }
+        }
+        if enc.capture {
+            self.note_seeded(st, m);
         }
         st.pos += m;
         Ok(())
@@ -553,13 +695,19 @@ impl Ds4Model {
         tokens: &Tensor,
         m: usize,
         layers: std::ops::Range<usize>,
-        logits: Logits,
+        enc: Enc,
     ) -> Result<()> {
         let cfg = &self.cfg;
         ensure!((1..=PREFILL_ROWS).contains(&m), "run of {m} rows");
         ensure!(st.pos + m <= st.capacity, "state capacity {}", st.capacity);
         ensure!(layers.end <= cfg.n_layer, "layers {layers:?}");
-        let r = Run { pos0: st.pos, m, tokens };
+        ensure!(!enc.defer || m <= EXACT_ROWS, "a verify pass of {m} rows");
+        let r = Run { pos0: st.pos, m, tokens, defer: enc.defer };
+        // DSpark's target features: the rows whose support rows the drafter
+        // can use (the last 128 of a run), captured after its target layers.
+        let capture = enc.capture && self.dspark.is_some();
+        let cap_rows = m.min(d::WINDOW);
+        let cap = |slot: usize| capture.then_some((slot, m - cap_rows, cap_rows));
         if layers.start == 0 {
             d::embed(ctx, pass, &self.embed, tokens, &sc.h, m)?;
             pass.memory_barrier()?;
@@ -568,7 +716,12 @@ impl Ds4Model {
             let l = &self.layers[il];
             // Each HC pre applies the HC post of the sublayer before it.
             let prev = (il > 0).then_some(&sc.ffn_out);
-            self.hc_pre(ctx, pass, sc, &l.hc[0], &l.attn_norm, m, prev)?;
+            // The streams after a target layer are complete once the next
+            // layer's HC pre has applied its post.
+            let slot = self.dspark.as_ref().and_then(|ds| {
+                ds.targets.iter().position(|&t| t + 1 == il).and_then(cap)
+            });
+            self.hc_pre_capture(ctx, pass, sc, &l.hc[0], &l.attn_norm, m, prev, slot)?;
             self.attention(ctx, pass, st, sc, l, il, r)?;
             self.hc_pre(ctx, pass, sc, &l.hc[1], &l.ffn_norm, m, Some(&sc.attn_out))?;
             self.ffn(ctx, pass, sc, l, r)?;
@@ -578,7 +731,13 @@ impl Ds4Model {
         }
         k::hc_post(ctx, pass, &sc.h, &sc.ffn_out, &sc.split, &sc.h, m, cfg.hidden)?;
         pass.memory_barrier()?;
-        self.head(ctx, pass, sc, m, logits)
+        if let Some(ds) = self.dspark.as_ref().filter(|_| capture) {
+            let (slot, row0, rows) = cap(ds.targets.len() - 1).expect("capturing");
+            self.capture(ctx, pass, sc, slot, row0, rows)?;
+            pass.memory_barrier()?;
+            self.encode_seeds(ctx, pass, st, sc, st.pos + row0, rows, enc.defer)?;
+        }
+        self.head(ctx, pass, sc, m, enc.logits)
     }
 
     /// A run committing after every sublayer and reading its intermediates
@@ -592,7 +751,7 @@ impl Ds4Model {
         trace: &mut Vec<LayerTrace>,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        let r = Run { pos0: st.pos, m, tokens: &sc.tokens };
+        let r = Run { pos0: st.pos, m, tokens: &sc.tokens, defer: false };
         let mut pass = ctx.begin_concurrent()?;
         d::embed(ctx, &pass, &self.embed, &sc.tokens, &sc.h, m)?;
         pass.memory_barrier()?;
@@ -658,7 +817,7 @@ impl Ds4Model {
         x: &Tensor,
         m: usize,
     ) -> Result<()> {
-        if m > MAX_ROWS {
+        if m > EXACT_ROWS {
             // A prompt run: the matrix units (operands rounded to bfloat,
             // f32 accumulation).
             for &(w, y) in sets {
@@ -667,8 +826,11 @@ impl Ds4Model {
             return Ok(());
         }
         let cols = sets[0].0.cols;
-        for c0 in (0..m).step_by(MAX_ROWS) {
-            let rows = (m - c0).min(MAX_ROWS);
+        // Up to eight rows a dispatch for Q8_0 and F16 weights (each weight
+        // read once for a verify pass), four for the others.
+        let chunk = k::gemv_max_rows(sets[0].0.ty);
+        for c0 in (0..m).step_by(chunk) {
+            let rows = (m - c0).min(chunk);
             let xv = x.view(c0 * cols, &[rows * cols])?;
             let ys: Vec<(&QWeight, Tensor)> = sets
                 .iter()
@@ -695,6 +857,23 @@ impl Ds4Model {
         m: usize,
         post: Option<&Tensor>,
     ) -> Result<()> {
+        self.hc_pre_capture(ctx, pass, sc, hc, norm, m, post, None)
+    }
+
+    /// [`Self::hc_pre`], capturing DSpark's target features (`(slot, row0,
+    /// rows)`) of the streams once the previous sublayer's post is applied.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_pre_capture(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        sc: &Scratch,
+        hc: &HcW,
+        norm: &Tensor,
+        m: usize,
+        post: Option<&Tensor>,
+        capture: Option<(usize, usize, usize)>,
+    ) -> Result<()> {
         let cfg = &self.cfg;
         // GLM's fused kernels: the previous sublayer's HC post (when `post`
         // gives its output; its weights are still in `sc.split`) with the
@@ -714,6 +893,9 @@ impl Ds4Model {
             cfg.hidden,
         )?;
         pass.memory_barrier()?;
+        if let Some((slot, row0, rows)) = capture {
+            self.capture(ctx, pass, sc, slot, row0, rows)?;
+        }
         k::hc_pre2(
             ctx,
             pass,
@@ -748,6 +930,9 @@ impl Ds4Model {
         let cfg = &self.cfg;
         let (pos0, m) = (r.pos0, r.m);
         let ls = &st.layers[il];
+        // A verify pass keeps its rows' KV and compressor projections per
+        // layer and writes no ring: `commit_rows` writes the accepted ones.
+        let b = if r.defer { sc.verify[il].bufs() } else { sc.shared_bufs() };
         let yarn = cfg.ratio(il) != 0;
         // The state's RoPE tables are indexed by position.
         let (table, t0) =
@@ -759,21 +944,17 @@ impl Ds4Model {
                 ctx,
                 pass,
                 &[
-                    (&c.kv, &sc.ckv),
-                    (&c.gate, &sc.csc),
-                    (&ix.comp.kv, &sc.ikv),
-                    (&ix.comp.gate, &sc.isc),
+                    (&c.kv, b.ckv),
+                    (&c.gate, b.csc),
+                    (&ix.comp.kv, b.ikv),
+                    (&ix.comp.gate, b.isc),
                 ],
                 &sc.xn,
                 m,
             )?,
-            (Some(c), None) => self.proj(
-                ctx,
-                pass,
-                &[(&c.kv, &sc.ckv), (&c.gate, &sc.csc)],
-                &sc.xn,
-                m,
-            )?,
+            (Some(c), None) => {
+                self.proj(ctx, pass, &[(&c.kv, b.ckv), (&c.gate, b.csc)], &sc.xn, m)?
+            }
             _ => {}
         }
         if let Some(ix) = &l.indexer {
@@ -830,8 +1011,8 @@ impl Ds4Model {
                 ctx,
                 pass,
                 cg,
-                &sc.ckv,
-                &sc.csc,
+                b.ckv,
+                b.csc,
                 &s.cache,
                 &st.rope_yarn,
                 0,
@@ -845,8 +1026,8 @@ impl Ds4Model {
                 ctx,
                 pass,
                 cg,
-                &sc.ikv,
-                &sc.isc,
+                b.ikv,
+                b.isc,
                 &s.cache,
                 &st.rope_yarn,
                 0,
@@ -862,12 +1043,14 @@ impl Ds4Model {
         if let (true, Some(ix)) = (sparse, &l.indexer) {
             self.proj(ctx, pass, &[(&ix.q_b, &sc.iq)], &sc.qr, m)?;
         }
-        d::kv_store(ctx, pass, &sc.kv, &sc.kv_run, table, t0, m)?;
-        if let Some(cg) = &comp_gpu {
-            d::comp_ring(ctx, pass, cg, &sc.ckv, &sc.csc, pos0, m)?;
-        }
-        if let Some(cg) = &index_gpu {
-            d::comp_ring(ctx, pass, cg, &sc.ikv, &sc.isc, pos0, m)?;
+        d::kv_store(ctx, pass, &sc.kv, b.kv_run, table, t0, m)?;
+        if !r.defer {
+            if let Some(cg) = &comp_gpu {
+                d::comp_ring(ctx, pass, cg, b.ckv, b.csc, pos0, m)?;
+            }
+            if let Some(cg) = &index_gpu {
+                d::comp_ring(ctx, pass, cg, b.ikv, b.isc, pos0, m)?;
+            }
         }
         pass.memory_barrier()?;
         // Level 4: query norm and rotation; indexer queries.
@@ -930,8 +1113,18 @@ impl Ds4Model {
             CompRows::None
         };
         d::attend(
-            ctx, pass, &sc.q, &sc.kv_run, &ls.ring, rows, &l.sinks, &sc.heads, m,
-            cfg.n_head, pos0,
+            ctx,
+            pass,
+            &sc.q,
+            b.kv_run,
+            &ls.ring,
+            rows,
+            &l.sinks,
+            &sc.heads,
+            m,
+            cfg.n_head,
+            pos0,
+            d::RawWindow::MODEL,
         )?;
         pass.memory_barrier()?;
         // Rotate back; the ring takes the run's rows.
@@ -948,12 +1141,27 @@ impl Ds4Model {
             0.0,
             HeadOp::InverseRope,
         )?;
-        d::ring_store(ctx, pass, &sc.kv_run, &ls.ring, pos0, m)?;
+        if !r.defer {
+            d::ring_store(ctx, pass, b.kv_run, &ls.ring, pos0, m)?;
+        }
         pass.memory_barrier()?;
+        self.grouped_out(ctx, pass, sc, l, m)
+    }
+
+    /// The grouped output projection from `sc.heads` to `sc.attn_out`.
+    fn grouped_out(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        sc: &Scratch,
+        l: &LayerW,
+        m: usize,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
         // The grouped output projection.
         let group_in = cfg.o_group_heads() * cfg.head_dim;
         debug_assert_eq!(l.out_a.cols, group_in);
-        if m > MAX_ROWS {
+        if m > EXACT_ROWS {
             // Per group: low[i][g] (1024) = out_a[g] (1024 x 4096) . heads[i][g].
             let gl = k::GemmLayout {
                 ldx: cfg.q_dim(),
@@ -965,8 +1173,9 @@ impl Ds4Model {
             };
             k::gemm_with(ctx, pass, &l.out_a, &sc.heads, &sc.low, m, cfg.o_lora, gl)?;
         }
-        for c0 in (0..m).step_by(MAX_ROWS).take_while(|_| m <= MAX_ROWS) {
-            let rows = (m - c0).min(MAX_ROWS);
+        let chunk = k::gemv_max_rows(l.out_a.ty);
+        for c0 in (0..m).step_by(chunk).take_while(|_| m <= EXACT_ROWS) {
+            let rows = (m - c0).min(chunk);
             let x = sc.heads.view(c0 * cfg.q_dim(), &[rows * cfg.q_dim()])?;
             let y = sc.low.view(c0 * l.out_a.rows, &[rows * l.out_a.rows])?;
             k::gemv_with(
@@ -1020,7 +1229,7 @@ impl Ds4Model {
         )?;
         k::swiglu(ctx, pass, &sc.fg, &sc.fu, &sc.fmid, m * cfg.ff_expert, lim)?;
         pass.memory_barrier()?;
-        if m > MAX_ROWS {
+        if m > EXACT_ROWS {
             // A prompt run: the shared expert, then the routed experts
             // grouped by expert on the matrix units (adding to it).
             self.proj(ctx, pass, &[(&l.sh_down, &sc.ffn_out)], &sc.fmid, m)?;
@@ -1093,7 +1302,7 @@ impl Ds4Model {
             Logits::Last => (m - 1, 1),
             Logits::All => (0, m),
         };
-        ensure!(rows <= MAX_ROWS, "logits of {rows} rows");
+        ensure!(rows <= EXACT_ROWS, "logits of {rows} rows");
         // Only the rows whose logits are asked for, through the f32 GEMVs.
         let h = sc.h.view(first * cfg.hc_dim(), &[rows * cfg.hc_dim()])?;
         k::rmsnorm(ctx, pass, &h, None, &sc.flat, rows, cfg.hc_dim(), cfg.rms_eps)?;
@@ -1124,7 +1333,7 @@ impl Ds4Model {
             cfg.rms_eps,
         )?;
         pass.memory_barrier()?;
-        k::gemv(ctx, pass, &self.output, &sc.hidden_norm, &sc.logits, rows)?;
+        self.proj(ctx, pass, &[(&self.output, &sc.logits)], &sc.hidden_norm, rows)?;
         pass.memory_barrier()
     }
 }

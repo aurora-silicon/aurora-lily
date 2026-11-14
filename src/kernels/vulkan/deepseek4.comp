@@ -530,7 +530,11 @@ void main() {
 // at the end. Grid (heads, m), 256 threads. Buffers: 0 q f32 [m][heads][512],
 // 1 kv_run f16 [m][512], 2 ring f16 [128][512], 3 comp f16 [cap][512], 4 sel
 // u32 [m][S], 5 count u32 [m], 6 sinks f32 [heads], 7 out f32
-// [m][heads][512]. Params: 8 pos0, 9 ratio, 10 use_sel, 11 S, 12 scale.
+// [m][heads][512]. Params: 8 pos0, 9 ratio, 10 use_sel, 11 S, 12 scale, 13
+// p_last (0: each row at its own position; else every row at position
+// p_last - 1, DSpark's non-causal block), 14 window (raw rows a row sees at
+// most, 128 for the model), 15 raw_lo (the first position whose raw row is
+// valid).
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_ds4_attend
 shared float sm_m[8];
@@ -545,10 +549,13 @@ void main() {
     const uint h = gl_WorkGroupID.x;
     const uint i = gl_WorkGroupID.y;
     const uint heads = gl_NumWorkGroups.x;
-    const uint p = pos0 + i;
+    const uint p_last = arg_u32(13);
+    const uint window = arg_u32(14);
+    const uint raw_lo = arg_u32(15);
+    const uint p = p_last != 0u ? p_last - 1u : pos0 + i;
     const uint lane = gl_SubgroupInvocationID;
     const uint sg = gl_SubgroupID;
-    const uint n_raw = min(p + 1u, 128u);
+    const uint n_raw = min(window, p + 1u - min(raw_lo, p));
     const uint n_comp = ratio == 0u ? 0u
         : (use_sel ? U32(arg(5)).v[i] : (p + 1u) / ratio);
     const uint total = n_raw + n_comp;
@@ -704,5 +711,52 @@ void main() {
         acc += F32(H).v[s * hidden + d] * w;
     }
     F32(arg(4) + 4u * uint64_t(i) * hidden).v[d] = acc;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// DSpark's target features: the mean of the four HC streams of rows row0 ..
+// into slot `slot` of each row's `slots` feature vectors (ds4's
+// hc_weighted_sum with weights 1/4). Grid (hidden, rows). Buffers: 0 H
+// [m][4][hidden], 1 out [rows][slots][hidden]. Params: 2 hidden, 3 slot, 4
+// slots, 5 row0.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_hc_capture
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint hidden = arg_u32(2);
+    const uint slot = arg_u32(3);
+    const uint slots = arg_u32(4);
+    const uint d = gl_GlobalInvocationID.x;
+    const uint i = gl_GlobalInvocationID.y;
+    const uint64_t H = arg(0) + 16u * uint64_t(arg_u32(5) + i) * hidden;
+    float acc = 0.0;
+    [[unroll]] for (uint s = 0u; s < 4u; s++) acc += F32(H).v[s * hidden + d] * 0.25;
+    F32(arg(1) + 4u * (uint64_t(i) * slots + slot) * hidden).v[d] = acc;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// DSpark's Markov step input: features = [hid (hidden), w1 row of the
+// previous token (rank, Q8_0 dequantized)]. Grid (hidden + rank). Buffers:
+// 0 w1 Q8_0 [vocab][rank], 1 tokens u32, 2 hid f32 [hidden], 3 features
+// out. Params: 4 hidden, 5 rank, 6 index of the previous token in buffer 1.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_markov_prep
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint hidden = arg_u32(4);
+    const uint rank = arg_u32(5);
+    const uint d = gl_GlobalInvocationID.x;
+    if (d < hidden) {
+        F32(arg(3)).v[d] = F32(arg(2)).v[d];
+        return;
+    }
+    const uint j = d - hidden;
+    const uint prev = U32(arg(1)).v[arg_u32(6)];
+    const uint64_t row = arg(0) + uint64_t(prev) * (rank / 32u) * 34u;
+    const uint64_t blk = row + uint64_t(j / 32u) * 34u;
+    const float scale = unpackHalf2x16(uint(U16(blk).v[0])).x;
+    F32(arg(3)).v[d] = scale * float(I8(blk + 2u).v[j % 32u]);
 }
 #endif

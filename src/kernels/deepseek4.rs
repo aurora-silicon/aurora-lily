@@ -396,6 +396,24 @@ pub enum CompRows<'t> {
     Selected { cache: &'t Tensor, sel: &'t Tensor, count: &'t Tensor, k: usize },
 }
 
+/// Which raw rows [`attend`] reads beyond the defaults.
+#[derive(Clone, Copy)]
+pub struct RawWindow {
+    /// `Some(p)`: every row attends as the row at position `p` (DSpark's
+    /// non-causal block, all rows seeing the whole block); `None`: each row
+    /// at its own position.
+    pub at: Option<usize>,
+    /// Raw rows a row sees at most.
+    pub window: usize,
+    /// The first position whose raw row is valid.
+    pub lo: usize,
+}
+
+impl RawWindow {
+    /// The model's: each row's last [`WINDOW`] positions.
+    pub const MODEL: Self = Self { at: None, window: WINDOW, lo: 0 };
+}
+
 /// Sink attention of every head of every step row over its raw window
 /// (`kv_run` for the step's positions, `ring` before) and compressed rows.
 #[allow(clippy::too_many_arguments)]
@@ -411,8 +429,16 @@ pub fn attend(
     m: usize,
     heads: usize,
     pos0: usize,
+    raw: RawWindow,
 ) -> Result<()> {
     check(&[q, sinks, out], DType::F32)?;
+    if let Some(at) = raw.at {
+        ensure!(at >= pos0 && raw.lo <= at, "raw window at {at}");
+        // The ring holds the positions before pos0: no two may share a slot.
+        ensure!(raw.window <= WINDOW + (at + 1 - pos0), "raw window of {}", raw.window);
+    } else {
+        ensure!(raw.window <= WINDOW, "raw window of {}", raw.window);
+    }
     check(&[kv_run, ring], DType::F16)?;
     ensure!(
         q.numel() >= m * heads * KV_DIM && out.numel() >= m * heads * KV_DIM,
@@ -449,6 +475,9 @@ pub fn attend(
             &u32_bytes(usize::from(use_sel)),
             &u32_bytes(s),
             &f32_bytes(1.0 / (KV_DIM as f32).sqrt()),
+            &u32_bytes(raw.at.map_or(0, |p| p + 1)),
+            &u32_bytes(raw.window),
+            &u32_bytes(raw.lo),
         ],
         Grid::Threadgroups { groups: (heads, m, 1), threadgroup: (256, 1, 1) },
     )
@@ -528,6 +557,60 @@ pub fn out_collapse(
         ],
         &[&u32_bytes(hidden), &f32_bytes(eps)],
         Grid::Threads { grid: (hidden, m, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
+/// DSpark's target features: the stream means of rows `row0..row0 + rows`
+/// of `streams` into slot `slot` of `out` (`[rows][slots][hidden]`).
+#[allow(clippy::too_many_arguments)]
+pub fn hc_capture(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    streams: &Tensor,
+    out: &Tensor,
+    row0: usize,
+    rows: usize,
+    slot: usize,
+    slots: usize,
+    hidden: usize,
+) -> Result<()> {
+    check(&[streams, out], DType::F32)?;
+    ensure!(slot < slots && out.numel() >= rows * slots * hidden, "feature capture");
+    ensure!(streams.numel() >= (row0 + rows) * 4 * hidden, "streams");
+    let pipeline = ctx.pipeline("ds4_hc_capture", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[streams.binding(), out.binding()],
+        &[&u32_bytes(hidden), &u32_bytes(slot), &u32_bytes(slots), &u32_bytes(row0)],
+        Grid::Threads { grid: (hidden, rows, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
+/// DSpark's Markov step input: `features = [hid, w1[tokens[at]]]`.
+#[allow(clippy::too_many_arguments)]
+pub fn markov_prep(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w1: &QWeight,
+    tokens: &Tensor,
+    at: usize,
+    hid: &Tensor,
+    features: &Tensor,
+    hidden: usize,
+) -> Result<()> {
+    ensure!(w1.ty == crate::gguf::GgmlType::Q8_0, "Markov w1 of {:?}", w1.ty);
+    check(&[hid, features], DType::F32)?;
+    check(&[tokens], DType::U32)?;
+    ensure!(
+        features.numel() >= hidden + w1.cols && tokens.numel() > at,
+        "Markov features"
+    );
+    let pipeline = ctx.pipeline("ds4_markov_prep", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[w1.t.binding(), tokens.binding(), hid.binding(), features.binding()],
+        &[&u32_bytes(hidden), &u32_bytes(w1.cols), &u32_bytes(at)],
+        Grid::Threads { grid: (hidden + w1.cols, 1, 1), threadgroup: (256, 1, 1) },
     )
 }
 
