@@ -476,8 +476,8 @@ fn thinking_tokens(generator: &Generator) -> Result<Arc<ThinkingTokens>> {
         |s: &str| t.token_id(s).with_context(|| format!("no {s} in the vocabulary"));
     Ok(Arc::new(ThinkingTokens::new(
         id("</think>")?,
-        id("<tool_call>")?,
-        id("</tool_call>")?,
+        Some(id("<tool_call>")?),
+        Some(id("</tool_call>")?),
         &ThinkingTexts::default(),
         |s| t.encode(s),
         |id| t.is_added(id),
@@ -788,9 +788,10 @@ fn replay_with(
         }
         if control.is_open()
             && rest.starts_with(&close_tag)
-            && rest.get(close_tag.len()) == Some(&tokens.tool_call)
+            && rest.get(close_tag.len()) == tokens.tool_call.as_ref()
         {
-            let action = control.decide(tokens.tool_call, &text(tokens.tool_call)?);
+            let call = tokens.tool_call.expect("Qwen has <tool_call>");
+            let action = control.decide(call, &text(call)?);
             anyhow::ensure!(
                 action == Action::Before(close_tag.clone()),
                 "at {i}: a close before a tool call the control does not ask for ({action:?})"

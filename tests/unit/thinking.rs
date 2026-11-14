@@ -47,8 +47,8 @@ fn tokens(texts: &ThinkingTexts) -> Arc<ThinkingTokens> {
     Arc::new(
         ThinkingTokens::new(
             THINK_END,
-            TOOL_CALL,
-            TOOL_CALL_END,
+            Some(TOOL_CALL),
+            Some(TOOL_CALL_END),
             texts,
             encode,
             is_added,
@@ -532,7 +532,14 @@ fn the_control_never_acts_unannounced() {
 
 #[test]
 fn texts_validate_and_read_from_json() {
-    let ok = ThinkingTokens::new(1, 2, 3, &ThinkingTexts::default(), encode, is_added);
+    let ok = ThinkingTokens::new(
+        1,
+        Some(2),
+        Some(3),
+        &ThinkingTexts::default(),
+        encode,
+        is_added,
+    );
     assert!(ok.is_ok(), "the built-in texts");
     let bad_order = ThinkingTexts {
         close: vec![],
@@ -541,18 +548,25 @@ fn texts_validate_and_read_from_json() {
             NudgeLevel { at: 0.5, texts: vec!["b".into()] },
         ],
     };
-    assert!(ThinkingTokens::new(1, 2, 3, &bad_order, encode, is_added).is_err());
+    assert!(
+        ThinkingTokens::new(1, Some(2), Some(3), &bad_order, encode, is_added).is_err()
+    );
     let at_one = ThinkingTexts {
         close: vec![],
         nudges: vec![NudgeLevel { at: 1.0, texts: vec!["a".into()] }],
     };
-    assert!(ThinkingTokens::new(1, 2, 3, &at_one, encode, is_added).is_err());
+    assert!(
+        ThinkingTokens::new(1, Some(2), Some(3), &at_one, encode, is_added).is_err()
+    );
     // A text that spells the close itself is refused.
     let spelled = ThinkingTexts { close: vec!["</think>".into()], nudges: vec![] };
     let marker_encode = |t: &str| -> Result<Vec<u32>> {
         Ok(if t.contains("</think>") { vec![THINK_END] } else { encode(t)? })
     };
-    assert!(ThinkingTokens::new(1, 2, 3, &spelled, marker_encode, is_added).is_err());
+    assert!(
+        ThinkingTokens::new(1, Some(2), Some(3), &spelled, marker_encode, is_added)
+            .is_err()
+    );
     // So is one that spells any other added or special token: `<|im_end|>`
     // would end the turn inside the inserted group.
     let im_end = |t: &str| -> Result<Vec<u32>> {
@@ -562,15 +576,16 @@ fn texts_validate_and_read_from_json() {
         close: vec![],
         nudges: vec![NudgeLevel { at: 0.5, texts: vec!["Done<|im_end|>".into()] }],
     };
-    let err = ThinkingTokens::new(1, 2, 3, &ending, im_end, is_added).unwrap_err();
+    let err = ThinkingTokens::new(1, Some(2), Some(3), &ending, im_end, is_added)
+        .unwrap_err();
     assert!(err.to_string().contains("added token"), "{err}");
 
     // No close text: just the line end the template writes before the tag.
     let bare = Arc::new(
         ThinkingTokens::new(
             1,
-            2,
-            3,
+            Some(2),
+            Some(3),
             &ThinkingTexts { close: vec![], nudges: vec![] },
             encode,
             is_added,
@@ -694,4 +709,31 @@ fn a_close_cut_short_is_not_reported_as_emitted() {
     generated.truncate(1 + cut);
     assert!(!c.close_emitted(&generated));
     assert!(!c.close_emitted(&[100]), "no room for any of it");
+}
+
+/// Without tool-call tags (DeepSeek V4's vocabulary) the budget, nudges and
+/// the replaced end of turn work; nothing is a tool call that ends thinking.
+#[test]
+fn without_tool_call_tags_the_budget_still_closes() {
+    let tokens = Arc::new(
+        ThinkingTokens::new(THINK_END, None, None, &texts(), encode, is_added)
+            .expect("toy"),
+    );
+    assert!(!tokens.tool_calls());
+    let on = ThinkingSettings { tool_call_ends_thinking: true, ..budget(3, 0) };
+    let mut c = ThinkingControl::new(Arc::clone(&tokens), on, true);
+    assert!(c.may_act_next(), "a budget acts at any draw");
+    // The id that is `<tool_call>` elsewhere is an ordinary token here.
+    assert_eq!(c.decide(TOOL_CALL, "x"), Action::Keep, "not a tool call here");
+    assert!(c.is_open());
+    for t in ["a", "b\n"] {
+        let _ = word(&mut c, t);
+    }
+    assert!(!c.is_open(), "closed by the budget");
+    assert_eq!(c.closed().map(|c| c.by), Some(ClosedBy::Budget));
+    let mut c = ThinkingControl::new(tokens, budget(100, 0), true);
+    assert!(
+        matches!(c.decide_stop(), Action::Replace(_)),
+        "an end of turn is replaced"
+    );
 }

@@ -2228,18 +2228,20 @@ fn loopback_of(address: SocketAddr) -> SocketAddr {
 }
 
 /// The thinking controls' token sequences for `texts`, or `None` when the
-/// vocabulary has no `</think>`, `<tool_call>` or `</tool_call>`.
+/// vocabulary has no `</think>`. `<tool_call>` and `</tool_call>` are used
+/// when it has them (a tool call that ends thinking needs them).
 fn thinking_tokens(
     tokenizer: &crate::tokenizer::Tokenizer,
     texts: &ThinkingTexts,
 ) -> Result<Option<ThinkingTokens>> {
-    let (Some(think_end), Some(tool_call), Some(tool_call_end)) = (
-        tokenizer.token_id("</think>"),
-        tokenizer.token_id("<tool_call>"),
-        tokenizer.token_id("</tool_call>"),
-    ) else {
+    let Some(think_end) = tokenizer.token_id("</think>") else {
         return Ok(None);
     };
+    let (tool_call, tool_call_end) =
+        match (tokenizer.token_id("<tool_call>"), tokenizer.token_id("</tool_call>")) {
+            (Some(a), Some(b)) => (Some(a), Some(b)),
+            _ => (None, None),
+        };
     ThinkingTokens::new(
         think_end,
         tool_call,
@@ -2253,11 +2255,13 @@ fn thinking_tokens(
 }
 
 /// The startup line's account of the thinking controls' defaults.
-fn describe_thinking_defaults(d: &api::ThinkingDefaults, available: bool) -> String {
-    if !available {
-        return "unavailable (the vocabulary lacks </think> or the tool call tags)"
-            .to_owned();
-    }
+fn describe_thinking_defaults(
+    d: &api::ThinkingDefaults,
+    tokens: Option<&ThinkingTokens>,
+) -> String {
+    let Some(tokens) = tokens else {
+        return "unavailable (the vocabulary lacks </think>)".to_owned();
+    };
     let b = d.budgets;
     let budget = if b == api::ThinkingBudgets::default() {
         "no default budget".to_owned()
@@ -2279,7 +2283,13 @@ fn describe_thinking_defaults(d: &api::ThinkingDefaults, available: bool) -> Str
     };
     format!(
         "{budget}; a tool call ends thinking: {}; per request: thinking_budget, thinking_nudges, tool_call_ends_thinking",
-        if d.tool_call_ends_thinking { "on" } else { "off" }
+        if !tokens.tool_calls() {
+            "unavailable (no <tool_call> tag in the vocabulary)"
+        } else if d.tool_call_ends_thinking {
+            "on"
+        } else {
+            "off"
+        }
     )
 }
 
@@ -2336,7 +2346,7 @@ fn run_with<M: LanguageModel + 'static>(
         "thinking controls: {}",
         describe_thinking_defaults(
             &options.thinking_controls,
-            thinking_tokens.is_some()
+            thinking_tokens.as_deref()
         )
     );
     eprintln!(

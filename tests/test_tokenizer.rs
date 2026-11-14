@@ -742,8 +742,8 @@ fn thinking_tokens(
     let id = |s: &str| tok.token_id(s).with_context(|| format!("no {s}"));
     Ok(Arc::new(ThinkingTokens::new(
         id("</think>")?,
-        id("<tool_call>")?,
-        id("</tool_call>")?,
+        Some(id("<tool_call>")?),
+        Some(id("</tool_call>")?),
         texts,
         |s| tok.encode(s),
         |id| tok.is_added(id),
@@ -935,9 +935,10 @@ fn every_insertion_matches_the_whole_texts_encoding() -> Result<()> {
             for &id in earlier.iter().chain([&last]) {
                 assert_eq!(decide(&mut c, id).ok()?, Action::Keep);
             }
-            match decide(&mut c, tokens.tool_call).ok()? {
+            let call = tokens.tool_call?;
+            match decide(&mut c, call).ok()? {
                 Action::Before(mut ids) => {
-                    ids.push(tokens.tool_call);
+                    ids.push(call);
                     Some(ids)
                 }
                 _ => None,
