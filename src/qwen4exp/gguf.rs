@@ -89,7 +89,15 @@ pub fn config_from_gguf(g: &Gguf) -> Result<Qwen4ExpConfig> {
     ensure!(g.architecture()? == ARCH, "not a {ARCH} GGUF");
     let blocks = key(g, "block_count")?;
     let nextn = key(g, "nextn_predict_layers").unwrap_or(0);
-    let layers = blocks - nextn;
+    let mut layers = blocks - nextn;
+    let mut nextn = nextn;
+    // Diagnostic: the first N trunk layers only, without the draft head
+    // (a partly downloaded file, a quick run).
+    if let Some(n) = std::env::var("LILY_QWEN_LAYERS").ok().and_then(|v| v.parse().ok())
+    {
+        layers = layers.min(n);
+        nextn = 0;
+    }
     let interval = key(g, "full_attention_interval")?;
     let layer_types = (0..layers)
         .map(|i| {

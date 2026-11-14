@@ -67,6 +67,15 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
+    /// The prompt's last logits by prefill against the same prompt fed one
+    /// token at a time after a one-token prefill (the GEMM against the GEMV
+    /// path): max difference and both argmaxes.
+    Selfcheck {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        prompt: String,
+    },
     /// One user message through the chat template, decoded greedily.
     Chat {
         #[arg(long)]
@@ -350,6 +359,32 @@ fn run() -> Result<()> {
                 nll_sum / n_tok as f64,
                 lcp_sum as f64 / cases as f64,
                 100.0 * agree as f64 / n_tok as f64
+            );
+        }
+        Cmd::Selfcheck { model, prompt } => {
+            let tok = Tokenizer::from_model_dir(&model)?;
+            let ids = tok.encode(&prompt)?;
+            let r = Runner::load(&model)?;
+            let mut a = Vec::new();
+            r.forced(&ids, ids.len(), 1, |_, row| {
+                a = row.to_vec();
+                Ok(())
+            })?;
+            let mut b = Vec::new();
+            r.forced(&ids, 1, 1, |i, row| {
+                if i == ids.len() {
+                    b = row.to_vec();
+                }
+                Ok(())
+            })?;
+            let diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            let scale = a.iter().map(|x| x.abs()).fold(0f32, f32::max);
+            println!(
+                "{} tokens: prefill argmax {} decode argmax {}, max |diff| {diff:.4} of max |logit| {scale:.2}, finite {}",
+                ids.len(),
+                top2(&a).0,
+                top2(&b).0,
+                a.iter().chain(&b).all(|x| x.is_finite())
             );
         }
         Cmd::Chat { model, prompt, n, think } => {
