@@ -70,6 +70,10 @@ layer 24, under FFN-input differences of at most 5e-5 between the two
 paths; the outputs parted at token 119, where plain decoding's top two
 logits were 0.066 apart). The plain router itself meets margins below 1e-5
 about once every 14 tokens there.
+Decode steps run synchronously (`forward`, the verify pass) are committed
+in four passes; when one fails to encode, the passes before it have run,
+so the state is partly advanced although its position is not: discard it
+or restore a snapshot taken before the step.
 
 ## Differences from ds4
 
@@ -103,8 +107,8 @@ speculative steps against ordinary decoding (accepted and rejected drafts,
 rollback across an indexer pool past the sparse window, snapshot restore and
 fork), sampled speculation against ordinary sampling (the same draws and
 penalty counts after a rejection and an acceptance, and following the
-engine's own proposals with and without a draft), the draft threshold, and
-cancelled prefill. `lily-glm53` (`src/bin/lily-glm53.rs`) compares
+engine's own proposals with and without a draft), the draft threshold, a
+step that fails after its first passes, and cancelled prefill. `lily-glm53` (`src/bin/lily-glm53.rs`) compares
 the GPU with the CPU reference layer by layer (`compare`), scores ds4's
 official GLM 5.3 Flash continuations from its `gguf-tools/quality-testing`
 (`score`, `--legacy` for ds4's reference rendering), measures prefill,

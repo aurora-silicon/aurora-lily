@@ -1016,14 +1016,23 @@ impl Glm53Model {
         Ok(())
     }
 
-    /// Runs a decode or verify step of `m` <= [`MAX_ROWS`] rows (tokens
-    /// read from `tokens` on the GPU), `tail` encoded at its end, and waits.
-    /// The step goes to the GPU in four passes, the first after two layers
-    /// are encoded, so the GPU works while the host encodes the rest: in a
-    /// speculative loop the host waits for every pass and its CPU slows
-    /// down, and one pass a step left the GPU idle for its whole encoding.
-    /// Verify pass on code (2026-11-14): one pass 39.1-39.2 ms, halves
-    /// 37.7-37.9, thirds 36.9-37.6, layers 0-2 then thirds 36.86-36.90.
+    /// Runs a step of `m` <= [`MAX_ROWS`] rows synchronously (the verify
+    /// pass, `forward` and `run_rows`; tokens read from `tokens` on the
+    /// GPU), `tail` encoded at its end, and waits. The engine's ordinary
+    /// decode step (`encode_decode_step`) stays one pass: the generation
+    /// loop encodes it while the step before runs. Here the step goes to
+    /// the GPU in four passes, the first after two layers are encoded, so
+    /// the GPU works while the host encodes the rest: in a speculative loop
+    /// the host waits for every pass and its CPU slows down, and one pass a
+    /// step left the GPU idle for its whole encoding. Verify pass on code
+    /// (2026-11-14): one pass 39.1-39.2 ms, halves 37.7-37.9, thirds
+    /// 36.9-37.6, layers 0-2 then thirds 36.86-36.90.
+    ///
+    /// Not transactional: when encoding a later pass (or `tail`) fails, the
+    /// passes before it have run (they are waited for before the error
+    /// returns), so the recurrent state and caches are partly advanced
+    /// while `st.pos` is not. Discard the state or restore a snapshot taken
+    /// before the step.
     #[allow(clippy::too_many_arguments)]
     pub fn run_step(
         &self,

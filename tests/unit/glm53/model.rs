@@ -568,6 +568,49 @@ fn sampled_speculation_follows_its_proposals() {
     }
 }
 
+/// A synchronous step whose last pass fails to encode has run its earlier
+/// passes (and waited for them): the recurrent state is partly advanced
+/// while the position is not. Restoring a snapshot taken before the step
+/// recovers it: the step then gives exactly the logits it gives from the
+/// snapshot without the failure.
+#[test]
+#[ignore = "requires LILY_GLM53_GGUF"]
+fn a_failed_step_is_recovered_from_a_snapshot() {
+    use crate::engine::DecodeStateApi;
+    let ctx = MetalContext::new().expect("context");
+    let m = real_model(&ctx);
+    let p = prompt(40);
+    let mut st = m.new_state(&ctx, p.len() + 8).unwrap();
+    let mut sc = m.new_scratch(&ctx).unwrap();
+    m.prefill(&ctx, &mut st, &mut sc, &p).unwrap();
+    let snap = st.snapshot(&ctx).unwrap();
+    let token = 2025;
+    m.forward(&ctx, &mut st, &mut sc, &[token], true).unwrap();
+    let want = sc.logits_last.to_f32().unwrap();
+    st.restore(&ctx, &snap).unwrap();
+    let kda0 = |st: &Glm53State| {
+        st.layers
+            .iter()
+            .find_map(|l| match l {
+                LayerState::Kda { s, .. } => Some(s.to_f32().unwrap()),
+                LayerState::Dsa { .. } => None,
+            })
+            .unwrap()
+    };
+    let before = kda0(&st);
+    sc.stage_tokens(&[token]).unwrap();
+    let r = m.run_step(&ctx, &st, &sc, &sc.tokens, 1, Logits::Last, None, |_| {
+        anyhow::bail!("injected failure")
+    });
+    assert!(r.is_err(), "the step reports the failure");
+    assert_eq!(st.pos(), p.len(), "the position is unchanged");
+    assert_ne!(kda0(&st), before, "the first passes ran: the first KDA layer moved");
+    st.restore(&ctx, &snap).unwrap();
+    assert_eq!(kda0(&st), before);
+    m.forward(&ctx, &mut st, &mut sc, &[token], true).unwrap();
+    assert_eq!(sc.logits_last.to_f32().unwrap(), want, "the step after the restore");
+}
+
 /// prefill_until stops at a run boundary before committing it and reports
 /// what it fed; the rest fed afterwards gives exactly what one prefill of
 /// the whole prompt gives.
