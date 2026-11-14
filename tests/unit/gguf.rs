@@ -6,6 +6,12 @@ use super::*;
 /// and from random bytes, the values from ds4's reference formulas.
 const GOLDEN: &[u8] = include_bytes!("../goldens/gguf_dequant.bin");
 
+/// `tests/goldens/gguf_dequant_gemma4.bin`, written by
+/// `tools/reference/gemma4/gguf_dequant_golden.c`: the same records for
+/// the types Gemma 4's files add, blocks from those files, values from
+/// ggml's own dequantization (llama.cpp 0.6.0).
+const GOLDEN_GEMMA4: &[u8] = include_bytes!("../goldens/gguf_dequant_gemma4.bin");
+
 struct Record<'a> {
     ty: GgmlType,
     raw: &'a [u8],
@@ -13,17 +19,21 @@ struct Record<'a> {
 }
 
 fn records() -> Vec<Record<'static>> {
+    records_of(GOLDEN)
+}
+
+fn records_of(golden: &'static [u8]) -> Vec<Record<'static>> {
     let mut out = Vec::new();
     let mut at = 0;
-    while at < GOLDEN.len() {
-        let id = u32::from_le_bytes(GOLDEN[at..at + 4].try_into().unwrap());
-        let n = u32::from_le_bytes(GOLDEN[at + 4..at + 8].try_into().unwrap()) as usize;
+    while at < golden.len() {
+        let id = u32::from_le_bytes(golden[at..at + 4].try_into().unwrap());
+        let n = u32::from_le_bytes(golden[at + 4..at + 8].try_into().unwrap()) as usize;
         at += 8;
         let ty = GgmlType::from_id(id).expect("golden type");
-        let raw = &GOLDEN[at..at + n * ty.block_bytes()];
+        let raw = &golden[at..at + n * ty.block_bytes()];
         at += raw.len();
         let count = n * ty.block_values();
-        let values = GOLDEN[at..at + 4 * count]
+        let values = golden[at..at + 4 * count]
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -54,6 +64,29 @@ fn dequantize_matches_ds4_bit_for_bit() {
         seen.into_iter().collect::<Vec<_>>(),
         ["IQ2_XXS", "Q2_K", "Q4_K", "Q8_0"],
         "every quantized type is covered"
+    );
+}
+
+#[test]
+fn dequantize_matches_ggml_bit_for_bit() {
+    let mut seen = std::collections::BTreeSet::new();
+    for r in records_of(GOLDEN_GEMMA4) {
+        let mut out = vec![0f32; r.values.len()];
+        dequantize(r.ty, r.raw, &mut out).unwrap();
+        for (i, (a, b)) in out.iter().zip(&r.values).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{:?} value {i}: lily {a} ggml {b}",
+                r.ty
+            );
+        }
+        seen.insert(r.ty.name());
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        ["IQ2_S", "IQ4_NL", "Q4_0", "Q5_K", "Q6_K"],
+        "every Gemma 4 type is covered"
     );
 }
 

@@ -1,20 +1,27 @@
-// GGUF block decoders for GLM 5.3 Flash (src/gguf.rs is the CPU version;
-// layouts and value formulas are ggml's as antirez's ds4, MIT, has them).
+// GGUF block decoders for GLM 5.3 Flash and Gemma 4 (src/gguf.rs is the CPU
+// version; layouts and value formulas are ggml's as antirez's ds4, MIT, has
+// them, and ggml's own, llama.cpp MIT, for Q4_0, Q5_K, Q6_K, IQ4_NL, IQ2_S).
 // Every decoder turns one "task" of 32 consecutive values of a row into
-// floats: one Q8_0 block, one 32-value sub-block of Q4_K, two 16-value groups
-// of Q2_K, one 32-value group of IQ2_XXS, or 32 BF16/F32 values. Each value
-// is a product of small exact factors (f16 scale times small integers), so
-// the decode is exact whatever the compiler contracts.
+// floats: one Q8_0, Q4_0 or IQ4_NL block, one 32-value sub-block of Q4_K,
+// Q5_K or Q6_K, two 16-value groups of Q2_K, one 32-value group of IQ2_XXS
+// or IQ2_S, or 32 BF16/F32 values. Each value is a product of small factors
+// in ggml's order; where it is not exact in f32 (Q6_K) the order is pinned
+// with `precise`.
 
 #define GLM53_TASK 32u
 
 // Type ids (GGUF): the kernels take the type as a compile-time constant.
 #define GLM53_F32 0u
 #define GLM53_F16 1u
+#define GLM53_Q4_0 2u
 #define GLM53_Q8_0 8u
 #define GLM53_Q2_K 10u
 #define GLM53_Q4_K 12u
+#define GLM53_Q5_K 13u
+#define GLM53_Q6_K 14u
 #define GLM53_IQ2_XXS 16u
+#define GLM53_IQ4_NL 20u
+#define GLM53_IQ2_S 22u
 #define GLM53_BF16 30u
 
 float glm53_h2f(uint bits) { return unpackHalf2x16(bits).x; }
@@ -125,6 +132,151 @@ void glm53_decode_iq2_xxs(uint64_t row, uint t, out float w[32]) {
     }
 }
 
+// Gemma 4's types, compiled only into the kernels that take them (a file
+// defines GLM53_EXT_TYPES for those): GLM's kernels stay as they were.
+#ifdef GLM53_EXT_TYPES
+// --- Q4_0 and IQ4_NL: f16 d, 16 nibble bytes (18-byte blocks, 2-byte
+// aligned); value j is the low nibble of byte j, value j + 16 its high
+// nibble: Q4_0 (code - 8) * d, IQ4_NL d * kvalues_iq4nl[code]. ---
+void glm53_decode_q4_0(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t) * 18u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        const uint pair = uint(U16(b + 2u).v[i]);
+        [[unroll]] for (uint k = 0u; k < 2u; k++) {
+            const uint byte = (pair >> (8u * k)) & 0xffu;
+            w[2u * i + k] = float(int(byte & 0xfu) - 8) * d;
+            w[2u * i + k + 16u] = float(int(byte >> 4u) - 8) * d;
+        }
+    }
+}
+
+// The IQ4_NL code value (ggml's kvalues_iq4nl): a select tree, not a dynamically indexed array
+// (which the compiler copies to per-thread scratch).
+float glm53_iq4nl_value(uint c) {
+    const vec4 a = c < 8u ? (c < 4u ? vec4(-127.0, -104.0, -83.0, -65.0)
+                                    : vec4(-49.0, -35.0, -22.0, -10.0))
+                          : (c < 12u ? vec4(1.0, 13.0, 25.0, 38.0)
+                                     : vec4(53.0, 69.0, 89.0, 113.0));
+    return a[c & 3u];
+}
+
+void glm53_decode_iq4_nl(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t) * 18u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        const uint pair = uint(U16(b + 2u).v[i]);
+        [[unroll]] for (uint k = 0u; k < 2u; k++) {
+            const uint byte = (pair >> (8u * k)) & 0xffu;
+            w[2u * i + k] = d * glm53_iq4nl_value(byte & 0xfu);
+            w[2u * i + k + 16u] = d * glm53_iq4nl_value(byte >> 4u);
+        }
+    }
+}
+
+// The 6-bit scale and min of sub-block j of a Q4_K/Q5_K block at b (scale
+// bytes at b + 4..16).
+void glm53_k4_scale_min(uint64_t b, uint j, out uint sc, out uint m) {
+    const uvec3 sw = uvec3(U16(b + 4u).v[0] | (uint(U16(b + 4u).v[1]) << 16u),
+                           U16(b + 4u).v[2] | (uint(U16(b + 4u).v[3]) << 16u),
+                           U16(b + 4u).v[4] | (uint(U16(b + 4u).v[5]) << 16u));
+    #define K4_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
+    if (j < 4u) {
+        sc = K4_BYTE(j) & 63u;
+        m = K4_BYTE(j + 4u) & 63u;
+    } else {
+        sc = (K4_BYTE(j + 4u) & 0xfu) | ((K4_BYTE(j - 4u) >> 6u) << 4u);
+        m = (K4_BYTE(j + 4u) >> 4u) | ((K4_BYTE(j) >> 6u) << 4u);
+    }
+    #undef K4_BYTE
+}
+
+// --- Q5_K: f16 d, f16 dmin, 12 scale bytes (Q4_K's), 32 bytes of high
+// bits, 128 nibble bytes (176-byte blocks, 16-byte aligned in 2816-wide
+// rows; read as 32-bit words). Task t: block t / 8, sub-block j = t % 8:
+// Q4_K's nibbles plus bit j of high byte l as 16. ---
+void glm53_decode_q5_k(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 176u;
+    const uint j = t & 7u;
+    const uint dd = U32(b).v[0];
+    const float d = glm53_h2f(dd & 0xffffu);
+    const float dmin = glm53_h2f(dd >> 16u);
+    uint sc, m;
+    glm53_k4_scale_min(b, j, sc, m);
+    const float scale = d * float(sc);
+    const float minv = dmin * float(m);
+    const uint shift = (j & 1u) * 4u;
+    const uint64_t qs = b + 48u + (j >> 1u) * 32u;
+    [[unroll]] for (uint c = 0u; c < 8u; c++) {
+        const uint word = U32(qs).v[c] >> shift;
+        const uint hw = U32(b + 16u).v[c] >> j;
+        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+            const uint q = ((word >> (8u * k)) & 0xfu) | (((hw >> (8u * k)) & 1u) << 4u);
+            w[4u * c + k] = scale * float(q) - minv;
+        }
+    }
+}
+
+// --- Q6_K: 128 bytes of low nibbles, 64 of 2-bit highs, 16 int8 scales,
+// f16 d (210-byte blocks, 2-byte aligned: read as 16-bit words). Task t:
+// block t / 8, half n = (t % 8) / 4, quarter q = t % 4: value l takes nibble
+// q / 2 of byte 64 n + 32 (q & 1) + l, bits 2 q of high byte 32 n + l,
+// scale 8 n + 2 q + l / 16; value = (d * scale) * (code - 32). ---
+void glm53_decode_q6_k(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 210u;
+    const uint n = (t >> 2u) & 1u, q = t & 3u;
+    const float d = glm53_h2f(uint(U16(b).v[104]));
+    const uint sw = uint(U16(b + 192u).v[4u * n + q]);
+    precise float s0 = d * float(int(sw << 24) >> 24);
+    precise float s1 = d * float(int(sw << 16) >> 24);
+    const uint64_t ql = b + 64u * n + 32u * (q & 1u);
+    const uint64_t qh = b + 128u + 32u * n;
+    const uint lshift = 4u * (q >> 1u), hshift = 2u * q;
+    [[unroll]] for (uint i = 0u; i < 16u; i++) {
+        const uint lo = uint(U16(ql).v[i]) >> lshift;
+        const uint hi = uint(U16(qh).v[i]) >> hshift;
+        [[unroll]] for (uint k = 0u; k < 2u; k++) {
+            const uint c = ((lo >> (8u * k)) & 0xfu) | (((hi >> (8u * k)) & 3u) << 4u);
+            precise float v = (i < 8u ? s0 : s1) * float(int(c) - 32);
+            w[2u * i + k] = v;
+        }
+    }
+}
+
+// --- IQ2_S: f16 d, 32 grid-index low bytes, 32 sign bytes, 8 high-bit
+// bytes, 8 scale bytes (82-byte blocks, 2-byte aligned). Task t: block
+// t / 8, group ib = t % 8: values 8 l + j (l < 4) are grid vector qs[4 ib +
+// l] | ((qh[ib] << (8 - 2 l)) & 0x300) times d (0.5 + scale nibble l / 2)
+// / 4, negated by bit j of sign byte 4 ib + l. ---
+uint glm53_iq2s_grid[2048] = uint[2048](
+#include "glm53_iq2s_grid.glsl"
+);
+
+void glm53_decode_iq2_s(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 82u;
+    const uint ib = t & 7u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint qs = uint(U16(b + 2u).v[2u * ib]) | (uint(U16(b + 2u).v[2u * ib + 1u]) << 16u);
+    const uint sg = uint(U16(b + 34u).v[2u * ib]) | (uint(U16(b + 34u).v[2u * ib + 1u]) << 16u);
+    const uint hs = uint(U16(b + 66u).v[ib >> 1u]) >> (8u * (ib & 1u));
+    const uint scb = uint(U16(b + 74u).v[ib >> 1u]) >> (8u * (ib & 1u));
+    const float db0 = d * (0.5 + float(scb & 0xfu)) * 0.25;
+    const float db1 = d * (0.5 + float((scb >> 4u) & 0xfu)) * 0.25;
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const uint g = ((qs >> (8u * l)) & 0xffu) | (((hs & 0xffu) << (8u - 2u * l)) & 0x300u);
+        const uint lo = glm53_iq2s_grid[2u * g];
+        const uint hi = glm53_iq2s_grid[2u * g + 1u];
+        const uint signs = (sg >> (8u * l)) & 0xffu;
+        const float dl = l < 2u ? db0 : db1;
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            const float v = dl * float(((k < 4u ? lo : hi) >> (8u * (k & 3u))) & 0xffu);
+            w[8u * l + k] = (signs >> k & 1u) != 0u ? -v : v;
+        }
+    }
+}
+
+#endif
+
 // --- BF16, F16 and F32 rows (16-byte aligned here). ---
 void glm53_decode_bf16(uint64_t row, uint t, out float w[32]) {
     const uint64_t b = row + uint64_t(t) * 64u;
@@ -161,6 +313,13 @@ void glm53_decode_f32(uint64_t row, uint t, out float w[32]) {
 void glm53_decode(uint ty, uint64_t row, uint t, out float w[32]) {
     if (ty == GLM53_Q8_0) glm53_decode_q8_0(row, t, w);
     else if (ty == GLM53_Q4_K) glm53_decode_q4_k(row, t, w);
+#ifdef GLM53_EXT_TYPES
+    else if (ty == GLM53_Q4_0) glm53_decode_q4_0(row, t, w);
+    else if (ty == GLM53_Q5_K) glm53_decode_q5_k(row, t, w);
+    else if (ty == GLM53_Q6_K) glm53_decode_q6_k(row, t, w);
+    else if (ty == GLM53_IQ4_NL) glm53_decode_iq4_nl(row, t, w);
+    else if (ty == GLM53_IQ2_S) glm53_decode_iq2_s(row, t, w);
+#endif
     else if (ty == GLM53_Q2_K) glm53_decode_q2_k(row, t, w);
     else if (ty == GLM53_IQ2_XXS) glm53_decode_iq2_xxs(row, t, w);
     else if (ty == GLM53_BF16) glm53_decode_bf16(row, t, w);

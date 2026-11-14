@@ -15,6 +15,12 @@
 // attn_k_b and attn_v_b projections.
 // Buffers: 0 X, 1 W, 2 Y. Params: 3 M, 4 N, 5 K, 6 row_bytes, 7 ldx,
 // 8 ldy, 9 x_batch (elements), 10 w_batch (rows), 11 y_batch (elements).
+// Gemma 4's block types (glm53_quant.glsl).
+#if defined(KERNEL_glm53_gemm_q4_0) || defined(KERNEL_glm53_gemm_q5_k) || \
+    defined(KERNEL_glm53_gemm_q6_k) || defined(KERNEL_glm53_gemm_iq4_nl) || \
+    defined(KERNEL_glm53_gemm_iq2_s)
+#define GLM53_EXT_TYPES
+#endif
 #include "common.glsl"
 #include "glm53_quant.glsl"
 #include "matmul.glsl"
@@ -68,11 +74,21 @@ uint glm53_bf16_bits(float f) {
 #define GM_SUB 16u
 #endif
 
+// Gemma 4's block types (glm53_gemm_q4_0, _q5_k, _q6_k, _iq4_nl, _iq2_s):
+// the dense GEMM with gd_decode8 taking 8 values of glm53_decode's 32-value
+// task (four times the decode work of a dedicated decode8).
+#if defined(KERNEL_glm53_gemm_q4_0) || defined(KERNEL_glm53_gemm_q5_k) || \
+    defined(KERNEL_glm53_gemm_q6_k) || defined(KERNEL_glm53_gemm_iq4_nl) || \
+    defined(KERNEL_glm53_gemm_iq2_s)
+#define GEMM_GENERIC
+#endif
+
 #if defined(KERNEL_glm53_gemm_q8_0) || defined(KERNEL_glm53_gemm_q4_k) || \
     defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32) || \
     defined(KERNEL_glm53_gemm_f16) || defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
     defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q4_k) || \
-    defined(KERNEL_glm53_gemm_moe_q8_0)
+    defined(KERNEL_glm53_gemm_moe_q8_0) || \
+    defined(GEMM_GENERIC)
 #define GM_STEP 64u
 // Vector (k - k0) / 2 * 16 + n / 4 of a step's tile holds weights k and
 // k + 1 of the tile's rows n .. n + 3 (quant_grouped.glsl's qg_tile).
@@ -104,9 +120,20 @@ uint gm_round_w(float f) { return floatBitsToUint(f) + 0x8000u; }
 
 #if defined(KERNEL_glm53_gemm_q8_0) || defined(KERNEL_glm53_gemm_q4_k) || \
     defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32) || \
-    defined(KERNEL_glm53_gemm_f16)
+    defined(KERNEL_glm53_gemm_f16) || \
+    defined(GEMM_GENERIC)
 #if defined(KERNEL_glm53_gemm_q8_0)
 #define GEMM_TYPE GLM53_Q8_0
+#elif defined(KERNEL_glm53_gemm_q4_0)
+#define GEMM_TYPE GLM53_Q4_0
+#elif defined(KERNEL_glm53_gemm_q5_k)
+#define GEMM_TYPE GLM53_Q5_K
+#elif defined(KERNEL_glm53_gemm_q6_k)
+#define GEMM_TYPE GLM53_Q6_K
+#elif defined(KERNEL_glm53_gemm_iq4_nl)
+#define GEMM_TYPE GLM53_IQ4_NL
+#elif defined(KERNEL_glm53_gemm_iq2_s)
+#define GEMM_TYPE GLM53_IQ2_S
 #elif defined(KERNEL_glm53_gemm_q4_k)
 #define GEMM_TYPE GLM53_Q4_K
 #elif defined(KERNEL_glm53_gemm_bf16)
@@ -120,6 +147,12 @@ uint gm_round_w(float f) { return floatBitsToUint(f) + 0x8000u; }
 // Weights k .. k + 8 (k a multiple of 8) of `row`, as glm53_decode gives
 // them.
 void gd_decode8(uint64_t row, uint k, out float w[8]) {
+#ifdef GEMM_GENERIC
+    float t[32];
+    glm53_decode(GEMM_TYPE, row, k >> 5u, t);
+    [[unroll]] for (uint i = 0u; i < 8u; i++) w[i] = t[(k & 24u) + i];
+    return;
+#endif
     if (GEMM_TYPE == GLM53_Q8_0) {
         const uint64_t b = row + uint64_t(k >> 5u) * 34u;
         const float d = glm53_h2f(uint(U16(b).v[0]));

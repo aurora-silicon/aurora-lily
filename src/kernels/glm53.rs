@@ -82,7 +82,7 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
             ]
         };
     }
-    const NAMES: [[&str; GEMV_MAX_ROWS]; 7] = [
+    const NAMES: [[&str; GEMV_MAX_ROWS]; 12] = [
         rows!("q8_0"),
         rows!("q4_k"),
         rows!("q2_k"),
@@ -90,6 +90,11 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
         rows!("bf16"),
         rows!("f32"),
         rows!("f16"),
+        rows!("q4_0"),
+        rows!("q5_k"),
+        rows!("q6_k"),
+        rows!("iq4_nl"),
+        rows!("iq2_s"),
     ];
     if m > GEMV_MAX_ROWS {
         const WIDE: [[&str; 4]; 2] = [
@@ -120,6 +125,11 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
         GgmlType::F32 => 5,
         GgmlType::F16 => 6,
         GgmlType::I32 | GgmlType::Mxfp4 => anyhow::bail!("no GEMV over {ty:?}"),
+        GgmlType::Q4_0 => 7,
+        GgmlType::Q5K => 8,
+        GgmlType::Q6K => 9,
+        GgmlType::Iq4Nl => 10,
+        GgmlType::Iq2S => 11,
     };
     Ok(NAMES[t][m - 1])
 }
@@ -295,6 +305,11 @@ fn gemm_name(ty: GgmlType) -> Result<&'static str> {
         GgmlType::Bf16 => "glm53_gemm_bf16",
         GgmlType::F32 => "glm53_gemm_f32",
         GgmlType::F16 => "glm53_gemm_f16",
+        GgmlType::Q4_0 => "glm53_gemm_q4_0",
+        GgmlType::Q5K => "glm53_gemm_q5_k",
+        GgmlType::Q6K => "glm53_gemm_q6_k",
+        GgmlType::Iq4Nl => "glm53_gemm_iq4_nl",
+        GgmlType::Iq2S => "glm53_gemm_iq2_s",
         other => anyhow::bail!("no GLM GEMM over {other:?}"),
     })
 }
