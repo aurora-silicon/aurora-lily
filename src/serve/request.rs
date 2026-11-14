@@ -557,14 +557,13 @@ impl<M: LanguageModel> Engine<M> {
         generator: &'g Generator,
         prefill: &mut impl PrefillChunks<M>,
     ) -> Result<Option<Admitted<'g, M>>> {
-        // The HTTP thread validated against the same limit; this only guards
-        // the engine's buffers if the two ever disagree.
-        ensure!(
-            p.prompt.len() < self.max_seq,
-            "prompt exceeds the engine context: {} prompt tokens, {} tokens of context",
-            p.prompt.len(),
-            self.max_seq
-        );
+        // The HTTP thread validated against the checkpoint's window; the
+        // engine's can be shorter (a model whose memory limit fits less), so
+        // this refuses the request before anything is allocated for it.
+        if p.prompt.len() >= self.max_seq {
+            let (prompt, context) = (p.prompt.len(), self.max_seq);
+            return Err(ContextExceeded { prompt, context }.into());
+        }
         let n = p.prompt.len();
         let images: Vec<CachedImage> =
             p.images.iter().map(|i| CachedImage::new(i.span, i.digest)).collect();
@@ -1152,17 +1151,38 @@ pub(super) enum Ending<'e> {
 /// Ends a response with an error: an error body when nothing was sent yet,
 /// an error event and the end of the stream when an event stream started.
 fn error_end(sink: &mut Sink, stream: bool, status: u16, message: &str) {
+    let kind = if status == 400 { "invalid_request_error" } else { "server_error" };
     if !sink.started {
         sink.start(status, "application/json");
-        sink.send(error_json("server_error", message));
+        sink.send(error_json(kind, message));
     } else if stream {
-        sink.sse(&json!({"error": {"message": message, "type": "server_error"}}));
+        sink.sse(&json!({"error": {"message": message, "type": kind}}));
         sink.send(b"data: [DONE]\n\n".to_vec());
     }
 }
 
+/// A prompt longer than the engine's context (answered with a 400).
+#[derive(Debug)]
+pub(super) struct ContextExceeded {
+    prompt: usize,
+    context: usize,
+}
+
+impl std::fmt::Display for ContextExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "prompt exceeds the engine context: {} prompt tokens, {} tokens of context",
+            self.prompt, self.context
+        )
+    }
+}
+
+impl std::error::Error for ContextExceeded {}
+
 /// Answers a request that failed: logs the error and ends the response
-/// with a 503 on a GPU fault (the engine reloads) or a 500.
+/// with a 503 on a GPU fault (the engine reloads), a 400 on a prompt past
+/// the engine's context, or a 500.
 pub(super) fn answer_failure(
     sink: &mut Sink,
     stream: bool,
@@ -1181,7 +1201,10 @@ pub(super) fn answer_failure(
         }
         None => {
             eprintln!("request failed: {error:#}");
-            (500, "internal server error".to_owned())
+            match error.downcast_ref::<ContextExceeded>() {
+                Some(e) => (400, e.to_string()),
+                None => (500, "internal server error".to_owned()),
+            }
         }
     };
     error_end(sink, stream, status, &message);
