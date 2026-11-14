@@ -87,6 +87,19 @@ pub struct Qwen36Model {
     /// `--memory-limit-gb`: what the server's session cache budget is
     /// capped to leave (the 32 GB tier runs with 24).
     pub memory_limit: Option<u64>,
+    /// The longest request context served: the file's, the attention
+    /// kernel's, or what the memory limit fits ([`Self::fit_context`]).
+    pub context_cap: usize,
+}
+
+/// Cache rows a session needs past its request's tokens: a verify pass's
+/// draft row and the MTP head's row after it.
+pub const LOOKAHEAD: usize = 4;
+
+/// The most cache rows a session holds for a context of `context` tokens
+/// (a multiple of 4, at most the attention kernel's limit).
+pub fn capacity_cap(context: usize) -> usize {
+    (context + LOOKAHEAD).min(attn::MAX_SEQ) / 4 * 4
 }
 
 /// The MTP block (`blk.<n_layer>` of the `mtp-*.gguf` beside the model): a
@@ -171,6 +184,7 @@ impl Qwen36Model {
         let embed = mapped.q("token_embd.weight")?;
         let output = mapped.q("output.weight")?;
         let output_norm = mapped.f32("output_norm.weight")?;
+        let context_cap = cfg.context_length.min(attn::MAX_SEQ);
         Ok(Self {
             cfg,
             gguf,
@@ -182,6 +196,7 @@ impl Qwen36Model {
             kv_format: KvFormat::Bf16,
             mtp: None,
             memory_limit: None,
+            context_cap,
         })
     }
 
@@ -269,7 +284,65 @@ impl Qwen36Model {
         ctx: &MetalContext,
         capacity: usize,
     ) -> Result<Qwen36State> {
-        Qwen36State::new(ctx, &self.cfg, self.kv_format, capacity, self.mtp.is_some())
+        Qwen36State::new(
+            ctx,
+            &self.cfg,
+            self.kv_format,
+            capacity,
+            capacity_cap(self.context_cap),
+            self.mtp.is_some(),
+        )
+    }
+
+    /// GPU bytes one session holds with caches for `capacity` tokens and
+    /// `checkpoints` snapshots: the K/V rows (the trunk's attention layers'
+    /// and the MTP head's), the GDN windows and states and their verify
+    /// alternates, the MTP pending row; a snapshot is the GDN windows and
+    /// states and the pending row. Matches `Qwen36State::bytes` and
+    /// `Qwen36Snapshot::bytes` (checked against a real state at warm-up).
+    pub fn session_bytes(&self, capacity: usize, checkpoints: usize) -> u64 {
+        let c = &self.cfg;
+        let cap = capacity.next_multiple_of(4) as u64;
+        let mtp = self.mtp.is_some();
+        let kv_layers = (c.attn_layers() + usize::from(mtp)) as u64;
+        let row = self.kv_format.row_bytes(c.head_dim) as u64;
+        let kv = 2 * kv_layers * c.n_head_kv as u64 * cap * row;
+        let gdn_layers = c.recurrent.iter().filter(|r| **r).count() as u64;
+        let gdn = gdn_layers
+            * 4
+            * (3 * c.gdn_qkv() + c.gdn_v_heads * c.gdn_dim * c.gdn_dim) as u64;
+        let pending = if mtp { 4 * c.hidden as u64 } else { 0 };
+        kv + 2 * gdn + pending + checkpoints as u64 * (gdn + pending)
+    }
+
+    /// Under `--memory-limit-gb`: the longest context whose session (with
+    /// `checkpoints` snapshots, growth to its full capacity and the
+    /// speculative lookahead) fits what the limit leaves after `allocated`
+    /// bytes (the weights and the scratch); `context_cap` becomes it, so the
+    /// server caps `--max-seq` there and refuses longer requests.
+    pub fn fit_context(
+        &mut self,
+        limit: u64,
+        allocated: u64,
+        checkpoints: usize,
+    ) -> Result<usize> {
+        let room = limit.saturating_sub(allocated);
+        let per_token =
+            self.session_bytes(4, 0).saturating_sub(self.session_bytes(0, 0)) / 4;
+        let fixed = self.session_bytes(0, checkpoints);
+        let rows = room.saturating_sub(fixed) / per_token.max(1);
+        let context = (rows as usize).saturating_sub(LOOKAHEAD) / 4 * 4;
+        let context = context.min(self.cfg.context_length).min(attn::MAX_SEQ);
+        ensure!(
+            context >= 4096,
+            "--memory-limit-gb {:.1} leaves {:.2} GB after {:.1} GB of weights and scratch: a context \
+             of {context} tokens (lily wants at least 4096)",
+            limit as f64 / (1u64 << 30) as f64,
+            room as f64 / 1e9,
+            allocated as f64 / 1e9
+        );
+        self.context_cap = context;
+        Ok(context)
     }
 
     pub fn new_scratch(&self, ctx: &MetalContext) -> Result<Scratch> {
@@ -308,6 +381,9 @@ pub struct MtpState {
 pub struct Qwen36State {
     pub pos: usize,
     pub capacity: usize,
+    /// The most rows the caches grow to (the model's context cap plus the
+    /// lookahead, at most the attention kernel's limit).
+    pub max_capacity: usize,
     pub layers: Vec<LayerState>,
     pub mtp: Option<MtpState>,
     /// A verify pass that fed rows from this position and the draws of its
@@ -321,9 +397,18 @@ impl Qwen36State {
         cfg: &Config,
         format: KvFormat,
         capacity: usize,
+        max_capacity: usize,
         mtp: bool,
     ) -> Result<Self> {
-        let capacity = capacity.next_multiple_of(4);
+        ensure!(
+            max_capacity.is_multiple_of(4) && max_capacity <= attn::MAX_SEQ,
+            "a cache of at most {max_capacity} rows"
+        );
+        ensure!(
+            capacity <= max_capacity,
+            "a session of {capacity} tokens exceeds the {max_capacity} rows this model serves"
+        );
+        let capacity = capacity.next_multiple_of(4).max(4);
         let ch = cfg.gdn_qkv();
         let layers = (0..cfg.n_layer)
             .map(|il| -> Result<LayerState> {
@@ -368,7 +453,7 @@ impl Qwen36State {
         } else {
             None
         };
-        Ok(Self { pos: 0, capacity, layers, mtp, spec: None })
+        Ok(Self { pos: 0, capacity, max_capacity, layers, mtp, spec: None })
     }
 
     /// Zeroes the recurrent state and rewinds (GPU idle).
@@ -530,7 +615,8 @@ impl Scratch {
         })
     }
 
-    /// Stages a run's token ids (at most PREFILL_ROWS).
+    /// Stages a run's token ids (at most PREFILL_ROWS; checked against the
+    /// vocabulary by the callers, [`check_tokens`]).
     pub(crate) fn stage_tokens(&self, tokens: &[u32]) -> Result<()> {
         crate::glm53::model::write_words(&self.tokens, tokens)
     }
@@ -539,6 +625,15 @@ impl Scratch {
     pub fn sampler(&self) -> &SamplerScratch {
         &self.sampler
     }
+}
+
+/// Refuses token ids outside the vocabulary before they reach the GPU (the
+/// embedding kernel adds `id * row_bytes` to the table's address).
+pub fn check_tokens(tokens: &[u32], vocab: usize) -> Result<()> {
+    if let Some(&t) = tokens.iter().find(|&&t| t as usize >= vocab) {
+        anyhow::bail!("token id {t} is outside the vocabulary of {vocab}");
+    }
+    Ok(())
 }
 
 /// Which rows' logits a forward step computes into `Scratch::logits`.
@@ -577,6 +672,7 @@ impl Qwen36Model {
         let m = tokens.len();
         ensure!((1..=PREFILL_ROWS).contains(&m), "forward of {m} rows");
         ensure!(st.pos + m <= st.capacity, "state capacity {}", st.capacity);
+        check_tokens(tokens, self.cfg.vocab)?;
         sc.stage_tokens(tokens)?;
         self.run_rows(ctx, st, sc, m, logits, None, |_| Ok(()))?;
         st.pos += m;

@@ -54,6 +54,34 @@ fn copy_cache_rows(src: &KvCache, dst: &KvCache, tokens: usize) {
     }
 }
 
+/// The capacity a state of `capacity` rows grows to for `tokens`: doubling,
+/// at most `max` (both multiples of 4; `tokens <= max`).
+pub(crate) fn grown_capacity(capacity: usize, tokens: usize, max: usize) -> usize {
+    tokens.max(capacity.saturating_mul(2)).next_multiple_of(4).min(max)
+}
+
+/// Whether a draft may be proposed for the token at `p`: its verify pass
+/// feeds rows `p` and `p + 1`, and the head's catch-up after it writes its
+/// row `p + 2`.
+pub(crate) fn draft_fits(p: usize, max_capacity: usize) -> bool {
+    p + 3 <= max_capacity
+}
+
+/// The MTP pairs a finished verify pass from `pos0` writes, head rows
+/// `pos0 + 1 ..= pos0 + pairs`, within `capacity` rows: the kept rows', and
+/// with `propose` the new pending token's, whose output is the draft.
+/// Returns the pairs and whether the draft pair is among them.
+pub(crate) fn mtp_pairs(
+    pos0: usize,
+    accepted: usize,
+    propose: bool,
+    capacity: usize,
+) -> (usize, bool) {
+    let want = accepted + usize::from(propose);
+    let room = capacity.saturating_sub(pos0 + 1);
+    (want.min(room), propose && want <= room)
+}
+
 /// The recurrent part of a state: the GDN conv windows and states.
 pub struct Qwen36Snapshot {
     pos: usize,
@@ -138,7 +166,12 @@ impl DecodeStateApi for Qwen36State {
         if tokens <= self.capacity {
             return Ok(());
         }
-        let capacity = tokens.max(self.capacity * 2).next_multiple_of(4);
+        ensure!(
+            tokens <= self.max_capacity,
+            "a session of {tokens} tokens exceeds the {} rows this model serves",
+            self.max_capacity
+        );
+        let capacity = grown_capacity(self.capacity, tokens, self.max_capacity);
         let rows =
             self.pos.max(self.mtp.as_ref().map_or(0, |m| m.pos)).min(self.capacity);
         for c in caches_mut(self) {
@@ -243,6 +276,7 @@ impl Qwen36Model {
         stop: &dyn Fn() -> bool,
     ) -> Result<usize> {
         ensure!(!tokens.is_empty(), "empty prefill");
+        super::model::check_tokens(tokens, self.cfg.vocab)?;
         state.ensure_capacity(ctx, state.pos + tokens.len())?;
         let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_ROWS).collect();
         let mut fed = 0;
@@ -317,13 +351,28 @@ impl LanguageModel for Qwen36Model {
             }
         }
         if let Some(limit) = model.memory_limit {
-            let weights: usize =
-                model.weight_buffers().iter().map(|b| b.length()).sum();
-            ensure!(
-                weights as u64 <= limit,
-                "--memory-limit-gb {:.1} is below the model's {:.1} GB of weights",
+            // The weights and a scratch as the server allocates it (made
+            // here once to measure it), then the longest context whose
+            // session fits the rest: the server caps --max-seq there.
+            let before = ctx.current_allocated();
+            let probe = Qwen36Model::new_scratch(&model, ctx)?;
+            let scratch = ctx.current_allocated().saturating_sub(before);
+            drop(probe);
+            let allocated = before + scratch;
+            let checkpoints = crate::serve::CHECKPOINTS_PER_SESSION
+                + crate::serve::DECODE_CHECKPOINTS_PER_SESSION;
+            let context = model.fit_context(limit, allocated as u64, checkpoints)?;
+            eprintln!(
+                "qwen3.6: --memory-limit-gb {:.1} ({:.1} GB) leaves {:.2} GB after {:.1} GB of weights and \
+                 scratch: contexts of up to {context} tokens (one session of {:.2} GB with \
+                 {checkpoints} snapshots); --max-seq is capped there",
+                limit as f64 / (1u64 << 30) as f64,
                 limit as f64 / 1e9,
-                weights as f64 / 1e9
+                limit.saturating_sub(allocated as u64) as f64 / 1e9,
+                allocated as f64 / 1e9,
+                model.session_bytes(super::model::capacity_cap(context), checkpoints)
+                    as f64
+                    / 1e9,
             );
         }
         Ok(model)
@@ -344,8 +393,13 @@ impl LanguageModel for Qwen36Model {
         _params: &SamplingParams,
         _step0: usize,
     ) -> Result<Vec<u32>> {
+        super::model::check_tokens(&[first], self.cfg.vocab)?;
         let p = state.pos;
-        state.ensure_capacity(ctx, p + 2)?;
+        if !draft_fits(p, state.max_capacity) {
+            // The context's last rows: plain steps to the end.
+            return Ok(Vec::new());
+        }
+        state.ensure_capacity(ctx, p + 3)?;
         let m = state.mtp.as_mut().ok_or_else(|| anyhow::anyhow!("no MTP state"))?;
         // The pair (hidden at p - 1, first) at head row p; a head that fell
         // behind (rows fed without it) resumes here.
@@ -381,7 +435,12 @@ impl LanguageModel for Qwen36Model {
         let rows = 1 + drafts.len();
         ensure!(rows <= 2, "Qwen3.6 verifies one draft a step, got {}", drafts.len());
         ensure!(state.spec.is_none(), "a verify pass is already pending");
-        state.ensure_capacity(ctx, state.pos + rows + 1)?;
+        state.ensure_capacity(ctx, state.pos + rows)?;
+        // And the head's row after them, where the context leaves one.
+        let after = (state.pos + rows + 1).min(state.max_capacity);
+        state.ensure_capacity(ctx, after)?;
+        super::model::check_tokens(&[pending], self.cfg.vocab)?;
+        super::model::check_tokens(drafts, self.cfg.vocab)?;
         let toks: Vec<u32> =
             std::iter::once(pending).chain(drafts.iter().copied()).collect();
         crate::glm53::model::write_words(&scratch.spec_tokens, &toks)?;
@@ -432,7 +491,9 @@ impl LanguageModel for Qwen36Model {
         // The head's pairs of the kept rows: (hidden row r, draw r) at head
         // row pos0 + 1 + r; with `propose` also the last draw's (the new
         // pending token), whose greedy next token is the draft.
-        let pairs = if propose { accepted + 1 } else { accepted };
+        // No draft for the context's last rows ([`draft_fits`]).
+        let propose = propose && draft_fits(pos0 + 1 + accepted, state.max_capacity);
+        let (pairs, draft) = mtp_pairs(pos0, accepted, propose, state.capacity);
         if pairs > 0 {
             let sc: &Scratch = scratch;
             let st: &Qwen36State = state;
@@ -440,31 +501,28 @@ impl LanguageModel for Qwen36Model {
             let pass = self.begin(ctx)?;
             let tokens = sc.draws.view(0, &[pairs])?;
             let hin = sc.hidden_norm.view(0, &[pairs * h])?;
-            self.encode_mtp(
-                ctx,
-                &pass,
-                st,
-                sc,
-                &tokens,
-                &hin,
-                pos0 + 1,
-                pairs,
-                propose,
-            )?;
+            self.encode_mtp(ctx, &pass, st, sc, &tokens, &hin, pos0 + 1, pairs, draft)?;
             pass.commit_wait()?;
         }
         let m = state.mtp.as_mut().ok_or_else(|| anyhow::anyhow!("no MTP state"))?;
         m.pos = pos0 + 1 + pairs;
-        if !propose {
-            // At rest: the next pair takes the last kept row's hidden state.
+        if !draft {
+            // At rest (or at the context's end): the next pair takes the
+            // last kept row's hidden state.
             self.copy_row(&scratch.hidden_norm, accepted, &m.pending_h)?;
             return Ok(Vec::new());
         }
         Ok(vec![scratch.mtp_io.to_u32()?[1]])
     }
 
+    /// The file's context, or less: what the attention kernel or the
+    /// memory limit takes ([`Qwen36Model::fit_context`]).
     fn max_position_embeddings(&self) -> usize {
-        self.cfg.context_length
+        self.context_cap
+    }
+
+    fn session_bytes(&self, capacity: usize, checkpoints: usize) -> Option<u64> {
+        Some(Qwen36Model::session_bytes(self, capacity, checkpoints))
     }
 
     fn eos_token_ids(&self) -> Vec<u32> {
@@ -580,3 +638,7 @@ impl LanguageModel for Qwen36Model {
         pass.end()
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen36/engine.rs"]
+mod tests;
