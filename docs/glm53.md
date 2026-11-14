@@ -94,7 +94,10 @@ or restore a snapshot taken before the step.
   which steps verify two rows (see the finite-precision caveat above).
 - Prefill GEMMs round both operands to bfloat16 (the weights to nearest,
   ties away from zero), the routed experts' to f16 (f32 accumulators);
-  decode works on f32 activations. Quality is close to ds4's (below).
+  decode works on f32 activations.
+- Prompt runs of more than 32 rows compute KDA in its chunked (WY) form,
+  32 tokens a chunk, in f32: the recurrence's values summed in another
+  order. Decode and verify rows step the recurrence. Quality is close to ds4's (below).
 - Prompt runs compute DSA attention on the matrix units: the f32 queries
   and attention weights are split into an f16 high part (the value with its
   mantissa cut to ten bits) and the f16 rounding of the rest, multiplied
