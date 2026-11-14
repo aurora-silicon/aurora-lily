@@ -79,7 +79,8 @@ fn round_bf16(v: f32) -> f32 {
 fn gemv_sets_match_cpu_for_every_type_width_and_row_count() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(38);
-    for ty in [GgmlType::Q8_0, GgmlType::F16, GgmlType::F32, GgmlType::Bf16, GgmlType::Q4K]
+    for ty in
+        [GgmlType::Q8_0, GgmlType::F16, GgmlType::F32, GgmlType::Bf16, GgmlType::Q4K]
     {
         // The model's widths: hidden 2560, hc up 320, shared down 640, GDN
         // out 6144, eh_proj halves 2560 of 5120.
@@ -140,8 +141,9 @@ fn gemv_reads_a_column_view_of_wider_rows() {
     let (x, tx) = bf16_input(&ctx, &mut rng, cols);
     let y = Tensor::zeros(&ctx, &[rows], DType::F32).unwrap();
     run(&ctx, |p| gemv(&ctx, p, &w, &tx, &y, 1).unwrap());
-    let e: Vec<f32> =
-        (0..rows).map(|n| dot(&full[n * 2 * cols + cols..(n + 1) * 2 * cols], &x)).collect();
+    let e: Vec<f32> = (0..rows)
+        .map(|n| dot(&full[n * 2 * cols + cols..(n + 1) * 2 * cols], &x))
+        .collect();
     assert_close(&y.to_f32().unwrap(), &e, 1e-4, 1e-4);
 }
 
@@ -168,7 +170,9 @@ fn embed_gathers_bf16_rows() {
     let raw = random_blocks(&mut rng, GgmlType::Bf16, rows * cols);
     let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Bf16, cols, rows).unwrap();
     let ids: Vec<u32> = vec![7, 0, 49, 7];
-    let tid = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[ids.len()], DType::U32).unwrap();
+    let tid =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[ids.len()], DType::U32)
+            .unwrap();
     let out = Tensor::zeros(&ctx, &[ids.len(), cols], DType::BF16).unwrap();
     run(&ctx, |p| embed_bf16(&ctx, p, &w, &tid, &out, ids.len()).unwrap());
     let table = decode(GgmlType::Bf16, &raw);
@@ -202,7 +206,8 @@ fn cpu_moe(
                 let row = (e * ff + r) * h;
                 let gv = round_bf16(dot(&g[row..row + h], xi));
                 let uv = round_bf16(dot(&u[row..row + h], xi));
-                act[(i * used + s) * ff + r] = round_bf16(gv / (1.0 + (-gv).exp()) * uv);
+                act[(i * used + s) * ff + r] =
+                    round_bf16(gv / (1.0 + (-gv).exp()) * uv);
             }
         }
     }
@@ -233,9 +238,10 @@ fn routed_experts_match_cpu_with_padded_down_rows() {
     // Qwen's shapes at fewer experts: hidden 2560, FF 640, down rows padded
     // to 768 (Q2_K) as ds4's file has them; the draft head's Q4_K / MXFP4.
     let (h, ff, experts) = (2560usize, 640usize, 6usize);
-    for (gty, dty, d_cols) in
-        [(GgmlType::Iq2Xxs, GgmlType::Q2K, 768usize), (GgmlType::Q4K, GgmlType::Mxfp4, 640)]
-    {
+    for (gty, dty, d_cols) in [
+        (GgmlType::Iq2Xxs, GgmlType::Q2K, 768usize),
+        (GgmlType::Q4K, GgmlType::Mxfp4, 640),
+    ] {
         let raw_g = random_blocks(&mut rng, gty, experts * ff * h);
         let raw_u = random_blocks(&mut rng, gty, experts * ff * h);
         let mut raw_d = random_blocks(&mut rng, dty, experts * h * d_cols);
@@ -247,24 +253,34 @@ fn routed_experts_match_cpu_with_padded_down_rows() {
         let wg = QWeight::from_bytes(&ctx, &raw_g, gty, h, experts * ff).unwrap();
         let wu = QWeight::from_bytes(&ctx, &raw_u, gty, h, experts * ff).unwrap();
         let wd = QWeight::from_bytes(&ctx, &raw_d, dty, d_cols, experts * h).unwrap();
-        let (cg, cu, cd) = (decode(gty, &raw_g), decode(gty, &raw_u), decode(dty, &raw_d));
+        let (cg, cu, cd) =
+            (decode(gty, &raw_g), decode(gty, &raw_u), decode(dty, &raw_d));
         for (m, used) in [(1usize, 4usize), (3, 4), (2, 5)] {
             let (x, tx) = bf16_input(&ctx, &mut rng, m * h);
             let sel: Vec<u32> =
                 (0..m * used).map(|_| rng.gen_range(0..experts as u32)).collect();
-            let scores: Vec<f32> = (0..m * used).map(|_| rng.gen_range(0.0..0.5)).collect();
+            let scores: Vec<f32> =
+                (0..m * used).map(|_| rng.gen_range(0.0..0.5)).collect();
             let (so, tso) = bf16_input(&ctx, &mut rng, m * h);
             let sg: Vec<f32> = (0..m).map(|_| rng.gen_range(-2.0..2.0)).collect();
-            let tsel = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32).unwrap();
+            let tsel = Tensor::from_bytes(
+                &ctx,
+                bytemuck::cast_slice(&sel),
+                &[sel.len()],
+                DType::U32,
+            )
+            .unwrap();
             let tsc = Tensor::from_f32(&ctx, &scores, &[scores.len()]).unwrap();
             let tsg = Tensor::from_f32(&ctx, &sg, &[m]).unwrap();
             let act = Tensor::zeros(&ctx, &[m * used * ff], DType::BF16).unwrap();
             let out = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
             for with_shared in [false, true] {
                 run(&ctx, |p| {
-                    moe_gate_up(&ctx, p, &wg, &wu, ff, &tx, &tsel, &act, m, used).unwrap();
+                    moe_gate_up(&ctx, p, &wg, &wu, ff, &tx, &tsel, &act, m, used)
+                        .unwrap();
                     p.memory_barrier().unwrap();
-                    let shared = with_shared.then(|| SharedAdd { out: &tso, gate: &tsg });
+                    let shared =
+                        with_shared.then(|| SharedAdd { out: &tso, gate: &tsg });
                     moe_down(
                         &ctx, p, &wd, ff, h, &act, &tsel, &tsc, shared, &out, m, used,
                     )

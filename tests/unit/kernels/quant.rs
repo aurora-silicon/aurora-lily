@@ -1581,7 +1581,15 @@ fn project_mat_routes_match_staged() {
         let pass = ctx.begin().expect("pass");
         gemm_quant_bf16_nt(&ctx, &pass, &a_ref, &w, &staged, &scratch_ref)
             .expect("staged");
-        crate::moe_ffn::project_mat(&ctx, &pass, &a, &w, &c, &scratch).expect("routed");
+        crate::moe_ffn::project_mat(
+            &ctx,
+            &pass,
+            &a,
+            &crate::weights::LinearWeights::Affine(w.clone()),
+            &c,
+            &scratch,
+        )
+        .expect("routed");
         pass.commit_wait().expect("commit");
 
         let all = c_all.to_f32().expect("read");

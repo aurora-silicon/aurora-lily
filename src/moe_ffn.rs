@@ -8,10 +8,10 @@ use anyhow::{Result, ensure};
 use crate::kernels::elementwise::{
     gather_rows_bf16, silu_mul_bf16, silu_mul_rows_bf16, split_cols_bf16,
 };
-use crate::kernels::{moe, quant, skinny};
+use crate::kernels::{moe, quant, qwen_gguf, skinny};
 use crate::metal::{ComputePass, MetalContext};
 use crate::tensor::{DType, Tensor};
-use crate::weights::{LinearWeights, MoeWeights};
+use crate::weights::{GgufLinear, LinearWeights, MoeWeights, QuantWeights};
 
 /// The FFN shape a model hands the shared graph.
 #[derive(Clone, Copy, Debug)]
@@ -21,6 +21,87 @@ pub(crate) struct MoeDims {
     pub moe_intermediate: usize,
     pub hidden: usize,
     pub norm_topk_prob: bool,
+}
+
+/// GEMVs of GGUF stacks over `m` (<= 4) rows of the same bfloat16 input
+/// (`x` rows of the stacks' width): each part writes its rows of its stack's
+/// output (rows of the stack's width apart), parts of one type and width
+/// going out together, four to a dispatch.
+pub(crate) fn gguf_gemv_sets(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    sets: &[(&GgufLinear, &Tensor)],
+    m: usize,
+) -> Result<()> {
+    let mut items: Vec<(&qwen_gguf::QWeight, Tensor, usize)> = Vec::new();
+    for &(g, y) in sets {
+        let n_total = g.out_features();
+        let mut off = 0;
+        for p in &g.parts {
+            items.push((p, y.view(off, &[y.numel() - off])?, n_total));
+            off += p.rows;
+        }
+    }
+    while !items.is_empty() {
+        let (ty, cols, stride) = (items[0].0.ty, items[0].0.cols, items[0].2);
+        let mut group = Vec::new();
+        let mut rest = Vec::new();
+        for it in items {
+            if group.len() < 4
+                && it.0.ty == ty
+                && it.0.cols == cols
+                && (m == 1 || it.2 == stride)
+            {
+                group.push(it);
+            } else {
+                rest.push(it);
+            }
+        }
+        let pairs: Vec<(&qwen_gguf::QWeight, &Tensor)> =
+            group.iter().map(|(w, y, _)| (*w, y)).collect();
+        qwen_gguf::gemv_sets(ctx, pass, x, &pairs, m, cols, Some(stride))?;
+        items = rest;
+    }
+    Ok(())
+}
+
+/// One row through a linear layer of either storage: `y = W x` (`y`
+/// bfloat16 or f32).
+pub(crate) fn linear_gemv(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w: &LinearWeights,
+    x: &Tensor,
+    y: &Tensor,
+) -> Result<()> {
+    match w {
+        LinearWeights::Affine(w) => quant::gemv_quant(ctx, pass, w, x, y),
+        LinearWeights::Gguf(g) => gguf_gemv_sets(ctx, pass, x, &[(g, y)], 1),
+    }
+}
+
+/// [`quant::gemv_quant_sets`] over layers of either storage (all of one).
+pub(crate) fn linear_gemv_sets(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    sets: &[(&LinearWeights, &Tensor)],
+) -> Result<()> {
+    if sets.iter().all(|(w, _)| matches!(w, LinearWeights::Affine(_))) {
+        let affine: Vec<(&QuantWeights, &Tensor)> =
+            sets.iter().map(|(w, y)| (w.affine().expect("affine"), *y)).collect();
+        return quant::gemv_quant_sets(ctx, pass, x, &affine);
+    }
+    let gguf: Vec<(&GgufLinear, &Tensor)> = sets
+        .iter()
+        .map(|(w, y)| {
+            w.gguf()
+                .map(|g| (g, *y))
+                .ok_or_else(|| anyhow::anyhow!("GEMV sets mix affine and GGUF weights"))
+        })
+        .collect::<Result<_>>()?;
+    gguf_gemv_sets(ctx, pass, x, &gguf, 1)
 }
 
 /// Projects `a` `[m, K]` through an already-stacked weight group as one
@@ -39,6 +120,7 @@ pub(crate) fn project_stack_fused(
     let Some(c) = stack_fused_view(a, stack_w, stack_c, widths)? else {
         return Ok(None);
     };
+    let stack_w = stack_w.affine()?;
     if stack_w.bits == 4 {
         skinny::gemm_skinny_q4_nt(ctx, pass, a, stack_w, &c)?;
     } else {
@@ -60,6 +142,10 @@ pub(crate) fn stack_fused_view(
     if widths.iter().sum::<usize>() != n_total || !skinny::dense_smallm_routes(m) {
         return Ok(None);
     }
+    // GGUF stacks go out as their slices.
+    let LinearWeights::Affine(stack_w) = stack_w else {
+        return Ok(None);
+    };
     // Fusing is bit-identical only when the stack and every slice choose
     // the same skinny variant; staged and register-A reduce in different
     // f32 orders.
@@ -148,6 +234,10 @@ pub(crate) fn project_mat(
     scratch: &Tensor,
 ) -> Result<()> {
     let m = a.shape()[0];
+    let w = match w {
+        LinearWeights::Affine(w) => w,
+        LinearWeights::Gguf(g) => return gguf_project_mat(ctx, pass, a, g, c, scratch),
+    };
     if skinny::dense_smallm_routes(m) {
         if w.bits == 4 {
             return skinny::gemm_skinny_q4_nt(ctx, pass, a, w, c);
@@ -164,6 +254,37 @@ pub(crate) fn project_mat(
         return quant::gemm_quant_fused_nt(ctx, pass, a, w, c, tile);
     }
     quant::gemm_quant_bf16_nt(ctx, pass, a, w, c, scratch)
+}
+
+/// [`project_mat`] for GGUF weights: up to four rows by the GEMV (every
+/// part of a stack into its columns), more by the bfloat16 GEMM over the
+/// weight dequantized into `scratch` (one part: `c` holds whole rows of it).
+fn gguf_project_mat(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    g: &GgufLinear,
+    c: &Tensor,
+    scratch: &Tensor,
+) -> Result<()> {
+    let m = a.shape()[0];
+    if m <= qwen_gguf::GEMV_MAX_ROWS {
+        return gguf_gemv_sets(ctx, pass, a, &[(g, c)], m);
+    }
+    ensure!(g.parts.len() == 1, "a GGUF stack in a GEMM goes out as its slices");
+    let w = &g.parts[0];
+    let (n, k) = (w.rows, w.cols);
+    ensure!(
+        scratch.numel() >= n * k && scratch.dtype() == DType::BF16,
+        "dequant scratch holds {} bf16 elements, needs {}",
+        scratch.numel(),
+        n * k
+    );
+    let staged = scratch.view(0, &[n, k])?;
+    qwen_gguf::dequant_bf16(ctx, pass, w, &staged)?;
+    pass.level_barrier(&[&staged])?;
+    crate::kernels::gemm::gemm_bf16_nt(ctx, pass, a, &staged, c)?;
+    pass.level_barrier(&[c])
 }
 
 /// Decode-side MoE intermediates: the router distribution and the top-k
@@ -399,7 +520,7 @@ pub(crate) fn router_project_decode(
     x: &Tensor,
     logits: &Tensor,
 ) -> Result<()> {
-    quant::gemv_quant(ctx, pass, gate, x, logits)
+    linear_gemv(ctx, pass, gate, x, logits)
 }
 
 /// The decode routing decision over `logits` `[E]` (see
@@ -502,7 +623,11 @@ pub(crate) fn prefill_moe(
     let stack_view =
         stack_fused_view(io.x, &shared.gate_up_proj, io.stack, &[inter_s, inter_s])?;
     // The route `project_mat` gives an 8-bit weight at a small m.
+    if moe_w.expert_gate.gguf().is_some() {
+        return gguf_prefill_moe(ctx, pass, dims, moe_w, io, ms);
+    }
     let skinny_q8 = |w: &LinearWeights| {
+        let LinearWeights::Affine(w) = w else { return false };
         skinny::dense_smallm_routes(m)
             && w.bits == 8
             && w.group_size.is_multiple_of(8)
@@ -522,9 +647,9 @@ pub(crate) fn prefill_moe(
                 pass,
                 io.x,
                 &[
-                    (&moe_w.gate, &ms.router_logits),
-                    (&shared.gate_up_proj, &c),
-                    (&moe_w.shared_gate, &ms.shared_gate),
+                    (moe_w.gate.affine()?, &ms.router_logits),
+                    (shared.gate_up_proj.affine()?, &c),
+                    (moe_w.shared_gate.affine()?, &ms.shared_gate),
                 ],
             )?;
             Some(c)
@@ -582,9 +707,9 @@ pub(crate) fn prefill_moe(
         quant::MoeRoute::Grouped(tile) => tile,
         quant::MoeRoute::SmallmGemv => {
             ensure!(
-                moe_w.expert_gate.bits == 4
-                    && moe_w.expert_up.bits == 4
-                    && moe_w.expert_down.bits == 4,
+                moe_w.expert_gate.affine()?.bits == 4
+                    && moe_w.expert_up.affine()?.bits == 4
+                    && moe_w.expert_down.affine()?.bits == 4,
                 "small-m route requires q4 experts"
             );
             // The fused kernels consume the router output directly in
@@ -594,8 +719,8 @@ pub(crate) fn prefill_moe(
             moe::moe_smallm_gate_up(
                 ctx,
                 pass,
-                &moe_w.expert_gate,
-                &moe_w.expert_up,
+                moe_w.expert_gate.affine()?,
+                moe_w.expert_up.affine()?,
                 inter,
                 io.x,
                 slots,
@@ -606,7 +731,7 @@ pub(crate) fn prefill_moe(
             return moe::moe_smallm_down_combine(
                 ctx,
                 pass,
-                &moe_w.expert_down,
+                moe_w.expert_down.affine()?,
                 h,
                 &ms.ea,
                 slots,
@@ -670,7 +795,7 @@ pub(crate) fn prefill_moe(
         ctx,
         pass,
         &ms.gx,
-        &moe_w.expert_gate,
+        moe_w.expert_gate.affine()?,
         &ms.eg,
         &ms.blocks_gu,
         nb_gu,
@@ -680,7 +805,7 @@ pub(crate) fn prefill_moe(
         ctx,
         pass,
         &ms.gx,
-        &moe_w.expert_up,
+        moe_w.expert_up.affine()?,
         &ms.eu,
         &ms.blocks_gu,
         nb_gu,
@@ -693,7 +818,7 @@ pub(crate) fn prefill_moe(
         ctx,
         pass,
         &ms.ea,
-        &moe_w.expert_down,
+        moe_w.expert_down.affine()?,
         &ms.ed,
         &ms.blocks_dn,
         nb_dn,
@@ -776,6 +901,9 @@ pub(crate) fn decode_moe(
     if crate::ablate::on(crate::ablate::Group::Moe) {
         return Ok(());
     }
+    if moe_w.expert_gate.gguf().is_some() {
+        return gguf_decode_moe(ctx, pass, dims, moe_w, io, ms);
+    }
     // Level 0 — everything whose only input is `x`: the router's projection
     // (`router_project_decode`) and the shared expert's, as one dispatch
     // where the backend does not overlap a level's dispatches.
@@ -787,7 +915,7 @@ pub(crate) fn decode_moe(
         level0.push((&shared.gate_up_proj, io.mlp_gu));
         level0.push((&moe_w.shared_gate, &ms.shared_gate));
     }
-    quant::gemv_quant_sets(ctx, pass, io.x, &level0)?;
+    linear_gemv_sets(ctx, pass, io.x, &level0)?;
     pass.level_barrier(&[&ms.router_logits, io.mlp_gu, &ms.shared_gate])?;
 
     // Level 1 — the routing decision, and the shared expert's activation.
@@ -819,15 +947,15 @@ pub(crate) fn decode_moe(
     moe::moe_gather_gemv_gate_up(
         ctx,
         pass,
-        &moe_w.expert_gate,
-        &moe_w.expert_up,
+        moe_w.expert_gate.affine()?,
+        moe_w.expert_up.affine()?,
         inter,
         io.x,
         slots,
         &ms.act,
     )?;
     if !crate::ablate::on(crate::ablate::Group::Shared) {
-        quant::gemv_quant(ctx, pass, &shared.down_proj, io.mlp_act, &ms.shared_out)?;
+        linear_gemv(ctx, pass, &shared.down_proj, io.mlp_act, &ms.shared_out)?;
     }
     pass.level_barrier(&[&ms.act, &ms.shared_out])?;
 
@@ -837,7 +965,7 @@ pub(crate) fn decode_moe(
     moe::moe_gather_gemv_down_combine(
         ctx,
         pass,
-        &moe_w.expert_down,
+        moe_w.expert_down.affine()?,
         dims.hidden,
         &ms.act,
         slots,
@@ -845,4 +973,139 @@ pub(crate) fn decode_moe(
         Some((&ms.shared_out, &ms.shared_gate)),
         io.out,
     )
+}
+
+/// The single GGUF part of an expert stack.
+fn expert_part(w: &LinearWeights) -> Result<&qwen_gguf::QWeight> {
+    match w.gguf() {
+        Some(g) if g.parts.len() == 1 => Ok(&g.parts[0]),
+        _ => anyhow::bail!("GGUF experts are one tensor per stack"),
+    }
+}
+
+/// [`decode_moe`] over GGUF weights (`kernels::qwen_gguf`): the same levels
+/// and arithmetic, the router, shared expert and its gate as GGUF GEMVs,
+/// the routed experts through the GGUF gathers.
+fn gguf_decode_moe(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    dims: &MoeDims,
+    moe_w: &MoeWeights,
+    io: &DecodeMoeIo<'_>,
+    ms: &MoeScratch,
+) -> Result<()> {
+    let (inter, k) = (dims.moe_intermediate, dims.top_k);
+    let shared = &moe_w.shared;
+    linear_gemv_sets(
+        ctx,
+        pass,
+        io.x,
+        &[
+            (&moe_w.gate, &ms.router_logits),
+            (&shared.gate_up_proj, io.mlp_gu),
+            (&moe_w.shared_gate, &ms.shared_gate),
+        ],
+    )?;
+    pass.level_barrier(&[&ms.router_logits, io.mlp_gu, &ms.shared_gate])?;
+    router_select_decode(ctx, pass, dims, &ms.router_logits, &ms.indices, &ms.scores)?;
+    silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?;
+    pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;
+    qwen_gguf::moe_gate_up(
+        ctx,
+        pass,
+        expert_part(&moe_w.expert_gate)?,
+        expert_part(&moe_w.expert_up)?,
+        inter,
+        io.x,
+        &ms.indices,
+        &ms.act,
+        1,
+        k,
+    )?;
+    linear_gemv(ctx, pass, &shared.down_proj, io.mlp_act, &ms.shared_out)?;
+    pass.level_barrier(&[&ms.act, &ms.shared_out])?;
+    qwen_gguf::moe_down(
+        ctx,
+        pass,
+        expert_part(&moe_w.expert_down)?,
+        inter,
+        dims.hidden,
+        &ms.act,
+        &ms.indices,
+        &ms.scores,
+        Some(qwen_gguf::SharedAdd { out: &ms.shared_out, gate: &ms.shared_gate }),
+        io.out,
+        1,
+        k,
+    )
+}
+
+/// [`prefill_moe`] over GGUF weights: the router and the shared expert by
+/// [`project_mat`], the routed experts of every row through the decode
+/// gathers (one expert walk per (row, slot) pair; grouped GEMMs on the
+/// matrix units are the faster form still to come).
+fn gguf_prefill_moe(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    dims: &MoeDims,
+    moe_w: &MoeWeights,
+    io: &PrefillMoeIo<'_>,
+    ms: &PrefillMoeScratch,
+) -> Result<()> {
+    let m = io.x.shape()[0];
+    let (inter, k) = (dims.moe_intermediate, dims.top_k);
+    let shared = &moe_w.shared;
+    router_project_rows(ctx, pass, &moe_w.gate, io.x, &ms.router_logits, io.dequant)?;
+    project_mat(ctx, pass, io.x, &shared.gate_proj, io.mlp_gate, io.dequant)?;
+    project_mat(ctx, pass, io.x, &shared.up_proj, io.mlp_up, io.dequant)?;
+    project_mat(ctx, pass, io.x, &moe_w.shared_gate, &ms.shared_gate, io.dequant)?;
+    pass.level_barrier(&[&ms.router_logits, io.mlp_gate, io.mlp_up, &ms.shared_gate])?;
+    router_select_rows(ctx, pass, dims, &ms.router_logits, &ms.indices, &ms.scores)?;
+    silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?;
+    pass.level_barrier(&[&ms.indices, &ms.scores, io.mlp_act])?;
+    project_mat(ctx, pass, io.mlp_act, &shared.down_proj, &ms.shared_out, io.dequant)?;
+    qwen_gguf::moe_gate_up(
+        ctx,
+        pass,
+        expert_part(&moe_w.expert_gate)?,
+        expert_part(&moe_w.expert_up)?,
+        inter,
+        io.x,
+        &ms.indices,
+        &ms.ea,
+        m,
+        k,
+    )?;
+    pass.level_barrier(&[&ms.ea, &ms.shared_out])?;
+    qwen_gguf::moe_down(
+        ctx,
+        pass,
+        expert_part(&moe_w.expert_down)?,
+        inter,
+        dims.hidden,
+        &ms.ea,
+        &ms.indices,
+        &ms.scores,
+        Some(qwen_gguf::SharedAdd { out: &ms.shared_out, gate: &ms.shared_gate }),
+        io.out,
+        m,
+        k,
+    )
+}
+
+/// `out[r]` = the embedding rows of `ids` (`[m]`), for a table of either
+/// storage.
+pub(crate) fn embed_rows(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    table: &LinearWeights,
+    ids: &Tensor,
+    out: &Tensor,
+) -> Result<()> {
+    match table {
+        LinearWeights::Affine(w) => quant::gather_rows_quant(ctx, pass, w, ids, out),
+        LinearWeights::Gguf(_) => {
+            qwen_gguf::embed_bf16(ctx, pass, expert_part(table)?, ids, out, ids.numel())
+        }
+    }
 }

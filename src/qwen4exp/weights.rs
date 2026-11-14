@@ -20,7 +20,9 @@ use anyhow::Context as _;
 use super::expert_cache::ExpertCache;
 use super::expert_prefetch::PrefetchSetup;
 use super::expert_store::{ExpertStore, LiveUsage, SlotPolicy, UsageRanking};
-use crate::weights::{LinearWeights, Loader, MlpWeights, MoeWeights, expect_shape};
+use crate::weights::{
+    LinearWeights, Loader, MlpWeights, MoeWeights, QuantWeights, expect_shape,
+};
 
 use super::config::{LayerType, Q8Group, Qwen4ExpConfig, StoragePolicy, VISION_PREFIX};
 use super::ngram::{self, NgramStorage, NgramTable, PagedTable};
@@ -47,6 +49,25 @@ pub struct HcWeights {
     pub up: LinearWeights,
     /// `[hc_count, hc_count * h]`.
     pub inject: Option<LinearWeights>,
+}
+
+impl HcWeights {
+    /// The affine down, up and inject projections, when the mixer is in
+    /// lily's checkpoint format (the fused read kernels' input).
+    pub fn affine(
+        &self,
+    ) -> Option<(&QuantWeights, &QuantWeights, Option<&QuantWeights>)> {
+        let (LinearWeights::Affine(d), LinearWeights::Affine(u)) =
+            (&self.down, &self.up)
+        else {
+            return None;
+        };
+        match &self.inject {
+            None => Some((d, u, None)),
+            Some(LinearWeights::Affine(i)) => Some((d, u, Some(i))),
+            Some(LinearWeights::Gguf(_)) => None,
+        }
+    }
 }
 
 /// Per-layer n-gram embedding module.
@@ -517,7 +538,13 @@ fn load_ffn(
                 }
             }
             let (g, u, d, t) = cache.layer_weights(layer)?;
-            (g, u, d, Some(t), Some((cache.link(), layer)))
+            (
+                LinearWeights::Affine(g),
+                LinearWeights::Affine(u),
+                LinearWeights::Affine(d),
+                Some(t),
+                Some((cache.link(), layer)),
+            )
         }
         None => {
             let expert_gate =
@@ -675,6 +702,9 @@ fn load_ple(
                 ple.head_dim(),
                 "ngram table",
             )?;
+            let LinearWeights::Affine(table) = table else {
+                anyhow::bail!("the resident n-gram table is affine");
+            };
             ensure!(
                 table.bits == ple.quantization.bits,
                 "ngram table bit width mismatch"

@@ -474,7 +474,8 @@ fn a_row_finishing_under_a_parked_step_keeps_its_final_token() {
 }
 
 /// Bytes a projection's weights occupy (what one pass over them reads).
-fn weight_bytes(w: &crate::weights::QuantWeights) -> usize {
+fn weight_bytes(w: &crate::weights::LinearWeights) -> usize {
+    let w = w.affine().expect("affine weights");
     w.codes.byte_len() + w.scales.byte_len() + w.biases.byte_len()
 }
 
@@ -589,11 +590,11 @@ fn shared_weight_kernels_vs_rows_probe() {
             .enumerate()
             .flat_map(|(li, l)| match &l.mixer {
                 Mixer::Gdn(w) => {
-                    vec![(li, w.in_proj.codes.shape()[0]), (li, cfg.hidden_size)]
+                    vec![(li, w.in_proj.out_features()), (li, cfg.hidden_size)]
                 }
                 Mixer::Attn(w) => vec![
-                    (li, w.qkv_proj.codes.shape()[0]),
-                    (li, w.indexer.qk_proj.codes.shape()[0]),
+                    (li, w.qkv_proj.out_features()),
+                    (li, w.indexer.qk_proj.out_features()),
                     (li, cfg.hidden_size),
                 ],
             })
@@ -610,11 +611,12 @@ fn shared_weight_kernels_vs_rows_probe() {
         let t = time(&|pass| {
             let mut out = outs.iter();
             for l in layers {
-                let ws: Vec<&crate::weights::QuantWeights> = match &l.mixer {
+                let ws: Vec<&crate::weights::LinearWeights> = match &l.mixer {
                     Mixer::Gdn(w) => vec![&w.in_proj, &w.out_proj],
                     Mixer::Attn(w) => vec![&w.qkv_proj, &w.indexer.qk_proj, &w.o_proj],
                 };
                 for w in ws {
+                    let w = w.affine()?;
                     let k = w.codes.shape()[1] * 32 / w.bits;
                     let x = ins.iter().find(|t| t.numel() == k).expect("input width");
                     gemv_quant(&ctx, pass, w, x, &out.next().expect("out").1)?;

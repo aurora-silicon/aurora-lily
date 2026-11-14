@@ -49,16 +49,16 @@ use crate::kernels::qsa::{self, INDEXER_D, SparseAttnRoute, SparseSplitScratch};
 use crate::kernels::sample::{
     DraftDists, SamplerScratch, SamplingParams, sample_f32, sample_spec_f32,
 };
+use crate::kernels::skinny;
 use crate::kernels::spec::ctrl_words;
 use crate::kernels::{Arg, Pos, Rope};
-use crate::kernels::{quant, skinny};
 use crate::metal::{
     BlitCopy, ComputePass, EncodedPass, MetalContext, PendingPass, SharedEvent,
 };
 use crate::moe_ffn::{
     DecodeMoeIo, MoeDims, MoeScratch, PrefillMoeIo, PrefillMoeScratch, decode_moe,
-    prefill_moe, prefix_rows, project_mat, project_stack_or_slices, route_decode,
-    route_rows,
+    embed_rows, linear_gemv, linear_gemv_sets, prefill_moe, prefix_rows, project_mat,
+    project_stack_or_slices, route_decode, route_rows,
 };
 use crate::tensor::{DType, Tensor};
 
@@ -2877,13 +2877,7 @@ impl Qwen4ExpModel {
             None => Rope::Delta(state.rope_delta),
         };
 
-        quant::gather_rows_quant(
-            ctx,
-            &pass,
-            &self.weights.embed_tokens,
-            &ps.ids,
-            &ps.x,
-        )?;
+        embed_rows(ctx, &pass, &self.weights.embed_tokens, &ps.ids, &ps.x)?;
         if let Some(v) = vision {
             // The images' merged rows replace the placeholders' embeddings
             // before the streams are initialised from them (the reference's
@@ -2987,7 +2981,7 @@ impl Qwen4ExpModel {
                     gather_row_bf16(ctx, &pass, &ps.hyper, &s.hyper, m - 1)?;
                     pass.level_barrier(&[&s.hyper])?;
                     self.hc_read_decode(ctx, &pass, &self.weights.final_mixer, s)?;
-                    quant::gemv_quant(
+                    linear_gemv(
                         ctx,
                         &pass,
                         &self.weights.lm_head,
@@ -3199,16 +3193,17 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
-        if m <= HC_FUSED_MAX_ROWS
-            && fused_read_supported(&hc.down, &hc.up, hc.inject.as_ref(), h, g)
+        if let Some((down, up, inject)) = hc.affine()
+            && m <= HC_FUSED_MAX_ROWS
+            && fused_read_supported(down, up, inject, h, g)
         {
             hc_read_down_q8_rows(
                 ctx,
                 pass,
                 hyper,
                 &hc.norm,
-                &hc.down,
-                hc.inject.as_ref(),
+                down,
+                inject,
                 &out.down,
                 &out.inj,
                 &out.inv_rms,
@@ -3222,7 +3217,7 @@ impl Qwen4ExpModel {
             hc_read_up_mix_q8_rows(
                 ctx,
                 pass,
-                &hc.up,
+                up,
                 &out.act,
                 hyper,
                 &hc.norm,
@@ -3910,7 +3905,7 @@ impl Qwen4ExpModel {
             eps,
             NORM_WEIGHT_BIAS,
         )?;
-        quant::gather_rows_quant(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
+        embed_rows(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
         if !overrides.is_empty() {
             pass.level_barrier(&[&ps.x])?;
             override_rows(ctx, pass, &ps.x, overrides, h)?;
@@ -4089,7 +4084,7 @@ impl Qwen4ExpModel {
         self.set_cache_position(Some(state.pos));
 
         let ids = s.next_token.view(slot_in, &[1])?;
-        quant::gather_rows_quant(ctx, pass, &self.weights.embed_tokens, &ids, &s.x)?;
+        embed_rows(ctx, pass, &self.weights.embed_tokens, &ids, &s.x)?;
         pass.level_barrier(&[&s.x])?;
         hc_broadcast_bf16(ctx, pass, &s.x, &s.hyper, h, g)?;
         pass.level_barrier(&[&s.hyper])?;
@@ -4195,13 +4190,7 @@ impl Qwen4ExpModel {
 
         self.hc_read_decode(ctx, pass, &self.weights.final_mixer, s)?;
         if !crate::ablate::on(crate::ablate::Group::Head) {
-            quant::gemv_quant(
-                ctx,
-                pass,
-                &self.weights.lm_head,
-                &s.hc.mixed,
-                &s.logits,
-            )?;
+            linear_gemv(ctx, pass, &self.weights.lm_head, &s.hc.mixed, &s.logits)?;
             pass.level_barrier(&[&s.logits])?;
         }
         let out = s.next_token.view(slot_out, &[1])?;
@@ -4241,13 +4230,18 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
+        let Some((down, up, inject)) = hc.affine() else {
+            // GGUF mixers take the unfused read; one row goes by the GEMVs,
+            // which stage nothing.
+            return self.hc_read_rows(ctx, pass, hc, hyper, out, 1, hyper);
+        };
         hc_read_down_q8(
             ctx,
             pass,
             hyper,
             &hc.norm,
-            &hc.down,
-            hc.inject.as_ref(),
+            down,
+            inject,
             &out.down,
             &out.inj,
             &out.inv_rms,
@@ -4260,7 +4254,7 @@ impl Qwen4ExpModel {
         hc_read_up_mix_q8(
             ctx,
             pass,
-            &hc.up,
+            up,
             &out.down,
             hyper,
             &hc.norm,
@@ -4300,7 +4294,7 @@ impl Qwen4ExpModel {
             NORM_WEIGHT_BIAS,
         )?;
         pass.level_barrier(&[&p.emb, &p.query_n])?;
-        quant::gemv_quant_sets(
+        linear_gemv_sets(
             ctx,
             pass,
             &p.emb,
@@ -4358,7 +4352,7 @@ impl Qwen4ExpModel {
         conv_window: &Tensor,
     ) -> Result<()> {
         if !crate::ablate::on(crate::ablate::Group::GdnProj) {
-            quant::gemv_quant(ctx, pass, &w.in_proj, &s.hc.mixed, &s.gdn_in)?;
+            linear_gemv(ctx, pass, &w.in_proj, &s.hc.mixed, &s.gdn_in)?;
             pass.level_barrier(&[&s.gdn_in])?;
         }
         if crate::ablate::on(crate::ablate::Group::GdnStep) {
@@ -4387,7 +4381,7 @@ impl Qwen4ExpModel {
         if crate::ablate::on(crate::ablate::Group::GdnProj) {
             return Ok(());
         }
-        quant::gemv_quant(ctx, pass, &w.out_proj, &s.gdn_gated, &s.branch_out)
+        linear_gemv(ctx, pass, &w.out_proj, &s.gdn_gated, &s.branch_out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4421,7 +4415,7 @@ impl Qwen4ExpModel {
         if crate::ablate::on(crate::ablate::Group::Attn) {
             return Ok(());
         }
-        quant::gemv_quant_sets(
+        linear_gemv_sets(
             ctx,
             pass,
             &s.hc.mixed,
@@ -4538,7 +4532,7 @@ impl Qwen4ExpModel {
         pass.level_barrier(&[&s.attn_o])?;
         sigmoid_mul_bf16(ctx, pass, &s.gate, &s.attn_o, &s.attn_gated)?;
         pass.level_barrier(&[&s.attn_gated])?;
-        quant::gemv_quant(ctx, pass, &w.o_proj, &s.attn_gated, &s.branch_out)
+        linear_gemv(ctx, pass, &w.o_proj, &s.attn_gated, &s.branch_out)
     }
 }
 

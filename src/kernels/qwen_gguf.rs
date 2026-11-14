@@ -79,10 +79,7 @@ pub fn gemv_sets(
     let mut groups = 0;
     let mut bf_mask = 0usize;
     for (s, &(w, y)) in sets.iter().enumerate() {
-        ensure!(
-            w.ty == w0.ty && w.cols == k,
-            "GEMV sets of different types or widths"
-        );
+        ensure!(w.ty == w0.ty && w.cols == k, "GEMV sets of different types or widths");
         let stride = y_row_stride.unwrap_or(w.rows);
         ensure!(y.numel() >= (m - 1) * stride + w.rows, "GEMV output of {}", y.numel());
         match y.dtype() {
@@ -227,20 +224,17 @@ pub fn moe_gate_up(
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
-        &[
-            gate.t.binding(),
-            up.t.binding(),
-            x.binding(),
-            sel.binding(),
-            act.binding(),
-        ],
+        &[gate.t.binding(), up.t.binding(), x.binding(), sel.binding(), act.binding()],
         &[
             &u32_bytes(gate.cols),
             &u32_bytes(ff),
             &u32_bytes(gate.row_bytes),
             &u32_bytes(used),
         ],
-        Grid::Threadgroups { groups: (ff.div_ceil(8), m * used, 1), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups {
+            groups: (ff.div_ceil(8), m * used, 1),
+            threadgroup: (256, 1, 1),
+        },
     )
 }
 
@@ -324,7 +318,10 @@ pub fn moe_down(
             &u32_bytes(used),
             &u32_bytes(flags),
         ],
-        Grid::Threadgroups { groups: (hidden.div_ceil(8), m, 1), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups {
+            groups: (hidden.div_ceil(8), m, 1),
+            threadgroup: (256, 1, 1),
+        },
     )
 }
 
