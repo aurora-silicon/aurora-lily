@@ -76,6 +76,14 @@ enum Cmd {
         #[arg(long)]
         prompt: String,
     },
+    /// The chat prompt ids of a conversation (a JSON file: `messages`,
+    /// optional `tools`), with thinking off and on, one line each.
+    ChatIds {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        conversation: PathBuf,
+    },
     /// One user message through the chat template, decoded greedily.
     Chat {
         #[arg(long)]
@@ -377,7 +385,8 @@ fn run() -> Result<()> {
                 }
                 Ok(())
             })?;
-            let diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            let diff =
+                a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
             let scale = a.iter().map(|x| x.abs()).fold(0f32, f32::max);
             println!(
                 "{} tokens: prefill argmax {} decode argmax {}, max |diff| {diff:.4} of max |logit| {scale:.2}, finite {}",
@@ -386,6 +395,29 @@ fn run() -> Result<()> {
                 top2(&b).0,
                 a.iter().chain(&b).all(|x| x.is_finite())
             );
+        }
+        Cmd::ChatIds { model, conversation } => {
+            use lily::tokenizer::ChatRender;
+            let tok = Tokenizer::from_model_dir(&model)?;
+            let conv: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&conversation)?)?;
+            let messages = conv["messages"].as_array().context("messages")?.clone();
+            let tools = conv["tools"].as_array().cloned();
+            for think in [false, true] {
+                let render = ChatRender {
+                    messages: &messages,
+                    tools: tools.as_deref(),
+                    enable_thinking: think,
+                    reasoning_effort: None,
+                    preserve_thinking: None,
+                };
+                let ids = tok.encode_chat(&render)?;
+                println!(
+                    "{}",
+                    ids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")
+                );
+            }
+            println!("stops {:?}", tok.stop_tokens());
         }
         Cmd::Chat { model, prompt, n, think } => {
             use lily::tokenizer::ChatRender;
