@@ -501,17 +501,10 @@ impl Load<'_> {
             true,
         )?;
         let ab = |name: &str| -> Result<QWeight> {
-            let (v, t) = f32s(self.g, &format!("{b}{name}.weight"))?;
-            let cols = t.row_len();
-            let w = regrouped_f32(self.g, &format!("{b}{name}.weight"), cols, n_k, r)?;
-            let _ = v;
-            QWeight::from_bytes(
-                self.ctx,
-                bytemuck::cast_slice(&w),
-                GgmlType::F32,
-                cols,
-                n_v,
-            )
+            let name = format!("{b}{name}.weight");
+            let cols = self.g.require(&name)?.row_len();
+            let w = regrouped_f32(self.g, &name, cols, n_k, r)?;
+            exact_bf16_weight(self.ctx, &w, cols, n_v)
         };
         let in_proj = LinearWeights::Gguf(GgufLinear {
             parts: vec![qkv, z, ab("ssm_alpha")?, ab("ssm_beta")?],
