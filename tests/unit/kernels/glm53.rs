@@ -937,11 +937,6 @@ fn dsa_attend_refuses_unpadded_prompt_widths() {
     pass.commit_wait().unwrap();
 }
 
-/// The scores stage on both routes against an f64 reference over 200 slots
-/// (four matrix tiles): f16's largest value alone stays on the matrix
-/// route, the next value past it (either sign) sends its query's tiles to
-/// f32, a NaN or infinite query value makes only its own head's scores
-/// non-finite, and slots past each row's count are -inf.
 /// The matrix route's scores at its block edges, from an output buffer full
 /// of NaN: causal rows whose counts are 63, 64, 65 and 66 with S = 192
 /// (blocks wholly past a row's count only write -inf), and selected rows
@@ -1065,6 +1060,11 @@ fn dsa_scores_mu_block_boundaries() {
     }
 }
 
+/// The scores stage on both routes against an f64 reference over 200 slots
+/// (four matrix tiles): f16's largest value alone stays on the matrix
+/// route, the next value past it (either sign) sends its query's tiles to
+/// f32, a NaN or infinite query value makes only its own head's scores
+/// non-finite, and slots past each row's count are -inf.
 #[test]
 fn dsa_scores_at_and_past_f16_range() {
     let ctx = ctx();
@@ -2500,161 +2500,6 @@ fn moe_grouped_fused_matches_separate() {
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&got[0].0), bits(&got[1].0), "mid, limit {limit}");
         assert_eq!(bits(&got[0].1), bits(&got[1].1), "out, limit {limit}");
-    }
-}
-
-/// The expert GEMMs' f16 decode against the exact dequantization: one-hot
-/// input rows make each gate/up output a single decoded weight. IQ2_XXS
-/// (f16(d (2s+1)) times grid / 8) and Q2_K (fma(f16(d sc), q, -f16(dmin
-/// m))) blocks with scales from 1e-7 (products below f16's normal range)
-/// to 0.5, and Q2_K blocks with dmin = d (cancellation). Each weight is
-/// within the two f16 roundings: 2^-10 of its terms' magnitude, plus
-/// 2^-23 absolute below the normal range.
-#[test]
-fn moe_grouped_f16_decode_against_exact() {
-    let ctx = ctx();
-    let mut rng = StdRng::seed_from_u64(82);
-    let (experts, hidden, ff, used, m) = (8usize, 256usize, 256usize, 8usize, 256usize);
-    let mags = [1e-7f32, 6e-6, 6e-5, 1e-3, 0.05, 0.5];
-    for ty in [GgmlType::Iq2Xxs, GgmlType::Q2K] {
-        let mut raw = random_blocks(&mut rng, ty, experts * ff * hidden);
-        let bb = ty.block_bytes();
-        for (bi, blk) in raw.chunks_exact_mut(bb).enumerate() {
-            let d = mags[bi % mags.len()] * rng.gen_range(0.5..1.5);
-            match ty {
-                GgmlType::Iq2Xxs => put_f16(blk, 0, d),
-                _ => {
-                    put_f16(blk, 80, d);
-                    put_f16(
-                        blk,
-                        82,
-                        if bi % 3 == 0 { d } else { d * rng.gen_range(0.1..2.0) },
-                    );
-                }
-            }
-        }
-        // Each block's terms: the magnitude the roundings are relative to.
-        let terms = |row: usize, k: usize| -> f32 {
-            let blk = &raw[(row * hidden + k) / 256 * bb..][..bb];
-            let v = k % 256;
-            let h = |at: usize| f16::from_le_bytes([blk[at], blk[at + 1]]).to_f32();
-            match ty {
-                GgmlType::Iq2Xxs => {
-                    let j = v / 32;
-                    let o = 2 + 8 * j + 4;
-                    let aux1 = u32::from_le_bytes([
-                        blk[o],
-                        blk[o + 1],
-                        blk[o + 2],
-                        blk[o + 3],
-                    ]);
-                    h(0) * (2 * (aux1 >> 28) + 1) as f32 * 43.0 / 8.0
-                }
-                _ => {
-                    let sc = blk[v / 16];
-                    h(80) * (sc & 15) as f32 * 3.0 + h(82) * (sc >> 4) as f32
-                }
-            }
-        };
-        let w = QWeight::from_bytes(&ctx, &raw, ty, hidden, experts * ff).unwrap();
-        let exact = mat(ty, &raw, experts * ff, hidden);
-        let draw = random_blocks(&mut rng, GgmlType::Q2K, experts * hidden * ff);
-        let dw = QWeight::from_bytes(&ctx, &draw, GgmlType::Q2K, ff, experts * hidden)
-            .unwrap();
-        // Row i is e_i; it uses every expert.
-        let mut x = vec![0f32; m * hidden];
-        for i in 0..m {
-            x[i * hidden + i] = 1.0;
-        }
-        let sel: Vec<u32> = (0..m)
-            .flat_map(|i| (0..used).map(move |s| ((i + s) % experts) as u32))
-            .collect();
-        let tx = tensor(&ctx, &x);
-        let tsel = Tensor::from_bytes(
-            &ctx,
-            bytemuck::cast_slice(&sel),
-            &[sel.len()],
-            DType::U32,
-        )
-        .unwrap();
-        let tw = tensor(&ctx, &vec![0.1f32; m * used]);
-        let out = zeros(&ctx, m * hidden);
-        let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
-        run(&ctx, |p| {
-            moe_grouped_with(
-                &ctx, p, &w, &w, &dw, ff, hidden, &tx, &tsel, &tw, &out, &gs, m, used,
-                experts, 0.0, false,
-            )
-            .unwrap()
-        });
-        let g = gs.g.to_f32().unwrap();
-        let mut worst = 0f32;
-        for i in 0..m {
-            for s in 0..used {
-                let e = sel[i * used + s] as usize;
-                for n in 0..ff {
-                    let row = e * ff + n;
-                    let want = exact.row(row)[i];
-                    let got = g[(i * used + s) * ff + n];
-                    let tol = terms(row, i).abs() * (1.0 / 1024.0) + 2f32.powi(-23);
-                    worst = worst.max((got - want).abs() / tol);
-                    assert!(
-                        (got - want).abs() <= tol,
-                        "{ty:?} expert {e} row {n} k {i}: {got} against {want} (tol {tol})"
-                    );
-                }
-            }
-        }
-        println!("{ty:?}: worst error {worst:.3} of the bound");
-    }
-}
-
-/// glm53_to_f16 against round-to-nearest-even with saturation: f16's
-/// largest values and past them, rounding ties, subnormals and underflow.
-#[test]
-fn to_f16_saturates_and_rounds_to_nearest_even() {
-    let ctx = ctx();
-    let mut v = vec![
-        65504.0f32,
-        -65504.0,
-        65519.0,
-        -65519.0,
-        65520.0,
-        -65520.0,
-        70000.0,
-        -1e9,
-        1e30,
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-        0.0,
-        -0.0,
-        1.0,
-        -1.0,
-        6.1035156e-5,
-        5.9604645e-8,
-        2.9802322e-8,
-        2.9802326e-8,
-        1e-9,
-        -3e-6,
-    ];
-    // Ties between f16 neighbours: 1 + (2k + 1) 2^-11.
-    for k in 0..8 {
-        v.push(1.0 + (2 * k + 1) as f32 * 2f32.powi(-11));
-        v.push(-(1024.0 + (2 * k + 1) as f32 * 0.5));
-    }
-    if v.len() % 2 == 1 {
-        v.push(0.25);
-    }
-    let tx = tensor(&ctx, &v);
-    let out = Tensor::zeros(&ctx, &[v.len()], DType::F16).unwrap();
-    run(&ctx, |p| to_f16(&ctx, p, &tx, &out, v.len()).unwrap());
-    let got = out.to_f32().unwrap();
-    for (k, (&x, &g)) in v.iter().zip(&got).enumerate() {
-        let want = f16::from_f32(x.clamp(-65504.0, 65504.0)).to_f32();
-        assert!(
-            g.to_bits() == want.to_bits(),
-            "value {k}: {x} -> {g}, round to nearest even with saturation gives {want}"
-        );
     }
 }
 

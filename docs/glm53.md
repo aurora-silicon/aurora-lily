@@ -93,18 +93,8 @@ or restore a snapshot taken before the step.
   run). This changes the drafts, not the sampling rule: drafts only decide
   which steps verify two rows (see the finite-precision caveat above).
 - Prefill GEMMs round both operands to bfloat16 (the weights to nearest,
-  ties away from zero), the routed experts' to f16 (f32 accumulators);
-  decode works on f32 activations. The experts' f16 weights come from f16
-  products of the block scales (IQ2_XXS: f16(d (2s + 1)) times the grid;
-  Q2_K: fma(f16(d sc), q, -f16(dmin m))), two roundings each: in f16's
-  normal range about three more bits than one bfloat rounding, below it
-  (weights under 6e-5) an absolute error of about 2^-24. The loader
-  refuses a checkpoint whose expert inputs could leave f16's range
-  (largest MoE ffn_norm gain over 65504 / 64, or a SwiGLU limit and
-  expert weight scale that bound the down input past it). On this
-  checkpoint (`lily-glm53 ranges`): largest MoE ffn_norm gain 0.94, expert
-  input at most 7.9 over a 1 024-token prompt, and every IQ2_XXS and Q2_K
-  scale factor in f16's normal range (1.0e-3 to 9.5).
+  ties away from zero; f32 accumulators); decode works on f32 activations.
+  Quality is close to ds4's (below).
 - Prompt runs of more than 32 rows (gate bound in [-5, 0]) compute KDA in
   its chunked (WY) form, 32 tokens a chunk, in f32: algebraically the
   recurrence, computed from cumulative log decays and factored

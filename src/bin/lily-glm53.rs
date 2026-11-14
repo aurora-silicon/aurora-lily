@@ -160,18 +160,6 @@ enum Cmd {
         #[arg(long)]
         dump: Option<PathBuf>,
     },
-    /// The f16 expert route's ranges on a checkpoint: the MoE layers'
-    /// largest ffn_norm gain, the expert input's largest magnitude over a
-    /// prompt (raw text, traced forward), and the decoded IQ2_XXS / Q2_K
-    /// scale factors against f16's normal range.
-    Ranges {
-        #[arg(long)]
-        model: PathBuf,
-        #[arg(long)]
-        text: PathBuf,
-        #[arg(long, default_value_t = 512)]
-        prompt_len: usize,
-    },
     /// Step time by row count: after a prompt, forward passes of 1 to 4
     /// rows (every row's logits, as a verify pass), each from the prompt's
     /// state (restored); medians.
@@ -228,7 +216,6 @@ fn run() -> Result<()> {
             spec_diff(&model, &text, prompt_len, n, chat.as_deref())
         }
         Cmd::Rows { model, text, prompt_len, n } => rows(&model, &text, prompt_len, n),
-        Cmd::Ranges { model, text, prompt_len } => ranges(&model, &text, prompt_len),
         Cmd::Mtpacc {
             model,
             text,
@@ -666,128 +653,6 @@ fn bench(
     Ok(())
 }
 
-fn ranges(
-    path: &std::path::Path,
-    text: &std::path::Path,
-    prompt_len: usize,
-) -> Result<()> {
-    use half::f16;
-    let g = lily::gguf::Gguf::open(path)?;
-    let n_layer = g.u64(&format!("{}.block_count", g.architecture()?))? as usize;
-    let tiny = f16::MIN_POSITIVE.to_f32();
-    let mut norm_max = 0f32;
-    // Scale factors of the f16 decode: count, below f16's normal range,
-    // smallest and largest nonzero magnitude.
-    #[derive(Default)]
-    struct R {
-        n: u64,
-        sub: u64,
-        min: f32,
-        max: f32,
-    }
-    impl R {
-        fn add(&mut self, v: f32, tiny: f32) {
-            let a = v.abs();
-            self.n += 1;
-            if a == 0.0 {
-                return;
-            }
-            if a < tiny {
-                self.sub += 1;
-            }
-            if self.min == 0.0 || a < self.min {
-                self.min = a;
-            }
-            self.max = self.max.max(a);
-        }
-    }
-    let (mut iq2, mut q2s, mut q2m) = (R::default(), R::default(), R::default());
-    let h =
-        |b: &[u8], at: usize| f16::from_bits(u16::from_le_bytes([b[at], b[at + 1]]));
-    for il in 0..n_layer {
-        let Some(gate) = g.tensor(&format!("blk.{il}.ffn_gate_exps.weight")) else {
-            continue;
-        };
-        let nw = g.require(&format!("blk.{il}.ffn_norm.weight"))?;
-        let w = g.read_rows_f32(nw, 0..nw.rows())?;
-        norm_max = w.iter().fold(norm_max, |m, v| m.max(v.abs()));
-        let up = g.require(&format!("blk.{il}.ffn_up_exps.weight"))?;
-        let down = g.require(&format!("blk.{il}.ffn_down_exps.weight"))?;
-        for t in [gate, up, down] {
-            let bb = t.ty.block_bytes() as u64;
-            let chunk = bb * 1_000_000;
-            let mut at = 0u64;
-            while at < t.bytes {
-                let len = chunk.min(t.bytes - at);
-                let b = g.read_bytes(t.offset + at, len as usize)?;
-                for blk in b.chunks_exact(bb as usize) {
-                    if t.ty == lily::gguf::GgmlType::Iq2Xxs {
-                        let d = h(blk, 0);
-                        for j in 0..8 {
-                            let o = 2 + 8 * j + 4;
-                            let aux1 = u32::from_le_bytes([
-                                blk[o],
-                                blk[o + 1],
-                                blk[o + 2],
-                                blk[o + 3],
-                            ]);
-                            let sc = d * f16::from_f32((2 * (aux1 >> 28) + 1) as f32);
-                            iq2.add(sc.to_f32(), tiny);
-                        }
-                    } else {
-                        let (d, dmin) = (h(blk, 80), h(blk, 82));
-                        for &sc in &blk[..16] {
-                            q2s.add(
-                                (d * f16::from_f32((sc & 15) as f32)).to_f32(),
-                                tiny,
-                            );
-                            q2m.add(
-                                (dmin * f16::from_f32((sc >> 4) as f32)).to_f32(),
-                                tiny,
-                            );
-                        }
-                    }
-                }
-                at += len;
-            }
-        }
-    }
-    let show = |name: &str, r: &R| {
-        println!(
-            "{name}: {} factors, {} below f16's normal range ({:.4}%), nonzero |x| in [{:e}, {:e}]",
-            r.n,
-            r.sub,
-            100.0 * r.sub as f64 / r.n as f64,
-            r.min,
-            r.max
-        )
-    };
-    println!(
-        "MoE layers' largest |ffn_norm| gain {norm_max} (f16-safe bound 65504 / 64 = 1023.5)"
-    );
-    show("IQ2_XXS f16(d (2s+1)) (weights are it x 1, 3.125, 5.375)", &iq2);
-    show("Q2_K f16(d sc)", &q2s);
-    show("Q2_K f16(dmin m)", &q2m);
-    // The expert input over a real prompt.
-    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
-    let mut ids = tok.encode("[gMASK]<sop>")?;
-    let body = tok.encode(&std::fs::read_to_string(text)?)?;
-    ids.extend_from_slice(&body[..prompt_len - ids.len()]);
-    let ctx = MetalContext::new()?;
-    let model = Glm53Model::load(&ctx, path)?;
-    let mut sc = model.new_scratch(&ctx)?;
-    let mut st = model.new_state(&ctx, prompt_len + 8)?;
-    let mut trace = Vec::new();
-    model.forward_traced(&ctx, &mut st, &mut sc, &ids, &mut trace)?;
-    let first_moe = model.cfg.n_leading_dense;
-    let mx = trace[first_moe..]
-        .iter()
-        .flat_map(|t| t.ffn_in.iter())
-        .fold(0f32, |m, v| m.max(v.abs()));
-    println!("expert input over a {prompt_len}-token prompt: largest |x| {mx}");
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn mtpacc(
     path: &std::path::Path,
@@ -893,7 +758,9 @@ fn mtpacc(
             }
         }
     }
-    let mut tsv = String::from("j\ttrue\tdraft\tgreedy\tmain_margin\tmtp_margin\n");
+    let mut tsv = String::from(
+        "j\ttrue\tdraft\tgreedy\tmain_margin\tmtp_margin\tmtp_prob\tproposed\n",
+    );
     if let Some(f) = save_cont {
         let mut out = vec![greedy_next];
         while out.len() < n {
@@ -920,11 +787,23 @@ fn mtpacc(
     // seq[j] is fed.
     let (mut hit_true, mut hit_greedy, mut total) = (0usize, 0usize, 0usize);
     let mut main_true = 0usize;
+    let (mut n_proposed, mut proposed_greedy) = (0usize, 0usize);
     let mut digest = 0xcbf29ce484222325u64;
     for j in 0..seq.len() - 1 {
-        let draft = LanguageModel::draft_initial(
+        // The production drafting step (its 0.3 probability gate kept); the
+        // raw draft and its probability are read from what the step
+        // published, so every position is compared whether or not the
+        // gate let the draft through.
+        let proposal = LanguageModel::draft_initial(
             &model, &ctx, &mut st, &mut sc, seq[j], 1, &greedy, 0,
-        )?[0];
+        )?;
+        let draft = sc.mtp_io.to_u32()?[1];
+        let prob = sc.mtp_prob.to_f32()?[0];
+        anyhow::ensure!(
+            proposal.is_empty() || proposal == [draft],
+            "proposal {proposal:?} is not the published draft {draft}"
+        );
+        let proposed = !proposal.is_empty();
         let mtp_margin = margin(&sc.logits.to_f32()?[..vocab]);
         if j == 0 && dump.is_some() {
             // The MTP block's first latent row (position pos - 1).
@@ -938,19 +817,22 @@ fn mtpacc(
         greedy_next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
         let main_margin = margin(&sc.logits.to_f32()?[..vocab]);
         tsv += &format!(
-            "{j}\t{}\t{draft}\t{greedy_next}\t{main_margin}\t{mtp_margin}\n",
-            seq[j + 1]
+            "{j}\t{}\t{draft}\t{greedy_next}\t{main_margin}\t{mtp_margin}\t{prob}\t{}\n",
+            seq[j + 1],
+            u8::from(proposed)
         );
         total += 1;
         hit_true += usize::from(draft == seq[j + 1]);
         hit_greedy += usize::from(draft == greedy_next);
+        n_proposed += usize::from(proposed);
+        proposed_greedy += usize::from(proposed && draft == greedy_next);
         digest = (digest ^ u64::from(draft)).wrapping_mul(0x100000001b3);
     }
     if let Some(d) = dump {
         std::fs::write(d.join("steps.tsv"), tsv)?;
     }
     println!(
-        "mtpacc: prompt {} ({}), {total} drafts: draft = true next {hit_true} ({:.1}%), draft = main greedy {hit_greedy} ({:.1}%), main greedy = true {main_true}/{total}; drafts digest {digest:016x}",
+        "mtpacc: prompt {} ({}), {total} drafts: draft = true next {hit_true} ({:.1}%), draft = main greedy {hit_greedy} ({:.1}%), main greedy = true {main_true}/{total}; proposed (p >= 0.3) {n_proposed}, of them = main greedy {proposed_greedy}; drafts digest {digest:016x}",
         prompt.len(),
         if decode_prompt { "decode" } else { "prefill" },
         100.0 * hit_true as f64 / total as f64,

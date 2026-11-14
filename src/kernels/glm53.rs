@@ -345,30 +345,6 @@ pub fn to_bf16(
     )
 }
 
-/// `out` = the first `n` values of `x` as f16 (the hardware's conversion,
-/// after clamping to +-65504: out-of-range values saturate), `n` even.
-pub fn to_f16(
-    ctx: &MetalContext,
-    pass: &ComputePass<'_>,
-    x: &Tensor,
-    out: &Tensor,
-    n: usize,
-) -> Result<()> {
-    check_f32(&[x])?;
-    ensure!(out.dtype() == DType::F16, "f16 copy into {:?}", out.dtype());
-    ensure!(
-        n.is_multiple_of(2) && x.numel() >= n && out.numel() >= n,
-        "f16 copy of {n} values"
-    );
-    let pipeline = ctx.pipeline("glm53_to_f16", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
-        &pipeline,
-        &[x.binding(), out.binding()],
-        &[],
-        Grid::Threads { grid: (n / 2, 1, 1), threadgroup: (256, 1, 1) },
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn gemm_any(
     ctx: &MetalContext,
@@ -451,11 +427,11 @@ pub struct MoeGroupScratch {
     pub pairs: Tensor,
     pub tiles: Tensor,
     pub tile_count: Tensor,
-    /// The run's input rows as f16 (the gate/up GEMMs' operand).
+    /// The run's input rows as bfloat (the gate/up GEMMs' operand).
     pub xb: Tensor,
     pub g: Tensor,
     pub u: Tensor,
-    /// F16: the down GEMM's operand.
+    /// BF16: the down GEMM's operand.
     pub mid: Tensor,
     pub down: Tensor,
 }
@@ -473,10 +449,10 @@ impl MoeGroupScratch {
             pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
             tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
             tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
-            xb: Tensor::zeros(ctx, &[pairs * hidden], DType::F16)?,
+            xb: Tensor::zeros(ctx, &[pairs * hidden], DType::BF16)?,
             g: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
             u: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
-            mid: Tensor::zeros(ctx, &[pairs * ff], DType::F16)?,
+            mid: Tensor::zeros(ctx, &[pairs * ff], DType::BF16)?,
             down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
         })
     }
@@ -555,7 +531,7 @@ fn moe_grouped_with(
         x.numel() >= m * hidden && sc.xb.numel() >= m * hidden,
         "grouped MoE input"
     );
-    to_f16(ctx, pass, x, &sc.xb, m * hidden)?;
+    to_bf16(ctx, pass, x, &sc.xb, m * hidden)?;
     pass.memory_barrier()?;
     let max_tiles = pairs.div_ceil(64) + experts;
     let gemm_moe =
@@ -597,7 +573,7 @@ fn moe_grouped_with(
     let shift = used.trailing_zeros() as usize;
     if gate.ty == GgmlType::Iq2Xxs && fuse_gate_up {
         // Gate, up and the SwiGLU in one GEMM: a tile is 32 columns of
-        // each, written as the down GEMM's f16 operand.
+        // each, written as the down GEMM's bfloat operand.
         ensure!(
             gate.cols.is_multiple_of(256) && ff.is_multiple_of(32),
             "grouped expert GEMM of {ff} x {}",
