@@ -130,6 +130,36 @@ enum Cmd {
         #[arg(long)]
         chat: Option<String>,
     },
+    /// Teacher-forced MTP acceptance: after the prompt (prefill, or with
+    /// --decode-prompt one decode step a token), a fixed continuation is fed
+    /// token by token; at each position the MTP block takes the true next
+    /// token and drafts the one after, which is compared with the true token
+    /// there and with the main model's greedy token. The continuation is the
+    /// text's (raw text) or read from --cont (one token id a line); --save-cont
+    /// writes this build's greedy continuation of the prompt instead.
+    Mtpacc {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, default_value_t = 512)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 160)]
+        n: usize,
+        #[arg(long)]
+        chat: Option<String>,
+        #[arg(long)]
+        cont: Option<PathBuf>,
+        #[arg(long)]
+        save_cont: Option<PathBuf>,
+        #[arg(long)]
+        decode_prompt: bool,
+        /// Write the prompt's state (final hidden row, logits, every
+        /// layer's KDA state and conv window or DSA latent, pooled keys and
+        /// tails), the first MTP latent row and a per-position TSV here.
+        #[arg(long)]
+        dump: Option<PathBuf>,
+    },
     /// Step time by row count: after a prompt, forward passes of 1 to 4
     /// rows (every row's logits, as a verify pass), each from the prompt's
     /// state (restored); medians.
@@ -186,6 +216,27 @@ fn run() -> Result<()> {
             spec_diff(&model, &text, prompt_len, n, chat.as_deref())
         }
         Cmd::Rows { model, text, prompt_len, n } => rows(&model, &text, prompt_len, n),
+        Cmd::Mtpacc {
+            model,
+            text,
+            prompt_len,
+            n,
+            chat,
+            cont,
+            save_cont,
+            decode_prompt,
+            dump,
+        } => mtpacc(
+            &model,
+            &text,
+            prompt_len,
+            n,
+            chat.as_deref(),
+            cont.as_deref(),
+            save_cont.as_deref(),
+            decode_prompt,
+            dump.as_deref(),
+        ),
         Cmd::Bench { model, text, prompt_len, n, runs } => {
             bench(&model, &text, prompt_len, n, runs)
         }
@@ -565,9 +616,11 @@ fn bench(
     for run in 0..runs {
         let mut st = model.new_state(&ctx, prompt_len + n + 8)?;
         let _ = lily::metal::profile::take();
+        let busy0 = lily::metal::gpu_busy_ns();
         let t = Instant::now();
         model.prefill(&ctx, &mut st, &mut sc, &ids)?;
         let pf = t.elapsed().as_secs_f64();
+        let pf_busy = (lily::metal::gpu_busy_ns() - busy0) as f64 * 1e-9;
         if ctx.profiling() {
             eprintln!("prefill of {prompt_len} tokens, per prefill:");
             profile_report(1);
@@ -590,13 +643,201 @@ fn bench(
         }
         steps.sort_by(f64::total_cmp);
         println!(
-            "run {run}: prompt {prompt_len}: prefill {pf:.2} s = {:.1} tok/s; decode {n} tokens {dt:.2} s = {:.2} tok/s; step median {:.2} ms p10 {:.2} ms; digest {digest:016x}",
+            "run {run}: prompt {prompt_len}: prefill {pf:.2} s = {:.1} tok/s (GPU busy {pf_busy:.2} s); decode {n} tokens {dt:.2} s = {:.2} tok/s; step median {:.2} ms p10 {:.2} ms; digest {digest:016x}",
             prompt_len as f64 / pf,
             n as f64 / dt,
             steps[n / 2],
             steps[n / 10],
         );
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mtpacc(
+    path: &std::path::Path,
+    text: &std::path::Path,
+    prompt_len: usize,
+    n: usize,
+    chat: Option<&str>,
+    cont: Option<&std::path::Path>,
+    save_cont: Option<&std::path::Path>,
+    decode_prompt: bool,
+    dump: Option<&std::path::Path>,
+) -> Result<()> {
+    use lily::engine::{Draw, LanguageModel, LoadOptions};
+    use lily::glm53::model::LayerState;
+    let write = |name: &str, v: &[f32]| -> Result<()> {
+        if let Some(d) = dump {
+            std::fs::create_dir_all(d)?;
+            std::fs::write(d.join(name), bytemuck::cast_slice(v))?;
+        }
+        Ok(())
+    };
+    let margin = |l: &[f32]| -> f32 {
+        let top = argmax(l);
+        let second = l
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != top)
+            .map(|(_, &v)| v)
+            .fold(f32::NEG_INFINITY, f32::max);
+        l[top] - second
+    };
+    use lily::kernels::sample::SamplingParams;
+    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
+    let mut body = Vec::new();
+    let prompt = match chat {
+        Some(q) => {
+            let messages = [serde_json::json!({"role": "user", "content": q})];
+            tok.encode_chat(&lily::tokenizer::ChatRender {
+                messages: &messages,
+                tools: None,
+                enable_thinking: false,
+                reasoning_effort: None,
+                preserve_thinking: None,
+            })?
+        }
+        None => {
+            let mut ids = tok.encode("[gMASK]<sop>")?;
+            body = tok.encode(&std::fs::read_to_string(text)?)?;
+            anyhow::ensure!(body.len() + ids.len() >= prompt_len + n, "text too short");
+            let used = prompt_len - ids.len();
+            ids.extend_from_slice(&body[..used]);
+            body = body[used..used + n].to_vec();
+            ids
+        }
+    };
+    let ctx = MetalContext::new()?;
+    let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
+    let model = <Glm53Model as LanguageModel>::load(&ctx, path, &options)?;
+    let vocab = model.cfg.vocab;
+    let greedy = SamplingParams::greedy();
+    let mut sc = LanguageModel::new_scratch_with_capacity(&model, &ctx, 0)?;
+    let mut st = LanguageModel::new_state(&model, &ctx, prompt.len() + n + 8)?;
+    if decode_prompt {
+        for &t in &prompt {
+            model.forward(&ctx, &mut st, &mut sc, &[t], true)?;
+        }
+    } else {
+        LanguageModel::prefill(
+            &model,
+            &ctx,
+            &mut st,
+            &mut sc,
+            &prompt,
+            Some(Draw { params: &greedy, step: 0 }),
+        )?;
+    }
+    // The main model's greedy token after the prompt.
+    let mut greedy_next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+    if dump.is_some() {
+        let h = model.cfg.hidden;
+        write("hidden", &sc.hidden.to_f32()?[..h])?;
+        write("logits", &sc.logits.to_f32()?[..vocab])?;
+        let pos = st.pos;
+        for (il, l) in st.layers.iter().enumerate() {
+            match l {
+                LayerState::Kda { conv, s, .. } => {
+                    write(&format!("l{il:02}_kda_s"), &s.to_f32()?)?;
+                    write(&format!("l{il:02}_kda_conv"), &conv.to_f32()?)?;
+                }
+                LayerState::Dsa { latent, pooled, tail_k, tail_g } => {
+                    write(
+                        &format!("l{il:02}_dsa_latent"),
+                        &latent.to_f32()?[..pos * 512],
+                    )?;
+                    let pd = pooled.numel() / (st.capacity / 4).max(1);
+                    write(
+                        &format!("l{il:02}_dsa_pooled"),
+                        &pooled.to_f32()?[..(pos / 4) * pd],
+                    )?;
+                    write(&format!("l{il:02}_dsa_tail_k"), &tail_k.to_f32()?)?;
+                    write(&format!("l{il:02}_dsa_tail_g"), &tail_g.to_f32()?)?;
+                }
+            }
+        }
+    }
+    let mut tsv = String::from(
+        "j\ttrue\tdraft\tgreedy\tmain_margin\tmtp_margin\tmtp_prob\tproposed\n",
+    );
+    if let Some(f) = save_cont {
+        let mut out = vec![greedy_next];
+        while out.len() < n {
+            model.forward(&ctx, &mut st, &mut sc, &[*out.last().unwrap()], true)?;
+            out.push(argmax(&sc.logits.to_f32()?[..vocab]) as u32);
+        }
+        let lines: Vec<String> = out.iter().map(|t| t.to_string()).collect();
+        std::fs::write(f, lines.join("\n") + "\n")?;
+        println!("saved {} tokens", out.len());
+        return Ok(());
+    }
+    let seq: Vec<u32> = match cont {
+        Some(f) => std::fs::read_to_string(f)?
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.trim().parse::<u32>())
+            .collect::<std::result::Result<_, _>>()?,
+        None => body,
+    };
+    anyhow::ensure!(seq.len() >= 2, "continuation of {} tokens", seq.len());
+    let seq = &seq[..seq.len().min(n)];
+    // At position p (the last fed token), the MTP block takes seq[j] (the
+    // token at p + 1) and drafts the token at p + 2, seq[j + 1]; then
+    // seq[j] is fed.
+    let (mut hit_true, mut hit_greedy, mut total) = (0usize, 0usize, 0usize);
+    let mut main_true = 0usize;
+    let (mut n_proposed, mut proposed_greedy) = (0usize, 0usize);
+    let mut digest = 0xcbf29ce484222325u64;
+    for j in 0..seq.len() - 1 {
+        // The production drafting step (its 0.3 probability gate kept); the
+        // raw draft and its probability are read from what the step
+        // published, so every position is compared whether or not the
+        // gate let the draft through.
+        let proposal = LanguageModel::draft_initial(
+            &model, &ctx, &mut st, &mut sc, seq[j], 1, &greedy, 0,
+        )?;
+        let draft = sc.mtp_io.to_u32()?[1];
+        let prob = sc.mtp_prob.to_f32()?[0];
+        anyhow::ensure!(
+            proposal.is_empty() || proposal == [draft],
+            "proposal {proposal:?} is not the published draft {draft}"
+        );
+        let proposed = !proposal.is_empty();
+        let mtp_margin = margin(&sc.logits.to_f32()?[..vocab]);
+        if j == 0 && dump.is_some() {
+            // The MTP block's first latent row (position pos - 1).
+            if let LayerState::Dsa { latent, .. } = &st.layers[model.cfg.mtp_layer()] {
+                let p = st.pos - 1;
+                write("mtp_latent0", &latent.to_f32()?[p * 512..(p + 1) * 512])?;
+            }
+        }
+        main_true += usize::from(greedy_next == seq[j]);
+        model.forward(&ctx, &mut st, &mut sc, &[seq[j]], true)?;
+        greedy_next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+        let main_margin = margin(&sc.logits.to_f32()?[..vocab]);
+        tsv += &format!(
+            "{j}\t{}\t{draft}\t{greedy_next}\t{main_margin}\t{mtp_margin}\t{prob}\t{}\n",
+            seq[j + 1],
+            u8::from(proposed)
+        );
+        total += 1;
+        hit_true += usize::from(draft == seq[j + 1]);
+        hit_greedy += usize::from(draft == greedy_next);
+        n_proposed += usize::from(proposed);
+        proposed_greedy += usize::from(proposed && draft == greedy_next);
+        digest = (digest ^ u64::from(draft)).wrapping_mul(0x100000001b3);
+    }
+    if let Some(d) = dump {
+        std::fs::write(d.join("steps.tsv"), tsv)?;
+    }
+    println!(
+        "mtpacc: prompt {} ({}), {total} drafts: draft = true next {hit_true} ({:.1}%), draft = main greedy {hit_greedy} ({:.1}%), main greedy = true {main_true}/{total}; proposed (p >= 0.3) {n_proposed}, of them = main greedy {proposed_greedy}; drafts digest {digest:016x}",
+        prompt.len(),
+        if decode_prompt { "decode" } else { "prefill" },
+        100.0 * hit_true as f64 / total as f64,
+        100.0 * hit_greedy as f64 / total as f64,
+    );
     Ok(())
 }
 

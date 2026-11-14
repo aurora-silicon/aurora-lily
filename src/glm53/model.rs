@@ -486,6 +486,8 @@ pub struct Scratch {
     klow: Tensor,
     klow2: Tensor,
     kout: Tensor,
+    /// BF16: a prompt run's GEMM input rounded once (bf16_input).
+    xbf: Tensor,
     /// The conv windows before each chunk of a prompt run's KDA prepare.
     kedges: Tensor,
     // DSA
@@ -603,6 +605,21 @@ impl Scratch {
             klow: f(m * cfg.kda_dim)?,
             klow2: f(m * cfg.kda_dim)?,
             kout: f(m * p)?,
+            xbf: Tensor::zeros(
+                ctx,
+                &[m * [
+                    cfg.hidden,
+                    p,
+                    cfg.ff_dense,
+                    cfg.ff_expert,
+                    cfg.n_head * cfg.value_dim,
+                    cfg.q_lora,
+                ]
+                .into_iter()
+                .max()
+                .unwrap_or(0)],
+                DType::BF16,
+            )?,
             kedges: f(k::kda_edges_len(m, cfg.kda_heads))?,
             qr: f(m * cfg.q_lora)?,
             q: f(m * hq)?,
@@ -1257,21 +1274,48 @@ impl Glm53Model {
 
     /// Projections of one input: the GEMV (several weights in one dispatch)
     /// up to [`MAX_ROWS`] rows, the matrix-unit GEMM beyond.
+    /// `xb`: the input's bfloat copy ([`Self::bf16_input`]) when there is
+    /// one, which the GEMMs over Q8_0 and Q4_K weights take.
     fn proj(
         &self,
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
         sets: &[(&QWeight, &Tensor)],
         x: &Tensor,
+        xb: Option<&Tensor>,
         m: usize,
     ) -> Result<()> {
         if m <= MAX_ROWS {
             return k::gemv_sets(ctx, pass, sets, x, m);
         }
         for &(w, y) in sets {
-            k::gemm(ctx, pass, w, x, y, m)?;
+            match xb {
+                Some(xb) if k::gemm_bx_takes(w) => k::gemm_bx(ctx, pass, w, xb, y, m)?,
+                _ => k::gemm(ctx, pass, w, x, y, m)?,
+            }
         }
         Ok(())
+    }
+
+    /// For a prompt run (more than [`MAX_ROWS`] rows): `x`'s `m` rows of
+    /// `width` values rounded to bfloat into `sc.xbf`, its own dependency
+    /// level, for the projections that read `x` next (the GEMMs round their
+    /// input to bfloat anyway; once here instead of in every column tile).
+    fn bf16_input<'s>(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        sc: &'s Scratch,
+        x: &Tensor,
+        width: usize,
+        m: usize,
+    ) -> Result<Option<&'s Tensor>> {
+        if m <= MAX_ROWS {
+            return Ok(None);
+        }
+        k::to_bf16(ctx, pass, x, &sc.xbf, m * width)?;
+        pass.memory_barrier()?;
+        Ok(Some(&sc.xbf))
     }
 
     /// The pass a step is encoded into: concurrent, its dependency levels
@@ -1351,7 +1395,8 @@ impl Glm53Model {
         let cfg = &self.cfg;
         match (a, &st.layers[il]) {
             (AttnW::Kda(w), LayerState::Kda { conv, s, conv_alt, s_alt }) => {
-                self.proj(ctx, pass, &[(&w.q, &sc.kq), (&w.k, &sc.kk)], &sc.xn, m)?;
+                let xb = self.bf16_input(ctx, pass, sc, &sc.xn, cfg.hidden, m)?;
+                self.proj(ctx, pass, &[(&w.q, &sc.kq), (&w.k, &sc.kk)], &sc.xn, xb, m)?;
                 self.proj(
                     ctx,
                     pass,
@@ -1362,12 +1407,13 @@ impl Glm53Model {
                         (&w.g_a, &sc.klow2),
                     ],
                     &sc.xn,
+                    xb,
                     m,
                 )?;
                 pass.memory_barrier()?;
                 // f_b and g_b read different inputs: one dispatch each.
-                self.proj(ctx, pass, &[(&w.f_b, &sc.kgate)], &sc.klow, m)?;
-                self.proj(ctx, pass, &[(&w.g_b, &sc.kog)], &sc.klow2, m)?;
+                self.proj(ctx, pass, &[(&w.f_b, &sc.kgate)], &sc.klow, None, m)?;
+                self.proj(ctx, pass, &[(&w.g_b, &sc.kog)], &sc.klow2, None, m)?;
                 pass.memory_barrier()?;
                 let p = KdaParams {
                     q_conv: &w.q_conv,
@@ -1396,7 +1442,9 @@ impl Glm53Model {
                 });
                 k::kda(ctx, pass, &p, &x, conv, s, &sc.kout, m, snap)?;
                 pass.memory_barrier()?;
-                self.proj(ctx, pass, &[(&w.out, &sc.attn_out)], &sc.kout, m)?;
+                let pw = cfg.kda_projection();
+                let xb = self.bf16_input(ctx, pass, sc, &sc.kout, pw, m)?;
+                self.proj(ctx, pass, &[(&w.out, &sc.attn_out)], &sc.kout, xb, m)?;
                 pass.memory_barrier()
             }
             (AttnW::Dsa(w), LayerState::Dsa { latent, pooled, tail_k, tail_g }) => {
@@ -1405,11 +1453,13 @@ impl Glm53Model {
                 let limit = cfg.indexer_selected_limit();
                 let sparse = w.indexer.is_some() && pos0 + m > limit;
                 // Level 1: everything that reads xn.
+                let xb = self.bf16_input(ctx, pass, sc, &sc.xn, cfg.hidden, m)?;
                 self.proj(
                     ctx,
                     pass,
                     &[(&w.q_a, &sc.qr), (&w.kv_a, &sc.kv_raw)],
                     &sc.xn,
+                    xb,
                     m,
                 )?;
                 if let Some(ix) = &w.indexer {
@@ -1417,7 +1467,7 @@ impl Glm53Model {
                     if sparse {
                         sets.push((&ix.proj, &sc.iw));
                     }
-                    self.proj(ctx, pass, &sets, &sc.xn, m)?;
+                    self.proj(ctx, pass, &sets, &sc.xn, xb, m)?;
                 }
                 pass.memory_barrier()?;
                 // Level 2: the norms, the latent store, the pooled keys.
@@ -1453,9 +1503,10 @@ impl Glm53Model {
                 }
                 pass.memory_barrier()?;
                 // Level 3: the queries.
-                self.proj(ctx, pass, &[(&w.q_b, &sc.q)], &sc.qr, m)?;
+                let xb = self.bf16_input(ctx, pass, sc, &sc.qr, cfg.q_lora, m)?;
+                self.proj(ctx, pass, &[(&w.q_b, &sc.q)], &sc.qr, xb, m)?;
                 if let (true, Some(ix)) = (sparse, &w.indexer) {
-                    self.proj(ctx, pass, &[(&ix.q_b, &sc.iq)], &sc.qr, m)?;
+                    self.proj(ctx, pass, &[(&ix.q_b, &sc.iq)], &sc.qr, xb, m)?;
                 }
                 pass.memory_barrier()?;
                 // Level 4: absorbed queries, pool scores.
@@ -1581,7 +1632,9 @@ impl Glm53Model {
                     )?;
                 }
                 pass.memory_barrier()?;
-                self.proj(ctx, pass, &[(&w.out, &sc.attn_out)], &sc.heads, m)?;
+                let hv = cfg.n_head * cfg.value_dim;
+                let xb = self.bf16_input(ctx, pass, sc, &sc.heads, hv, m)?;
+                self.proj(ctx, pass, &[(&w.out, &sc.attn_out)], &sc.heads, xb, m)?;
                 pass.memory_barrier()
             }
             _ => anyhow::bail!("layer {il}: weights and state disagree"),
@@ -1601,17 +1654,27 @@ impl Glm53Model {
         let lim = cfg.swiglu_limit;
         match f {
             FfnW::Dense { gate, up, down } => {
-                self.proj(ctx, pass, &[(gate, &sc.fg), (up, &sc.fu)], &sc.xn, m)?;
+                let xb = self.bf16_input(ctx, pass, sc, &sc.xn, cfg.hidden, m)?;
+                self.proj(ctx, pass, &[(gate, &sc.fg), (up, &sc.fu)], &sc.xn, xb, m)?;
                 pass.memory_barrier()?;
                 k::swiglu(ctx, pass, &sc.fg, &sc.fu, &sc.fmid, m * cfg.ff_dense, lim)?;
                 pass.memory_barrier()?;
-                self.proj(ctx, pass, &[(down, &sc.ffn_out)], &sc.fmid, m)?;
+                let xb = self.bf16_input(ctx, pass, sc, &sc.fmid, cfg.ff_dense, m)?;
+                self.proj(ctx, pass, &[(down, &sc.ffn_out)], &sc.fmid, xb, m)?;
                 pass.memory_barrier()
             }
             FfnW::Moe { router, bias, gate, up, down, sh_gate, sh_up, sh_down } => {
                 let used = cfg.n_expert_used;
-                self.proj(ctx, pass, &[(router, &sc.rlogits)], &sc.xn, m)?;
-                self.proj(ctx, pass, &[(sh_gate, &sc.fg), (sh_up, &sc.fu)], &sc.xn, m)?;
+                let xb = self.bf16_input(ctx, pass, sc, &sc.xn, cfg.hidden, m)?;
+                self.proj(ctx, pass, &[(router, &sc.rlogits)], &sc.xn, None, m)?;
+                self.proj(
+                    ctx,
+                    pass,
+                    &[(sh_gate, &sc.fg), (sh_up, &sc.fu)],
+                    &sc.xn,
+                    xb,
+                    m,
+                )?;
                 pass.memory_barrier()?;
                 k::router_topk(
                     ctx,
@@ -1630,7 +1693,9 @@ impl Glm53Model {
                 if m > MAX_ROWS {
                     // A prompt run: shared expert first, then the routed
                     // experts grouped by expert on the matrix units.
-                    self.proj(ctx, pass, &[(sh_down, &sc.ffn_out)], &sc.fmid, m)?;
+                    let xb =
+                        self.bf16_input(ctx, pass, sc, &sc.fmid, cfg.ff_expert, m)?;
+                    self.proj(ctx, pass, &[(sh_down, &sc.ffn_out)], &sc.fmid, xb, m)?;
                     pass.memory_barrier()?;
                     k::moe_grouped(
                         ctx,
@@ -1666,7 +1731,7 @@ impl Glm53Model {
                     used,
                     lim,
                 )?;
-                self.proj(ctx, pass, &[(sh_down, &sc.ffn_out)], &sc.fmid, m)?;
+                self.proj(ctx, pass, &[(sh_down, &sc.ffn_out)], &sc.fmid, None, m)?;
                 pass.memory_barrier()?;
                 // Routed sum plus the shared expert's output.
                 k::moe_down(

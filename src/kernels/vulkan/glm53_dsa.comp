@@ -64,6 +64,16 @@ void main() {
     const uint tid = gl_LocalInvocationIndex;
     const uint sg = gl_SubgroupID;
     const uint count = min(S, has_sel ? n_sel : pos0 + i + 1u);
+    if (s0 >= count) {
+        // A block wholly past the row's slots (half a causal prompt run's):
+        // only its -inf.
+        const uint64_t O = arg(3) + 4u * (uint64_t(i) * 64u * S);
+        for (uint o = tid; o < 64u * 64u; o += 128u) {
+            const uint s = s0 + (o & 63u);
+            if (s < S) F32(O).v[(o >> 6u) * S + s] = -1.0 / 0.0;
+        }
+        return;
+    }
     if (tid < 64u) {
         const uint s = s0 + tid;
         uint row = 0xffffffffu;

@@ -453,6 +453,17 @@ fn kda_case(rng: &mut StdRng, heads: usize) -> KdaCase {
 /// Runs `tokens` KDA tokens on the GPU in chunks of `chunk` rows and on the
 /// CPU one by one.
 fn kda_compare(tokens: usize, chunk: usize, seed: u64) {
+    kda_compare_gates(tokens, chunk, seed, -3.0, 3.0);
+}
+
+/// [`kda_compare`] with the raw gates drawn from `gate_lo..gate_hi`.
+fn kda_compare_gates(
+    tokens: usize,
+    chunk: usize,
+    seed: u64,
+    gate_lo: f32,
+    gate_hi: f32,
+) {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(seed);
     let mut cfg = crate::glm53::Config::glm53_flash();
@@ -497,7 +508,7 @@ fn kda_compare(tokens: usize, chunk: usize, seed: u64) {
         let q = f32s(&mut rng, n * p, -2.0, 2.0);
         let k = f32s(&mut rng, n * p, -2.0, 2.0);
         let v = f32s(&mut rng, n * p, -2.0, 2.0);
-        let g = f32s(&mut rng, n * p, -3.0, 3.0);
+        let g = f32s(&mut rng, n * p, gate_lo, gate_hi);
         let b = f32s(&mut rng, n * heads, -2.0, 2.0);
         let og = f32s(&mut rng, n * p, -2.0, 2.0);
         let (tq, tk, tv, tg, tb, tog) = (t(&q), t(&k), t(&v), t(&g), t(&b), t(&og));
@@ -535,6 +546,165 @@ fn kda_compare(tokens: usize, chunk: usize, seed: u64) {
         done += n;
     }
     assert_close(&state.to_f32().unwrap(), &st.s, 1e-4, 1e-3);
+}
+
+/// Prompt runs of more than KDA_CHUNK rows take the chunked form: whole
+/// and partial chunks, a run continuing another's state, and gates at the
+/// decay's extremes (the strongest decay is where the chunked form's
+/// factors are largest).
+#[test]
+fn kda_chunked_form_matches_cpu() {
+    kda_compare_gates(130, 65, 61, -3.0, 3.0);
+    kda_compare_gates(100, 100, 62, -3.0, 3.0);
+    kda_compare_gates(128, 64, 63, 20.0, 30.0);
+    kda_compare_gates(66, 33, 64, -30.0, -20.0);
+}
+
+/// KDA from a nonzero state and conv window through runs of `runs` rows
+/// (`Some(r)`: with a snapshot after row r, as a verify pass), each against
+/// the CPU recurrence: every output row, the snapshot, and the state and
+/// conv window after each run. Gates vary by channel (a third saturate to
+/// the strongest decay, a third to none, a third random) and beta by row
+/// and head (near 1, near 0, random).
+fn kda_handoff_case(runs: &[(usize, Option<usize>)], lower_bound: f32, seed: u64) {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut cfg = crate::glm53::Config::glm53_flash();
+    let heads = 4;
+    cfg.kda_heads = heads;
+    cfg.kda_gate_lower_bound = lower_bound;
+    let p = heads * 128;
+    let c = kda_case(&mut rng, heads);
+    let t = |v: &Vec<f32>| tensor(&ctx, v);
+    let (qc, kc, vc, al, dt, on) = (
+        t(&c.q_conv),
+        t(&c.k_conv),
+        t(&c.v_conv),
+        t(&c.a_log),
+        t(&c.dt_bias),
+        t(&c.o_norm),
+    );
+    let params = KdaParams {
+        q_conv: &qc,
+        k_conv: &kc,
+        v_conv: &vc,
+        a_log: &al,
+        dt_bias: &dt,
+        o_norm: &on,
+        heads,
+        lower_bound,
+        eps: 1e-5,
+    };
+    let cp = r::KdaParams {
+        q_conv: &c.q_conv,
+        k_conv: &c.k_conv,
+        v_conv: &c.v_conv,
+        a_log: &c.a_log,
+        dt_bias: &c.dt_bias,
+        o_norm: &c.o_norm,
+    };
+    let mut st = r::KdaState::new(&cfg);
+    st.conv = f32s(&mut rng, 9 * p, -1.0, 1.0);
+    st.s = f32s(&mut rng, heads * 128 * 128, -0.2, 0.2);
+    let conv_state = t(&st.conv);
+    let state = t(&st.s);
+    for (ri, &(n, snap_row)) in runs.iter().enumerate() {
+        let q = f32s(&mut rng, n * p, -2.0, 2.0);
+        let k = f32s(&mut rng, n * p, -2.0, 2.0);
+        let v = f32s(&mut rng, n * p, -2.0, 2.0);
+        let g: Vec<f32> = (0..n * p)
+            .map(|i| match (i % p) % 3 {
+                0 => 30.0,
+                1 => -30.0,
+                _ => rng.gen_range(-3.0..3.0),
+            })
+            .collect();
+        let b: Vec<f32> = (0..n * heads)
+            .map(|i| match i % 3 {
+                0 => 12.0,
+                1 => -12.0,
+                _ => rng.gen_range(-2.0..2.0),
+            })
+            .collect();
+        let og = f32s(&mut rng, n * p, -2.0, 2.0);
+        let (tq, tk, tv, tg, tb, tog) = (t(&q), t(&k), t(&v), t(&g), t(&b), t(&og));
+        let out = zeros(&ctx, n * p);
+        let edges = zeros(&ctx, kda_edges_len(n, heads));
+        let inputs = KdaInputs {
+            q: &tq,
+            k: &tk,
+            v: &tv,
+            gate: &tg,
+            beta: &tb,
+            out_gate: &tog,
+            edges: Some(&edges),
+        };
+        let (snap_conv, snap_state) =
+            (zeros(&ctx, 9 * p), zeros(&ctx, heads * 128 * 128));
+        let snap = snap_row.map(|row| KdaSnapshot {
+            row,
+            conv: &snap_conv,
+            state: &snap_state,
+        });
+        run(&ctx, |pass| {
+            kda(&ctx, pass, &params, &inputs, &conv_state, &state, &out, n, snap)
+                .unwrap()
+        });
+        let got = out.to_f32().unwrap();
+        for j in 0..n {
+            let s = j * p..(j + 1) * p;
+            let e = r::kda_step(
+                &cfg,
+                &mut st,
+                &cp,
+                &q[s.clone()],
+                &k[s.clone()],
+                &v[s.clone()],
+                &g[s.clone()],
+                &b[j * heads..(j + 1) * heads],
+                &og[s.clone()],
+            );
+            assert_close(&got[s], &e, 2e-4, 2e-3);
+            if snap_row == Some(j) {
+                assert_close(&snap_state.to_f32().unwrap(), &st.s, 1e-4, 1e-3);
+                assert_close(&snap_conv.to_f32().unwrap(), &st.conv, 0.0, 0.0);
+            }
+        }
+        let what = format!("run {ri} of {runs:?}, bound {lower_bound}");
+        let gs = state.to_f32().unwrap();
+        assert!(gs.iter().all(|v| v.is_finite()), "{what}: state not finite");
+        assert_close(&gs, &st.s, 1e-4, 1e-3);
+        assert_close(&conv_state.to_f32().unwrap(), &st.conv, 0.0, 0.0);
+    }
+}
+
+/// A prompt run in the chunked form hands its state and conv window to a
+/// decode step and a verify pass with a snapshot (the recurrence's kernels):
+/// runs of 33, 63, 64, 65 and 1 024 rows.
+#[test]
+fn kda_chunked_form_hands_off_to_decode_and_verify() {
+    for (i, n) in [33usize, 63, 64, 65, 1024].into_iter().enumerate() {
+        assert!(kda_takes_wy(-5.0, n, false));
+        kda_handoff_case(&[(n, None), (1, None), (2, Some(0))], -5.0, 90 + i as u64);
+    }
+}
+
+/// The chunked form only for a finite gate bound in [-5, 0]: the bounds it
+/// takes (-5, -2, 0) and one it leaves to the recurrence (-6) against the
+/// CPU; positive and non-finite bounds are not taken.
+#[test]
+fn kda_chunked_form_gate_bounds() {
+    for b in [-5.0f32, -2.0, -0.0, 0.0] {
+        assert!(kda_takes_wy(b, 33, false), "{b}");
+    }
+    for b in [-5.0001f32, -6.0, 1e-6, 3.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+        assert!(!kda_takes_wy(b, 1024, false), "{b}");
+    }
+    assert!(!kda_takes_wy(-5.0, 32, false));
+    assert!(!kda_takes_wy(-5.0, 1024, true));
+    for (i, b) in [-6.0f32, -5.0, -2.0, 0.0].into_iter().enumerate() {
+        kda_handoff_case(&[(97, None), (40, None)], b, 100 + i as u64);
+    }
 }
 
 #[test]
@@ -765,6 +935,129 @@ fn dsa_attend_refuses_unpadded_prompt_widths() {
     );
     assert!(r.is_err());
     pass.commit_wait().unwrap();
+}
+
+/// The matrix route's scores at its block edges, from an output buffer full
+/// of NaN: causal rows whose counts are 63, 64, 65 and 66 with S = 192
+/// (blocks wholly past a row's count only write -inf), and selected rows
+/// with counts 63, 64 and 65 whose selections reach far past their slot
+/// index (cache row 5 999). Valid slots against f64; every other slot -inf.
+#[test]
+fn dsa_scores_mu_block_boundaries() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(81);
+    let n = 6000usize;
+    let s = 192usize;
+    let lat: Vec<f32> =
+        f32s(&mut rng, n * 512, -1.5, 1.5).into_iter().map(r::round_f16).collect();
+    let bytes: Vec<u8> =
+        lat.iter().flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes()).collect();
+    let cache = Tensor::from_bytes(&ctx, &bytes, &[n * 512], DType::F16).unwrap();
+    let scale = 1.0 / 16.0;
+    let check = |qk: &[f32],
+                 g: &[f32],
+                 m: usize,
+                 count: &dyn Fn(usize) -> usize,
+                 row: &dyn Fn(usize, usize) -> usize,
+                 what: &str| {
+        for i in 0..m {
+            for h in 0..64 {
+                let q = &qk[(i * 64 + h) * 512..(i * 64 + h + 1) * 512];
+                for slot in 0..s {
+                    let got = g[(i * 64 + h) * s + slot];
+                    if slot >= count(i) {
+                        assert_eq!(
+                            got,
+                            f32::NEG_INFINITY,
+                            "{what} row {i} head {h} slot {slot}"
+                        );
+                        continue;
+                    }
+                    let k = &lat[row(i, slot) * 512..(row(i, slot) + 1) * 512];
+                    let terms = q.iter().zip(k).map(|(&a, &b)| a as f64 * b as f64);
+                    let want = terms.clone().sum::<f64>() * scale as f64;
+                    let mag: f64 = terms.map(f64::abs).sum();
+                    let tol = scale as f64 * (3e-6 * mag + 512.0 * 6e-8 * 2.0);
+                    assert!(
+                        got.is_finite() && (got as f64 - want).abs() <= tol,
+                        "{what} row {i} head {h} slot {slot}: {got} against {want}"
+                    );
+                }
+            }
+        }
+    };
+    // Causal: counts pos0 + i + 1 = 63, 64, 65, 66.
+    let (m, pos0) = (4usize, 62usize);
+    let qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+    let tqk = tensor(&ctx, &qk);
+    let scores = tensor(&ctx, &vec![f32::NAN; m * 64 * s]);
+    run(&ctx, |p| {
+        dsa_scores(
+            &ctx,
+            p,
+            &tqk,
+            &cache,
+            Rows::Causal { pos0 },
+            &scores,
+            m,
+            s,
+            scale,
+            true,
+        )
+        .unwrap()
+    });
+    check(
+        &qk,
+        &scores.to_f32().unwrap(),
+        m,
+        &|i| pos0 + i + 1,
+        &|_, slot| slot,
+        "causal",
+    );
+    // Selected: per dispatch one count; row slot -> a row far in the cache,
+    // the last slots' rows the cache's last.
+    let m = 2usize;
+    let sel: Vec<u32> = (0..m * s)
+        .map(|k| {
+            let slot = k % s;
+            if slot % 7 == 6 {
+                (n - 1) as u32
+            } else {
+                (5000 + 3 * slot + k / s) as u32
+            }
+        })
+        .collect();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    for count in [63usize, 64, 65] {
+        let qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+        let tqk = tensor(&ctx, &qk);
+        let scores = tensor(&ctx, &vec![f32::NAN; m * 64 * s]);
+        run(&ctx, |p| {
+            dsa_scores(
+                &ctx,
+                p,
+                &tqk,
+                &cache,
+                Rows::Selected { sel: &tsel, count },
+                &scores,
+                m,
+                s,
+                scale,
+                true,
+            )
+            .unwrap()
+        });
+        check(
+            &qk,
+            &scores.to_f32().unwrap(),
+            m,
+            &|_| count,
+            &|i, slot| sel[i * s + slot] as usize,
+            &format!("selected count {count}"),
+        );
+    }
 }
 
 /// The scores stage on both routes against an f64 reference over 200 slots
@@ -1912,6 +2205,57 @@ fn gemm_k_widths() {
     }
 }
 
+/// The GEMM over the input's bfloat copy gives the f32-input GEMM's
+/// results bit for bit (both round the input to bfloat, to nearest even,
+/// and the weights the same way): Q8_0 and Q4_K, row counts within, at
+/// and across the 256-row tiles, widths with partial column tiles, and
+/// input values at bfloat rounding ties (the ties are the input's).
+#[test]
+fn gemm_bx_matches_gemm() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(78);
+    // Rows within one 256-row tile, around its edge (255, 256, 257) and
+    // across several (513, 1 024); widths with partial 64-column tiles.
+    for (ty, cols, rows, m) in [
+        (GgmlType::Q8_0, 256usize, 96usize, 70usize),
+        (GgmlType::Q8_0, 512, 40, 130),
+        (GgmlType::Q4K, 512, 72, 65),
+        (GgmlType::Q4K, 256, 64, 33),
+        (GgmlType::Q8_0, 256, 72, 255),
+        (GgmlType::Q8_0, 256, 100, 256),
+        (GgmlType::Q8_0, 512, 40, 257),
+        (GgmlType::Q8_0, 256, 72, 513),
+        (GgmlType::Q8_0, 256, 136, 1024),
+        (GgmlType::Q4K, 256, 72, 255),
+        (GgmlType::Q4K, 512, 100, 256),
+        (GgmlType::Q4K, 256, 40, 257),
+        (GgmlType::Q4K, 256, 72, 513),
+        (GgmlType::Q4K, 512, 136, 1024),
+    ] {
+        let raw = random_blocks(&mut rng, ty, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+        let mut x = f32s(&mut rng, m * cols, -3.0, 3.0);
+        // Every fifth value exactly halfway between two bfloats.
+        for v in x.iter_mut().step_by(5) {
+            *v = f32::from_bits((v.to_bits() & 0xffff_0000) | 0x8000);
+        }
+        let tx = tensor(&ctx, &x);
+        let xb = Tensor::zeros(&ctx, &[m * cols], DType::BF16).unwrap();
+        let (y, yb) = (zeros(&ctx, m * rows), zeros(&ctx, m * rows));
+        run(&ctx, |p| {
+            gemm(&ctx, p, &w, &tx, &y, m).unwrap();
+            to_bf16(&ctx, p, &tx, &xb, m * cols).unwrap();
+            p.memory_barrier().unwrap();
+            gemm_bx(&ctx, p, &w, &xb, &yb, m).unwrap();
+        });
+        let (a, b) = (y.to_f32().unwrap(), yb.to_f32().unwrap());
+        assert!(
+            a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+            "{ty:?} {rows} x {cols}, {m} rows"
+        );
+    }
+}
+
 #[test]
 fn gemm_batched_matches_grouped_gemv() {
     // attn_k_b's shape for 4 heads, 70 rows: per head a 512 x 256 block.
@@ -2020,8 +2364,13 @@ fn moe_grouped_timing() {
     let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
-    // Rows such that pairs per expert = 256 * 8 / 288 and 4096 * 8 / 288.
-    for (label, m) in [("256-token density", 57), ("4K-token density", 910)] {
+    // Rows such that pairs per expert = n * 8 / 288 for prompts of 256, 1K
+    // and 4K tokens.
+    for (label, m) in [
+        ("256-token density", 57),
+        ("1K-token density", 228),
+        ("4K-token density", 910),
+    ] {
         let sel: Vec<u32> = (0..m)
             .flat_map(|i| {
                 let start = (i * 37) % experts;
@@ -2074,21 +2423,30 @@ fn gemm_timing() {
         let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
         let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
         let y = zeros(&ctx, m * rows);
-        let mut best = f64::MAX;
-        for _ in 0..3 {
-            let pass = ctx.begin().unwrap();
-            for _ in 0..4 {
-                gemm(&ctx, &pass, &w, &x, &y, m).unwrap();
+        let xb = Tensor::zeros(&ctx, &[m * cols], DType::BF16).unwrap();
+        run(&ctx, |p| to_bf16(&ctx, p, &x, &xb, m * cols).unwrap());
+        for bx in [false, true] {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let pass = ctx.begin().unwrap();
+                for _ in 0..4 {
+                    if bx {
+                        gemm_bx(&ctx, &pass, &w, &xb, &y, m).unwrap();
+                    } else {
+                        gemm(&ctx, &pass, &w, &x, &y, m).unwrap();
+                    }
+                }
+                let t = std::time::Instant::now();
+                pass.commit_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64() / 4.0);
             }
-            let t = std::time::Instant::now();
-            pass.commit_wait().unwrap();
-            best = best.min(t.elapsed().as_secs_f64() / 4.0);
+            println!(
+                "gemm {label:24} m {m}{}: {:8.1} us  {:5.1} TFLOP/s",
+                if bx { " bx" } else { "" },
+                best * 1e6,
+                2.0 * (m * rows * cols) as f64 / best / 1e12
+            );
         }
-        println!(
-            "gemm {label:24} m {m}: {:8.1} us  {:5.1} TFLOP/s",
-            best * 1e6,
-            2.0 * (m * rows * cols) as f64 / best / 1e12
-        );
     }
 }
 
