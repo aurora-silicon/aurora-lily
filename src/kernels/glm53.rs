@@ -578,7 +578,12 @@ pub fn moe_gate_up(
     ensure!(gate.rows.is_multiple_of(ff), "expert rows {} of {ff}", gate.rows);
     ensure!(sel.dtype() == DType::U32 && sel.numel() >= m * used, "selection");
     ensure!(mid.numel() >= m * used * ff, "mid of {}", mid.numel());
-    let name = moe_name(true, gate.ty)?;
+    // Two IQ2_XXS rows: an expert both rows picked is decoded once.
+    let name = if m == 2 && gate.ty == GgmlType::Iq2Xxs {
+        "glm53_moe_gate_up_iq2_xxs_m2"
+    } else {
+        moe_name(true, gate.ty)?
+    };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
