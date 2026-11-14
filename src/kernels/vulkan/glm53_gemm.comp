@@ -39,6 +39,27 @@ uint glm53_bf16_bits(float f) {
 #define GEMM_BX
 #endif
 
+// The _r128 expert variants: tiles of up to 128 rows, a subgroup taking 32
+// (moe_group's cap set to match). A row's sums are the same products in
+// the same order whatever tile it is in, so the results are the 64-row
+// kernels' bit for bit; an expert with 65 to 128 rows (a 4K prompt's
+// density) then decodes its weights once instead of twice.
+#ifdef KERNEL_glm53_gemm_moe_iq2_xxs_r128
+#define KERNEL_glm53_gemm_moe_iq2_xxs
+#define GM_SUB 32u
+#endif
+#ifdef KERNEL_glm53_gemm_moe_q2_k_r128
+#define KERNEL_glm53_gemm_moe_q2_k
+#define GM_SUB 32u
+#endif
+#ifdef KERNEL_glm53_gemm_moe_gate_up_iq2_xxs_r128
+#define KERNEL_glm53_gemm_moe_gate_up_iq2_xxs
+#define GM_SUB 32u
+#endif
+#ifndef GM_SUB
+#define GM_SUB 16u
+#endif
+
 #if defined(KERNEL_glm53_gemm_q8_0) || defined(KERNEL_glm53_gemm_q4_k) || \
     defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32) || \
     defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
@@ -339,11 +360,12 @@ void main() {
 // gate/up, the pair for down), Y row pairs[k]. X is bfloat (glm53_to_bf16,
 // glm53_moe_swiglu), read by each subgroup straight from device memory
 // (MAT_A_OF_ROWS). A threadgroup of four subgroups computes 64 rows x 64
-// columns; a subgroup owns 16 rows (none past the tile's: no multiplies)
-// and all 64 columns, and every thread dequantizes 8 weights of 4 weight
-// rows a 64-deep K step into the tile in the lanes' order (one load per B
-// operand), two tiles in turn so one barrier a step. The decoded values are
-// glm53_decode's, rounded to bfloat as before.
+// columns (128 rows, 32 a subgroup, in the _r128 variants); a subgroup
+// owns 16 rows (none past the tile's: no multiplies) and all 64 columns,
+// and every thread dequantizes 8 weights of 4 weight rows a 64-deep K step
+// into the tile in the lanes' order (one load per B operand), two tiles in
+// turn so one barrier a step. The decoded values are glm53_decode's,
+// rounded to bfloat as before.
 // Buffers: 0 X (bfloat), 1 W (the expert stack), 2 Y f32, 3 pairs u32,
 // 4 tiles u32 [3 per tile], 5 tile count u32. Params: 6 N (rows per
 // expert), 7 K (a multiple of 256), 8 row_bytes, 9 x_shift.
@@ -424,18 +446,23 @@ void main() {
     const uint64_t W = arg(1) + (uint64_t(expert) * N + n0) * row_bytes;
     [[unroll]] for (uint r = 0u; r < 4u; r++) wr[r] = W + uint64_t(min(4u * quad + r, N - 1u - n0)) * row_bytes;
 #endif
-    // The subgroup's rows, and its lanes' two rows of X (a row past the
-    // tile's reads the tile's last and is not stored).
-    const uint row0 = 16u * sg;
+    // The subgroup's rows, and its lanes' rows of X, two per 16 (a row
+    // past the tile's reads the tile's last and is not stored).
+    const uint row0 = GM_SUB * sg;
     const bool working = row0 < rows;
     const uint lane_row = mat_lane_row(), a_half = mat_a_half(), odd16 = 16u * mat_a_odd();
     const uint words = K / 8u;
-    const uint x0 = U32(arg(3)).v[first + min(row0 + lane_row, rows - 1u)] >> x_shift;
-    const uint x1 = U32(arg(3)).v[first + min(row0 + lane_row + 1u, rows - 1u)] >> x_shift;
-    const uint a_at0 = x0 * words, a_at1 = x1 * words;
+    uint a_at[GM_SUB / 8u];
+    [[unroll]] for (uint h = 0u; h < GM_SUB / 8u; h++) {
+        const uint r = row0 + 16u * (h >> 1u) + lane_row + (h & 1u);
+        a_at[h] = (U32(arg(3)).v[first + min(r, rows - 1u)] >> x_shift) * words;
+    }
     U32x4 xa = U32x4(arg(0));
     const uint lane_at = lane_row * 8u + mat_lane_col() / 4u;
-    MatC acc0 = MatC(0.0), acc1 = MatC(0.0), acc2 = MatC(0.0), acc3 = MatC(0.0);
+    MatC acc[GM_SUB / 16u][4];
+    [[unroll]] for (uint i = 0u; i < GM_SUB / 16u; i++) {
+        [[unroll]] for (uint c = 0u; c < 4u; c++) acc[i][c] = MatC(0.0);
+    }
     for (uint k0 = 0u; k0 < K; k0 += GM_STEP) {
         const uint tile_at = ((k0 / GM_STEP) & 1u) * (GM_STEP * 8u);
         {
@@ -448,20 +475,23 @@ void main() {
             [[unroll]] for (uint kk = 0u; kk < GM_STEP; kk += 16u) {
                 const uint at = (k0 + kk) / 8u + a_half;
                 const uint b_at = tile_at + lane_at + kk * 8u;
-                const uvec4 v0 = xa.v[a_at0 + at], v1 = xa.v[a_at1 + at];
+                uvec4 v[GM_SUB / 8u];
+                [[unroll]] for (uint h = 0u; h < GM_SUB / 8u; h++) v[h] = xa.v[a_at[h] + at];
                 const uvec4 b0 = gm_tile[b_at], b1 = gm_tile[b_at + 4u];
                 const uvec4 b2 = gm_tile[b_at + 8u], b3 = gm_tile[b_at + 12u];
-                MatA ma;
-                MatB mb;
-                MAT_A_OF_ROWS(ma, v0, v1, odd16)
-                MAT_OF_WORDS(mb, b0)
-                acc0 = coopMatMulAdd(ma, mb, acc0);
-                MAT_OF_WORDS(mb, b1)
-                acc1 = coopMatMulAdd(ma, mb, acc1);
-                MAT_OF_WORDS(mb, b2)
-                acc2 = coopMatMulAdd(ma, mb, acc2);
-                MAT_OF_WORDS(mb, b3)
-                acc3 = coopMatMulAdd(ma, mb, acc3);
+                [[unroll]] for (uint i = 0u; i < GM_SUB / 16u; i++) {
+                    MatA ma;
+                    MatB mb;
+                    MAT_A_OF_ROWS(ma, v[2u * i], v[2u * i + 1u], odd16)
+                    MAT_OF_WORDS(mb, b0)
+                    acc[i][0] = coopMatMulAdd(ma, mb, acc[i][0]);
+                    MAT_OF_WORDS(mb, b1)
+                    acc[i][1] = coopMatMulAdd(ma, mb, acc[i][1]);
+                    MAT_OF_WORDS(mb, b2)
+                    acc[i][2] = coopMatMulAdd(ma, mb, acc[i][2]);
+                    MAT_OF_WORDS(mb, b3)
+                    acc[i][3] = coopMatMulAdd(ma, mb, acc[i][3]);
+                }
             }
         }
     }
@@ -471,16 +501,17 @@ void main() {
     // mid[p][j] = w[p] * silu(min(g, L)) * clamp(u, -L, L) as bfloat (the
     // SwiGLU of glm53_moe_swiglu, from the same sums).
     const float limit = arg_f32(12);
+    [[unroll]] for (uint i = 0u; i < GM_SUB / 16u; i++)
     [[unroll]] for (uint h = 0u; h < 2u; h++) {
-        const uint r = row0 + lane_row + h;
+        const uint r = row0 + 16u * i + lane_row + h;
         if (r < rows) {
             const uint p = U32(arg(3)).v[first + r];
             const float we = F32(arg(7)).v[p];
             [[unroll]] for (uint half_ = 0u; half_ < 2u; half_++) {
                 uint b[4];
                 [[unroll]] for (uint c = 0u; c < 4u; c++) {
-                    float g = half_ == 0u ? acc0[4u * h + c] : acc1[4u * h + c];
-                    float u = half_ == 0u ? acc2[4u * h + c] : acc3[4u * h + c];
+                    float g = acc[i][half_][4u * h + c];
+                    float u = acc[i][2u + half_][4u * h + c];
                     if (limit > 1e-6) {
                         g = min(g, limit);
                         u = clamp(u, -limit, limit);
@@ -498,14 +529,15 @@ void main() {
         }
     }
 #else
+    [[unroll]] for (uint i = 0u; i < GM_SUB / 16u; i++)
     [[unroll]] for (uint h = 0u; h < 2u; h++) {
-        const uint r = row0 + lane_row + h;
+        const uint r = row0 + 16u * i + lane_row + h;
         if (r < rows) {
             const uint64_t y = arg(2) + 4u * uint64_t(U32(arg(3)).v[first + r]) * N;
-            F32x4(y).v[(col + 0u) / 4u] = vec4(acc0[4u * h], acc0[4u * h + 1u], acc0[4u * h + 2u], acc0[4u * h + 3u]);
-            F32x4(y).v[(col + 16u) / 4u] = vec4(acc1[4u * h], acc1[4u * h + 1u], acc1[4u * h + 2u], acc1[4u * h + 3u]);
-            F32x4(y).v[(col + 32u) / 4u] = vec4(acc2[4u * h], acc2[4u * h + 1u], acc2[4u * h + 2u], acc2[4u * h + 3u]);
-            F32x4(y).v[(col + 48u) / 4u] = vec4(acc3[4u * h], acc3[4u * h + 1u], acc3[4u * h + 2u], acc3[4u * h + 3u]);
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                F32x4(y).v[(col + 16u * c) / 4u] =
+                    vec4(acc[i][c][4u * h], acc[i][c][4u * h + 1u], acc[i][c][4u * h + 2u], acc[i][c][4u * h + 3u]);
+            }
         }
     }
 #endif
@@ -529,9 +561,9 @@ void main() {
 // Groups a run's routed pairs (row i, slot s: pair i * used + s) by expert:
 // pairs sorted by expert (order inside an expert arbitrary: each pair's
 // result goes to its own row), and a tile list of (expert, first, count)
-// with at most 64 pairs a tile. One threadgroup of 1024.
+// with at most `cap` pairs a tile. One threadgroup of 1024.
 // Buffers: 0 sel u32 [pairs], 1 pairs out, 2 tiles out [3 per tile], 3 tile
-// count out. Params: 4 number of pairs, 5 experts (<= 512).
+// count out. Params: 4 number of pairs, 5 experts (<= 512), 6 cap.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_glm53_moe_group
 shared uint counts[512];
@@ -539,6 +571,7 @@ shared uint offsets[512];
 void main() {
     const uint n = arg_u32(4);
     const uint E = arg_u32(5);
+    const uint cap = arg_u32(6);
     const uint tid = gl_LocalInvocationIndex;
     for (uint e = tid; e < E; e += 1024u) counts[e] = 0u;
     barrier();
@@ -549,10 +582,10 @@ void main() {
         for (uint e = 0u; e < E; e++) {
             const uint c = counts[e];
             offsets[e] = at;
-            for (uint s = 0u; s < c; s += 64u) {
+            for (uint s = 0u; s < c; s += cap) {
                 U32(arg(2)).v[3u * tiles] = e;
                 U32(arg(2)).v[3u * tiles + 1u] = at + s;
-                U32(arg(2)).v[3u * tiles + 2u] = min(64u, c - s);
+                U32(arg(2)).v[3u * tiles + 2u] = min(cap, c - s);
                 tiles++;
             }
             at += c;

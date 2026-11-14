@@ -481,14 +481,18 @@ pub fn moe_grouped(
     experts: usize,
     limit: f32,
 ) -> Result<()> {
+    // Tiles of up to 128 rows once an expert averages 48 pairs or more.
+    let tile_rows = if m * used >= 48 * experts { 128 } else { 64 };
     moe_grouped_with(
         ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true,
+        experts, limit, true, tile_rows,
     )
 }
 
 /// [`moe_grouped`]; `fuse_gate_up` false takes IQ2_XXS experts through the
-/// separate gate and up GEMMs and SwiGLU too (the tests' reference).
+/// separate gate and up GEMMs and SwiGLU too (the tests' reference);
+/// `tile_rows` (64 or 128) caps a tile's pairs (the results are the same
+/// either way).
 #[allow(clippy::too_many_arguments)]
 fn moe_grouped_with(
     ctx: &MetalContext,
@@ -508,7 +512,10 @@ fn moe_grouped_with(
     experts: usize,
     limit: f32,
     fuse_gate_up: bool,
+    tile_rows: usize,
 ) -> Result<()> {
+    ensure!(tile_rows == 64 || tile_rows == 128, "expert tiles of {tile_rows} rows");
+    let r128 = tile_rows == 128;
     let pairs = m * used;
     ensure!(
         sc.pairs.numel() >= pairs,
@@ -524,7 +531,7 @@ fn moe_grouped_with(
             sc.tiles.binding(),
             sc.tile_count.binding(),
         ],
-        &[&u32_bytes(pairs), &u32_bytes(experts)],
+        &[&u32_bytes(pairs), &u32_bytes(experts), &u32_bytes(tile_rows)],
         Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
     )?;
     ensure!(
@@ -533,13 +540,15 @@ fn moe_grouped_with(
     );
     to_bf16(ctx, pass, x, &sc.xb, m * hidden)?;
     pass.memory_barrier()?;
-    let max_tiles = pairs.div_ceil(64) + experts;
+    let max_tiles = pairs.div_ceil(tile_rows) + experts;
     let gemm_moe =
         |w: &QWeight, x: &Tensor, y: &Tensor, n: usize, x_shift: usize| -> Result<()> {
-            let name = match w.ty {
-                GgmlType::Iq2Xxs => "glm53_gemm_moe_iq2_xxs",
-                GgmlType::Q2K => "glm53_gemm_moe_q2_k",
-                other => anyhow::bail!("no grouped expert GEMM over {other:?}"),
+            let name = match (w.ty, r128) {
+                (GgmlType::Iq2Xxs, false) => "glm53_gemm_moe_iq2_xxs",
+                (GgmlType::Iq2Xxs, true) => "glm53_gemm_moe_iq2_xxs_r128",
+                (GgmlType::Q2K, false) => "glm53_gemm_moe_q2_k",
+                (GgmlType::Q2K, true) => "glm53_gemm_moe_q2_k_r128",
+                (other, _) => anyhow::bail!("no grouped expert GEMM over {other:?}"),
             };
             ensure!(
                 w.cols.is_multiple_of(256) && n.is_multiple_of(64),
@@ -579,8 +588,12 @@ fn moe_grouped_with(
             "grouped expert GEMM of {ff} x {}",
             gate.cols
         );
-        let pipeline =
-            ctx.pipeline("glm53_gemm_moe_gate_up_iq2_xxs", SOURCE, MslVersion::V3_1)?;
+        let name = if r128 {
+            "glm53_gemm_moe_gate_up_iq2_xxs_r128"
+        } else {
+            "glm53_gemm_moe_gate_up_iq2_xxs"
+        };
+        let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
         pass.dispatch_at(
             &pipeline,
             &[
