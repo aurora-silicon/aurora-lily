@@ -84,7 +84,9 @@ fn gemv_sets_match_cpu_for_every_type_width_and_row_count() {
     {
         // The model's widths: hidden 2560, hc up 320, shared down 640, GDN
         // out 6144, eh_proj halves 2560 of 5120.
-        for (cols, rows) in [(2560usize, 72usize), (320, 40), (640, 24), (6144, 9)] {
+        for (cols, rows) in
+            [(2560usize, 72usize), (320, 40), (640, 24), (6144, 9), (10240, 37)]
+        {
             if !cols.is_multiple_of(ty.block_values()) {
                 continue;
             }

@@ -75,7 +75,11 @@ pub fn gemv_sets(
     while width > tasks {
         width /= 2;
     }
-    let rows_per_tg = 8 * (32 / width);
+    // Few long rows (fewer than 128 threadgroups' worth): the threadgroup's
+    // subgroups split their tasks (see the kernel).
+    let total_rows: usize = sets.iter().map(|(w, _)| w.rows).sum();
+    let split = if total_rows < 1024 * width / 32 && tasks >= 128 { 8 } else { 1 };
+    let rows_per_tg = if split > 1 { 32 / width } else { 8 * (32 / width) };
     let mut groups = 0;
     let mut bf_mask = 0usize;
     for (s, &(w, y)) in sets.iter().enumerate() {
@@ -115,6 +119,7 @@ pub fn gemv_sets(
             &u32_bytes(x_row_stride),
             &u32_bytes(y_row_stride.unwrap_or(0)),
             &u32_bytes(bf_mask),
+            &u32_bytes(split),
         ],
         Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
     )

@@ -98,7 +98,11 @@ uint qg_width(uint tasks) {
 // 32 / width rows, width lanes striding a row's tasks.
 // Buffers: 0 x (bf16, rows x_row_stride apart), 1-4 W, 5-8 y. Params: 9 K,
 // 10-13 row_bytes, 14-17 rows (0: unused), 18 x_row_stride, 19 y_row_stride
-// (0: the set's rows), 20 bit s: set s writes bfloat16.
+// (0: the set's rows), 20 bit s: set s writes bfloat16, 21 split: 1, or 8
+// for weights of few long rows (the hyper-connection down projections, 320
+// rows of 10240: 40 threadgroups at a row per subgroup), whose threadgroup's
+// eight subgroups then share its rows' tasks and add their sums in shared
+// memory, in subgroup order.
 // Threadgroups of 256 threads.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_qg_gemv_q8_0_m1) || defined(KERNEL_qg_gemv_q8_0_m2) || \
@@ -118,6 +122,7 @@ uint qg_width(uint tasks) {
 #define QG_TYPE GLM53_Q4_K
 #endif
 #ifdef QG_TYPE
+shared float qg_red[8u * 32u * 4u];
 #if defined(KERNEL_qg_gemv_q8_0_m1) || defined(KERNEL_qg_gemv_f16_m1) || \
     defined(KERNEL_qg_gemv_f32_m1) || defined(KERNEL_qg_gemv_bf16_m1) || \
     defined(KERNEL_qg_gemv_q4_k_m1)
@@ -140,10 +145,11 @@ void main() {
     const uint x_row_stride = arg_u32(18);
     const uint y_stride_param = arg_u32(19);
     const uint bf_mask = arg_u32(20);
+    const uint split = arg_u32(21);
     const uint tasks = K / GLM53_TASK;
     const uint width = qg_width(tasks);
     const uint per_sg = 32u / width;
-    const uint rows_per_tg = 8u * per_sg;
+    const uint rows_per_tg = (split > 1u ? 1u : 8u) * per_sg;
     uint tg = gl_WorkGroupID.x;
     uint set = 0u;
     uint N = arg_u32(14);
@@ -161,13 +167,17 @@ void main() {
     const bool out_bf = ((bf_mask >> set) & 1u) != 0u;
     const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
     const uint lane = gl_SubgroupInvocationID;
-    const uint n = (tg * 8u + gl_SubgroupID) * per_sg + lane / width;
+    const uint sg_row = split > 1u ? 0u : gl_SubgroupID;
+    const uint n = (tg * (rows_per_tg / per_sg) + sg_row) * per_sg + lane / width;
     const uint sub = lane % width;
+    // Split: subgroup s takes tasks s width .. of every 8 width.
+    const uint t0 = sub + (split > 1u ? gl_SubgroupID * width : 0u);
+    const uint t_step = split * width;
     const bool live = n < N;
     const uint64_t row = W + uint64_t(min(n, N - 1u)) * row_bytes;
     float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
     const uint64_t xs = 2u * uint64_t(x_row_stride);
-    for (uint t = sub; t < tasks; t += width) {
+    for (uint t = t0; t < tasks; t += t_step) {
         float w[32];
         vec4 xv[8];
         qg_decode(QG_TYPE, row, t, w);
@@ -181,6 +191,25 @@ void main() {
     if (m > 1u) acc1 = qg_group_sum(acc1, width);
     if (m > 2u) acc2 = qg_group_sum(acc2, width);
     if (m > 3u) acc3 = qg_group_sum(acc3, width);
+    if (split > 1u) {
+        const uint slot = (gl_SubgroupID * 32u + lane / width) * 4u;
+        if (sub == 0u) {
+            qg_red[slot] = acc0;
+            qg_red[slot + 1u] = acc1;
+            qg_red[slot + 2u] = acc2;
+            qg_red[slot + 3u] = acc3;
+        }
+        barrier();
+        if (gl_SubgroupID != 0u) return;
+        acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+        for (uint g = 0u; g < 8u; g++) {
+            const uint at = (g * 32u + lane / width) * 4u;
+            acc0 += qg_red[at];
+            acc1 += qg_red[at + 1u];
+            acc2 += qg_red[at + 2u];
+            acc3 += qg_red[at + 3u];
+        }
+    }
     if (live && sub == 0u) {
         float acc[4] = float[4](acc0, acc1, acc2, acc3);
         [[unroll]] for (uint i = 0u; i < m; i++) {
