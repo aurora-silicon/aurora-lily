@@ -70,6 +70,7 @@ impl Config {
         };
         let f = |k: &str| g.f32(&format!("{ARCH}.{k}"));
         let n_layer = u("block_count")?;
+        ensure!(n_layer >= 1, "{ARCH}.block_count is 0");
         let array = |k: &str| -> Result<&Vec<Value>> {
             match g.get(&format!("{ARCH}.{k}")) {
                 Some(Value::Array(v)) => Ok(v),
@@ -91,8 +92,10 @@ impl Config {
             .collect::<Result<Vec<_>>>()?;
         let clamps = array("swiglu_clamp_exp")?;
         ensure!(clamps.len() >= n_layer, "swiglu_clamp_exp is shorter than the layers");
-        let swiglu_limit =
-            clamps[0].as_f32().context("swiglu_clamp_exp is not a float")?;
+        let swiglu_limit = clamps
+            .first()
+            .and_then(Value::as_f32)
+            .context("swiglu_clamp_exp is not a float")?;
         for (il, v) in clamps[..n_layer].iter().enumerate() {
             ensure!(
                 v.as_f32() == Some(swiglu_limit),
@@ -216,7 +219,7 @@ impl Config {
 
     /// The shape DeepSeek V4 Flash has; the kernels assume these numbers.
     pub fn validate(&self) -> Result<()> {
-        let want: [(&str, usize, usize); 17] = [
+        let want: [(&str, usize, usize); 18] = [
             ("block_count", self.n_layer, 43),
             ("embedding_length", self.hidden, 4096),
             ("vocab_size", self.vocab, 129280),
@@ -233,6 +236,8 @@ impl Config {
             ("attention.sliding_window", self.window, 128),
             ("attention.indexer.head_count", self.indexer_heads, 64),
             ("attention.indexer.key_length", self.indexer_dim, 128),
+            // The GPU path selects, allocates and attends a fixed 512 rows.
+            ("attention.indexer.top_k", self.indexer_top_k, 512),
             ("hyper_connection.count", self.n_hc, 4),
         ];
         for (name, got, expected) in want {
@@ -241,11 +246,6 @@ impl Config {
                 "DeepSeek V4 Flash {name} is {got}, lily's kernels need {expected}"
             );
         }
-        ensure!(
-            self.indexer_top_k >= 1,
-            "indexer top_k {} must be positive",
-            self.indexer_top_k
-        );
         ensure!(
             self.sinkhorn_iters >= 1,
             "Sinkhorn iterations {}",

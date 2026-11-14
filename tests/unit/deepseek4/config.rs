@@ -200,11 +200,24 @@ fn other_shapes_are_refused() {
         ("yarn", set("rope.scaling.factor", Meta::F(8.0)), "rope.scaling.factor"),
         ("kv heads", set("attention.head_count_kv", Meta::U(2)), "head_count_kv"),
         ("norm", set("expert_weights_norm", Meta::B(false)), "expert_weights_norm"),
+        ("top_k 1", set("attention.indexer.top_k", Meta::U(1)), "indexer.top_k"),
+        ("top_k 1024", set("attention.indexer.top_k", Meta::U(1024)), "indexer.top_k"),
     ];
     for (what, meta, msg) in cases {
         let e = parse("bad.gguf", &meta).unwrap_err();
         assert!(format!("{e:#}").contains(msg), "{what}: {e:#}");
     }
+    // No layers: refused before any per-layer array is indexed.
+    let mut v = set("block_count", Meta::U(0));
+    for (k, m) in v.iter_mut() {
+        if k.ends_with("compress_ratios") {
+            *m = Meta::Us(vec![]);
+        } else if k.ends_with("swiglu_clamp_exp") {
+            *m = Meta::Fs(vec![]);
+        }
+    }
+    let e = parse("zero.gguf", &v).unwrap_err();
+    assert!(format!("{e:#}").contains("block_count is 0"), "{e:#}");
     let mut v = metadata();
     v.push((format!("{ARCH}.checkpoint_variant"), Meta::S("vision-exp")));
     let e = parse("variant.gguf", &v).unwrap_err();
