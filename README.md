@@ -1,4 +1,4 @@
-# lily on Linux: Qwen3.8-Flash-Next and GLM 5.3 Flash on the Apple M5 Max
+# lily on Linux: Qwen3.8-Flash-Next, GLM 5.3 Flash and DeepSeek V4 Flash on the Apple M5 Max
 
 This fork runs [lily](https://github.com/perplexityai/pplx-garden/tree/main/lily),
 a compact inference server with hand-written GPU kernels, on **Linux on an
@@ -8,7 +8,7 @@ Apple M5 Max**, through Vulkan, and serves more than one model family:
 |---|---|---|
 | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | lily's own 4-bit conversions (q4-xl, q4) | runs |
 | GLM 5.3 Flash | antirez's Q2 GGUF, loaded as it is | runs |
-| DeepSeek V4 Flash | antirez's Q2 GGUF | in progress |
+| DeepSeek V4 Flash | antirez's Q2 GGUF and DSpark file, loaded as they are | runs |
 
 It is developed on a 16-inch M5 Max MacBook Pro with 128 GB (J716c) running
 the [aurora-silicon](https://github.com/aurora-silicon) Linux kernel and
@@ -36,7 +36,8 @@ Mesa's Honeykrisp Vulkan driver. The server is OpenAI-compatible
 - **ggml**: the GGUF block formats (Q8_0, Q4_K, Q2_K, IQ2_XXS) the decoders
   reproduce bit for bit.
 - **This fork**: the Vulkan backend and the GLSL port of every kernel, GLM
-  5.3 Flash support, and the GPU work on Linux it needed (below).
+  5.3 Flash and DeepSeek V4 Flash support, and the GPU work on Linux it
+  needed (below).
 
 `NOTICE` lists the upstream copyrights and licenses.
 
@@ -71,6 +72,20 @@ GLM reads about 10 GB of weights per token (Qwen about 4.4), so plain decode
 is bounded near 48 tok/s by memory bandwidth. On ds4's 100 official GLM 5.3
 Flash continuations lily scores an NLL of 0.466 per token with 89/100 first
 tokens matched, close to ds4's own references (0.458 to 0.462, 89 to 90/100).
+
+**DeepSeek V4 Flash (Q2 GGUF)** (`lily-ds4 bench` / `spec`):
+
+| | tok/s |
+|---|---:|
+| prefill, 1K / 4K prompt | ~560 / ~470-505 |
+| decode, no drafts | ~36 |
+| decode with DSpark, code | ~57 |
+| decode with DSpark, English prose | ~41 |
+| decode with DSpark, raw Italian text | ~37 |
+
+On ds4's 100 official DeepSeek V4 Flash continuations lily scores an NLL of
+0.395 per token with 57/100 first tokens matched (ds4's reference for this
+file: 0.398, 56/100).
 
 In daily agent use, short turns spend most of their prefill time on fixed
 per-request costs, and decode is often faster than these numbers because
@@ -111,12 +126,17 @@ cargo build --release --locked
 ./target/release/lily --model ~/models/GLM-5.3-Flash-Q2/GLM-5.3-Flash-Q2.gguf \
   --bind 127.0.0.1:8001 --max-seq 65536 --cache-bytes 9G --pin-weights off \
   --mtp-drafts 1 --max-batch 1
+
+# DeepSeek V4 Flash (DSpark's support file is found beside the model)
+./target/release/lily --model ~/models/DeepSeek-V4-Flash-Q2/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
+  --bind 127.0.0.1:8002 --max-seq 65536 --cache-bytes 9G --pin-weights off \
+  --mtp-drafts 5 --max-batch 1
 ```
 
 Only one model fits in 128 GB at a time; every loader takes a machine-wide
 instance lock before mapping weights. [docs/glm53.md](docs/glm53.md) has
 GLM's checkpoint, memory, differences from ds4 and what is not implemented
-yet. [src/kernels/vulkan/PORTING.md](src/kernels/vulkan/PORTING.md) describes
+yet; [docs/deepseek4.md](docs/deepseek4.md) the same for DeepSeek V4 Flash. [src/kernels/vulkan/PORTING.md](src/kernels/vulkan/PORTING.md) describes
 the Vulkan port.
 
 ## The Linux port
@@ -155,6 +175,17 @@ real weights and end to end against ds4's official continuations.
 Speculative decoding uses the MTP block, one draft a step, proposed only when
 the draft is confident enough to pay for the two-row verify pass.
 
+## DeepSeek V4 Flash
+
+DeepSeek V4 Flash (43 layers of multi-query attention over a 128-row window
+plus compressed rows, ratio 4 with a sparse indexer or ratio 128 by layer,
+FP8 KV rounding, 256 routed experts with 6 active and a shared one, four
+hyper-connection streams) runs from antirez's Q2 GGUF as published, checked
+against a schema of every tensor; `src/deepseek4/` holds the model and a CPU
+reference of every operation. Speculative decoding uses DSpark, antirez's
+three-stage block drafter (`--mtp-drafts 5`), which drafts up to five tokens
+a step and backs off when its drafts keep being rejected.
+
 ## Qwen3.8-Flash-Next
 
 Qwen's `qwen4_exp` preview architecture: 48 layers (36 Gated DeltaNet, 12
@@ -191,7 +222,8 @@ cargo test --locked
 runs the kernel tests against CPU references, the shader compilation test and
 the API tests on the local GPU through Vulkan; they need no
 checkpoint. Tests that need weights are ignored by default and take
-`LILY_MODEL_DIR_FLASH` (Qwen) or `LILY_GLM53_GGUF` (GLM).
+`LILY_MODEL_DIR_FLASH` (Qwen), `LILY_GLM53_GGUF` (GLM) or `LILY_DS4_GGUF`
+(DeepSeek).
 [CONTRIBUTING.md](CONTRIBUTING.md) has the gates.
 
 ## License
