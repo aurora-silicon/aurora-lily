@@ -1706,6 +1706,15 @@ fn read_config(model_dir: &Path) -> Result<Value> {
 fn gguf_config(path: &Path) -> Result<Value> {
     let g = crate::gguf::Gguf::open(path)?;
     let arch = g.architecture()?.to_string();
+    if arch == crate::qwen4exp::gguf::ARCH {
+        // Qwen3.8-Flash-Next in llama.cpp's schema: lily's model type.
+        let cfg = crate::qwen4exp::gguf::config_from_gguf(&g)?;
+        return Ok(serde_json::json!({
+            "model_type": "qwen4_exp",
+            "eos_token_id": cfg.eos_token_id.as_vec(),
+            "max_position_embeddings": cfg.max_position_embeddings,
+        }));
+    }
     let mut config = serde_json::json!({ "model_type": arch });
     if arch == crate::deepseek4::config::ARCH {
         let stops = crate::deepseek4::tokenizer::stop_ids(&g)?;

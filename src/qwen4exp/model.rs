@@ -1633,8 +1633,18 @@ impl Qwen4ExpModel {
         expert_usage_out: Option<std::path::PathBuf>,
         session_context: Option<weights::SessionContext>,
     ) -> Result<Self> {
-        let config = Qwen4ExpConfig::from_model_dir(&dir)?;
-        let checkpoint_id = super::config::checkpoint_identity(dir.as_ref())?;
+        let gguf_file = super::gguf::is_qwen_gguf(dir.as_ref());
+        let config = if gguf_file {
+            super::gguf::config_from_gguf(&crate::gguf::Gguf::open(dir.as_ref())?)?
+        } else {
+            Qwen4ExpConfig::from_model_dir(&dir)?
+        };
+        let checkpoint_id = if gguf_file {
+            let len = std::fs::metadata(dir.as_ref())?.len();
+            format!("gguf:{}:{len}", dir.as_ref().display())
+        } else {
+            super::config::checkpoint_identity(dir.as_ref())?
+        };
         ensure!(
             config.linear_key_head_dim == GDN_HEAD_DIM
                 && config.linear_value_head_dim == GDN_HEAD_DIM,
@@ -1646,20 +1656,24 @@ impl Qwen4ExpModel {
             "indexer head dim {} unsupported (kernels are compiled for {INDEXER_D})",
             config.indexer.head_dim
         );
-        let weights = weights::load(
-            ctx,
-            &dir,
-            &config,
-            storage,
-            with_mtp,
-            vision == VisionMode::Auto,
-            expert_slots,
-            expert_usage,
-            machine_memory,
-            memory_limit,
-            expert_usage_out,
-            session_context,
-        )?;
+        let weights = if gguf_file {
+            super::gguf::load(ctx, dir.as_ref(), &config, with_mtp)?
+        } else {
+            weights::load(
+                ctx,
+                &dir,
+                &config,
+                storage,
+                with_mtp,
+                vision == VisionMode::Auto,
+                expert_slots,
+                expert_usage,
+                machine_memory,
+                memory_limit,
+                expert_usage_out,
+                session_context,
+            )?
+        };
         let hasher = match &config.ple {
             Some(p) => Some(NgramHasher::new(
                 &p.layer_multipliers,

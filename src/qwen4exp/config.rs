@@ -876,7 +876,7 @@ impl Qwen4ExpConfig {
 
     /// The kernels are written for Qwen3.8-Flash-Next's exact shape; refuse
     /// anything else loudly rather than run subtly wrong.
-    fn validate_flash_next(&self) -> Result<()> {
+    pub(super) fn validate_flash_next(&self) -> Result<()> {
         let layer_pattern = self.layer_types.iter().enumerate().all(|(i, ty)| {
             *ty == if i % 4 == 3 {
                 LayerType::FullAttention
