@@ -253,6 +253,28 @@ impl Glm53Model {
     }
 }
 
+/// A draft whose probability under the MTP head is below this is not
+/// proposed. An empirical scheduling heuristic on the raw MTP confidence
+/// (the head's softmax at temperature 1 over the whole vocabulary, before
+/// the request's penalties or truncation), not a calibrated acceptance
+/// probability under every sampler. A verify pass of two rows costs about
+/// 37 ms against 28 for one row (M5 Max, 2026-11-14), so a draft pays when
+/// it is accepted more than about 30% of the time; greedy drafts of
+/// probability 0.2-0.3 were accepted 34% of the time, below 0.2 20%, from
+/// 0.5 up more than half. Skipping the drafts below 0.3 (two interleaved
+/// greedy runs): raw Italian 36.7 -> 38.7 tok/s, raw English 37.2 -> 37.9,
+/// raw C 45.2 -> 45.8, chat prose 43.1 -> 44.0, chat code unchanged (48.1).
+const DRAFT_MIN_PROB: f32 = 0.3;
+
+impl Glm53Model {
+    /// The MTP step's draft as a proposal list: empty when its probability
+    /// is below [`Self::draft_min_prob`].
+    fn proposal(&self, scratch: &Scratch, draft: u32) -> Result<Vec<u32>> {
+        let p = scratch.mtp_prob.to_f32()?[0];
+        Ok(if p >= self.draft_min_prob { vec![draft] } else { Vec::new() })
+    }
+}
+
 impl LanguageModel for Glm53Model {
     type State = Glm53State;
     type Scratch = Scratch;
@@ -262,6 +284,7 @@ impl LanguageModel for Glm53Model {
     fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
         let mut model = Glm53Model::load(ctx, path)?;
         model.mtp = options.mtp_drafts > 0;
+        model.draft_min_prob = DRAFT_MIN_PROB;
         Ok(model)
     }
 
@@ -289,7 +312,7 @@ impl LanguageModel for Glm53Model {
             state.mtp_min = Some(p);
         }
         let draft = self.mtp_step(ctx, state, scratch, first, 0, p, true)?;
-        Ok(vec![draft])
+        self.proposal(scratch, draft)
     }
 
     fn verify<'a>(
@@ -308,36 +331,37 @@ impl LanguageModel for Glm53Model {
         ensure!(state.spec.is_none(), "a verify pass is already pending");
         state.ensure_capacity(ctx, state.pos + rows)?;
         scratch.stage_spec_tokens(pending, drafts)?;
-        let pass = self.begin(ctx)?;
         // KDA keeps the state after row 0 aside: the rollback if row 1's
         // draft is rejected.
         let snap = (rows > 1).then_some(0);
-        self.encode(
+        let vocab = self.cfg.vocab;
+        let sc: &Scratch = scratch;
+        self.run_step(
             ctx,
-            &pass,
             state,
-            scratch,
-            &scratch.spec_tokens,
+            sc,
+            &sc.spec_tokens,
             rows,
             Logits::All,
             snap,
+            |pass| {
+                for r in 0..rows {
+                    let logits = sc.logits.view(r * vocab, &[vocab])?;
+                    let out = sc.draws.view(r, &[1])?;
+                    sample_f32(
+                        ctx,
+                        pass,
+                        &logits,
+                        sc.sampler(),
+                        params,
+                        step0 + r,
+                        &out,
+                    )?;
+                    pass.memory_barrier()?;
+                }
+                Ok(())
+            },
         )?;
-        let vocab = self.cfg.vocab;
-        for r in 0..rows {
-            let logits = scratch.logits.view(r * vocab, &[vocab])?;
-            let out = scratch.draws.view(r, &[1])?;
-            sample_f32(
-                ctx,
-                &pass,
-                &logits,
-                scratch.sampler(),
-                params,
-                step0 + r,
-                &out,
-            )?;
-            pass.memory_barrier()?;
-        }
-        pass.commit_wait()?;
         let draws = scratch.draws.to_u32()?[..rows].to_vec();
         state.spec = Some((state.pos, rows, draws.clone()));
         state.pos += rows;
@@ -396,7 +420,7 @@ impl LanguageModel for Glm53Model {
             }
             pass.commit_wait()?;
             state.mtp_next = Some(pos0 + accepted + 1);
-            proposals.push(scratch.mtp_io.to_u32()?[1]);
+            proposals = self.proposal(scratch, scratch.mtp_io.to_u32()?[1])?;
         } else {
             state.mtp_next = None;
         }

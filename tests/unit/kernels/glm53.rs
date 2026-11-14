@@ -213,6 +213,111 @@ fn moe_gate_up_and_down_match_cpu() {
     assert_eq!(both.to_f32().unwrap(), expect);
 }
 
+/// The two-row expert kernels (gate/up: an expert both rows picked decoded once)
+/// give each row exactly what the one-row kernels give it, for selections
+/// sharing 0, 1, 3 and 8 experts in any order, with and without the added
+/// shared-expert output.
+#[test]
+fn moe_two_rows_match_one_row_exactly() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(56);
+    let (experts, hidden, ff, used) = (20, 512, 256, 8);
+    let g_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
+    let u_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
+    let d_raw = random_blocks(&mut rng, GgmlType::Q2K, experts * hidden * ff);
+    let gw = QWeight::from_bytes(&ctx, &g_raw, GgmlType::Iq2Xxs, hidden, experts * ff)
+        .unwrap();
+    let uw = QWeight::from_bytes(&ctx, &u_raw, GgmlType::Iq2Xxs, hidden, experts * ff)
+        .unwrap();
+    let dw =
+        QWeight::from_bytes(&ctx, &d_raw, GgmlType::Q2K, ff, experts * hidden).unwrap();
+    let x = f32s(&mut rng, 2 * hidden, -2.0, 2.0);
+    let add = f32s(&mut rng, 2 * hidden, -1.0, 1.0);
+    let wts = f32s(&mut rng, 2 * used, 0.1, 0.6);
+    let row0: Vec<u32> = vec![3, 7, 0, 12, 19, 5, 9, 14];
+    let cases: [Vec<u32>; 5] = [
+        vec![1, 2, 4, 6, 8, 10, 11, 13],
+        vec![1, 2, 4, 6, 8, 10, 11, 3],
+        vec![14, 2, 12, 6, 8, 3, 11, 13],
+        vec![14, 9, 5, 19, 12, 0, 7, 3],
+        vec![3, 7, 0, 12, 19, 5, 9, 14],
+    ];
+    for (c, row1) in cases.iter().enumerate() {
+        let sel: Vec<u32> = row0.iter().chain(row1).copied().collect();
+        let u32t = |v: &[u32]| {
+            Tensor::from_bytes(&ctx, bytemuck::cast_slice(v), &[v.len()], DType::U32)
+                .unwrap()
+        };
+        let tsel = u32t(&sel);
+        let tx = tensor(&ctx, &x);
+        let tw = tensor(&ctx, &wts);
+        for with_add in [false, true] {
+            // Both rows at once.
+            let mid = zeros(&ctx, 2 * used * ff);
+            let out = tensor(&ctx, &add);
+            run(&ctx, |p| {
+                moe_gate_up(
+                    &ctx, p, &gw, &uw, ff, &tx, &tsel, &tw, &mid, 2, used, 0.05,
+                )
+                .unwrap();
+                p.memory_barrier().unwrap();
+                let a = with_add.then_some(&out);
+                moe_down(&ctx, p, &dw, hidden, &mid, &tsel, a, &out, 2, used).unwrap();
+            });
+            // Each row alone.
+            let mid_all = mid.to_f32().unwrap();
+            let out_all = out.to_f32().unwrap();
+            for i in 0..2 {
+                let xi = tensor(&ctx, &x[i * hidden..(i + 1) * hidden]);
+                let si = u32t(&sel[i * used..(i + 1) * used]);
+                let wi = tensor(&ctx, &wts[i * used..(i + 1) * used]);
+                let mi = zeros(&ctx, used * ff);
+                let oi = tensor(&ctx, &add[i * hidden..(i + 1) * hidden]);
+                run(&ctx, |p| {
+                    moe_gate_up(
+                        &ctx, p, &gw, &uw, ff, &xi, &si, &wi, &mi, 1, used, 0.05,
+                    )
+                    .unwrap();
+                    p.memory_barrier().unwrap();
+                    let a = with_add.then_some(&oi);
+                    moe_down(&ctx, p, &dw, hidden, &mi, &si, a, &oi, 1, used).unwrap();
+                });
+                assert_eq!(
+                    mi.to_f32().unwrap(),
+                    &mid_all[i * used * ff..(i + 1) * used * ff],
+                    "case {c} row {i}: mid"
+                );
+                assert_eq!(
+                    oi.to_f32().unwrap(),
+                    &out_all[i * hidden..(i + 1) * hidden],
+                    "case {c} row {i} add {with_add}: out"
+                );
+            }
+        }
+    }
+}
+
+/// glm53_top_prob against the CPU softmax maximum.
+#[test]
+fn top_prob_matches_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(58);
+    for (n, spread) in [(154_880usize, 12.0f32), (1000, 1.0), (5, 40.0)] {
+        let l = f32s(&mut rng, n, -spread, spread);
+        let tl = tensor(&ctx, &l);
+        let out = zeros(&ctx, 1);
+        run(&ctx, |p| top_prob(&ctx, p, &tl, &out, n).unwrap());
+        let mx = l.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let z: f64 = l.iter().map(|&v| f64::from(v - mx).exp()).sum();
+        let got = out.to_f32().unwrap()[0];
+        assert!(
+            (f64::from(got) - 1.0 / z).abs() <= 1e-5 / z,
+            "n={n}: {got} vs {}",
+            1.0 / z
+        );
+    }
+}
+
 #[test]
 fn router_matches_cpu() {
     let ctx = ctx();
@@ -2098,5 +2203,132 @@ fn moe_grouped_q2_k_gate_up_matches_per_pair_kernels() {
     let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
     for (k, (x, y)) in a.iter().zip(&b).enumerate() {
         assert!((x - y).abs() <= 3e-2 * scale, "element {k}: {x} vs {y}");
+    }
+}
+
+/// The decode GEMVs at one and more rows (the verify pass's m = 2): the
+/// step's main shapes, best of five passes of `LILY_GLM53_REPEAT` calls over
+/// four weight copies; rows from `LILY_GLM53_ROWS` (default "1,2").
+#[test]
+#[ignore = "timing only"]
+fn gemv_rows_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(68);
+    let repeat: usize = std::env::var("LILY_GLM53_REPEAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let rows_list: Vec<usize> = std::env::var("LILY_GLM53_ROWS")
+        .unwrap_or_else(|_| "1,2".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let shapes = [
+        ("kda_v Q8_0 8192x4096", GgmlType::Q8_0, 4096, 8192),
+        ("kda_out Q8_0 4096x8192", GgmlType::Q8_0, 8192, 4096),
+        ("shexp Q8_0 2048x4096", GgmlType::Q8_0, 4096, 2048),
+        ("q_a Q8_0 1536x4096", GgmlType::Q8_0, 4096, 1536),
+        ("f_b Q8_0 8192x128", GgmlType::Q8_0, 128, 8192),
+        ("kda_q Q4_K 8192x4096", GgmlType::Q4K, 4096, 8192),
+        ("router F32 288x4096", GgmlType::F32, 4096, 288),
+    ];
+    for (label, ty, cols, rows) in shapes {
+        let ws: Vec<QWeight> = (0..4)
+            .map(|_| {
+                let raw = random_blocks(&mut rng, ty, rows * cols);
+                QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+            })
+            .collect();
+        let mut line = format!("{label:24}");
+        for &m in &rows_list {
+            let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
+            let y = zeros(&ctx, m * rows);
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let pass = ctx.begin().unwrap();
+                for r in 0..repeat {
+                    gemv(&ctx, &pass, &ws[r % 4], &x, &y, m).unwrap();
+                }
+                let t = std::time::Instant::now();
+                pass.commit_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            line += &format!("  m={m} {:6.1} us", best / repeat as f64 * 1e6);
+        }
+        println!("{line}");
+    }
+}
+
+/// The routed experts' kernels for two rows (a verify pass) sharing
+/// `shared` of their 8 experts, against one row: model shapes as
+/// [`moe_timing`]. Prints us a layer for gate/up and down.
+#[test]
+#[ignore = "timing only"]
+fn moe_rows_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(69);
+    let repeat: usize = std::env::var("LILY_GLM53_REPEAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let (experts, hidden, ff, used) = (32, 4096, 2048, 8);
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let layers: Vec<(QWeight, QWeight, QWeight)> = (0..4)
+        .map(|_| {
+            (
+                mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff),
+                mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff),
+                mk(&mut rng, GgmlType::Q2K, ff, experts * hidden),
+            )
+        })
+        .collect();
+    let x = tensor(&ctx, &f32s(&mut rng, 2 * hidden, -1.0, 1.0));
+    let tw = tensor(&ctx, &vec![0.3f32; 2 * used]);
+    let mid = zeros(&ctx, 2 * used * ff);
+    let out = zeros(&ctx, 2 * hidden);
+    for (m, shared) in [(1usize, 0usize), (2, 0), (2, 2), (2, 4), (2, 8)] {
+        // Row 0 takes experts 0, 3, 6, ..; row 1 the first `shared` of
+        // those (in another order) and then experts of its own.
+        let mut sel: Vec<u32> = (0..used as u32).map(|i| i * 3).collect();
+        let mut second: Vec<u32> = (0..shared as u32).rev().map(|i| i * 3).collect();
+        second.extend((0..(used - shared) as u32).map(|i| i * 3 + 1));
+        sel.extend(second);
+        let tsel = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&sel),
+            &[sel.len()],
+            DType::U32,
+        )
+        .unwrap();
+        let mut line = format!("moe m={m} shared {shared}:");
+        for part in 0..2 {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let pass = ctx.begin().unwrap();
+                for r in 0..repeat {
+                    let (g, u, d) = &layers[r % 4];
+                    if part == 0 {
+                        moe_gate_up(
+                            &ctx, &pass, g, u, ff, &x, &tsel, &tw, &mid, m, used, 10.0,
+                        )
+                        .unwrap();
+                    } else {
+                        moe_down(
+                            &ctx, &pass, d, hidden, &mid, &tsel, None, &out, m, used,
+                        )
+                        .unwrap();
+                    }
+                }
+                let t = std::time::Instant::now();
+                pass.commit_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            let name = if part == 0 { "gate_up" } else { "down" };
+            line += &format!("  {name} {:6.1} us", best / repeat as f64 * 1e6);
+        }
+        println!("{line}");
     }
 }

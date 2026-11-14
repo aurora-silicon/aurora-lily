@@ -191,6 +191,10 @@ pub struct Glm53Model {
     output_norm: Tensor,
     /// Whether the engine speculates with the MTP block (`--mtp-drafts`).
     pub mtp: bool,
+    /// The engine proposes the MTP block's draft only when its softmax
+    /// probability is at least this; otherwise the next verify pass is a
+    /// one-row step.
+    pub draft_min_prob: f32,
 }
 
 impl Glm53Model {
@@ -317,6 +321,7 @@ impl Glm53Model {
             output,
             output_norm,
             mtp: false,
+            draft_min_prob: 0.0,
         })
     }
 
@@ -531,6 +536,8 @@ pub struct Scratch {
     mtp_h1: Tensor,
     /// U32[S]: the cache rows the MTP head attends.
     mtp_sel: Tensor,
+    /// F32[1]: the MTP draft's softmax probability.
+    pub mtp_prob: Tensor,
 }
 
 /// Writes `words` to the start of the U32 tensor `t` and zeroes the rest:
@@ -640,6 +647,7 @@ impl Scratch {
             mtp_x: f(cfg.hidden)?,
             mtp_h1: f(cfg.hidden)?,
             mtp_sel: u(s)?,
+            mtp_prob: f(1)?,
         })
     }
 
@@ -670,6 +678,39 @@ pub struct LayerTrace {
     pub h: Vec<f32>,
 }
 
+/// One layer of [`Glm53Model::step_layers`], row-major over the step's rows.
+#[derive(Default, Clone)]
+pub struct StepLayer {
+    pub attn_out: Vec<f32>,
+    /// The FFN's input (after the HC pre).
+    pub ffn_in: Vec<f32>,
+    pub ffn_out: Vec<f32>,
+    /// Routed layers: each row's selected experts, as the GPU chose them.
+    pub sel: Vec<u32>,
+    /// Routed layers: each row's 8th-best minus 9th-best selection score
+    /// (sigmoid(logit) + bias), reconstructed on the CPU (its own `exp`)
+    /// from the GPU's router logits: near-tie evidence, not the GPU's own
+    /// scores.
+    pub margin: Vec<f32>,
+}
+
+/// The first fed position below `end`, and its layer, where two runs'
+/// routing records (by state position: per layer the sorted selected
+/// experts) differ; positions only one run has are skipped. `end` limits
+/// the search to the rows both runs fed with the same tokens: for outputs
+/// that first differ at decode token `d` after a prompt of `n` tokens it is
+/// `n + d` (position `n + d - 1` consumes the last common token).
+pub fn first_routing_difference(
+    a: &std::collections::BTreeMap<usize, Vec<Vec<u32>>>,
+    b: &std::collections::BTreeMap<usize, Vec<Vec<u32>>>,
+    end: usize,
+) -> Option<(usize, usize)> {
+    a.range(..end).find_map(|(&p, la)| {
+        let lb = b.get(&p)?;
+        la.iter().zip(lb).position(|(x, y)| x != y).map(|il| (p, il))
+    })
+}
+
 impl Glm53Model {
     /// Feeds `tokens` (at most [`MAX_ROWS`]) at the state's position and
     /// leaves the last row's logits in `scratch.logits` when `logits`.
@@ -683,6 +724,67 @@ impl Glm53Model {
     ) -> Result<()> {
         let l = if logits { Logits::Last } else { Logits::None };
         self.forward_inner(ctx, st, sc, tokens, l, None)
+    }
+
+    /// A decode/verify step of `tokens` (at most [`MAX_ROWS`]) through the
+    /// production kernels (`run_step`'s), one pass a layer, reading each
+    /// layer's intermediates back (diagnostics: `lily-glm53 spec-diff`).
+    /// Advances the state; returns the layers and every row's logits.
+    pub fn step_layers(
+        &self,
+        ctx: &MetalContext,
+        st: &mut Glm53State,
+        sc: &mut Scratch,
+        tokens: &[u32],
+    ) -> Result<(Vec<StepLayer>, Vec<f32>)> {
+        let cfg = &self.cfg;
+        let m = tokens.len();
+        ensure!((1..=MAX_ROWS).contains(&m), "step of {m} rows");
+        ensure!(st.pos + m <= st.capacity, "state capacity {}", st.capacity);
+        sc.stage_tokens(tokens)?;
+        let snap = (m > 1).then_some(0);
+        let mut out = Vec::with_capacity(cfg.n_trunk);
+        for il in 0..cfg.n_trunk {
+            let pass = self.begin(ctx)?;
+            let r = il..il + 1;
+            self.encode_layers(
+                ctx,
+                &pass,
+                st,
+                sc,
+                &sc.tokens,
+                m,
+                Logits::All,
+                snap,
+                r,
+            )?;
+            pass.commit_wait()?;
+            let mut l = StepLayer {
+                attn_out: read(&sc.attn_out, m * cfg.hidden)?,
+                ffn_in: read(&sc.xn, m * cfg.hidden)?,
+                ffn_out: read(&sc.ffn_out, m * cfg.hidden)?,
+                ..Default::default()
+            };
+            if let FfnW::Moe { bias, .. } = &self.layers[il].ffn {
+                let (e, k) = (cfg.n_expert, cfg.n_expert_used);
+                l.sel = sc.rsel.to_u32()?[..m * k].to_vec();
+                let logits = read(&sc.rlogits, m * e)?;
+                let bias = bias.to_f32()?;
+                for row in logits.chunks(e) {
+                    let mut sc: Vec<f32> = row
+                        .iter()
+                        .zip(&bias)
+                        .map(|(&x, &b)| 1.0 / (1.0 + (-x).exp()) + b)
+                        .collect();
+                    sc.sort_by(|a, b| b.total_cmp(a));
+                    l.margin.push(sc[k - 1] - sc[k]);
+                }
+            }
+            out.push(l);
+        }
+        let logits = read(&sc.logits, m * cfg.vocab)?;
+        st.pos += m;
+        Ok((out, logits))
     }
 
     /// [`Self::forward`] with the logits of every row.
@@ -897,10 +999,7 @@ impl Glm53Model {
     ) -> Result<()> {
         let n = self.cfg.n_trunk;
         if m <= MAX_ROWS {
-            let pass = self.begin(ctx)?;
-            self.encode(ctx, &pass, st, sc, &sc.tokens, m, logits, None)?;
-            tail(&pass)?;
-            return pass.commit_wait();
+            return self.run_step(ctx, st, sc, &sc.tokens, m, logits, None, tail);
         }
         let mut pending: std::collections::VecDeque<crate::metal::PendingPass<'_>> =
             std::collections::VecDeque::new();
@@ -934,6 +1033,66 @@ impl Glm53Model {
             p.wait()?;
         }
         Ok(())
+    }
+
+    /// Runs a step of `m` <= [`MAX_ROWS`] rows synchronously (the verify
+    /// pass, `forward` and `run_rows`; tokens read from `tokens` on the
+    /// GPU), `tail` encoded at its end, and waits. The engine's ordinary
+    /// decode step (`encode_decode_step`) stays one pass: the generation
+    /// loop encodes it while the step before runs. Here the step goes to
+    /// the GPU in four passes, the first after two layers are encoded, so
+    /// the GPU works while the host encodes the rest: in a speculative loop
+    /// the host waits for every pass and its CPU slows down, and one pass a
+    /// step left the GPU idle for its whole encoding. Verify pass on code
+    /// (2026-11-14): one pass 39.1-39.2 ms, halves 37.7-37.9, thirds
+    /// 36.9-37.6, layers 0-2 then thirds 36.86-36.90.
+    ///
+    /// Not transactional: when encoding a later pass (or `tail`) fails, the
+    /// passes before it have run (they are waited for before the error
+    /// returns), so the recurrent state and caches are partly advanced
+    /// while `st.pos` is not. Discard the state or restore a snapshot taken
+    /// before the step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_step(
+        &self,
+        ctx: &MetalContext,
+        st: &Glm53State,
+        sc: &Scratch,
+        tokens: &Tensor,
+        m: usize,
+        logits: Logits,
+        snap: Option<usize>,
+        tail: impl FnOnce(&ComputePass<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let n = self.cfg.n_trunk;
+        let cuts = [0, 2.min(n), n / 3, 2 * n / 3];
+        let mut pending = Vec::with_capacity(cuts.len());
+        for w in cuts.windows(2) {
+            if w[1] > w[0] {
+                let pass = self.begin(ctx)?;
+                self.encode_layers(
+                    ctx,
+                    &pass,
+                    st,
+                    sc,
+                    tokens,
+                    m,
+                    logits,
+                    snap,
+                    w[0]..w[1],
+                )?;
+                pending.push(pass.commit()?);
+            }
+        }
+        let pass = self.begin(ctx)?;
+        let last = cuts[cuts.len() - 1].max(cuts[1]);
+        self.encode_layers(ctx, &pass, st, sc, tokens, m, logits, snap, last..n)?;
+        tail(&pass)?;
+        let r = pass.commit_wait();
+        for p in pending {
+            p.wait()?;
+        }
+        r
     }
 
     fn encode_head(
@@ -1092,6 +1251,7 @@ impl Glm53Model {
             0,
             &out,
         )?;
+        k::top_prob(ctx, pass, &sc.logits_last, &sc.mtp_prob, cfg.vocab)?;
         pass.memory_barrier()
     }
 

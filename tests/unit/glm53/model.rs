@@ -77,12 +77,15 @@ fn speculative_cycle_after_a_long_prefill() {
     let path = std::env::var("LILY_GLM53_GGUF").expect("LILY_GLM53_GGUF");
     let ctx = MetalContext::new().expect("context");
     let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
-    let model = <Glm53Model as LanguageModel>::load(
+    let mut model = <Glm53Model as LanguageModel>::load(
         &ctx,
         std::path::Path::new(&path),
         &options,
     )
     .expect("load");
+    // Every draft proposed (unlikely_drafts_are_not_proposed covers the
+    // threshold).
+    model.draft_min_prob = 0.0;
     let mut st = LanguageModel::new_state(&model, &ctx, 64).expect("state");
     let mut sc =
         LanguageModel::new_scratch_with_capacity(&model, &ctx, 0).expect("scratch");
@@ -131,6 +134,25 @@ fn speculative_cycle_after_a_long_prefill() {
     }
 }
 
+/// The routing search of `lily-glm53 spec-diff` looks only at the rows fed
+/// the same tokens (positions below `end`), skips rows one run lacks, and
+/// finds nothing when only later rows differ.
+#[test]
+fn first_routing_difference_stays_in_the_common_prefix() {
+    use std::collections::BTreeMap;
+    let rec = |rows: &[(usize, [u32; 2])]| -> BTreeMap<usize, Vec<Vec<u32>>> {
+        rows.iter().map(|&(p, l)| (p, vec![vec![l[0]], vec![l[1]]])).collect()
+    };
+    let a = rec(&[(10, [1, 2]), (11, [1, 2]), (12, [1, 2]), (13, [5, 6])]);
+    let b = rec(&[(10, [1, 2]), (12, [1, 9]), (13, [7, 6])]);
+    // Position 11 is only in `a`; 12 differs at layer 1; 13 at layer 0.
+    assert_eq!(first_routing_difference(&a, &b, 14), Some((12, 1)));
+    assert_eq!(first_routing_difference(&a, &b, 13), Some((12, 1)));
+    // Rows from 12 on were fed different tokens: unresolved.
+    assert_eq!(first_routing_difference(&a, &b, 12), None);
+    assert_eq!(first_routing_difference(&a, &a, 100), None);
+}
+
 /// Loads the published file for the real-weight tests.
 fn real_model(ctx: &MetalContext) -> Glm53Model {
     use crate::engine::{LanguageModel, LoadOptions};
@@ -138,6 +160,69 @@ fn real_model(ctx: &MetalContext) -> Glm53Model {
     let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
     <Glm53Model as LanguageModel>::load(ctx, std::path::Path::new(&path), &options)
         .expect("load")
+}
+
+/// The engine proposes no draft below `draft_min_prob`: the verify pass is
+/// then one row, whose draw is ordinary decoding's; at 0 every step
+/// proposes its draft.
+#[test]
+#[ignore = "needs the GLM 5.3 GGUF (LILY_GLM53_GGUF)"]
+fn unlikely_drafts_are_not_proposed() {
+    use crate::engine::{DecodeStateApi, LanguageModel};
+    use crate::kernels::sample::SamplingParams;
+    let ctx = MetalContext::new().expect("context");
+    let mut m = real_model(&ctx);
+    let greedy = SamplingParams::greedy();
+    let p = prompt(64);
+    let n = 8;
+    let mut want = Vec::new();
+    {
+        let mut st = m.new_state(&ctx, p.len() + n + 8).unwrap();
+        let mut sc = m.new_scratch(&ctx).unwrap();
+        m.prefill(&ctx, &mut st, &mut sc, &p).unwrap();
+        want.push(argmax(&sc.logits_last.to_f32().unwrap()));
+        while want.len() < n {
+            let last = *want.last().unwrap();
+            m.forward(&ctx, &mut st, &mut sc, &[last], true).unwrap();
+            want.push(argmax(&sc.logits_last.to_f32().unwrap()));
+        }
+    }
+    for (gate, every) in [(1.5f32, false), (0.0, true)] {
+        m.draft_min_prob = gate;
+        let mut st = LanguageModel::new_state(&m, &ctx, p.len() + n + 8).unwrap();
+        let mut sc = m.new_scratch(&ctx).unwrap();
+        m.prefill(&ctx, &mut st, &mut sc, &p).unwrap();
+        let mut out = vec![want[0]];
+        let mut proposals =
+            m.draft_initial(&ctx, &mut st, &mut sc, want[0], 1, &greedy, 1).unwrap();
+        while out.len() < n {
+            assert_eq!(proposals.len(), usize::from(every), "gate {gate}");
+            let pos = st.pos();
+            let pending = *out.last().unwrap();
+            let (draws, pend) = m
+                .verify(
+                    &ctx,
+                    &mut st,
+                    &mut sc,
+                    pending,
+                    &proposals,
+                    &greedy,
+                    out.len(),
+                    1,
+                )
+                .unwrap();
+            assert_eq!(draws.len(), 1 + proposals.len(), "gate {gate}");
+            let kept = proposals.first().map_or(0, |&d| usize::from(draws[0] == d));
+            out.extend_from_slice(&draws[..=kept]);
+            proposals =
+                m.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pend).unwrap();
+            assert_eq!(st.pos(), pos + 1 + kept, "gate {gate}");
+        }
+        if !every {
+            // One-row steps are ordinary decoding's steps.
+            assert_eq!(&out[..n], &want[..], "gate {gate}");
+        }
+    }
 }
 
 /// A prompt of `n` ordinary text tokens.
@@ -390,6 +475,181 @@ fn sampled_speculation_matches_ordinary_sampling() {
         assert_eq!(t, toks[k], "step {k} after speculation");
         assert_eq!(sc.sampler().counts().unwrap(), counts[k], "step {k} counts");
     }
+}
+
+/// Sampled speculation that follows the engine's own proposal lists, both
+/// empty (the draft below `draft_min_prob`: a one-row step) and not (the
+/// threshold alternates between 1.5 and 0 from step to step), emits what
+/// ordinary sampled decoding emits: the same draws at the same request
+/// steps, the same penalty counts after every step, positions advancing by
+/// the kept rows, and ordinary steps after it giving ordinary decoding's
+/// logits. (A routing tie that the two paths' rounding decides differently
+/// can part the two; this prompt and seed have none in these steps.)
+#[test]
+#[ignore = "requires LILY_GLM53_GGUF"]
+fn sampled_speculation_follows_its_proposals() {
+    use crate::engine::{DecodeStateApi, Draw, LanguageModel, ScratchApi};
+    use crate::kernels::sample::SamplingParams;
+    let ctx = MetalContext::new().expect("context");
+    let mut m = real_model(&ctx);
+    let params = SamplingParams {
+        temperature: 1.0,
+        top_k: 40,
+        top_p: 0.95,
+        presence_penalty: 0.5,
+        frequency_penalty: 0.5,
+        repetition_penalty: 1.1,
+        seed: 777,
+        ..SamplingParams::greedy()
+    };
+    let (steps, after) = (24, 3);
+    // Text: drafts are accepted at times and draws leave the argmax.
+    let path = std::env::var("LILY_GLM53_GGUF").expect("LILY_GLM53_GGUF");
+    let tok =
+        crate::tokenizer::Tokenizer::from_gguf(std::path::Path::new(&path)).unwrap();
+    let mut p = tok.encode("[gMASK]<sop>").unwrap();
+    p.extend(
+        tok.encode(
+            "The river rises in the hills north of the town, runs past the old mill \
+             and the market square, and reaches the sea after a journey of",
+        )
+        .unwrap(),
+    );
+    let total = steps + 2 + after;
+    // Ordinary: the draws and the counts after each.
+    let mut st = LanguageModel::new_state(&m, &ctx, p.len() + total + 8).unwrap();
+    let mut sc = m.new_scratch(&ctx).unwrap();
+    sc.begin_request();
+    let draw = Some(Draw { params: &params, step: 0 });
+    LanguageModel::prefill(&m, &ctx, &mut st, &mut sc, &p, draw).unwrap();
+    let mut toks = vec![sc.next_token.to_u32().unwrap()[0]];
+    let mut counts = vec![sc.sampler().counts().unwrap()];
+    let mut logits = vec![sc.logits_last.to_f32().unwrap()];
+    let mut off_argmax = 0;
+    for k in 1..total {
+        let t = sampled_step(&m, &ctx, &mut st, &sc, toks[k - 1], &params, k);
+        off_argmax +=
+            usize::from(k < steps && t != argmax(&sc.logits_last.to_f32().unwrap()));
+        toks.push(t);
+        counts.push(sc.sampler().counts().unwrap());
+        logits.push(sc.logits_last.to_f32().unwrap());
+    }
+    eprintln!("ordinary: {toks:?}, {off_argmax} draws off the argmax");
+    assert!(off_argmax > 0, "the run never left the argmax");
+    drop((st, sc));
+    // Speculative, as the engine's loop runs it.
+    let mut st = LanguageModel::new_state(&m, &ctx, p.len() + total + 8).unwrap();
+    let mut sc = m.new_scratch(&ctx).unwrap();
+    sc.begin_request();
+    LanguageModel::prefill(&m, &ctx, &mut st, &mut sc, &p, draw).unwrap();
+    let mut out = vec![sc.next_token.to_u32().unwrap()[0]];
+    m.draft_min_prob = 0.0;
+    let mut proposals =
+        m.draft_initial(&ctx, &mut st, &mut sc, out[0], 1, &params, 1).unwrap();
+    let (mut empty, mut proposed, mut accepted) = (0, 0, 0);
+    let mut i = 0;
+    while out.len() < steps {
+        if proposals.is_empty() {
+            empty += 1;
+        } else {
+            proposed += 1;
+        }
+        let (step0, pos) = (out.len(), st.pos());
+        let pending = *out.last().unwrap();
+        let (draws, pend) = m
+            .verify(&ctx, &mut st, &mut sc, pending, &proposals, &params, step0, 1)
+            .unwrap();
+        assert_eq!(draws.len(), 1 + proposals.len(), "step {i}: rows");
+        let kept = proposals.first().map_or(0, |&d| usize::from(draws[0] == d));
+        accepted += kept;
+        out.extend_from_slice(&draws[..=kept]);
+        m.draft_min_prob = if i % 2 == 0 { 1.5 } else { 0.0 };
+        proposals =
+            m.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pend).unwrap();
+        assert_eq!(proposals.len(), i % 2, "step {i}: proposals after the threshold");
+        assert_eq!(st.pos(), pos + 1 + kept, "step {i}: position");
+        assert_eq!(&out[..], &toks[..out.len()], "step {i}: draws");
+        let c = &counts[out.len() - 1];
+        assert_eq!(&sc.sampler().counts().unwrap(), c, "step {i}: penalty counts");
+        i += 1;
+    }
+    eprintln!(
+        "speculative: {empty} one-row steps, {proposed} drafts, {accepted} accepted"
+    );
+    assert!(empty > 0 && proposed > 0, "both kinds of step");
+    assert!(0 < accepted && accepted < proposed, "drafts both accepted and rejected");
+    // Ordinary steps continue from the speculative state.
+    for k in out.len()..out.len() + after {
+        let t = sampled_step(&m, &ctx, &mut st, &sc, toks[k - 1], &params, k);
+        let r = rel(&sc.logits_last.to_f32().unwrap(), &logits[k]);
+        eprintln!("step {k} after speculation: relative L2 {r:.2e}");
+        assert!(r < 5e-3, "step {k} logits differ (relative L2 {r:.2e})");
+        assert_eq!(t, toks[k], "step {k} after speculation");
+        assert_eq!(sc.sampler().counts().unwrap(), counts[k], "step {k} counts");
+    }
+}
+
+/// A synchronous step whose last pass fails to encode has run its earlier
+/// passes (and waited for them): the recurrent state is partly advanced
+/// while the position is not. Restoring a snapshot taken before the step
+/// recovers it: the step then gives exactly the logits it gives from the
+/// snapshot without the failure.
+#[test]
+#[ignore = "requires LILY_GLM53_GGUF"]
+fn a_failed_step_is_recovered_from_a_snapshot() {
+    use crate::engine::DecodeStateApi;
+    let ctx = MetalContext::new().expect("context");
+    let m = real_model(&ctx);
+    let p = prompt(40);
+    let mut st = m.new_state(&ctx, p.len() + 8).unwrap();
+    let mut sc = m.new_scratch(&ctx).unwrap();
+    m.prefill(&ctx, &mut st, &mut sc, &p).unwrap();
+    let snap = st.snapshot(&ctx).unwrap();
+    let token = 2025;
+    m.forward(&ctx, &mut st, &mut sc, &[token], true).unwrap();
+    let want = sc.logits_last.to_f32().unwrap();
+    st.restore(&ctx, &snap).unwrap();
+    let kda0 = |st: &Glm53State| {
+        st.layers
+            .iter()
+            .find_map(|l| match l {
+                LayerState::Kda { s, .. } => Some(s.to_f32().unwrap()),
+                LayerState::Dsa { .. } => None,
+            })
+            .unwrap()
+    };
+    // The last KDA layer: its pass is the one that fails.
+    let kda_last = |st: &Glm53State| {
+        st.layers[..m.cfg.n_trunk]
+            .iter()
+            .rev()
+            .find_map(|l| match l {
+                LayerState::Kda { s, .. } => Some(s.to_f32().unwrap()),
+                LayerState::Dsa { .. } => None,
+            })
+            .unwrap()
+    };
+    let (before, last_before) = (kda0(&st), kda_last(&st));
+    sc.stage_tokens(&[token]).unwrap();
+    let ran = std::cell::Cell::new(false);
+    let r = m.run_step(&ctx, &st, &sc, &sc.tokens, 1, Logits::Last, None, |_| {
+        ran.set(true);
+        anyhow::bail!("injected failure")
+    });
+    assert!(ran.get(), "the tail ran");
+    let e = r.expect_err("the step reports the failure");
+    assert_eq!(
+        e.to_string(),
+        "injected failure",
+        "the injected error is the one returned"
+    );
+    assert_eq!(st.pos(), p.len(), "the position is unchanged");
+    assert_ne!(kda0(&st), before, "the first passes ran: the first KDA layer moved");
+    assert_eq!(kda_last(&st), last_before, "the failed last pass never ran");
+    st.restore(&ctx, &snap).unwrap();
+    assert_eq!(kda0(&st), before);
+    m.forward(&ctx, &mut st, &mut sc, &[token], true).unwrap();
+    assert_eq!(sc.logits_last.to_f32().unwrap(), want, "the step after the restore");
 }
 
 /// prefill_until stops at a run boundary before committing it and reports

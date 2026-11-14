@@ -193,7 +193,7 @@ float glm53_dot_iq2_xxs(uint64_t row, uint t, in vec4 xv[8]) {
     const float d = glm53_h2f(uint(U16(row).v[bw]));
     const uint aux0 = uint(U16(row).v[qw]) | (uint(U16(row).v[qw + 1u]) << 16u);
     const uint aux1 = uint(U16(row).v[qw + 2u]) | (uint(U16(row).v[qw + 3u]) << 16u);
-    float s = 0.0;
+    precise float s = 0.0;
     [[unroll]] for (uint l = 0u; l < 4u; l++) {
         const uint gi = (aux0 >> (8u * l)) & 0xffu;
         const uint si = (aux1 >> (7u * l)) & 127u;
@@ -213,5 +213,41 @@ float glm53_dot_iq2_xxs(uint64_t row, uint t, in vec4 xv[8]) {
                         + ((p2.x * a.z + p2.y * b.z) + (p3.x * a.w + p3.y * b.w));
         s += e;
     }
-    return 0.125 * d * float(2u * (aux1 >> 28u) + 1u) * s;
+    // Scale and product pinned: glm53_dot2_iq2_xxs gives the same.
+    precise float k = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
+    precise float v = k * s;
+    return v;
+}
+
+// glm53_dot_iq2_xxs for two activation rows from one decode: each row's sum
+// is computed exactly as glm53_dot_iq2_xxs computes it.
+vec2 glm53_dot2_iq2_xxs(uint64_t row, uint t, in vec4 xa[8], in vec4 xb[8]) {
+    const uint bw = (t >> 3u) * 33u;
+    const uint qw = bw + 1u + 4u * (t & 7u);
+    const float d = glm53_h2f(uint(U16(row).v[bw]));
+    const uint aux0 = uint(U16(row).v[qw]) | (uint(U16(row).v[qw + 1u]) << 16u);
+    const uint aux1 = uint(U16(row).v[qw + 2u]) | (uint(U16(row).v[qw + 3u]) << 16u);
+    precise float s0 = 0.0, s1 = 0.0;
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const uint gi = (aux0 >> (8u * l)) & 0xffu;
+        const uint si = (aux1 >> (7u * l)) & 127u;
+        const uvec4 g = glm53_iq2xxs_grid_h[gi] ^ glm53_iq2xxs_signs_h[si];
+        const vec2 p0 = unpackHalf2x16(g.x), p1 = unpackHalf2x16(g.y);
+        const vec2 p2 = unpackHalf2x16(g.z), p3 = unpackHalf2x16(g.w);
+        {
+            const vec4 a = xa[2u * l], b = xa[2u * l + 1u];
+            precise float e = ((p0.x * a.x + p0.y * b.x) + (p1.x * a.y + p1.y * b.y))
+                            + ((p2.x * a.z + p2.y * b.z) + (p3.x * a.w + p3.y * b.w));
+            s0 += e;
+        }
+        {
+            const vec4 a = xb[2u * l], b = xb[2u * l + 1u];
+            precise float e = ((p0.x * a.x + p0.y * b.x) + (p1.x * a.y + p1.y * b.y))
+                            + ((p2.x * a.z + p2.y * b.z) + (p3.x * a.w + p3.y * b.w));
+            s1 += e;
+        }
+    }
+    precise float k = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
+    precise float v0 = k * s0, v1 = k * s1;
+    return vec2(v0, v1);
 }

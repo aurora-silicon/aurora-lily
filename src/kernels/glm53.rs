@@ -578,7 +578,12 @@ pub fn moe_gate_up(
     ensure!(gate.rows.is_multiple_of(ff), "expert rows {} of {ff}", gate.rows);
     ensure!(sel.dtype() == DType::U32 && sel.numel() >= m * used, "selection");
     ensure!(mid.numel() >= m * used * ff, "mid of {}", mid.numel());
-    let name = moe_name(true, gate.ty)?;
+    // Two IQ2_XXS rows: an expert both rows picked is decoded once.
+    let name = if m == 2 && gate.ty == GgmlType::Iq2Xxs {
+        "glm53_moe_gate_up_iq2_xxs_m2"
+    } else {
+        moe_name(true, gate.ty)?
+    };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -671,6 +676,26 @@ pub fn router_topk(
         &[logits.binding(), bias.binding(), sel.binding(), weights.binding()],
         &[&u32_bytes(n_expert), &u32_bytes(k), &f32_bytes(scale)],
         Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (32, 1, 1) },
+    )
+}
+
+/// `out[0]` = the largest softmax probability of the `n` logits.
+pub fn top_prob(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    logits: &Tensor,
+    out: &Tensor,
+    n: usize,
+) -> Result<()> {
+    check_f32(&[logits, out])?;
+    ensure!(logits.numel() >= n && n > 0, "top probability of {n} logits");
+    ensure!(out.numel() >= 1, "top probability into an empty tensor");
+    let pipeline = ctx.pipeline("glm53_top_prob", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[logits.binding(), out.binding()],
+        &[&u32_bytes(n)],
+        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
     )
 }
 

@@ -44,6 +44,7 @@ float glm53_group_sum(float v, uint width) {
     defined(KERNEL_glm53_gemv_q8_0_m2) || \
     defined(KERNEL_glm53_gemv_q8_0_m3) || defined(KERNEL_glm53_gemv_q8_0_m4)
 #define GEMV_TYPE GLM53_Q8_0
+#define GEMV_Q8_0 1
 #elif defined(KERNEL_glm53_gemv_q4_k_m1) || \
     defined(KERNEL_glm53_gemv_q4_k_m2) || \
     defined(KERNEL_glm53_gemv_q4_k_m3) || defined(KERNEL_glm53_gemv_q4_k_m4)
@@ -129,6 +130,27 @@ void main() {
     const uint64_t row = W + uint64_t(min(n, N - 1u)) * row_bytes;
     const uint g = min(n, N - 1u) / x_group;
     float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+#ifdef GEMV_Q8_0
+    // Q8_0: the block scale multiplies each row's sum of the task, not
+    // every weight; at two rows this kernel is bound by its ALU work (kda_out
+    // 4096 x 8192 at m = 2: 102.7 -> 81.0 us, m = 1 unchanged at 71,
+    // 2026-11-14).
+    for (uint t = sub; t < tasks; t += width) {
+        const uint64_t b = row + uint64_t(t) * 34u;
+        const float d = glm53_h2f(uint(U16(b).v[0]));
+        float w[32];
+        [[unroll]] for (uint i = 0u; i < 16u; i++) {
+            const uint pair = uint(U16(b + 2u).v[i]);
+            w[2u * i] = float(int(pair << 24) >> 24);
+            w[2u * i + 1u] = float(int(pair << 16) >> 24);
+        }
+        const uint64_t xt = X + 4u * (uint64_t(g) * K + t * GLM53_TASK);
+        acc0 += d * glm53_task_dot(w, xt);
+        if (m > 1u) acc1 += d * glm53_task_dot(w, xt + 4u * uint64_t(x_row_stride));
+        if (m > 2u) acc2 += d * glm53_task_dot(w, xt + 8u * uint64_t(x_row_stride));
+        if (m > 3u) acc3 += d * glm53_task_dot(w, xt + 12u * uint64_t(x_row_stride));
+    }
+#else
     for (uint t = sub; t < tasks; t += width) {
         float w[32];
         glm53_decode(GEMV_TYPE, row, t, w);
@@ -138,6 +160,7 @@ void main() {
         if (m > 2u) acc2 += glm53_task_dot(w, xt + 8u * uint64_t(x_row_stride));
         if (m > 3u) acc3 += glm53_task_dot(w, xt + 12u * uint64_t(x_row_stride));
     }
+#endif
     acc0 = glm53_group_sum(acc0, width);
     if (m > 1u) acc1 = glm53_group_sum(acc1, width);
     if (m > 2u) acc2 = glm53_group_sum(acc2, width);
@@ -160,6 +183,21 @@ void main() {
 // 4 weights f32 [m][used], 5 mid [m * used][F]. Params: 6 K, 7 F,
 // 8 row_bytes, 9 used, 10 limit.
 // ---------------------------------------------------------------------------
+// The routed expert's weighted clamped SwiGLU in one pinned order, the
+// prefill path's (glm53_moe_swiglu in glm53_gemm.comp): w ((g u) / (1 +
+// 2^(-g log2 e))). Left to the compiler, the same expression was
+// reassociated differently in different kernels.
+float glm53_moe_act(float g, float u, float limit, float we) {
+    if (limit > 1e-6) {
+        g = min(g, limit);
+        u = clamp(u, -limit, limit);
+    }
+    precise float gu = g * u;
+    precise float e = exp2(-(g * uintBitsToFloat(0x3fb8aa3bu)));
+    precise float sv = we * (gu * (1.0 / (1.0 + e)));
+    return sv;
+}
+
 #if defined(KERNEL_glm53_moe_gate_up_q4_k) || defined(KERNEL_glm53_moe_gate_up_q2_k)
 #if defined(KERNEL_glm53_moe_gate_up_q4_k)
 #define MOE_TYPE GLM53_Q4_K
@@ -194,12 +232,7 @@ void main() {
     ag = subgroupAdd(ag);
     au = subgroupAdd(au);
     if (gl_SubgroupInvocationID == 0u) {
-        float gv = ag, uv = au;
-        if (limit > 1e-6) {
-            gv = min(gv, limit);
-            uv = clamp(uv, -limit, limit);
-        }
-        F32(arg(5)).v[slot * F + r] = gv / (1.0 + exp(-gv)) * uv * we;
+        F32(arg(5)).v[slot * F + r] = glm53_moe_act(ag, au, limit, we);
     }
 }
 #endif
@@ -236,12 +269,81 @@ void main() {
     ag = subgroupAdd(ag);
     au = subgroupAdd(au);
     if (gl_SubgroupInvocationID == 0u) {
-        float gv = ag, uv = au;
-        if (limit > 1e-6) {
-            gv = min(gv, limit);
-            uv = clamp(uv, -limit, limit);
+        F32(arg(5)).v[slot * F + r] = glm53_moe_act(ag, au, limit, we);
+    }
+}
+#endif
+
+// Two rows (a verify pass) whose selections share experts: the slot of the
+// first row that picked a shared expert computes both rows' values from one
+// decode of its weights, the second row's slot of that expert does nothing.
+// Each row's value is computed exactly as for that row alone. Consecutive
+// tokens share 2 to 3 of their 8 experts on average; a shared expert's
+// task costs ~1.85 single ones (the per-row activation loads and products
+// dominate, not the weight decode): 200 us a layer with no expert shared,
+// 183 with all 8 (moe_rows_timing, 2026-11-14).
+#ifdef KERNEL_glm53_moe_gate_up_iq2_xxs_m2
+void main() {
+    const uint K = arg_u32(6);
+    const uint F = arg_u32(7);
+    const uint row_bytes = arg_u32(8);
+    const uint used = arg_u32(9);
+    const float limit = arg_f32(10);
+    const uint slot = gl_WorkGroupID.y;
+    const uint i = slot / used;
+    const uint e = U32(arg(3)).v[slot];
+    // The other row's slot of the same expert, if any.
+    const uint other = (1u - i) * used;
+    uint pair = ~0u;
+    for (uint s = 0u; s < used; s++) {
+        if (U32(arg(3)).v[other + s] == e) pair = other + s;
+    }
+    if (i == 1u && pair != ~0u) return;
+    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    if (r >= F) return;
+    const uint64_t off = (uint64_t(e) * F + r) * row_bytes;
+    const uint64_t gate = arg(0) + off;
+    const uint64_t up = arg(1) + off;
+    const uint64_t X = arg(2) + 4u * uint64_t(i) * K;
+    const uint tasks = K / GLM53_TASK;
+    const uint64_t mid = arg(5);
+    if (pair == ~0u) {
+        float ag = 0.0, au = 0.0;
+        for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
+            vec4 xv[8];
+            [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(X).v[8u * t + q];
+            ag += glm53_dot_iq2_xxs(gate, t, xv);
+            au += glm53_dot_iq2_xxs(up, t, xv);
         }
-        F32(arg(5)).v[slot * F + r] = gv / (1.0 + exp(-gv)) * uv * we;
+        ag = subgroupAdd(ag);
+        au = subgroupAdd(au);
+        if (gl_SubgroupInvocationID == 0u) {
+            F32(mid).v[slot * F + r] =
+                glm53_moe_act(ag, au, limit, F32(arg(4)).v[slot]);
+        }
+        return;
+    }
+    // Row 0's slot with row 1's slot `pair` of the same expert.
+    const uint64_t X1 = X + 4u * uint64_t(K);
+    float ag0 = 0.0, au0 = 0.0, ag1 = 0.0, au1 = 0.0;
+    for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
+        vec4 xv0[8], xv1[8];
+        [[unroll]] for (uint q = 0u; q < 8u; q++) xv0[q] = F32x4(X).v[8u * t + q];
+        [[unroll]] for (uint q = 0u; q < 8u; q++) xv1[q] = F32x4(X1).v[8u * t + q];
+        vec2 g = glm53_dot2_iq2_xxs(gate, t, xv0, xv1);
+        vec2 u = glm53_dot2_iq2_xxs(up, t, xv0, xv1);
+        ag0 += g.x;
+        ag1 += g.y;
+        au0 += u.x;
+        au1 += u.y;
+    }
+    ag0 = subgroupAdd(ag0);
+    au0 = subgroupAdd(au0);
+    ag1 = subgroupAdd(ag1);
+    au1 = subgroupAdd(au1);
+    if (gl_SubgroupInvocationID == 0u) {
+        F32(mid).v[slot * F + r] = glm53_moe_act(ag0, au0, limit, F32(arg(4)).v[slot]);
+        F32(mid).v[pair * F + r] = glm53_moe_act(ag1, au1, limit, F32(arg(4)).v[pair]);
     }
 }
 #endif
@@ -292,6 +394,13 @@ void main() {
 }
 #endif
 
+// The Q2_K form (the model's experts) dots straight from the blocks. A lane
+// takes a unit of 64 values of the row: block u / 4, half h = (u / 2) % 2,
+// code bytes 16 c.. of the half (c = u % 2) at their four shifts j, which
+// are the 16-value groups 8 h + 2 j + c; the mins multiply the groups'
+// activation sums. Codes are extracted and converted in the ALU: a byte
+// table of f16 codes was slower (88 us against 72 a layer, 2026-11-14), as
+// were two or four rows a subgroup sharing the activation loads (74, 79).
 // The Q2_K form (the model's experts) dots straight from the blocks. A lane
 // takes a unit of 64 values of the row: block u / 4, half h = (u / 2) % 2,
 // code bytes 16 c.. of the half (c = u % 2) at their four shifts j, which
@@ -538,6 +647,37 @@ void main() {
         acc += F32(S).v[8u + dst + 8u] * h2;
         acc += F32(S).v[8u + dst + 12u] * h3;
         F32(O).v[dst * hidden + d] = acc;
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The largest softmax probability of n logits: 1 / sum exp(l - max). One
+// threadgroup of 1024 threads (the MTP draft's confidence, read by the host
+// to decide whether proposing the draft pays).
+// Buffers: 0 logits [n], 1 out f32 [1]. Params: 2 n.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_top_prob
+shared float glm53_red[32];
+void main() {
+    const uint n = arg_u32(2);
+    const uint tid = gl_LocalInvocationIndex;
+    const uint64_t L = arg(0);
+    float mx = -1.0 / 0.0;
+    for (uint i = tid; i < n; i += 1024u) mx = max(mx, F32(L).v[i]);
+    mx = subgroupMax(mx);
+    if (gl_SubgroupInvocationID == 0u) glm53_red[gl_SubgroupID] = mx;
+    barrier();
+    mx = subgroupMax(glm53_red[gl_SubgroupInvocationID]);
+    barrier();
+    float sum = 0.0;
+    for (uint i = tid; i < n; i += 1024u) sum += exp(F32(L).v[i] - mx);
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0u) glm53_red[gl_SubgroupID] = sum;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        sum = subgroupAdd(glm53_red[gl_SubgroupInvocationID]);
+        if (gl_SubgroupInvocationID == 0u) F32(arg(1)).v[0] = 1.0 / sum;
     }
 }
 #endif
