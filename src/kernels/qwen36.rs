@@ -352,3 +352,7 @@ pub fn router_logits(
         Grid::Threadgroups { groups: (m.div_ceil(4), (e + 1).div_ceil(8), 1), threadgroup: (256, 1, 1) },
     )
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/kernels/qwen36.rs"]
+mod tests;

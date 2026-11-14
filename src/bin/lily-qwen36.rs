@@ -117,7 +117,7 @@ fn generate(path: &PathBuf, prompt: &[u32], n: usize) -> Result<()> {
     eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
     let cap = prompt.len() + n + 8;
     let mut st = model.new_state(&ctx, cap)?;
-    let mut sc = model.new_scratch(&ctx, cap)?;
+    let mut sc = model.new_scratch(&ctx)?;
     let t0 = Instant::now();
     model.prefill(&ctx, &mut st, &mut sc, prompt)?;
     let pf = t0.elapsed().as_secs_f64();
@@ -165,7 +165,7 @@ fn nll(path: &PathBuf, files: &[PathBuf], split: Option<usize>, quiet: bool) -> 
         .max()
         .unwrap_or(0);
     let mut st = model.new_state(&ctx, max_len + 8)?;
-    let mut sc = model.new_scratch(&ctx, max_len + 8)?;
+    let mut sc = model.new_scratch(&ctx)?;
     let (mut all_nll, mut all_n, mut all_hits) = (0f64, 0usize, 0usize);
     for f in files {
         let ids = read_ids(f)?;
@@ -248,12 +248,17 @@ fn bench(path: &PathBuf, ids: &[u32], prompt_len: usize, n: usize, runs: usize) 
     let model = Qwen36Model::load(&ctx, path)?;
     let cap = prompt_len + n + 8;
     let mut st = model.new_state(&ctx, cap)?;
-    let mut sc = model.new_scratch(&ctx, cap)?;
+    let mut sc = model.new_scratch(&ctx)?;
     for run in 0..runs {
         st.reset();
+        let _ = lily::metal::profile::take();
         let t0 = Instant::now();
         model.prefill(&ctx, &mut st, &mut sc, &ids[..prompt_len])?;
         let pf = t0.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("prefill of {prompt_len} tokens:");
+            profile_report(1);
+        }
         let mut next = argmax(&sc.logits_last.to_f32()?) as u32;
         let mut out = vec![next];
         let t0 = Instant::now();
@@ -263,6 +268,10 @@ fn bench(path: &PathBuf, ids: &[u32], prompt_len: usize, n: usize, runs: usize) 
             out.push(next);
         }
         let dt = t0.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("decode at prompt {prompt_len}, per step:");
+            profile_report(n - 1);
+        }
         let digest = out.iter().fold(0xcbf29ce484222325u64, |h, &t| {
             (h ^ u64::from(t)).wrapping_mul(0x100000001b3)
         });
@@ -276,4 +285,33 @@ fn bench(path: &PathBuf, ids: &[u32], prompt_len: usize, n: usize, runs: usize) 
         );
     }
     Ok(())
+}
+
+/// The kernel profile (`LILY_KERNEL_PROFILE=1`) since the last take, per
+/// step of `steps`.
+fn profile_report(steps: usize) {
+    let passes = lily::metal::profile::take();
+    let mut by: std::collections::HashMap<&str, (usize, f64)> = Default::default();
+    let mut total = 0.0;
+    for p in &passes {
+        for k in &p.kernels {
+            let e = by.entry(k.name).or_default();
+            e.0 += 1;
+            e.1 += k.gpu_secs;
+            total += k.gpu_secs;
+        }
+    }
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+    let n = steps as f64;
+    eprintln!("  ms/step  share  calls/step  kernel");
+    for (name, (calls, secs)) in rows {
+        eprintln!(
+            "  {:7.3}  {:4.1}%  {:9.1}  {name}",
+            secs / n * 1e3,
+            100.0 * secs / total,
+            calls as f64 / n
+        );
+    }
+    eprintln!("  {:7.3}  kernels summed per step", total / n * 1e3);
 }

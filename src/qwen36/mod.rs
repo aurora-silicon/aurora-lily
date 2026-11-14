@@ -4,6 +4,7 @@
 //! defines what each tensor means.
 
 pub mod config;
+pub mod engine;
 pub mod model;
 pub mod schema;
 pub mod tokenizer;

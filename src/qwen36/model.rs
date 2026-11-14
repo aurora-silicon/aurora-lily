@@ -172,8 +172,8 @@ impl Qwen36Model {
         Qwen36State::new(ctx, &self.cfg, self.kv_format, capacity)
     }
 
-    pub fn new_scratch(&self, ctx: &MetalContext, capacity: usize) -> Result<Scratch> {
-        Scratch::new(ctx, &self.cfg, capacity)
+    pub fn new_scratch(&self, ctx: &MetalContext) -> Result<Scratch> {
+        Scratch::new(ctx, &self.cfg)
     }
 }
 
@@ -296,12 +296,10 @@ pub struct Scratch {
     pub draws: Tensor,
     /// U32[MAX_ROWS]: tokens a verify pass feeds.
     pub spec_tokens: Tensor,
-    /// The session capacity the split-decode scratch is sized for.
-    pub capacity: usize,
 }
 
 impl Scratch {
-    pub(crate) fn new(ctx: &MetalContext, cfg: &Config, capacity: usize) -> Result<Self> {
+    pub(crate) fn new(ctx: &MetalContext, cfg: &Config) -> Result<Self> {
         let r = PREFILL_ROWS;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let b = |n: usize| Tensor::zeros(ctx, &[n], DType::BF16);
@@ -312,7 +310,8 @@ impl Scratch {
         let hq = cfg.n_head * cfg.head_dim;
         let kv = cfg.kv_width();
         let used = cfg.n_expert_used;
-        let splits = attn::sdpa_split_scratch_splits(capacity);
+        // The split decode's partials, for any context (bounded: 2 MB).
+        let splits = attn::sdpa_split_scratch_splits(attn::MAX_SEQ);
         let widest = [h, inner, hq, cfg.ff_shared].into_iter().max().unwrap_or(h);
         let logits = f(MAX_ROWS * cfg.vocab)?;
         Ok(Self {
@@ -354,7 +353,6 @@ impl Scratch {
             next_token: u(2)?,
             draws: u(MAX_ROWS)?,
             spec_tokens: u(MAX_ROWS)?,
-            capacity,
         })
     }
 

@@ -1,0 +1,331 @@
+//! Qwen3.6 kernels at small shapes against f64 CPU versions of llama.cpp's
+//! arithmetic (ggml's CPU ops for qwen35moe).
+
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
+use super::*;
+use crate::cpu_ref::assert_close;
+use crate::gguf::dequantize;
+use crate::kernels::glm53::QWeight;
+
+fn ctx() -> MetalContext {
+    MetalContext::new().expect("metal context")
+}
+
+fn f32s(rng: &mut StdRng, n: usize, lo: f32, hi: f32) -> Vec<f32> {
+    (0..n).map(|_| rng.gen_range(lo..hi)).collect()
+}
+
+fn tensor(ctx: &MetalContext, v: &[f32]) -> Tensor {
+    Tensor::from_f32(ctx, v, &[v.len()]).expect("tensor")
+}
+
+fn zeros(ctx: &MetalContext, n: usize, d: DType) -> Tensor {
+    Tensor::zeros(ctx, &[n], d).expect("zeros")
+}
+
+fn u32s(ctx: &MetalContext, v: &[u32]) -> Tensor {
+    Tensor::from_bytes(ctx, bytemuck::cast_slice(v), &[v.len()], DType::U32).expect("u32")
+}
+
+fn run(ctx: &MetalContext, f: impl FnOnce(&ComputePass<'_>)) {
+    let pass = ctx.begin().expect("pass");
+    f(&pass);
+    pass.commit_wait().expect("commit");
+}
+
+fn silu(x: f64) -> f64 {
+    x / (1.0 + (-x).exp())
+}
+
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// The GDN of `m` rows on the CPU: conv window `conv` ([3][C]) and state
+/// `s` ([H][j][i]) updated in place; returns o ([m][H][128]) and y.
+#[allow(clippy::too_many_arguments)]
+fn gdn_ref(
+    qkv: &[f32],
+    alpha: &[f32],
+    beta: &[f32],
+    z: &[f32],
+    w: &[f32],
+    ssm_a: &[f32],
+    dt: &[f32],
+    norm: &[f32],
+    conv: &mut [f32],
+    s: &mut [f64],
+    m: usize,
+    hk: usize,
+    eps: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    const D: usize = 128;
+    let h = ssm_a.len();
+    let ch = (2 * hk + h) * D;
+    let mut o = vec![0f64; m * h * D];
+    let mut y = vec![0f64; m * h * D];
+    for t in 0..m {
+        let mut c = vec![0f64; ch];
+        for x in 0..ch {
+            let win = [conv[x], conv[ch + x], conv[2 * ch + x], qkv[t * ch + x]];
+            let acc: f64 = (0..4).map(|k| win[k] as f64 * w[x * 4 + k] as f64).sum();
+            c[x] = silu(acc);
+            conv[x] = conv[ch + x];
+            conv[ch + x] = conv[2 * ch + x];
+            conv[2 * ch + x] = qkv[t * ch + x];
+        }
+        for vh in 0..h {
+            let kh = vh % hk;
+            let l2 = |v: &[f64]| {
+                let n: f64 = v.iter().map(|x| x * x).sum();
+                v.iter().map(|x| x / (n + eps).sqrt()).collect::<Vec<_>>()
+            };
+            let q = l2(&c[kh * D..(kh + 1) * D]);
+            let k = l2(&c[(hk + kh) * D..(hk + kh + 1) * D]);
+            let v = &c[(2 * hk + vh) * D..(2 * hk + vh + 1) * D];
+            let x = alpha[t * h + vh] as f64 + dt[vh] as f64;
+            let sp = if x > 20.0 { x } else { x.exp().ln_1p() };
+            let decay = (sp * ssm_a[vh] as f64).exp();
+            let b = sigmoid(beta[t * h + vh] as f64);
+            let st = &mut s[vh * D * D..(vh + 1) * D * D];
+            for j in 0..D {
+                let col = &mut st[j * D..(j + 1) * D];
+                col.iter_mut().for_each(|e| *e *= decay);
+                let kv: f64 = col.iter().zip(&k).map(|(a, b)| a * b).sum();
+                let d = (v[j] - kv) * b;
+                col.iter_mut().zip(&k).for_each(|(e, kk)| *e += kk * d);
+                o[(t * h + vh) * D + j] =
+                    col.iter().zip(&q).map(|(a, b)| a * b).sum::<f64>() / (D as f64).sqrt();
+            }
+            let oh = &o[(t * h + vh) * D..(t * h + vh + 1) * D];
+            let ms = oh.iter().map(|x| x * x).sum::<f64>() / D as f64;
+            for j in 0..D {
+                let i = (t * h + vh) * D + j;
+                y[i] = oh[j] / (ms + eps).sqrt() * norm[j] as f64 * silu(z[i] as f64);
+            }
+        }
+    }
+    (o, y)
+}
+
+#[test]
+fn gdn_matches_cpu_with_snapshot() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(36);
+    let (hk, h, m, eps) = (2, 4, 5, 1e-6);
+    let ch = (2 * hk + h) * GDN_DIM;
+    let inner = h * GDN_DIM;
+    let qkv = f32s(&mut rng, m * ch, -1.0, 1.0);
+    let alpha = f32s(&mut rng, m * h, -2.0, 2.0);
+    let beta = f32s(&mut rng, m * h, -2.0, 2.0);
+    let z = f32s(&mut rng, m * inner, -2.0, 2.0);
+    let w = f32s(&mut rng, 4 * ch, -0.5, 0.5);
+    let ssm_a = f32s(&mut rng, h, -2.0, -0.1);
+    let dt = f32s(&mut rng, h, -1.0, 1.0);
+    let norm = f32s(&mut rng, GDN_DIM, 0.5, 1.5);
+    let conv0 = f32s(&mut rng, 3 * ch, -1.0, 1.0);
+    let s0 = f32s(&mut rng, h * GDN_DIM * GDN_DIM, -0.1, 0.1);
+
+    let (mut conv_r, mut s_r) = (conv0.clone(), s0.iter().map(|&x| x as f64).collect::<Vec<_>>());
+    let (o_r, y_r) = gdn_ref(
+        &qkv, &alpha, &beta, &z, &w, &ssm_a, &dt, &norm, &mut conv_r, &mut s_r, m, hk, eps,
+    );
+    // The state after row 1 (the snapshot's).
+    let (mut conv_2, mut s_2) = (conv0.clone(), s0.iter().map(|&x| x as f64).collect::<Vec<_>>());
+    gdn_ref(
+        &qkv[..2 * ch], &alpha[..2 * h], &beta[..2 * h], &z[..2 * inner], &w, &ssm_a, &dt,
+        &norm, &mut conv_2, &mut s_2, 2, hk, eps,
+    );
+
+    let t = |v: &[f32]| tensor(&ctx, v);
+    let (wt, at, dtt, nt) = (t(&w), t(&ssm_a), t(&dt), t(&norm));
+    let p = GdnParams { conv_w: &wt, ssm_a: &at, dt_bias: &dtt, norm: &nt };
+    let (conv, s) = (t(&conv0), t(&s0));
+    let st = GdnState { conv: &conv, s: &s };
+    let (sconv, ss) = (zeros(&ctx, 3 * ch, DType::F32), zeros(&ctx, s0.len(), DType::F32));
+    let snap = GdnSnapshot { row: 1, conv: &sconv, s: &ss };
+    let (qkv_t, a_t, b_t, z_t) = (t(&qkv), t(&alpha), t(&beta), t(&z));
+    let c = zeros(&ctx, m * ch, DType::F32);
+    let o = zeros(&ctx, m * inner, DType::F32);
+    let y = zeros(&ctx, m * inner, DType::F32);
+    run(&ctx, |pass| {
+        gdn(
+            &ctx, pass, &p, &st, Some(&snap), &qkv_t, &a_t, &b_t, &z_t, &c, &o, &y, m, hk,
+            eps as f32,
+        )
+        .unwrap()
+    });
+    let f = |v: &[f64]| v.iter().map(|&x| x as f32).collect::<Vec<_>>();
+    assert_close(&o.to_f32().unwrap(), &f(&o_r), 2e-5, 2e-4);
+    assert_close(&y.to_f32().unwrap(), &f(&y_r), 2e-4, 2e-3);
+    assert_close(&s.to_f32().unwrap(), &f(&s_r), 2e-5, 2e-4);
+    assert_close(&conv.to_f32().unwrap(), &conv_r, 0.0, 0.0);
+    assert_close(&ss.to_f32().unwrap(), &f(&s_2), 2e-5, 2e-4);
+    assert_close(&sconv.to_f32().unwrap(), &conv_2, 0.0, 0.0);
+}
+
+#[test]
+fn attn_prep_and_gate_match_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(37);
+    let (m, nq, nkv, d, rot, base, eps, pos0) = (3, 4, 2, HEAD_DIM, 64, 1e7f32, 1e-6, 1000);
+    let qg = f32s(&mut rng, m * nq * 2 * d, -2.0, 2.0);
+    let kx = f32s(&mut rng, m * nkv * d, -2.0, 2.0);
+    let vx = f32s(&mut rng, m * nkv * d, -2.0, 2.0);
+    let qn = f32s(&mut rng, d, 0.5, 1.5);
+    let kn = f32s(&mut rng, d, 0.5, 1.5);
+    // CPU: RMSNorm, NeoX RoPE with ggml's cumulative angle.
+    let prep = |x: &[f32], w: &[f32], pos: usize| -> Vec<f32> {
+        let ms = x.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / d as f64;
+        let n: Vec<f64> = x.iter().zip(w).map(|(&v, &w)| v as f64 / (ms + eps).sqrt() * w as f64).collect();
+        let mut r = n.clone();
+        let scale = (base as f64).powf(-2.0 / rot as f64);
+        let mut theta = pos as f64;
+        for i in 0..rot / 2 {
+            let (c, s) = (theta.cos(), theta.sin());
+            r[i] = n[i] * c - n[i + rot / 2] * s;
+            r[i + rot / 2] = n[i] * s + n[i + rot / 2] * c;
+            theta *= scale;
+        }
+        r.iter().map(|&v| v as f32).collect()
+    };
+    let mut q_r = Vec::new();
+    let mut k_r = Vec::new();
+    for t in 0..m {
+        for hh in 0..nq {
+            let at = (t * nq + hh) * 2 * d;
+            q_r.extend(prep(&qg[at..at + d], &qn, pos0 + t));
+        }
+        for hh in 0..nkv {
+            let at = (t * nkv + hh) * d;
+            k_r.extend(prep(&kx[at..at + d], &kn, pos0 + t));
+        }
+    }
+    let t = |v: &[f32]| tensor(&ctx, v);
+    let (qg_t, k_t, v_t, qn_t, kn_t) = (t(&qg), t(&kx), t(&vx), t(&qn), t(&kn));
+    let qo = zeros(&ctx, m * nq * d, DType::BF16);
+    let ko = zeros(&ctx, m * nkv * d, DType::BF16);
+    let vo = zeros(&ctx, m * nkv * d, DType::BF16);
+    let y = zeros(&ctx, m * nq * d, DType::F32);
+    run(&ctx, |pass| {
+        attn_prep(
+            &ctx, pass, &qg_t, &k_t, &v_t, &qn_t, &kn_t, &qo, &ko, &vo, m, nq, nkv, pos0, rot,
+            base, eps as f32,
+        )
+        .unwrap();
+        pass.memory_barrier().unwrap();
+        // The gate over the bfloat q as if it were the attention's output.
+        attn_gate(&ctx, pass, &qo, &qg_t, &y, m, nq).unwrap();
+    });
+    // bfloat outputs: relative 2^-8.
+    assert_close(&qo.to_f32().unwrap(), &q_r, 1e-3, 8e-3);
+    assert_close(&ko.to_f32().unwrap(), &k_r, 1e-3, 8e-3);
+    assert_close(&vo.to_f32().unwrap(), &vx, 1e-3, 8e-3);
+    let qb = qo.to_f32().unwrap();
+    let y_r: Vec<f32> = (0..m * nq * d)
+        .map(|i| {
+            let (tt, hh, dd) = (i / (nq * d), i / d % nq, i % d);
+            qb[i] * sigmoid(qg[(tt * nq + hh) * 2 * d + d + dd] as f64) as f32
+        })
+        .collect();
+    assert_close(&y.to_f32().unwrap(), &y_r, 1e-6, 1e-5);
+}
+
+#[test]
+fn router_matches_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(38);
+    let (m, e, k, kk) = (6, 256, 8, 512);
+    let w = f32s(&mut rng, e * kk, -0.1, 0.1);
+    let wg = f32s(&mut rng, kk, -0.1, 0.1);
+    let x = f32s(&mut rng, m * kk, -1.0, 1.0);
+    let mut logits: Vec<f32> = (0..m * e)
+        .map(|i| (0..kk).map(|c| w[i % e * kk + c] as f64 * x[i / e * kk + c] as f64).sum::<f64>() as f32)
+        .collect();
+    let gl: Vec<f32> = (0..m)
+        .map(|t| (0..kk).map(|c| wg[c] as f64 * x[t * kk + c] as f64).sum::<f64>() as f32)
+        .collect();
+    let rw = QWeight::from_bytes(&ctx, bytemuck::cast_slice(&w), GgmlType::F32, kk, e).unwrap();
+    let rg = QWeight::from_bytes(&ctx, bytemuck::cast_slice(&wg), GgmlType::F32, kk, 1).unwrap();
+    let xt = tensor(&ctx, &x);
+    let lt = zeros(&ctx, m * e, DType::F32);
+    let gt = zeros(&ctx, m, DType::F32);
+    run(&ctx, |pass| router_logits(&ctx, pass, &rw, &rg, &xt, &lt, &gt, m).unwrap());
+    assert_close(&lt.to_f32().unwrap(), &logits, 1e-5, 1e-4);
+    assert_close(&gt.to_f32().unwrap(), &gl, 1e-5, 1e-4);
+
+    // A tie in row 0 (lower index wins), then the selection.
+    logits[3] = logits[1] + 50.0;
+    logits[7] = logits[3];
+    let lt = tensor(&ctx, &logits);
+    let sel = zeros(&ctx, m * k, DType::U32);
+    let wts = zeros(&ctx, m * k, DType::F32);
+    run(&ctx, |pass| router(&ctx, pass, &lt, &sel, &wts, m, e, k).unwrap());
+    let (sel, wts) = (sel.to_u32().unwrap(), wts.to_f32().unwrap());
+    for t in 0..m {
+        let row = &logits[t * e..(t + 1) * e];
+        let mx = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) as f64;
+        let z: f64 = row.iter().map(|&l| (l as f64 - mx).exp()).sum();
+        let mut idx: Vec<usize> = (0..e).collect();
+        idx.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+        let top = &idx[..k];
+        let ps: Vec<f64> = top.iter().map(|&i| (row[i] as f64 - mx).exp() / z).collect();
+        let sum: f64 = ps.iter().sum();
+        assert_eq!(&sel[t * k..(t + 1) * k], &top.iter().map(|&i| i as u32).collect::<Vec<_>>()[..]);
+        let want: Vec<f32> = ps.iter().map(|p| (p / sum) as f32).collect();
+        assert_close(&wts[t * k..(t + 1) * k], &want, 1e-6, 1e-5);
+    }
+    assert_eq!(&sel[..2], &[3, 7]);
+}
+
+#[test]
+fn embed_rows_match_dequant() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(39);
+    let (cols, rows) = (512, 10);
+    for ty in [GgmlType::Q8_0, GgmlType::Q4K] {
+        let nb = cols * rows / ty.block_values();
+        let mut raw: Vec<u8> = (0..nb * ty.block_bytes()).map(|_| rng.r#gen()).collect();
+        for blk in raw.chunks_exact_mut(ty.block_bytes()) {
+            blk[0..2].copy_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
+            if ty == GgmlType::Q4K {
+                blk[2..4].copy_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
+            }
+        }
+        let mut all = vec![0f32; cols * rows];
+        dequantize(ty, &raw, &mut all).unwrap();
+        let table = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+        let toks = [7u32, 0, 9, 7];
+        let tt = u32s(&ctx, &toks);
+        let out = zeros(&ctx, toks.len() * cols, DType::F32);
+        run(&ctx, |pass| embed(&ctx, pass, &table, &tt, &out, toks.len()).unwrap());
+        let want: Vec<f32> = toks
+            .iter()
+            .flat_map(|&t| all[t as usize * cols..(t as usize + 1) * cols].to_vec())
+            .collect();
+        assert_close(&out.to_f32().unwrap(), &want, 0.0, 0.0);
+    }
+}
+
+#[test]
+fn ffn_residual_matches_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(40);
+    let (m, h) = (3, 512);
+    let x = f32s(&mut rng, m * h, -1.0, 1.0);
+    let moe = f32s(&mut rng, m * h, -1.0, 1.0);
+    let sh = f32s(&mut rng, m * h, -1.0, 1.0);
+    let g = f32s(&mut rng, m, -3.0, 3.0);
+    let want: Vec<f32> = (0..m * h)
+        .map(|i| {
+            let s = sh[i] * (1.0 / (1.0 + (-g[i / h]).exp()));
+            (moe[i] + s) + x[i]
+        })
+        .collect();
+    let xt = tensor(&ctx, &x);
+    let (mt, st, gt) = (tensor(&ctx, &moe), tensor(&ctx, &sh), tensor(&ctx, &g));
+    run(&ctx, |pass| ffn_residual(&ctx, pass, &xt, &mt, &st, &gt, m, h).unwrap());
+    assert_close(&xt.to_f32().unwrap(), &want, 1e-6, 1e-6);
+}

@@ -1703,6 +1703,12 @@ fn gguf_config(path: &Path) -> Result<Value> {
         config["max_position_embeddings"] =
             serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
     }
+    if arch == crate::qwen36::config::ARCH {
+        let stops = crate::qwen36::tokenizer::stop_ids(&g)?;
+        config["eos_token_id"] = serde_json::json!(stops);
+        config["max_position_embeddings"] =
+            serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
+    }
     Ok(config)
 }
 
@@ -1913,10 +1919,14 @@ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
         crate::deepseek4::config::ARCH => {
             run_with::<crate::deepseek4::Ds4Model>(model_dir, options, signals)
         }
+        crate::qwen36::config::ARCH => {
+            run_with::<crate::qwen36::Qwen36Model>(model_dir, options, signals)
+        }
         other => anyhow::bail!(
             "unsupported model_type {other:?}; lily serves qwen4_exp \
-             (Qwen3.8-Flash-Next), a glm5-next GGUF (GLM 5.3 Flash) and a \
-             deepseek4 GGUF (DeepSeek V4 Flash)"
+             (Qwen3.8-Flash-Next), a glm5-next GGUF (GLM 5.3 Flash), a \
+             deepseek4 GGUF (DeepSeek V4 Flash) and a qwen35moe GGUF \
+             (Qwen3.6-35B-A3B)"
         ),
     }
 }
