@@ -1,5 +1,6 @@
 //! Qwen3.6 kernels at small shapes against f64 CPU versions of llama.cpp's
-//! arithmetic (ggml's CPU ops for qwen35moe).
+//! arithmetic (ggml's CPU ops for qwen35moe); the GDN reference keeps its
+//! whole recurrence in f64, the rest takes `crate::refops`.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -8,6 +9,7 @@ use super::*;
 use crate::cpu_ref::assert_close;
 use crate::gguf::dequantize;
 use crate::kernels::glm53::QWeight;
+use crate::refops;
 
 fn ctx() -> MetalContext {
     MetalContext::new().expect("metal context")
@@ -287,18 +289,10 @@ fn router_matches_cpu() {
     let w = f32s(&mut rng, e * kk, -0.1, 0.1);
     let wg = f32s(&mut rng, kk, -0.1, 0.1);
     let x = f32s(&mut rng, m * kk, -1.0, 1.0);
-    let mut logits: Vec<f32> = (0..m * e)
-        .map(|i| {
-            (0..kk)
-                .map(|c| w[i % e * kk + c] as f64 * x[i / e * kk + c] as f64)
-                .sum::<f64>() as f32
-        })
-        .collect();
-    let gl: Vec<f32> = (0..m)
-        .map(|t| {
-            (0..kk).map(|c| wg[c] as f64 * x[t * kk + c] as f64).sum::<f64>() as f32
-        })
-        .collect();
+    let row = |v: &[f32], r: usize| v[r * kk..(r + 1) * kk].to_vec();
+    let mut logits: Vec<f32> =
+        (0..m * e).map(|i| refops::dot(&row(&w, i % e), &row(&x, i / e))).collect();
+    let gl: Vec<f32> = (0..m).map(|t| refops::dot(&wg, &row(&x, t))).collect();
     let rw = QWeight::from_bytes(&ctx, bytemuck::cast_slice(&w), GgmlType::F32, kk, e)
         .unwrap();
     let rg = QWeight::from_bytes(&ctx, bytemuck::cast_slice(&wg), GgmlType::F32, kk, 1)
@@ -382,7 +376,7 @@ fn ffn_residual_matches_cpu() {
     let g = f32s(&mut rng, m, -3.0, 3.0);
     let want: Vec<f32> = (0..m * h)
         .map(|i| {
-            let s = sh[i] * (1.0 / (1.0 + (-g[i / h]).exp()));
+            let s = sh[i] * refops::sigmoid(g[i / h]);
             (moe[i] + s) + x[i]
         })
         .collect();
