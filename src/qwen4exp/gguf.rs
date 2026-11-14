@@ -197,9 +197,7 @@ pub fn config_from_gguf(g: &Gguf) -> Result<Qwen4ExpConfig> {
         storage: StoragePolicy::Q4,
         mtp: (nextn > 0).then_some(MtpConfig { layers: nextn, rope_theta: theta }),
         vision: None,
-        gguf_down_cols: Some(
-            g.require("blk.0.ffn_down_exps.weight")?.row_len(),
-        ),
+        gguf_down_cols: Some(g.require("blk.0.ffn_down_exps.weight")?.row_len()),
     };
     config.validate_flash_next()?;
     Ok(config)
@@ -212,9 +210,25 @@ struct Mapped {
 }
 
 impl Mapped {
-    fn map(ctx: &MetalContext, g: &Gguf, path: &Path) -> Result<Self> {
+    /// Maps every tensor but the n-gram table, the copied ones, and the
+    /// blocks from `first_unused` on (the draft head when it is not loaded,
+    /// or the layers `LILY_QWEN_LAYERS` leaves out).
+    fn map(
+        ctx: &MetalContext,
+        g: &Gguf,
+        path: &Path,
+        first_unused: usize,
+    ) -> Result<Self> {
+        let unused = |name: &str| {
+            name.strip_prefix("blk.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_some_and(|il| il >= first_unused)
+        };
         let skip = |t: &TensorInfo| {
-            t.name == NGRAM_TABLE || COPIED.iter().any(|c| t.name.ends_with(c))
+            t.name == NGRAM_TABLE
+                || COPIED.iter().any(|c| t.name.ends_with(c))
+                || unused(&t.name)
         };
         let mut order: Vec<&TensorInfo> = g.tensors.iter().collect();
         order.sort_by_key(|t| t.offset);
@@ -696,7 +710,9 @@ pub fn load(
     crate::instance::acquire()?;
     let recording = ctx.record_buffers()?;
     let g = Gguf::open(path)?;
-    let mapped = Mapped::map(ctx, &g, path)?;
+    let loads_mtp = with_mtp && config.mtp.is_some();
+    let first_unused = config.num_hidden_layers + usize::from(loads_mtp);
+    let mapped = Mapped::map(ctx, &g, path, first_unused)?;
     let l = Load { ctx, g: &g, m: &mapped, cfg: config };
     let table = match &config.ple {
         Some(p) => Some(ngram_table(&ngram_table_dir(ngram_checkpoint)?, p)?),
