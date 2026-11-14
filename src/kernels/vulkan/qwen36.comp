@@ -396,3 +396,19 @@ void main() {
     }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// The shared expert's gated output: y[t][c] = shared[t][c] * sigmoid(g[t])
+// (the routed sum is added to it next). Grid threads (H, m).
+// Buffers: 0 shared [m][H], 1 g [m], 2 y [m][H]. Params: 3 H.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_qwen36_shared_gate
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint H = arg_u32(3);
+    const uint c = gl_GlobalInvocationID.x;
+    const uint t = gl_GlobalInvocationID.y;
+    const uint i = t * H + c;
+    F32(arg(2)).v[i] = F32(arg(0)).v[i] * qwen36_sigmoid(F32(arg(1)).v[t]);
+}
+#endif

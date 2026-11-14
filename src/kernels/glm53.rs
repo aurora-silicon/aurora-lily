@@ -585,6 +585,10 @@ fn moe_grouped_with(
                 (GgmlType::Iq2Xxs, true) => "glm53_gemm_moe_iq2_xxs_r128",
                 (GgmlType::Q2K, false) => "glm53_gemm_moe_q2_k",
                 (GgmlType::Q2K, true) => "glm53_gemm_moe_q2_k_r128",
+                (GgmlType::Q4K, false) => "glm53_gemm_moe_q4_k",
+                (GgmlType::Q4K, true) => "glm53_gemm_moe_q4_k_r128",
+                (GgmlType::Q8_0, false) => "glm53_gemm_moe_q8_0",
+                (GgmlType::Q8_0, true) => "glm53_gemm_moe_q8_0_r128",
                 (other, _) => anyhow::bail!("no grouped expert GEMM over {other:?}"),
             };
             ensure!(

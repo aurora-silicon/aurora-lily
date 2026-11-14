@@ -280,6 +280,7 @@ pub struct Scratch {
     rw: Tensor,
     moe_mid: Tensor,
     moe_out: Tensor,
+    moe_group: g::MoeGroupScratch,
     sfg: Tensor,
     sfu: Tensor,
     sfm: Tensor,
@@ -343,6 +344,7 @@ impl Scratch {
             rw: f(r * used)?,
             moe_mid: f(r * used * cfg.ff_expert)?,
             moe_out: f(r * h)?,
+            moe_group: g::MoeGroupScratch::new(ctx, r * used, cfg.n_expert, cfg.ff_expert, h)?,
             sfg: f(r * cfg.ff_shared)?,
             sfu: f(r * cfg.ff_shared)?,
             sfm: f(r * cfg.ff_shared)?,
@@ -722,6 +724,36 @@ impl Qwen36Model {
         k::router(ctx, pass, &sc.rlogits, &sc.rsel, &sc.rw, m, cfg.n_expert, used)?;
         g::swiglu(ctx, pass, &sc.sfg, &sc.sfu, &sc.sfm, m * cfg.ff_shared, 0.0)?;
         pass.memory_barrier()?;
+        if m > MAX_ROWS {
+            // A prompt run: the gated shared expert, then the routed experts
+            // grouped by expert on the matrix units add their sum to it.
+            let xb = self.bf16_input(ctx, pass, sc, &sc.sfm, cfg.ff_shared, m)?;
+            self.proj(ctx, pass, &[(&f.sh_down, &sc.sout)], &sc.sfm, xb, m)?;
+            pass.memory_barrier()?;
+            k::shared_gate(ctx, pass, &sc.sout, &sc.shg, &sc.moe_out, m, cfg.hidden)?;
+            pass.memory_barrier()?;
+            g::moe_grouped(
+                ctx,
+                pass,
+                &f.gate,
+                &f.up,
+                &f.down,
+                cfg.ff_expert,
+                cfg.hidden,
+                &sc.xn,
+                &sc.rsel,
+                &sc.rw,
+                &sc.moe_out,
+                &sc.moe_group,
+                m,
+                used,
+                cfg.n_expert,
+                0.0,
+            )?;
+            pass.memory_barrier()?;
+            g::add(ctx, pass, &sc.x, &sc.moe_out, &sc.x, m * cfg.hidden)?;
+            return pass.memory_barrier();
+        }
         g::moe_gate_up(
             ctx,
             pass,

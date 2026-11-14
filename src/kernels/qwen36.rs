@@ -353,6 +353,28 @@ pub fn router_logits(
     )
 }
 
+/// `y = shared * sigmoid(g)` over `m` rows of `hidden` (the prompt path's
+/// shared expert, before the grouped routed sum is added to it).
+pub fn shared_gate(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    shared: &Tensor,
+    g: &Tensor,
+    y: &Tensor,
+    m: usize,
+    hidden: usize,
+) -> Result<()> {
+    check(&[(shared, DType::F32), (g, DType::F32), (y, DType::F32)])?;
+    ensure!(shared.numel() >= m * hidden && y.numel() >= m * hidden, "shared gate rows");
+    let pipeline = ctx.pipeline("qwen36_shared_gate", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[shared.binding(), g.binding(), y.binding()],
+        &[&u32_bytes(hidden)],
+        Grid::Threads { grid: (hidden, m, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/qwen36.rs"]
 mod tests;

@@ -329,3 +329,63 @@ fn ffn_residual_matches_cpu() {
     run(&ctx, |pass| ffn_residual(&ctx, pass, &xt, &mt, &st, &gt, m, h).unwrap());
     assert_close(&xt.to_f32().unwrap(), &want, 1e-6, 1e-6);
 }
+
+/// Random Q8_0 or Q4_K blocks with small f16 scales.
+fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
+    let nb = values / ty.block_values();
+    let mut b: Vec<u8> = (0..nb * ty.block_bytes()).map(|_| rng.r#gen()).collect();
+    let f16 = |v: f32| half::f16::from_f32(v).to_bits().to_le_bytes();
+    for blk in b.chunks_exact_mut(ty.block_bytes()) {
+        blk[0..2].copy_from_slice(&f16(rng.gen_range(0.001..0.01)));
+        if ty == GgmlType::Q4K {
+            blk[2..4].copy_from_slice(&f16(rng.gen_range(0.001..0.01)));
+        }
+    }
+    b
+}
+
+#[test]
+fn moe_grouped_q4_k_q8_0_match_per_pair_kernels() {
+    use crate::kernels::glm53::{MoeGroupScratch, moe_down, moe_gate_up, moe_grouped};
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(41);
+    let (experts, hidden, ff, used, m) = (12, 512, 512, 8, 70);
+    for ty in [GgmlType::Q4K, GgmlType::Q8_0] {
+        let q = |rng: &mut StdRng, cols: usize, rows: usize| {
+            let raw = random_blocks(rng, ty, cols * rows);
+            QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+        };
+        let gw = q(&mut rng, hidden, experts * ff);
+        let uw = q(&mut rng, hidden, experts * ff);
+        let dw = q(&mut rng, ff, experts * hidden);
+        let x = f32s(&mut rng, m * hidden, -2.0, 2.0);
+        let sel: Vec<u32> = (0..m)
+            .flat_map(|i| (0..used).map(move |s| ((i * (s + 1) + s * s) % experts) as u32))
+            .collect();
+        let wts = f32s(&mut rng, m * used, 0.1, 0.6);
+        let shared = f32s(&mut rng, m * hidden, -1.0, 1.0);
+        let (tx, tsel, tw) = (tensor(&ctx, &x), u32s(&ctx, &sel), tensor(&ctx, &wts));
+        let grouped = tensor(&ctx, &shared);
+        let reference = tensor(&ctx, &shared);
+        let mid = zeros(&ctx, m * used * ff, DType::F32);
+        let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+        run(&ctx, |p| {
+            moe_grouped(
+                &ctx, p, &gw, &uw, &dw, ff, hidden, &tx, &tsel, &tw, &grouped, &gs, m, used,
+                experts, 0.0,
+            )
+            .unwrap();
+            moe_gate_up(&ctx, p, &gw, &uw, ff, &tx, &tsel, &tw, &mid, m, used, 0.0).unwrap();
+            p.memory_barrier().unwrap();
+            moe_down(&ctx, p, &dw, hidden, &mid, &tsel, Some(&reference), &reference, m, used)
+                .unwrap();
+        });
+        let a = grouped.to_f32().unwrap();
+        let b = reference.to_f32().unwrap();
+        // bfloat operands in the grouped GEMMs.
+        let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
+        for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!((x - y).abs() <= 3e-2 * scale, "{ty:?} element {k}: {x} vs {y}");
+        }
+    }
+}
