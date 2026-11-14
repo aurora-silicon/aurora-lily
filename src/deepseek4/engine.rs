@@ -1,6 +1,7 @@
 //! DeepSeek V4 Flash behind the engine's [`LanguageModel`] interface: what
-//! the server and the bench drive. One session at a time, no draft head yet
-//! (DSpark), no batching across sessions.
+//! the server and the bench drive. Speculative decoding drafts with DSpark
+//! (when its support file is loaded) under ds4's scheduler; one session at
+//! a time, no batching across sessions.
 
 use std::path::Path;
 
