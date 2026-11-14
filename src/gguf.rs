@@ -29,6 +29,7 @@ pub enum GgmlType {
     /// Integer tables (DeepSeek V4's hash routing); decoded as exact f32.
     I32 = 26,
     Bf16 = 30,
+    Mxfp4 = 39,
 }
 
 impl GgmlType {
@@ -42,6 +43,7 @@ impl GgmlType {
             16 => Self::Iq2Xxs,
             26 => Self::I32,
             30 => Self::Bf16,
+            39 => Self::Mxfp4,
             _ => return None,
         })
     }
@@ -50,7 +52,7 @@ impl GgmlType {
     pub fn block_values(self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::Bf16 | Self::I32 => 1,
-            Self::Q8_0 => 32,
+            Self::Q8_0 | Self::Mxfp4 => 32,
             Self::Q2K | Self::Q4K | Self::Iq2Xxs => QK_K,
         }
     }
@@ -64,6 +66,7 @@ impl GgmlType {
             Self::Q2K => 84,
             Self::Q4K => 144,
             Self::Iq2Xxs => 66,
+            Self::Mxfp4 => 17,
         }
     }
 
@@ -89,6 +92,7 @@ impl GgmlType {
             Self::Iq2Xxs => "IQ2_XXS",
             Self::I32 => "I32",
             Self::Bf16 => "BF16",
+            Self::Mxfp4 => "MXFP4",
         }
     }
 }
@@ -583,9 +587,24 @@ pub fn dequantize(ty: GgmlType, raw: &[u8], out: &mut [f32]) -> Result<()> {
             GgmlType::Q4K => dequant_q4_k(blk, dst),
             GgmlType::Q2K => dequant_q2_k(blk, dst),
             GgmlType::Iq2Xxs => dequant_iq2_xxs(blk, dst),
+            GgmlType::Mxfp4 => dequant_mxfp4(blk, dst),
         }
     }
     Ok(())
+}
+
+/// MXFP4 (ggml's `block_mxfp4`): an E8M0 exponent byte `e`, then 16 bytes of
+/// E2M1 codes, value `j` in the low nibble of byte `j` and value `j + 16` in
+/// the high one. Value = `KVALUES_MXFP4[code] * 2^(e - 128)` (ggml's
+/// `ggml_e8m0_to_fp32_half`: the table holds twice the E2M1 values).
+fn dequant_mxfp4(b: &[u8], out: &mut [f32]) {
+    const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    let e = u32::from(b[0]);
+    let d = if e < 2 { f32::from_bits(0x0020_0000 << e) } else { f32::from_bits((e - 1) << 23) };
+    for j in 0..16 {
+        out[j] = f32::from(KVALUES_MXFP4[usize::from(b[1 + j] & 0xf)]) * d;
+        out[j + 16] = f32::from(KVALUES_MXFP4[usize::from(b[1 + j] >> 4)]) * d;
+    }
 }
 
 /// Q8_0: f16 scale, 32 signed bytes.

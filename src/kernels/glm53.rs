@@ -119,7 +119,7 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
         GgmlType::Bf16 => 4,
         GgmlType::F32 => 5,
         GgmlType::F16 => 6,
-        GgmlType::I32 => anyhow::bail!("no GEMV over {ty:?}"),
+        GgmlType::I32 | GgmlType::Mxfp4 => anyhow::bail!("no GEMV over {ty:?}"),
     };
     Ok(NAMES[t][m - 1])
 }

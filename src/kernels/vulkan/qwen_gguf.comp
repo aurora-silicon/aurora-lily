@@ -1,0 +1,351 @@
+#version 460
+// Qwen3.8-Flash-Next over GGUF weights (src/kernels/qwen_gguf.rs dispatches
+// them): the projections, expert gathers and embedding of the Qwen graph
+// (src/qwen4exp/) when its weights are GGUF blocks read in place, as ds4's
+// Q2 file has them. Activations are lily's Qwen ones, bfloat16; the block
+// decoders are GLM's (glm53_quant.glsl). The CPU reference is
+// crate::gguf::dequantize and tests/support/cpu_ref.rs.
+#include "common.glsl"
+#include "glm53_quant.glsl"
+
+// The 32 bfloat16 activations of task t at x (64-byte aligned) as f32.
+void qg_load_x(uint64_t x, uint t, out vec4 xv[8]) {
+    const uint64_t b = x + uint64_t(t) * 64u;
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        const uvec4 v = U32x4(b + 16u * q).v[0];
+        xv[2u * q] = vec4(uintBitsToFloat(v.x << 16u), uintBitsToFloat(v.x & 0xffff0000u),
+                          uintBitsToFloat(v.y << 16u), uintBitsToFloat(v.y & 0xffff0000u));
+        xv[2u * q + 1u] = vec4(uintBitsToFloat(v.z << 16u), uintBitsToFloat(v.z & 0xffff0000u),
+                               uintBitsToFloat(v.w << 16u), uintBitsToFloat(v.w & 0xffff0000u));
+    }
+}
+
+float qg_dot32(in float w[32], in vec4 xv[8]) {
+    float acc = 0.0;
+    [[unroll]] for (uint q = 0u; q < 8u; q++) {
+        acc += w[4u * q] * xv[q].x + w[4u * q + 1u] * xv[q].y + w[4u * q + 2u] * xv[q].z
+             + w[4u * q + 3u] * xv[q].w;
+    }
+    return acc;
+}
+
+// F16 rows (2-byte aligned values, 16-byte aligned rows here).
+#define QG_F16 1u
+// MXFP4 (ggml's block_mxfp4): an E8M0 scale byte, then 16 bytes of E2M1
+// codes, value j in the low nibble of byte j and value j + 16 in its high
+// one (17-byte blocks: byte loads). The value is kvalues_mxfp4[code] times
+// 2^(e - 128) (ggml_e8m0_to_fp32_half: kvalues are twice the E2M1 values).
+#define QG_MXFP4 39u
+
+const float qg_mxfp4_values[16] = float[16](
+    0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0);
+
+void qg_decode_mxfp4(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t) * 17u;
+    const uint e = uint(U8(b).v[0]);
+    const float d = e < 2u ? uintBitsToFloat(0x00200000u << e) : uintBitsToFloat((e - 1u) << 23u);
+    [[unroll]] for (uint j = 0u; j < 16u; j++) {
+        const uint q = uint(U8(b + 1u).v[j]);
+        w[j] = qg_mxfp4_values[q & 15u] * d;
+        w[j + 16u] = qg_mxfp4_values[q >> 4u] * d;
+    }
+}
+
+void qg_decode(uint ty, uint64_t row, uint t, out float w[32]) {
+    if (ty == QG_MXFP4) {
+        qg_decode_mxfp4(row, t, w);
+    } else if (ty == QG_F16) {
+        const uint64_t b = row + uint64_t(t) * 64u;
+        [[unroll]] for (uint q = 0u; q < 4u; q++) {
+            const uvec4 v = U32x4(b + 16u * q).v[0];
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                const vec2 p = unpackHalf2x16(v[c]);
+                w[8u * q + 2u * c] = p.x;
+                w[8u * q + 2u * c + 1u] = p.y;
+            }
+        }
+    } else {
+        glm53_decode(ty, row, t, w);
+    }
+}
+
+// Sum over the `width` lanes (a power of two up to 32) of an aligned lane
+// group; every lane of the group gets the sum.
+float qg_group_sum(float v, uint width) {
+    if (width >= 32u) return subgroupAdd(v);
+    if (width > 16u) v += subgroupShuffleXor(v, 16u);
+    if (width > 8u) v += subgroupShuffleXor(v, 8u);
+    if (width > 4u) v += subgroupShuffleXor(v, 4u);
+    if (width > 2u) v += subgroupShuffleXor(v, 2u);
+    if (width > 1u) v += subgroupShuffleXor(v, 1u);
+    return v;
+}
+
+// The lanes a row takes: the largest power of two up to 32 that is at most
+// the row's tasks of 32 values.
+uint qg_width(uint tasks) {
+    uint w = 32u;
+    while (w > tasks && w > 1u) w >>= 1u;
+    return w;
+}
+
+// ---------------------------------------------------------------------------
+// GEMV over up to four GGUF weights of one type and width sharing their
+// bfloat16 input: y_s[i][n] = W_s[n] . x[i] for i < m (the kernel's M <= 4),
+// rounded to bfloat16 or stored as f32 per set. Set s (rows_s rows, rows
+// row_bytes_s apart: a view of wider rows has the wider stride) owns the
+// next ceil(rows_s / rows per threadgroup) threadgroups. A subgroup takes
+// 32 / width rows, width lanes striding a row's tasks.
+// Buffers: 0 x (bf16, rows x_row_stride apart), 1-4 W, 5-8 y. Params: 9 K,
+// 10-13 row_bytes, 14-17 rows (0: unused), 18 x_row_stride, 19 y_row_stride
+// (0: the set's rows), 20 bit s: set s writes bfloat16.
+// Threadgroups of 256 threads.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qg_gemv_q8_0_m1) || defined(KERNEL_qg_gemv_q8_0_m2) || \
+    defined(KERNEL_qg_gemv_q8_0_m3) || defined(KERNEL_qg_gemv_q8_0_m4)
+#define QG_TYPE GLM53_Q8_0
+#elif defined(KERNEL_qg_gemv_f16_m1) || defined(KERNEL_qg_gemv_f16_m2) || \
+    defined(KERNEL_qg_gemv_f16_m3) || defined(KERNEL_qg_gemv_f16_m4)
+#define QG_TYPE QG_F16
+#elif defined(KERNEL_qg_gemv_f32_m1) || defined(KERNEL_qg_gemv_f32_m2) || \
+    defined(KERNEL_qg_gemv_f32_m3) || defined(KERNEL_qg_gemv_f32_m4)
+#define QG_TYPE GLM53_F32
+#elif defined(KERNEL_qg_gemv_bf16_m1) || defined(KERNEL_qg_gemv_bf16_m2) || \
+    defined(KERNEL_qg_gemv_bf16_m3) || defined(KERNEL_qg_gemv_bf16_m4)
+#define QG_TYPE GLM53_BF16
+#elif defined(KERNEL_qg_gemv_q4_k_m1) || defined(KERNEL_qg_gemv_q4_k_m2) || \
+    defined(KERNEL_qg_gemv_q4_k_m3) || defined(KERNEL_qg_gemv_q4_k_m4)
+#define QG_TYPE GLM53_Q4_K
+#endif
+#ifdef QG_TYPE
+#if defined(KERNEL_qg_gemv_q8_0_m1) || defined(KERNEL_qg_gemv_f16_m1) || \
+    defined(KERNEL_qg_gemv_f32_m1) || defined(KERNEL_qg_gemv_bf16_m1) || \
+    defined(KERNEL_qg_gemv_q4_k_m1)
+#define QG_M 1u
+#elif defined(KERNEL_qg_gemv_q8_0_m2) || defined(KERNEL_qg_gemv_f16_m2) || \
+    defined(KERNEL_qg_gemv_f32_m2) || defined(KERNEL_qg_gemv_bf16_m2) || \
+    defined(KERNEL_qg_gemv_q4_k_m2)
+#define QG_M 2u
+#elif defined(KERNEL_qg_gemv_q8_0_m3) || defined(KERNEL_qg_gemv_f16_m3) || \
+    defined(KERNEL_qg_gemv_f32_m3) || defined(KERNEL_qg_gemv_bf16_m3) || \
+    defined(KERNEL_qg_gemv_q4_k_m3)
+#define QG_M 3u
+#else
+#define QG_M 4u
+#endif
+void main() {
+    const uint64_t X = arg(0);
+    const uint K = arg_u32(9);
+    const uint m = QG_M;
+    const uint x_row_stride = arg_u32(18);
+    const uint y_stride_param = arg_u32(19);
+    const uint bf_mask = arg_u32(20);
+    const uint tasks = K / GLM53_TASK;
+    const uint width = qg_width(tasks);
+    const uint per_sg = 32u / width;
+    const uint rows_per_tg = 8u * per_sg;
+    uint tg = gl_WorkGroupID.x;
+    uint set = 0u;
+    uint N = arg_u32(14);
+    [[unroll]] for (uint s = 0u; s < 3u; s++) {
+        const uint tgs = (N + rows_per_tg - 1u) / rows_per_tg;
+        if (set == s && tg >= tgs) {
+            tg -= tgs;
+            set = s + 1u;
+            N = arg_u32(15u + s);
+        }
+    }
+    const uint64_t W = arg(1u + set);
+    const uint64_t Y = arg(5u + set);
+    const uint row_bytes = arg_u32(10u + set);
+    const bool out_bf = ((bf_mask >> set) & 1u) != 0u;
+    const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint n = (tg * 8u + gl_SubgroupID) * per_sg + lane / width;
+    const uint sub = lane % width;
+    const bool live = n < N;
+    const uint64_t row = W + uint64_t(min(n, N - 1u)) * row_bytes;
+    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+    const uint64_t xs = 2u * uint64_t(x_row_stride);
+    for (uint t = sub; t < tasks; t += width) {
+        float w[32];
+        vec4 xv[8];
+        qg_decode(QG_TYPE, row, t, w);
+        qg_load_x(X, t, xv);
+        acc0 += qg_dot32(w, xv);
+        if (m > 1u) { qg_load_x(X + xs, t, xv); acc1 += qg_dot32(w, xv); }
+        if (m > 2u) { qg_load_x(X + 2u * xs, t, xv); acc2 += qg_dot32(w, xv); }
+        if (m > 3u) { qg_load_x(X + 3u * xs, t, xv); acc3 += qg_dot32(w, xv); }
+    }
+    acc0 = qg_group_sum(acc0, width);
+    if (m > 1u) acc1 = qg_group_sum(acc1, width);
+    if (m > 2u) acc2 = qg_group_sum(acc2, width);
+    if (m > 3u) acc3 = qg_group_sum(acc3, width);
+    if (live && sub == 0u) {
+        float acc[4] = float[4](acc0, acc1, acc2, acc3);
+        [[unroll]] for (uint i = 0u; i < m; i++) {
+            if (out_bf) BF16(Y).v[i * y_row_stride + n] = bfloat16_t(acc[i]);
+            else F32(Y).v[i * y_row_stride + n] = acc[i];
+        }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// out[r][n][k] = bfloat16(W[n][k]) for the staged GEMM of a prefill
+// projection: N rows of K values, row_bytes apart. Grid (K / 32 tasks, N).
+// Buffers: 0 W, 1 out. Params: 2 K, 3 row_bytes, 4 N.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qg_dequant_q8_0) || defined(KERNEL_qg_dequant_f16) || \
+    defined(KERNEL_qg_dequant_f32) || defined(KERNEL_qg_dequant_bf16)
+#if defined(KERNEL_qg_dequant_q8_0)
+#define QG_DQ_TYPE GLM53_Q8_0
+#elif defined(KERNEL_qg_dequant_f16)
+#define QG_DQ_TYPE QG_F16
+#elif defined(KERNEL_qg_dequant_f32)
+#define QG_DQ_TYPE GLM53_F32
+#else
+#define QG_DQ_TYPE GLM53_BF16
+#endif
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint K = arg_u32(2);
+    const uint row_bytes = arg_u32(3);
+    const uint t = gl_GlobalInvocationID.x;
+    const uint n = gl_GlobalInvocationID.y;
+    float w[32];
+    qg_decode(QG_DQ_TYPE, arg(0) + uint64_t(n) * row_bytes, t, w);
+    const uint64_t dst = arg(1) + 2u * (uint64_t(n) * K + uint64_t(t) * 32u);
+    [[unroll]] for (uint q = 0u; q < 8u; q++) {
+        BF16x4(dst).v[q] = bf16(vec4(w[4u * q], w[4u * q + 1u], w[4u * q + 2u], w[4u * q + 3u]));
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// out[r][i] = table[ids[r]][i]: rows of a BF16 embedding table. Grid (H, m).
+// Buffers: 0 table, 1 ids (u32), 2 out. Params: 3 H.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_qg_embed_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint H = arg_u32(3);
+    const uint i = gl_GlobalInvocationID.x;
+    const uint r = gl_GlobalInvocationID.y;
+    const uint id = U32(arg(1)).v[r];
+    U16(arg(2)).v[r * H + i] = U16(arg(0) + 2u * (uint64_t(id) * H)).v[i];
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Routed experts, gate and up with the SwiGLU, lily's Qwen arithmetic
+// (moe.comp's gathers): for slot s of row i (expert sel[i * used + s]),
+// act[i * used + s][r] = bf16(silu(g) * u) with g and u, rows r of the
+// expert's gate and up, rounded to bfloat16 first. One subgroup per row r.
+// Grid (ceil(F / 8), m * used), 256 threads.
+// Buffers: 0 gate experts, 1 up experts, 2 x bf16 [m][K], 3 sel u32
+// [m * used], 4 act bf16 [m * used][F]. Params: 5 K, 6 F, 7 row_bytes,
+// 8 used.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qg_moe_gate_up_iq2_xxs) || defined(KERNEL_qg_moe_gate_up_q4_k)
+void main() {
+    const uint K = arg_u32(5);
+    const uint F = arg_u32(6);
+    const uint row_bytes = arg_u32(7);
+    const uint used = arg_u32(8);
+    const uint slot = gl_WorkGroupID.y;
+    const uint i = slot / used;
+    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    if (r >= F) return;
+    const uint e = U32(arg(3)).v[slot];
+    const uint64_t off = (uint64_t(e) * F + r) * row_bytes;
+    const uint64_t gate = arg(0) + off;
+    const uint64_t up = arg(1) + off;
+    const uint64_t X = arg(2) + 2u * uint64_t(i) * K;
+    const uint tasks = K / GLM53_TASK;
+    float ag = 0.0, au = 0.0;
+    for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
+        vec4 xv[8];
+        qg_load_x(X, t, xv);
+#ifdef KERNEL_qg_moe_gate_up_iq2_xxs
+        ag += glm53_dot_iq2_xxs(gate, t, xv);
+        au += glm53_dot_iq2_xxs(up, t, xv);
+#else
+        float w[32];
+        glm53_decode(GLM53_Q4_K, gate, t, w);
+        ag += qg_dot32(w, xv);
+        glm53_decode(GLM53_Q4_K, up, t, w);
+        au += qg_dot32(w, xv);
+#endif
+    }
+    ag = subgroupAdd(ag);
+    au = subgroupAdd(au);
+    if (gl_SubgroupInvocationID == 0u) {
+        const float g = float(bfloat16_t(ag));
+        const float u = float(bfloat16_t(au));
+        precise float sv = g / (1.0 + exp(-g));
+        precise float act = sv * u;
+        BF16(arg(4) + 2u * (uint64_t(slot) * F)).v[r] = bfloat16_t(act);
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Routed experts, down and combine, lily's Qwen arithmetic (moe.comp's
+// moe_gather_gemv_q4_down_combine): out[i][r] = bf16(sum over the row's
+// slots, in slot order, of score * bf16(down_e[r] . act[slot]) (+
+// sigmoid(shared_gate[i]) * shared[i][r])). The down rows are row_bytes
+// apart and may be longer than the F activations a slot has (ds4's Q2_K
+// rows are padded from 640 to 768 values): only the first F values are
+// read. One subgroup per output row. Grid (ceil(H / 8), m), 256 threads.
+// Buffers: 0 down experts, 1 act bf16 [m * used][F], 2 sel, 3 scores f32
+// [m * used], 4 shared bf16 [m][H], 5 shared gate [m] (f32, or bf16 when
+// param 11 has bit 1), 6 out bf16 [m][H]. Params: 7 F, 8 H, 9 row_bytes,
+// 10 used, 11 bit 0: add the shared expert, bit 1: its gate is bf16.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qg_moe_down_q2_k) || defined(KERNEL_qg_moe_down_mxfp4) || \
+    defined(KERNEL_qg_moe_down_q8_0)
+#if defined(KERNEL_qg_moe_down_q2_k)
+#define QG_DOWN_TYPE GLM53_Q2_K
+#elif defined(KERNEL_qg_moe_down_q8_0)
+#define QG_DOWN_TYPE GLM53_Q8_0
+#else
+#define QG_DOWN_TYPE QG_MXFP4
+#endif
+void main() {
+    const uint F = arg_u32(7);
+    const uint H = arg_u32(8);
+    const uint row_bytes = arg_u32(9);
+    const uint used = arg_u32(10);
+    const uint flags = arg_u32(11);
+    const uint i = gl_WorkGroupID.y;
+    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    if (r >= H) return;
+    const uint tasks = F / GLM53_TASK;
+    precise float combined = 0.0;
+    for (uint s = 0u; s < used; s++) {
+        const uint slot = i * used + s;
+        const uint e = U32(arg(2)).v[slot];
+        const uint64_t row = arg(0) + (uint64_t(e) * H + r) * row_bytes;
+        const uint64_t X = arg(1) + 2u * uint64_t(slot) * F;
+        float acc = 0.0;
+        for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
+            float w[32];
+            vec4 xv[8];
+            qg_decode(QG_DOWN_TYPE, row, t, w);
+            qg_load_x(X, t, xv);
+            acc += qg_dot32(w, xv);
+        }
+        acc = subgroupAdd(acc);
+        combined += F32(arg(3)).v[slot] * float(bfloat16_t(acc));
+    }
+    if (gl_SubgroupInvocationID == 0u) {
+        if ((flags & 1u) != 0u) {
+            const float gl = (flags & 2u) != 0u ? float(BF16(arg(5)).v[i]) : F32(arg(5)).v[i];
+            precise float gate = 1.0 / (1.0 + exp(-gl));
+            combined += gate * float(BF16(arg(4)).v[i * H + r]);
+        }
+        BF16(arg(6)).v[i * H + r] = bfloat16_t(combined);
+    }
+}
+#endif

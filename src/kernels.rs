@@ -16,6 +16,7 @@ pub mod ple;
 pub mod qsa;
 pub mod quant;
 pub mod qwen36;
+pub mod qwen_gguf;
 pub mod sample;
 pub mod skinny;
 pub mod spec;
