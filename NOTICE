@@ -4,6 +4,11 @@ Copyright 2026 Perplexity AI, Inc.
 lily-qwen3.8-flash-next, a modified version of lily
 Copyright 2026 Fabio Greter
 
+lily on Linux, a modified version of lily-qwen3.8-flash-next: the Vulkan
+backend and its GLSL kernels, and GLM 5.3 Flash support
+Copyright 2026 Erik Bourget
+The files changed, and how, are recorded in this repository's git history.
+
 This product includes software developed as part of the lily project,
 licensed under the Apache License, Version 2.0 (see LICENSE).
 
@@ -36,6 +41,13 @@ https://github.com/ml-explore/mlx-lm
 
     src/kernels/metal/gdn.metal
       MLX-LM gated_delta.py
+
+  and their Vulkan ports, the same arithmetic in GLSL:
+
+    src/kernels/vulkan/attention.comp (from attention.metal)
+    src/kernels/vulkan/quant.comp, quant_rows.glsl (from quant.metal)
+    src/kernels/vulkan/moe.comp (from moe.metal)
+    src/kernels/vulkan/gdn.comp, gdn_common.glsl (from gdn.metal)
 
 MLX and MLX-LM are licensed under the following terms:
 
@@ -75,6 +87,9 @@ https://github.com/antirez/ds4
 
   Licensed under the MIT License, whose full text, with ds4's copyright
   lines, follows this entry.
+
+  ds4's license also carries the ggml authors' copyright, which covers the
+  GGUF block layouts and the IQ2_XXS grid tables below.
 
   lily serves GLM 5.3 Flash from ds4's published GGUF and follows ds4's
   implementation of the model: the graph (src/glm53/), the GGUF block
