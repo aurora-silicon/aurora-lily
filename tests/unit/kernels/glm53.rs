@@ -560,6 +560,153 @@ fn kda_chunked_form_matches_cpu() {
     kda_compare_gates(66, 33, 64, -30.0, -20.0);
 }
 
+/// KDA from a nonzero state and conv window through runs of `runs` rows
+/// (`Some(r)`: with a snapshot after row r, as a verify pass), each against
+/// the CPU recurrence: every output row, the snapshot, and the state and
+/// conv window after each run. Gates vary by channel (a third saturate to
+/// the strongest decay, a third to none, a third random) and beta by row
+/// and head (near 1, near 0, random).
+fn kda_handoff_case(runs: &[(usize, Option<usize>)], lower_bound: f32, seed: u64) {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut cfg = crate::glm53::Config::glm53_flash();
+    let heads = 4;
+    cfg.kda_heads = heads;
+    cfg.kda_gate_lower_bound = lower_bound;
+    let p = heads * 128;
+    let c = kda_case(&mut rng, heads);
+    let t = |v: &Vec<f32>| tensor(&ctx, v);
+    let (qc, kc, vc, al, dt, on) = (
+        t(&c.q_conv),
+        t(&c.k_conv),
+        t(&c.v_conv),
+        t(&c.a_log),
+        t(&c.dt_bias),
+        t(&c.o_norm),
+    );
+    let params = KdaParams {
+        q_conv: &qc,
+        k_conv: &kc,
+        v_conv: &vc,
+        a_log: &al,
+        dt_bias: &dt,
+        o_norm: &on,
+        heads,
+        lower_bound,
+        eps: 1e-5,
+    };
+    let cp = r::KdaParams {
+        q_conv: &c.q_conv,
+        k_conv: &c.k_conv,
+        v_conv: &c.v_conv,
+        a_log: &c.a_log,
+        dt_bias: &c.dt_bias,
+        o_norm: &c.o_norm,
+    };
+    let mut st = r::KdaState::new(&cfg);
+    st.conv = f32s(&mut rng, 9 * p, -1.0, 1.0);
+    st.s = f32s(&mut rng, heads * 128 * 128, -0.2, 0.2);
+    let conv_state = t(&st.conv);
+    let state = t(&st.s);
+    for (ri, &(n, snap_row)) in runs.iter().enumerate() {
+        let q = f32s(&mut rng, n * p, -2.0, 2.0);
+        let k = f32s(&mut rng, n * p, -2.0, 2.0);
+        let v = f32s(&mut rng, n * p, -2.0, 2.0);
+        let g: Vec<f32> = (0..n * p)
+            .map(|i| match (i % p) % 3 {
+                0 => 30.0,
+                1 => -30.0,
+                _ => rng.gen_range(-3.0..3.0),
+            })
+            .collect();
+        let b: Vec<f32> = (0..n * heads)
+            .map(|i| match i % 3 {
+                0 => 12.0,
+                1 => -12.0,
+                _ => rng.gen_range(-2.0..2.0),
+            })
+            .collect();
+        let og = f32s(&mut rng, n * p, -2.0, 2.0);
+        let (tq, tk, tv, tg, tb, tog) = (t(&q), t(&k), t(&v), t(&g), t(&b), t(&og));
+        let out = zeros(&ctx, n * p);
+        let edges = zeros(&ctx, kda_edges_len(n, heads));
+        let inputs = KdaInputs {
+            q: &tq,
+            k: &tk,
+            v: &tv,
+            gate: &tg,
+            beta: &tb,
+            out_gate: &tog,
+            edges: Some(&edges),
+        };
+        let (snap_conv, snap_state) =
+            (zeros(&ctx, 9 * p), zeros(&ctx, heads * 128 * 128));
+        let snap = snap_row.map(|row| KdaSnapshot {
+            row,
+            conv: &snap_conv,
+            state: &snap_state,
+        });
+        run(&ctx, |pass| {
+            kda(&ctx, pass, &params, &inputs, &conv_state, &state, &out, n, snap)
+                .unwrap()
+        });
+        let got = out.to_f32().unwrap();
+        for j in 0..n {
+            let s = j * p..(j + 1) * p;
+            let e = r::kda_step(
+                &cfg,
+                &mut st,
+                &cp,
+                &q[s.clone()],
+                &k[s.clone()],
+                &v[s.clone()],
+                &g[s.clone()],
+                &b[j * heads..(j + 1) * heads],
+                &og[s.clone()],
+            );
+            assert_close(&got[s], &e, 2e-4, 2e-3);
+            if snap_row == Some(j) {
+                assert_close(&snap_state.to_f32().unwrap(), &st.s, 1e-4, 1e-3);
+                assert_close(&snap_conv.to_f32().unwrap(), &st.conv, 0.0, 0.0);
+            }
+        }
+        let what = format!("run {ri} of {runs:?}, bound {lower_bound}");
+        let gs = state.to_f32().unwrap();
+        assert!(gs.iter().all(|v| v.is_finite()), "{what}: state not finite");
+        assert_close(&gs, &st.s, 1e-4, 1e-3);
+        assert_close(&conv_state.to_f32().unwrap(), &st.conv, 0.0, 0.0);
+    }
+}
+
+/// A prompt run in the chunked form hands its state and conv window to a
+/// decode step and a verify pass with a snapshot (the recurrence's kernels):
+/// runs of 33, 63, 64, 65 and 1 024 rows.
+#[test]
+fn kda_chunked_form_hands_off_to_decode_and_verify() {
+    for (i, n) in [33usize, 63, 64, 65, 1024].into_iter().enumerate() {
+        assert!(kda_takes_wy(-5.0, n, false));
+        kda_handoff_case(&[(n, None), (1, None), (2, Some(0))], -5.0, 90 + i as u64);
+    }
+}
+
+/// The chunked form only for a finite gate bound in [-5, 0]: the bounds it
+/// takes (-5, -2, 0) and one it leaves to the recurrence (-6) against the
+/// CPU; positive and non-finite bounds are not taken.
+#[test]
+fn kda_chunked_form_gate_bounds() {
+    for b in [-5.0f32, -2.0, -0.0, 0.0] {
+        assert!(kda_takes_wy(b, 33, false), "{b}");
+    }
+    for b in [-5.0001f32, -6.0, 1e-6, 3.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+        assert!(!kda_takes_wy(b, 1024, false), "{b}");
+    }
+    assert!(!kda_takes_wy(-5.0, 32, false));
+    assert!(!kda_takes_wy(-5.0, 1024, true));
+    for (i, b) in [-6.0f32, -5.0, -2.0, 0.0].into_iter().enumerate() {
+        kda_handoff_case(&[(97, None), (40, None)], b, 100 + i as u64);
+    }
+}
+
 #[test]
 fn kda_decode_matches_cpu() {
     kda_compare(6, 1, 59);
@@ -795,6 +942,129 @@ fn dsa_attend_refuses_unpadded_prompt_widths() {
 /// route, the next value past it (either sign) sends its query's tiles to
 /// f32, a NaN or infinite query value makes only its own head's scores
 /// non-finite, and slots past each row's count are -inf.
+/// The matrix route's scores at its block edges, from an output buffer full
+/// of NaN: causal rows whose counts are 63, 64, 65 and 66 with S = 192
+/// (blocks wholly past a row's count only write -inf), and selected rows
+/// with counts 63, 64 and 65 whose selections reach far past their slot
+/// index (cache row 5 999). Valid slots against f64; every other slot -inf.
+#[test]
+fn dsa_scores_mu_block_boundaries() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(81);
+    let n = 6000usize;
+    let s = 192usize;
+    let lat: Vec<f32> =
+        f32s(&mut rng, n * 512, -1.5, 1.5).into_iter().map(r::round_f16).collect();
+    let bytes: Vec<u8> =
+        lat.iter().flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes()).collect();
+    let cache = Tensor::from_bytes(&ctx, &bytes, &[n * 512], DType::F16).unwrap();
+    let scale = 1.0 / 16.0;
+    let check = |qk: &[f32],
+                 g: &[f32],
+                 m: usize,
+                 count: &dyn Fn(usize) -> usize,
+                 row: &dyn Fn(usize, usize) -> usize,
+                 what: &str| {
+        for i in 0..m {
+            for h in 0..64 {
+                let q = &qk[(i * 64 + h) * 512..(i * 64 + h + 1) * 512];
+                for slot in 0..s {
+                    let got = g[(i * 64 + h) * s + slot];
+                    if slot >= count(i) {
+                        assert_eq!(
+                            got,
+                            f32::NEG_INFINITY,
+                            "{what} row {i} head {h} slot {slot}"
+                        );
+                        continue;
+                    }
+                    let k = &lat[row(i, slot) * 512..(row(i, slot) + 1) * 512];
+                    let terms = q.iter().zip(k).map(|(&a, &b)| a as f64 * b as f64);
+                    let want = terms.clone().sum::<f64>() * scale as f64;
+                    let mag: f64 = terms.map(f64::abs).sum();
+                    let tol = scale as f64 * (3e-6 * mag + 512.0 * 6e-8 * 2.0);
+                    assert!(
+                        got.is_finite() && (got as f64 - want).abs() <= tol,
+                        "{what} row {i} head {h} slot {slot}: {got} against {want}"
+                    );
+                }
+            }
+        }
+    };
+    // Causal: counts pos0 + i + 1 = 63, 64, 65, 66.
+    let (m, pos0) = (4usize, 62usize);
+    let qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+    let tqk = tensor(&ctx, &qk);
+    let scores = tensor(&ctx, &vec![f32::NAN; m * 64 * s]);
+    run(&ctx, |p| {
+        dsa_scores(
+            &ctx,
+            p,
+            &tqk,
+            &cache,
+            Rows::Causal { pos0 },
+            &scores,
+            m,
+            s,
+            scale,
+            true,
+        )
+        .unwrap()
+    });
+    check(
+        &qk,
+        &scores.to_f32().unwrap(),
+        m,
+        &|i| pos0 + i + 1,
+        &|_, slot| slot,
+        "causal",
+    );
+    // Selected: per dispatch one count; row slot -> a row far in the cache,
+    // the last slots' rows the cache's last.
+    let m = 2usize;
+    let sel: Vec<u32> = (0..m * s)
+        .map(|k| {
+            let slot = k % s;
+            if slot % 7 == 6 {
+                (n - 1) as u32
+            } else {
+                (5000 + 3 * slot + k / s) as u32
+            }
+        })
+        .collect();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    for count in [63usize, 64, 65] {
+        let qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+        let tqk = tensor(&ctx, &qk);
+        let scores = tensor(&ctx, &vec![f32::NAN; m * 64 * s]);
+        run(&ctx, |p| {
+            dsa_scores(
+                &ctx,
+                p,
+                &tqk,
+                &cache,
+                Rows::Selected { sel: &tsel, count },
+                &scores,
+                m,
+                s,
+                scale,
+                true,
+            )
+            .unwrap()
+        });
+        check(
+            &qk,
+            &scores.to_f32().unwrap(),
+            m,
+            &|_| count,
+            &|i, slot| sel[i * s + slot] as usize,
+            &format!("selected count {count}"),
+        );
+    }
+}
+
 #[test]
 fn dsa_scores_at_and_past_f16_range() {
     let ctx = ctx();
@@ -1936,18 +2206,31 @@ fn gemm_k_widths() {
 }
 
 /// The GEMM over the input's bfloat copy gives the f32-input GEMM's
-/// results bit for bit (both round the input to bfloat, to nearest even):
-/// Q8_0 and Q4_K, row counts and widths with partial tiles, inputs with
-/// values at rounding ties.
+/// results bit for bit (both round the input to bfloat, to nearest even,
+/// and the weights the same way): Q8_0 and Q4_K, row counts within, at
+/// and across the 256-row tiles, widths with partial column tiles, and
+/// input values at bfloat rounding ties (the ties are the input's).
 #[test]
 fn gemm_bx_matches_gemm() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(78);
+    // Rows within one 256-row tile, around its edge (255, 256, 257) and
+    // across several (513, 1 024); widths with partial 64-column tiles.
     for (ty, cols, rows, m) in [
         (GgmlType::Q8_0, 256usize, 96usize, 70usize),
         (GgmlType::Q8_0, 512, 40, 130),
         (GgmlType::Q4K, 512, 72, 65),
         (GgmlType::Q4K, 256, 64, 33),
+        (GgmlType::Q8_0, 256, 72, 255),
+        (GgmlType::Q8_0, 256, 100, 256),
+        (GgmlType::Q8_0, 512, 40, 257),
+        (GgmlType::Q8_0, 256, 72, 513),
+        (GgmlType::Q8_0, 256, 136, 1024),
+        (GgmlType::Q4K, 256, 72, 255),
+        (GgmlType::Q4K, 512, 100, 256),
+        (GgmlType::Q4K, 256, 40, 257),
+        (GgmlType::Q4K, 256, 72, 513),
+        (GgmlType::Q4K, 512, 136, 1024),
     ] {
         let raw = random_blocks(&mut rng, ty, rows * cols);
         let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
@@ -2217,6 +2500,161 @@ fn moe_grouped_fused_matches_separate() {
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&got[0].0), bits(&got[1].0), "mid, limit {limit}");
         assert_eq!(bits(&got[0].1), bits(&got[1].1), "out, limit {limit}");
+    }
+}
+
+/// The expert GEMMs' f16 decode against the exact dequantization: one-hot
+/// input rows make each gate/up output a single decoded weight. IQ2_XXS
+/// (f16(d (2s+1)) times grid / 8) and Q2_K (fma(f16(d sc), q, -f16(dmin
+/// m))) blocks with scales from 1e-7 (products below f16's normal range)
+/// to 0.5, and Q2_K blocks with dmin = d (cancellation). Each weight is
+/// within the two f16 roundings: 2^-10 of its terms' magnitude, plus
+/// 2^-23 absolute below the normal range.
+#[test]
+fn moe_grouped_f16_decode_against_exact() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(82);
+    let (experts, hidden, ff, used, m) = (8usize, 256usize, 256usize, 8usize, 256usize);
+    let mags = [1e-7f32, 6e-6, 6e-5, 1e-3, 0.05, 0.5];
+    for ty in [GgmlType::Iq2Xxs, GgmlType::Q2K] {
+        let mut raw = random_blocks(&mut rng, ty, experts * ff * hidden);
+        let bb = ty.block_bytes();
+        for (bi, blk) in raw.chunks_exact_mut(bb).enumerate() {
+            let d = mags[bi % mags.len()] * rng.gen_range(0.5..1.5);
+            match ty {
+                GgmlType::Iq2Xxs => put_f16(blk, 0, d),
+                _ => {
+                    put_f16(blk, 80, d);
+                    put_f16(
+                        blk,
+                        82,
+                        if bi % 3 == 0 { d } else { d * rng.gen_range(0.1..2.0) },
+                    );
+                }
+            }
+        }
+        // Each block's terms: the magnitude the roundings are relative to.
+        let terms = |row: usize, k: usize| -> f32 {
+            let blk = &raw[(row * hidden + k) / 256 * bb..][..bb];
+            let v = k % 256;
+            let h = |at: usize| f16::from_le_bytes([blk[at], blk[at + 1]]).to_f32();
+            match ty {
+                GgmlType::Iq2Xxs => {
+                    let j = v / 32;
+                    let o = 2 + 8 * j + 4;
+                    let aux1 = u32::from_le_bytes([
+                        blk[o],
+                        blk[o + 1],
+                        blk[o + 2],
+                        blk[o + 3],
+                    ]);
+                    h(0) * (2 * (aux1 >> 28) + 1) as f32 * 43.0 / 8.0
+                }
+                _ => {
+                    let sc = blk[v / 16];
+                    h(80) * (sc & 15) as f32 * 3.0 + h(82) * (sc >> 4) as f32
+                }
+            }
+        };
+        let w = QWeight::from_bytes(&ctx, &raw, ty, hidden, experts * ff).unwrap();
+        let exact = mat(ty, &raw, experts * ff, hidden);
+        let draw = random_blocks(&mut rng, GgmlType::Q2K, experts * hidden * ff);
+        let dw = QWeight::from_bytes(&ctx, &draw, GgmlType::Q2K, ff, experts * hidden)
+            .unwrap();
+        // Row i is e_i; it uses every expert.
+        let mut x = vec![0f32; m * hidden];
+        for i in 0..m {
+            x[i * hidden + i] = 1.0;
+        }
+        let sel: Vec<u32> = (0..m)
+            .flat_map(|i| (0..used).map(move |s| ((i + s) % experts) as u32))
+            .collect();
+        let tx = tensor(&ctx, &x);
+        let tsel = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&sel),
+            &[sel.len()],
+            DType::U32,
+        )
+        .unwrap();
+        let tw = tensor(&ctx, &vec![0.1f32; m * used]);
+        let out = zeros(&ctx, m * hidden);
+        let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+        run(&ctx, |p| {
+            moe_grouped_with(
+                &ctx, p, &w, &w, &dw, ff, hidden, &tx, &tsel, &tw, &out, &gs, m, used,
+                experts, 0.0, false,
+            )
+            .unwrap()
+        });
+        let g = gs.g.to_f32().unwrap();
+        let mut worst = 0f32;
+        for i in 0..m {
+            for s in 0..used {
+                let e = sel[i * used + s] as usize;
+                for n in 0..ff {
+                    let row = e * ff + n;
+                    let want = exact.row(row)[i];
+                    let got = g[(i * used + s) * ff + n];
+                    let tol = terms(row, i).abs() * (1.0 / 1024.0) + 2f32.powi(-23);
+                    worst = worst.max((got - want).abs() / tol);
+                    assert!(
+                        (got - want).abs() <= tol,
+                        "{ty:?} expert {e} row {n} k {i}: {got} against {want} (tol {tol})"
+                    );
+                }
+            }
+        }
+        println!("{ty:?}: worst error {worst:.3} of the bound");
+    }
+}
+
+/// glm53_to_f16 against round-to-nearest-even with saturation: f16's
+/// largest values and past them, rounding ties, subnormals and underflow.
+#[test]
+fn to_f16_saturates_and_rounds_to_nearest_even() {
+    let ctx = ctx();
+    let mut v = vec![
+        65504.0f32,
+        -65504.0,
+        65519.0,
+        -65519.0,
+        65520.0,
+        -65520.0,
+        70000.0,
+        -1e9,
+        1e30,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        6.1035156e-5,
+        5.9604645e-8,
+        2.9802322e-8,
+        2.9802326e-8,
+        1e-9,
+        -3e-6,
+    ];
+    // Ties between f16 neighbours: 1 + (2k + 1) 2^-11.
+    for k in 0..8 {
+        v.push(1.0 + (2 * k + 1) as f32 * 2f32.powi(-11));
+        v.push(-(1024.0 + (2 * k + 1) as f32 * 0.5));
+    }
+    if v.len() % 2 == 1 {
+        v.push(0.25);
+    }
+    let tx = tensor(&ctx, &v);
+    let out = Tensor::zeros(&ctx, &[v.len()], DType::F16).unwrap();
+    run(&ctx, |p| to_f16(&ctx, p, &tx, &out, v.len()).unwrap());
+    let got = out.to_f32().unwrap();
+    for (k, (&x, &g)) in v.iter().zip(&got).enumerate() {
+        let want = f16::from_f32(x.clamp(-65504.0, 65504.0)).to_f32();
+        assert!(
+            g.to_bits() == want.to_bits(),
+            "value {k}: {x} -> {g}, round to nearest even with saturation gives {want}"
+        );
     }
 }
 

@@ -1,13 +1,17 @@
 #version 460
-// GLM 5.3 Flash prefill GEMMs (src/kernels/glm53.rs `gemm`, `moe_grouped`):
-// Y[m][n] = X[m] . W[n] for runs of prompt rows, W GGUF blocks decoded
-// exactly (glm53_quant.glsl) and rounded to bfloat, f32 accumulators on the
-// matrix units. Both follow Qwen's grouped GEMM (quant_grouped.glsl): a
-// threadgroup of four subgroups computes 64 rows x 64 columns, every thread
-// decodes 8 values of 4 weight rows of a 64-deep K step into a tile in the
-// lanes' order (one load per B operand), two tiles in turn, one barrier a
-// step; a subgroup owns 16 rows and all 64 columns and reads its rows of X
-// from device memory. Rows past M and N are clamped on load and not stored.
+// GLM 5.3 Flash prefill GEMMs (src/kernels/glm53.rs `gemm`, `gemm_bx`,
+// `moe_grouped`): Y[m][n] = X[m] . W[n] for runs of prompt rows, W GGUF
+// blocks decoded exactly (glm53_quant.glsl), f32 accumulators on the matrix
+// units. The dense GEMMs round both operands to bfloat (weights to nearest,
+// ties away from zero); the routed experts' take f16 operands (see their
+// section). They follow Qwen's grouped GEMM (quant_grouped.glsl): every
+// thread decodes 8 values of 4 (or 2) weight rows of a 64-deep K step into
+// a tile of 64 weight rows in the lanes' order (one load per B operand),
+// two tiles in turn, one barrier a step; a subgroup owns 16 rows of X (32
+// in the bfloat-input `_bx` kernels) and all 64 columns and reads its rows
+// of X from device memory. Threadgroups: four subgroups, 64 rows (the f32
+// input and expert kernels); eight subgroups, 256 rows (`_bx`). Rows past
+// M and N are clamped on load and not stored.
 // Batches (grid z) step X, W and Y by their own strides: the per-head
 // attn_k_b and attn_v_b projections.
 // Buffers: 0 X, 1 W, 2 Y. Params: 3 M, 4 N, 5 K, 6 row_bytes, 7 ldx,

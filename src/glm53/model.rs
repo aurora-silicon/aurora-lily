@@ -301,6 +301,32 @@ impl Glm53Model {
                 ffn,
             });
         }
+        // The routed experts' prompt-run GEMMs take f16 operands
+        // (k::moe_grouped): their input rmsnorm(x) w is at most
+        // sqrt(hidden) max|w| in magnitude, the down GEMM's input w_e
+        // swiglu(..) at most the expert weight scale times limit^2. A
+        // checkpoint whose bounds leave f16's range is refused.
+        let f16_max = 65504.0f32;
+        let rms_bound = (cfg.hidden as f32).sqrt();
+        let mut moe = false;
+        for (il, l) in layers.iter().enumerate() {
+            if cfg.is_moe(il) {
+                moe = true;
+                let gain =
+                    l.ffn_norm.to_f32()?.iter().fold(0f32, |m, v| m.max(v.abs()));
+                ensure!(
+                    gain.is_finite() && rms_bound * gain <= f16_max,
+                    "layer {il}: ffn_norm gain {gain} would put the expert input past f16's range"
+                );
+            }
+        }
+        if moe {
+            let (lim, scale) = (cfg.swiglu_limit, cfg.expert_weight_scale);
+            ensure!(
+                lim > 0.0 && scale >= 0.0 && lim * lim * scale <= f16_max,
+                "SwiGLU limit {lim} with expert weight scale {scale}: the down input could pass f16's range"
+            );
+        }
         let embed = mapped.q("token_embd.weight")?;
         let output = mapped.q("output.weight")?;
         let output_norm = mapped.f32("output_norm.weight")?;

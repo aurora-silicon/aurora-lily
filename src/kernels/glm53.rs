@@ -311,7 +311,7 @@ pub fn gemm_bx(
 }
 
 /// Rows of X a threadgroup of the bfloat-input GEMM takes (the kernel's
-/// 4 GM_BX_SUB).
+/// GM_BX_SG * GM_BX_SUB: 8 subgroups of 32).
 const GEMM_BX_ROWS: usize = 256;
 /// Threads a threadgroup of it (32 a subgroup of the kernel's GM_BX_SG).
 const GEMM_BX_THREADS: usize = 256;
@@ -339,6 +339,30 @@ pub fn to_bf16(
     let to_bf16 = ctx.pipeline("glm53_to_bf16", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &to_bf16,
+        &[x.binding(), out.binding()],
+        &[],
+        Grid::Threads { grid: (n / 2, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
+/// `out` = the first `n` values of `x` as f16 (the hardware's conversion,
+/// after clamping to +-65504: out-of-range values saturate), `n` even.
+pub fn to_f16(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    out: &Tensor,
+    n: usize,
+) -> Result<()> {
+    check_f32(&[x])?;
+    ensure!(out.dtype() == DType::F16, "f16 copy into {:?}", out.dtype());
+    ensure!(
+        n.is_multiple_of(2) && x.numel() >= n && out.numel() >= n,
+        "f16 copy of {n} values"
+    );
+    let pipeline = ctx.pipeline("glm53_to_f16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
         &[x.binding(), out.binding()],
         &[],
         Grid::Threads { grid: (n / 2, 1, 1), threadgroup: (256, 1, 1) },
@@ -527,17 +551,11 @@ fn moe_grouped_with(
         &[&u32_bytes(pairs), &u32_bytes(experts)],
         Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
     )?;
-    let to_f16 = ctx.pipeline("glm53_to_f16", SOURCE, MslVersion::V3_1)?;
     ensure!(
         x.numel() >= m * hidden && sc.xb.numel() >= m * hidden,
         "grouped MoE input"
     );
-    pass.dispatch_at(
-        &to_f16,
-        &[x.binding(), sc.xb.binding()],
-        &[],
-        Grid::Threads { grid: (m * hidden / 2, 1, 1), threadgroup: (256, 1, 1) },
-    )?;
+    to_f16(ctx, pass, x, &sc.xb, m * hidden)?;
     pass.memory_barrier()?;
     let max_tiles = pairs.div_ceil(64) + experts;
     let gemm_moe =
@@ -1091,6 +1109,14 @@ pub struct KdaSnapshot<'a> {
 /// (e^80; f32 ends at e^88).
 pub const KDA_WY_MIN_BOUND: f32 = -5.0;
 
+/// Whether [`kda`] takes the chunked form: runs of more than [`KDA_CHUNK`]
+/// rows without a snapshot, and a finite gate bound in
+/// [[`KDA_WY_MIN_BOUND`], 0] (decays at most 1: a positive bound would grow
+/// the chunk's cumulative products past f32).
+pub(crate) fn kda_takes_wy(lower_bound: f32, rows: usize, snapshot: bool) -> bool {
+    !snapshot && rows > KDA_CHUNK && (KDA_WY_MIN_BOUND..=0.0).contains(&lower_bound)
+}
+
 /// KDA for `rows` consecutive tokens of one sequence: the one-token kernel
 /// for a single row without a snapshot; prepare, then the chunked form
 /// (glm53_kda_chunk_wy and _scan) for runs of more than [`KDA_CHUNK`] rows
@@ -1109,7 +1135,7 @@ pub fn kda(
     rows: usize,
     snap: Option<KdaSnapshot<'_>>,
 ) -> Result<()> {
-    if snap.is_none() && rows > KDA_CHUNK && p.lower_bound >= KDA_WY_MIN_BOUND {
+    if kda_takes_wy(p.lower_bound, rows, snap.is_some()) {
         return kda_wy(ctx, pass, p, x, conv_state, state, out, rows);
     }
     kda_chunked(ctx, pass, p, x, conv_state, state, out, rows, snap, KDA_CHUNK)
