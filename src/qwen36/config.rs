@@ -107,7 +107,11 @@ impl Config {
             u("attention.value_length")? == c.head_dim,
             "attention key and value widths differ"
         );
-        ensure!(inner / v_heads == c.gdn_dim, "GDN value width {} != key width", inner / v_heads);
+        ensure!(
+            inner / v_heads == c.gdn_dim,
+            "GDN value width {} != key width",
+            inner / v_heads
+        );
         c.validate()?;
         Ok(c)
     }

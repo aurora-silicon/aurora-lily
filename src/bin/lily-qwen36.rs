@@ -88,7 +88,8 @@ enum Cmd {
 }
 
 fn read_ids(path: &PathBuf) -> Result<Vec<u32>> {
-    let s = std::fs::read_to_string(path).with_context(|| format!("{}", path.display()))?;
+    let s =
+        std::fs::read_to_string(path).with_context(|| format!("{}", path.display()))?;
     s.split_whitespace().map(|t| t.parse::<u32>().context("token id")).collect()
 }
 
@@ -170,7 +171,12 @@ fn log_softmax_at(logits: &[f32], target: usize) -> f64 {
     logits[target] as f64 - mx - z.ln()
 }
 
-fn nll(path: &PathBuf, files: &[PathBuf], split: Option<usize>, quiet: bool) -> Result<()> {
+fn nll(
+    path: &PathBuf,
+    files: &[PathBuf],
+    split: Option<usize>,
+    quiet: bool,
+) -> Result<()> {
     use std::io::Write as _;
     let ctx = MetalContext::new()?;
     let model = Qwen36Model::load(&ctx, path)?;
@@ -189,9 +195,15 @@ fn nll(path: &PathBuf, files: &[PathBuf], split: Option<usize>, quiet: bool) -> 
         let ids = read_ids(f)?;
         let split = match split {
             Some(s) => s,
-            None => std::fs::read_to_string(f.with_extension("split"))?.trim().parse()?,
+            None => {
+                std::fs::read_to_string(f.with_extension("split"))?.trim().parse()?
+            }
         };
-        anyhow::ensure!(split >= 1 && split < ids.len(), "split {split} of {}", ids.len());
+        anyhow::ensure!(
+            split >= 1 && split < ids.len(),
+            "split {split} of {}",
+            ids.len()
+        );
         st.reset();
         let t0 = Instant::now();
         model.prefill(&ctx, &mut st, &mut sc, &ids[..split])?;
@@ -260,8 +272,18 @@ fn nll(path: &PathBuf, files: &[PathBuf], split: Option<usize>, quiet: bool) -> 
     Ok(())
 }
 
-fn bench(path: &PathBuf, ids: &[u32], prompt_len: usize, n: usize, runs: usize) -> Result<()> {
-    anyhow::ensure!(ids.len() >= prompt_len, "{} ids for a prompt of {prompt_len}", ids.len());
+fn bench(
+    path: &PathBuf,
+    ids: &[u32],
+    prompt_len: usize,
+    n: usize,
+    runs: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        ids.len() >= prompt_len,
+        "{} ids for a prompt of {prompt_len}",
+        ids.len()
+    );
     let ctx = MetalContext::new()?;
     let model = Qwen36Model::load(&ctx, path)?;
     let cap = prompt_len + n + 8;
@@ -334,10 +356,20 @@ fn profile_report(steps: usize) {
     eprintln!("  {:7.3}  kernels summed per step", total / n * 1e3);
 }
 
-fn spec(path: &PathBuf, ids: &[u32], prompt_len: usize, n: usize, runs: usize) -> Result<()> {
+fn spec(
+    path: &PathBuf,
+    ids: &[u32],
+    prompt_len: usize,
+    n: usize,
+    runs: usize,
+) -> Result<()> {
     use lily::engine::{Draw, LanguageModel, LoadOptions};
     use lily::kernels::sample::SamplingParams;
-    anyhow::ensure!(ids.len() >= prompt_len, "{} ids for a prompt of {prompt_len}", ids.len());
+    anyhow::ensure!(
+        ids.len() >= prompt_len,
+        "{} ids for a prompt of {prompt_len}",
+        ids.len()
+    );
     let ctx = MetalContext::new()?;
     let opts = LoadOptions { mtp_drafts: 1, ..Default::default() };
     let model = <Qwen36Model as LanguageModel>::load(&ctx, path, &opts)?;
@@ -349,31 +381,64 @@ fn spec(path: &PathBuf, ids: &[u32], prompt_len: usize, n: usize, runs: usize) -
     let prompt = &ids[..prompt_len];
     // Plain greedy reference through the same prefill.
     st.reset();
-    LanguageModel::prefill(&model, &ctx, &mut st, &mut sc, prompt, Some(Draw { params: &greedy, step: 0 }))?;
+    LanguageModel::prefill(
+        &model,
+        &ctx,
+        &mut st,
+        &mut sc,
+        prompt,
+        Some(Draw { params: &greedy, step: 0 }),
+    )?;
     let mut plain = vec![sc.next_token.to_u32()?[0]];
     // Top-2 logit margin of each plain draw past the first.
     let mut margins = vec![f32::NAN];
     let t0 = Instant::now();
     while plain.len() < n {
-        model.forward(&ctx, &mut st, &mut sc, &[*plain.last().expect("one")], Logits::Last)?;
+        model.forward(
+            &ctx,
+            &mut st,
+            &mut sc,
+            &[*plain.last().expect("one")],
+            Logits::Last,
+        )?;
         let l = sc.logits_last.to_f32()?;
         let a = argmax(&l);
-        let second = l.iter().enumerate().filter(|&(i, _)| i != a).fold(f32::NEG_INFINITY, |m, (_, &x)| m.max(x));
+        let second = l
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != a)
+            .fold(f32::NEG_INFINITY, |m, (_, &x)| m.max(x));
         margins.push(l[a] - second);
         plain.push(a as u32);
     }
     let plain_dt = t0.elapsed().as_secs_f64();
     for run in 0..runs {
         st.reset();
-        LanguageModel::prefill(&model, &ctx, &mut st, &mut sc, prompt, Some(Draw { params: &greedy, step: 0 }))?;
+        LanguageModel::prefill(
+            &model,
+            &ctx,
+            &mut st,
+            &mut sc,
+            prompt,
+            Some(Draw { params: &greedy, step: 0 }),
+        )?;
         let mut out = vec![sc.next_token.to_u32()?[0]];
         let t0 = Instant::now();
         let (mut drafted, mut accepted, mut steps) = (0usize, 0usize, 0usize);
-        let mut proposals = model.draft_initial(&ctx, &mut st, &mut sc, out[0], 1, &greedy, 1)?;
+        let mut proposals =
+            model.draft_initial(&ctx, &mut st, &mut sc, out[0], 1, &greedy, 1)?;
         while out.len() < n {
             let pending = *out.last().expect("one");
-            let (draws, pass) =
-                model.verify(&ctx, &mut st, &mut sc, pending, &proposals, &greedy, out.len(), 1)?;
+            let (draws, pass) = model.verify(
+                &ctx,
+                &mut st,
+                &mut sc,
+                pending,
+                &proposals,
+                &greedy,
+                out.len(),
+                1,
+            )?;
             let mut kept = 0;
             for (j, &t) in draws.iter().enumerate() {
                 out.push(t);
@@ -385,7 +450,8 @@ fn spec(path: &PathBuf, ids: &[u32], prompt_len: usize, n: usize, runs: usize) -
             drafted += proposals.len();
             accepted += kept;
             steps += 1;
-            proposals = model.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pass)?;
+            proposals =
+                model.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pass)?;
         }
         let dt = t0.elapsed().as_secs_f64();
         out.truncate(n);

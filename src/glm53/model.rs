@@ -49,7 +49,8 @@ impl Mapped {
         g: &Gguf,
         keep: impl Fn(&TensorInfo) -> bool,
     ) -> Result<Self> {
-        let mut order: Vec<&TensorInfo> = g.tensors.iter().filter(|t| keep(t)).collect();
+        let mut order: Vec<&TensorInfo> =
+            g.tensors.iter().filter(|t| keep(t)).collect();
         order.sort_by_key(|t| t.offset);
         let mut tensors = std::collections::HashMap::new();
         let mut buffers = Vec::new();

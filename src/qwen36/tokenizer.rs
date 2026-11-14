@@ -31,7 +31,9 @@ pub fn tokenizer_json(g: &Gguf) -> Result<String> {
 pub fn chat_template(g: &Gguf) -> Result<String> {
     let mut t = g.str("tokenizer.chat_template")?.to_string();
     for tag in ["generation", "endgeneration"] {
-        for (open, close) in [("{%-", "-%}"), ("{%-", "%}"), ("{%", "-%}"), ("{%", "%}")] {
+        for (open, close) in
+            [("{%-", "-%}"), ("{%-", "%}"), ("{%", "-%}"), ("{%", "%}")]
+        {
             t = t.replace(&format!("{open} {tag} {close}"), "");
         }
     }

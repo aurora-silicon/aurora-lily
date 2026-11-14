@@ -26,7 +26,8 @@ fn zeros(ctx: &MetalContext, n: usize, d: DType) -> Tensor {
 }
 
 fn u32s(ctx: &MetalContext, v: &[u32]) -> Tensor {
-    Tensor::from_bytes(ctx, bytemuck::cast_slice(v), &[v.len()], DType::U32).expect("u32")
+    Tensor::from_bytes(ctx, bytemuck::cast_slice(v), &[v.len()], DType::U32)
+        .expect("u32")
 }
 
 fn run(ctx: &MetalContext, f: impl FnOnce(&ComputePass<'_>)) {
@@ -97,7 +98,8 @@ fn gdn_ref(
                 let d = (v[j] - kv) * b;
                 col.iter_mut().zip(&k).for_each(|(e, kk)| *e += kk * d);
                 o[(t * h + vh) * D + j] =
-                    col.iter().zip(&q).map(|(a, b)| a * b).sum::<f64>() / (D as f64).sqrt();
+                    col.iter().zip(&q).map(|(a, b)| a * b).sum::<f64>()
+                        / (D as f64).sqrt();
             }
             let oh = &o[(t * h + vh) * D..(t * h + vh + 1) * D];
             let ms = oh.iter().map(|x| x * x).sum::<f64>() / D as f64;
@@ -128,15 +130,40 @@ fn gdn_matches_cpu_with_snapshot() {
     let conv0 = f32s(&mut rng, 3 * ch, -1.0, 1.0);
     let s0 = f32s(&mut rng, h * GDN_DIM * GDN_DIM, -0.1, 0.1);
 
-    let (mut conv_r, mut s_r) = (conv0.clone(), s0.iter().map(|&x| x as f64).collect::<Vec<_>>());
+    let (mut conv_r, mut s_r) =
+        (conv0.clone(), s0.iter().map(|&x| x as f64).collect::<Vec<_>>());
     let (o_r, y_r) = gdn_ref(
-        &qkv, &alpha, &beta, &z, &w, &ssm_a, &dt, &norm, &mut conv_r, &mut s_r, m, hk, eps,
+        &qkv,
+        &alpha,
+        &beta,
+        &z,
+        &w,
+        &ssm_a,
+        &dt,
+        &norm,
+        &mut conv_r,
+        &mut s_r,
+        m,
+        hk,
+        eps,
     );
     // The state after row 1 (the snapshot's).
-    let (mut conv_2, mut s_2) = (conv0.clone(), s0.iter().map(|&x| x as f64).collect::<Vec<_>>());
+    let (mut conv_2, mut s_2) =
+        (conv0.clone(), s0.iter().map(|&x| x as f64).collect::<Vec<_>>());
     gdn_ref(
-        &qkv[..2 * ch], &alpha[..2 * h], &beta[..2 * h], &z[..2 * inner], &w, &ssm_a, &dt,
-        &norm, &mut conv_2, &mut s_2, 2, hk, eps,
+        &qkv[..2 * ch],
+        &alpha[..2 * h],
+        &beta[..2 * h],
+        &z[..2 * inner],
+        &w,
+        &ssm_a,
+        &dt,
+        &norm,
+        &mut conv_2,
+        &mut s_2,
+        2,
+        hk,
+        eps,
     );
 
     let t = |v: &[f32]| tensor(&ctx, v);
@@ -144,7 +171,8 @@ fn gdn_matches_cpu_with_snapshot() {
     let p = GdnParams { conv_w: &wt, ssm_a: &at, dt_bias: &dtt, norm: &nt };
     let (conv, s) = (t(&conv0), t(&s0));
     let st = GdnState { conv: &conv, s: &s };
-    let (sconv, ss) = (zeros(&ctx, 3 * ch, DType::F32), zeros(&ctx, s0.len(), DType::F32));
+    let (sconv, ss) =
+        (zeros(&ctx, 3 * ch, DType::F32), zeros(&ctx, s0.len(), DType::F32));
     let snap = GdnSnapshot { row: 1, conv: &sconv, s: &ss };
     let (qkv_t, a_t, b_t, z_t) = (t(&qkv), t(&alpha), t(&beta), t(&z));
     let c = zeros(&ctx, m * ch, DType::F32);
@@ -152,7 +180,20 @@ fn gdn_matches_cpu_with_snapshot() {
     let y = zeros(&ctx, m * inner, DType::F32);
     run(&ctx, |pass| {
         gdn(
-            &ctx, pass, &p, &st, Some(&snap), &qkv_t, &a_t, &b_t, &z_t, &c, &o, &y, m, hk,
+            &ctx,
+            pass,
+            &p,
+            &st,
+            Some(&snap),
+            &qkv_t,
+            &a_t,
+            &b_t,
+            &z_t,
+            &c,
+            &o,
+            &y,
+            m,
+            hk,
             eps as f32,
         )
         .unwrap()
@@ -170,7 +211,8 @@ fn gdn_matches_cpu_with_snapshot() {
 fn attn_prep_and_gate_match_cpu() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(37);
-    let (m, nq, nkv, d, rot, base, eps, pos0) = (3, 4, 2, HEAD_DIM, 64, 1e7f32, 1e-6, 1000);
+    let (m, nq, nkv, d, rot, base, eps, pos0) =
+        (3, 4, 2, HEAD_DIM, 64, 1e7f32, 1e-6, 1000);
     let qg = f32s(&mut rng, m * nq * 2 * d, -2.0, 2.0);
     let kx = f32s(&mut rng, m * nkv * d, -2.0, 2.0);
     let vx = f32s(&mut rng, m * nkv * d, -2.0, 2.0);
@@ -179,7 +221,11 @@ fn attn_prep_and_gate_match_cpu() {
     // CPU: RMSNorm, NeoX RoPE with ggml's cumulative angle.
     let prep = |x: &[f32], w: &[f32], pos: usize| -> Vec<f32> {
         let ms = x.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / d as f64;
-        let n: Vec<f64> = x.iter().zip(w).map(|(&v, &w)| v as f64 / (ms + eps).sqrt() * w as f64).collect();
+        let n: Vec<f64> = x
+            .iter()
+            .zip(w)
+            .map(|(&v, &w)| v as f64 / (ms + eps).sqrt() * w as f64)
+            .collect();
         let mut r = n.clone();
         let scale = (base as f64).powf(-2.0 / rot as f64);
         let mut theta = pos as f64;
@@ -211,8 +257,8 @@ fn attn_prep_and_gate_match_cpu() {
     let y = zeros(&ctx, m * nq * d, DType::F32);
     run(&ctx, |pass| {
         attn_prep(
-            &ctx, pass, &qg_t, &k_t, &v_t, &qn_t, &kn_t, &qo, &ko, &vo, m, nq, nkv, pos0, rot,
-            base, eps as f32,
+            &ctx, pass, &qg_t, &k_t, &v_t, &qn_t, &kn_t, &qo, &ko, &vo, m, nq, nkv,
+            pos0, rot, base, eps as f32,
         )
         .unwrap();
         pass.memory_barrier().unwrap();
@@ -242,13 +288,21 @@ fn router_matches_cpu() {
     let wg = f32s(&mut rng, kk, -0.1, 0.1);
     let x = f32s(&mut rng, m * kk, -1.0, 1.0);
     let mut logits: Vec<f32> = (0..m * e)
-        .map(|i| (0..kk).map(|c| w[i % e * kk + c] as f64 * x[i / e * kk + c] as f64).sum::<f64>() as f32)
+        .map(|i| {
+            (0..kk)
+                .map(|c| w[i % e * kk + c] as f64 * x[i / e * kk + c] as f64)
+                .sum::<f64>() as f32
+        })
         .collect();
     let gl: Vec<f32> = (0..m)
-        .map(|t| (0..kk).map(|c| wg[c] as f64 * x[t * kk + c] as f64).sum::<f64>() as f32)
+        .map(|t| {
+            (0..kk).map(|c| wg[c] as f64 * x[t * kk + c] as f64).sum::<f64>() as f32
+        })
         .collect();
-    let rw = QWeight::from_bytes(&ctx, bytemuck::cast_slice(&w), GgmlType::F32, kk, e).unwrap();
-    let rg = QWeight::from_bytes(&ctx, bytemuck::cast_slice(&wg), GgmlType::F32, kk, 1).unwrap();
+    let rw = QWeight::from_bytes(&ctx, bytemuck::cast_slice(&w), GgmlType::F32, kk, e)
+        .unwrap();
+    let rg = QWeight::from_bytes(&ctx, bytemuck::cast_slice(&wg), GgmlType::F32, kk, 1)
+        .unwrap();
     let xt = tensor(&ctx, &x);
     let lt = zeros(&ctx, m * e, DType::F32);
     let gt = zeros(&ctx, m, DType::F32);
@@ -271,9 +325,13 @@ fn router_matches_cpu() {
         let mut idx: Vec<usize> = (0..e).collect();
         idx.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
         let top = &idx[..k];
-        let ps: Vec<f64> = top.iter().map(|&i| (row[i] as f64 - mx).exp() / z).collect();
+        let ps: Vec<f64> =
+            top.iter().map(|&i| (row[i] as f64 - mx).exp() / z).collect();
         let sum: f64 = ps.iter().sum();
-        assert_eq!(&sel[t * k..(t + 1) * k], &top.iter().map(|&i| i as u32).collect::<Vec<_>>()[..]);
+        assert_eq!(
+            &sel[t * k..(t + 1) * k],
+            &top.iter().map(|&i| i as u32).collect::<Vec<_>>()[..]
+        );
         let want: Vec<f32> = ps.iter().map(|p| (p / sum) as f32).collect();
         assert_close(&wts[t * k..(t + 1) * k], &want, 1e-6, 1e-5);
     }
@@ -287,11 +345,15 @@ fn embed_rows_match_dequant() {
     let (cols, rows) = (512, 10);
     for ty in [GgmlType::Q8_0, GgmlType::Q4K] {
         let nb = cols * rows / ty.block_values();
-        let mut raw: Vec<u8> = (0..nb * ty.block_bytes()).map(|_| rng.r#gen()).collect();
+        let mut raw: Vec<u8> =
+            (0..nb * ty.block_bytes()).map(|_| rng.r#gen()).collect();
         for blk in raw.chunks_exact_mut(ty.block_bytes()) {
-            blk[0..2].copy_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
+            blk[0..2]
+                .copy_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
             if ty == GgmlType::Q4K {
-                blk[2..4].copy_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
+                blk[2..4].copy_from_slice(
+                    &half::f16::from_f32(0.005).to_bits().to_le_bytes(),
+                );
             }
         }
         let mut all = vec![0f32; cols * rows];
@@ -360,7 +422,9 @@ fn moe_grouped_q4_k_q8_0_match_per_pair_kernels() {
         let dw = q(&mut rng, ff, experts * hidden);
         let x = f32s(&mut rng, m * hidden, -2.0, 2.0);
         let sel: Vec<u32> = (0..m)
-            .flat_map(|i| (0..used).map(move |s| ((i * (s + 1) + s * s) % experts) as u32))
+            .flat_map(|i| {
+                (0..used).map(move |s| ((i * (s + 1) + s * s) % experts) as u32)
+            })
             .collect();
         let wts = f32s(&mut rng, m * used, 0.1, 0.6);
         let shared = f32s(&mut rng, m * hidden, -1.0, 1.0);
@@ -371,14 +435,26 @@ fn moe_grouped_q4_k_q8_0_match_per_pair_kernels() {
         let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
         run(&ctx, |p| {
             moe_grouped(
-                &ctx, p, &gw, &uw, &dw, ff, hidden, &tx, &tsel, &tw, &grouped, &gs, m, used,
-                experts, 0.0,
+                &ctx, p, &gw, &uw, &dw, ff, hidden, &tx, &tsel, &tw, &grouped, &gs, m,
+                used, experts, 0.0,
             )
             .unwrap();
-            moe_gate_up(&ctx, p, &gw, &uw, ff, &tx, &tsel, &tw, &mid, m, used, 0.0).unwrap();
-            p.memory_barrier().unwrap();
-            moe_down(&ctx, p, &dw, hidden, &mid, &tsel, Some(&reference), &reference, m, used)
+            moe_gate_up(&ctx, p, &gw, &uw, ff, &tx, &tsel, &tw, &mid, m, used, 0.0)
                 .unwrap();
+            p.memory_barrier().unwrap();
+            moe_down(
+                &ctx,
+                p,
+                &dw,
+                hidden,
+                &mid,
+                &tsel,
+                Some(&reference),
+                &reference,
+                m,
+                used,
+            )
+            .unwrap();
         });
         let a = grouped.to_f32().unwrap();
         let b = reference.to_f32().unwrap();
@@ -395,17 +471,22 @@ fn moe_down_matches_glm53() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(43);
     let (experts, hidden, used, m) = (10, 512, 8, 3);
-    for (ty, ff) in [(GgmlType::Q4K, 512), (GgmlType::Q8_0, 512), (GgmlType::Q4K, 256)] {
+    for (ty, ff) in [(GgmlType::Q4K, 512), (GgmlType::Q8_0, 512), (GgmlType::Q4K, 256)]
+    {
         let raw = random_blocks(&mut rng, ty, experts * hidden * ff);
         let dw = QWeight::from_bytes(&ctx, &raw, ty, ff, experts * hidden).unwrap();
         let mid = tensor(&ctx, &f32s(&mut rng, m * used * ff, -1.0, 1.0));
-        let sel: Vec<u32> = (0..m * used).map(|p| ((p * 7 + 3) % experts) as u32).collect();
+        let sel: Vec<u32> =
+            (0..m * used).map(|p| ((p * 7 + 3) % experts) as u32).collect();
         let tsel = u32s(&ctx, &sel);
-        let (a, b) = (zeros(&ctx, m * hidden, DType::F32), zeros(&ctx, m * hidden, DType::F32));
+        let (a, b) =
+            (zeros(&ctx, m * hidden, DType::F32), zeros(&ctx, m * hidden, DType::F32));
         run(&ctx, |p| {
             moe_down(&ctx, p, &dw, hidden, &mid, &tsel, &a, m, used).unwrap();
-            crate::kernels::glm53::moe_down(&ctx, p, &dw, hidden, &mid, &tsel, None, &b, m, used)
-                .unwrap();
+            crate::kernels::glm53::moe_down(
+                &ctx, p, &dw, hidden, &mid, &tsel, None, &b, m, used,
+            )
+            .unwrap();
         });
         assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-5, 1e-4);
     }

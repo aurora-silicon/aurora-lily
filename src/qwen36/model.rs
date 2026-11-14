@@ -202,7 +202,8 @@ impl Qwen36Model {
             let g = Gguf::open(&p)?;
             let arch = super::config::ARCH;
             if g.architecture()? == arch
-                && g.u64(&format!("{arch}.embedding_length"))? as usize == self.cfg.hidden
+                && g.u64(&format!("{arch}.embedding_length"))? as usize
+                    == self.cfg.hidden
             {
                 found.push(p);
             }
@@ -234,7 +235,11 @@ impl Qwen36Model {
         for n in ["enorm", "hnorm", "shared_head_norm"] {
             specs.push(spec(n, &[h as u64], f32_));
         }
-        super::schema::validate_specs(&g, &specs, &super::schema::fused_groups(il, false))?;
+        super::schema::validate_specs(
+            &g,
+            &specs,
+            &super::schema::fused_groups(il, false),
+        )?;
         let prefix = format!("blk.{il}.");
         let mapped = Mapped::map_only(ctx, &g, |t| t.name.starts_with(&prefix))?;
         let n = |s: &str| format!("blk.{il}.nextn.{s}.weight");
@@ -259,7 +264,11 @@ impl Qwen36Model {
         b
     }
 
-    pub fn new_state(&self, ctx: &MetalContext, capacity: usize) -> Result<Qwen36State> {
+    pub fn new_state(
+        &self,
+        ctx: &MetalContext,
+        capacity: usize,
+    ) -> Result<Qwen36State> {
         Qwen36State::new(ctx, &self.cfg, self.kv_format, capacity, self.mtp.is_some())
     }
 
@@ -272,8 +281,16 @@ impl Qwen36Model {
 pub enum LayerState {
     /// `conv_alt`/`s_alt` receive the state after a verify pass's first row,
     /// which becomes current when its draft is rejected.
-    Gdn { conv: Tensor, s: Tensor, conv_alt: Tensor, s_alt: Tensor },
-    Attn { k: KvCache, v: KvCache },
+    Gdn {
+        conv: Tensor,
+        s: Tensor,
+        conv_alt: Tensor,
+        s_alt: Tensor,
+    },
+    Attn {
+        k: KvCache,
+        v: KvCache,
+    },
 }
 
 /// The MTP head's per-session state: its K/V caches (row `p` holds the pair
@@ -319,17 +336,29 @@ impl Qwen36State {
                             DType::F32,
                         )
                     };
-                    LayerState::Gdn { conv: conv()?, s: s()?, conv_alt: conv()?, s_alt: s()? }
+                    LayerState::Gdn {
+                        conv: conv()?,
+                        s: s()?,
+                        conv_alt: conv()?,
+                        s_alt: s()?,
+                    }
                 } else {
                     let c = || {
-                        KvCache::zeros(ctx, format, cfg.n_head_kv, capacity, cfg.head_dim)
+                        KvCache::zeros(
+                            ctx,
+                            format,
+                            cfg.n_head_kv,
+                            capacity,
+                            cfg.head_dim,
+                        )
                     };
                     LayerState::Attn { k: c()?, v: c()? }
                 })
             })
             .collect::<Result<_>>()?;
         let mtp = if mtp {
-            let c = || KvCache::zeros(ctx, format, cfg.n_head_kv, capacity, cfg.head_dim);
+            let c =
+                || KvCache::zeros(ctx, format, cfg.n_head_kv, capacity, cfg.head_dim);
             Some(MtpState {
                 k: c()?,
                 v: c()?,
@@ -477,7 +506,13 @@ impl Scratch {
             rw: f(r * used)?,
             moe_mid: f(r * used * cfg.ff_expert)?,
             moe_out: f(r * h)?,
-            moe_group: g::MoeGroupScratch::new(ctx, r * used, cfg.n_expert, cfg.ff_expert, h)?,
+            moe_group: g::MoeGroupScratch::new(
+                ctx,
+                r * used,
+                cfg.n_expert,
+                cfg.ff_expert,
+                h,
+            )?,
             sfg: f(r * cfg.ff_shared)?,
             sfu: f(r * cfg.ff_shared)?,
             sfm: f(r * cfg.ff_shared)?,
@@ -590,7 +625,17 @@ impl Qwen36Model {
         while start < n {
             let end = (start + per_pass).min(n);
             let pass = self.begin(ctx)?;
-            self.encode_layers(ctx, &pass, st, sc, &sc.tokens, m, logits, snap, start..end)?;
+            self.encode_layers(
+                ctx,
+                &pass,
+                st,
+                sc,
+                &sc.tokens,
+                m,
+                logits,
+                snap,
+                start..end,
+            )?;
             while pending.len() >= 2 {
                 pending.pop_front().expect("in flight").wait()?;
             }
@@ -635,7 +680,16 @@ impl Qwen36Model {
             pass.memory_barrier()?;
         }
         for il in layers.clone() {
-            self.encode_block(ctx, pass, sc, &self.layers[il], &st.layers[il], st.pos, snap, m)?;
+            self.encode_block(
+                ctx,
+                pass,
+                sc,
+                &self.layers[il],
+                &st.layers[il],
+                st.pos,
+                snap,
+                m,
+            )?;
         }
         if layers.end < cfg.n_layer {
             return Ok(());
@@ -658,11 +712,21 @@ impl Qwen36Model {
         m: usize,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        g::rmsnorm(ctx, pass, &sc.x, Some(&l.attn_norm), &sc.xn, m, cfg.hidden, cfg.rms_eps)?;
+        g::rmsnorm(
+            ctx,
+            pass,
+            &sc.x,
+            Some(&l.attn_norm),
+            &sc.xn,
+            m,
+            cfg.hidden,
+            cfg.rms_eps,
+        )?;
         pass.memory_barrier()?;
         match (&l.mixer, ls) {
             (Mixer::Gdn(w), LayerState::Gdn { conv, s, conv_alt, s_alt }) => {
-                let snap = snap.map(|row| GdnSnapshot { row, conv: conv_alt, s: s_alt });
+                let snap =
+                    snap.map(|row| GdnSnapshot { row, conv: conv_alt, s: s_alt });
                 self.gdn(ctx, pass, sc, w, &GdnState { conv, s }, snap.as_ref(), m)?;
             }
             (Mixer::Attn(w), LayerState::Attn { k: kc, v: vc }) => {
@@ -672,7 +736,16 @@ impl Qwen36Model {
         }
         g::add(ctx, pass, &sc.x, &sc.mix, &sc.x, m * cfg.hidden)?;
         pass.memory_barrier()?;
-        g::rmsnorm(ctx, pass, &sc.x, Some(&l.post_norm), &sc.xn, m, cfg.hidden, cfg.rms_eps)?;
+        g::rmsnorm(
+            ctx,
+            pass,
+            &sc.x,
+            Some(&l.post_norm),
+            &sc.xn,
+            m,
+            cfg.hidden,
+            cfg.rms_eps,
+        )?;
         pass.memory_barrier()?;
         self.ffn(ctx, pass, sc, &l.ffn, m)
     }
@@ -697,13 +770,25 @@ impl Qwen36Model {
         draft: bool,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        let w = self.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no MTP head loaded"))?;
+        let w =
+            self.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no MTP head loaded"))?;
         let ms = st.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no MTP state"))?;
         ensure!((1..=PREFILL_ROWS).contains(&m), "MTP over {m} pairs");
         ensure!(pos0 + m <= st.capacity, "MTP rows past the state's capacity");
         k::embed(ctx, pass, &self.embed, tokens, &sc.xn, m)?;
         pass.memory_barrier()?;
-        k::mtp_cat(ctx, pass, &sc.xn, hin, &w.enorm, &w.hnorm, &sc.cat, m, cfg.hidden, cfg.rms_eps)?;
+        k::mtp_cat(
+            ctx,
+            pass,
+            &sc.xn,
+            hin,
+            &w.enorm,
+            &w.hnorm,
+            &sc.cat,
+            m,
+            cfg.hidden,
+            cfg.rms_eps,
+        )?;
         pass.memory_barrier()?;
         let xb = self.bf16_input(ctx, pass, sc, &sc.cat, 2 * cfg.hidden, m)?;
         self.proj(ctx, pass, &[(&w.eh_proj, &sc.x)], &sc.cat, xb, m)?;
@@ -714,7 +799,16 @@ impl Qwen36Model {
             return Ok(());
         }
         let x = sc.x.view((m - 1) * cfg.hidden, &[cfg.hidden])?;
-        g::rmsnorm(ctx, pass, &x, Some(&w.head_norm), &sc.mtp_hn, 1, cfg.hidden, cfg.rms_eps)?;
+        g::rmsnorm(
+            ctx,
+            pass,
+            &x,
+            Some(&w.head_norm),
+            &sc.mtp_hn,
+            1,
+            cfg.hidden,
+            cfg.rms_eps,
+        )?;
         pass.memory_barrier()?;
         self.proj(ctx, pass, &[(&self.output, &sc.logits)], &sc.mtp_hn, None, 1)?;
         pass.memory_barrier()?;
@@ -745,7 +839,16 @@ impl Qwen36Model {
     ) -> Result<()> {
         let h = self.cfg.hidden;
         let rows = sc.hbuf.view(h, &[m * h])?;
-        g::rmsnorm(ctx, pass, &sc.x, Some(&self.output_norm), &rows, m, h, self.cfg.rms_eps)?;
+        g::rmsnorm(
+            ctx,
+            pass,
+            &sc.x,
+            Some(&self.output_norm),
+            &rows,
+            m,
+            h,
+            self.cfg.rms_eps,
+        )?;
         pass.memory_barrier()?;
         let hin = sc.hbuf.view(0, &[m * h])?;
         self.encode_mtp(ctx, pass, st, sc, &sc.tokens, &hin, pos0, m, false)
@@ -753,7 +856,12 @@ impl Qwen36Model {
 
     /// Copies hidden row `row` of `src` (`[rows][hidden]`) into `dst`
     /// through host memory (GPU idle on both).
-    pub(crate) fn copy_row(&self, src: &Tensor, row: usize, dst: &Tensor) -> Result<()> {
+    pub(crate) fn copy_row(
+        &self,
+        src: &Tensor,
+        row: usize,
+        dst: &Tensor,
+    ) -> Result<()> {
         let h = self.cfg.hidden;
         let v = src.view(row * h, &[h])?;
         dst.write_bytes(v.contents())
@@ -777,9 +885,25 @@ impl Qwen36Model {
         }
         let (first, rows) = if logits == Logits::All { (0, m) } else { (m - 1, 1) };
         let x = sc.x.view(first * cfg.hidden, &[rows * cfg.hidden])?;
-        g::rmsnorm(ctx, pass, &x, Some(&self.output_norm), &sc.hidden_norm, rows, cfg.hidden, cfg.rms_eps)?;
+        g::rmsnorm(
+            ctx,
+            pass,
+            &x,
+            Some(&self.output_norm),
+            &sc.hidden_norm,
+            rows,
+            cfg.hidden,
+            cfg.rms_eps,
+        )?;
         pass.memory_barrier()?;
-        self.proj(ctx, pass, &[(&self.output, &sc.logits)], &sc.hidden_norm, None, rows)?;
+        self.proj(
+            ctx,
+            pass,
+            &[(&self.output, &sc.logits)],
+            &sc.hidden_norm,
+            None,
+            rows,
+        )?;
         pass.memory_barrier()
     }
 
@@ -842,13 +966,23 @@ impl Qwen36Model {
         self.proj(
             ctx,
             pass,
-            &[(&w.qkv, &sc.qkv), (&w.gate, &sc.z), (&w.alpha, &sc.ga), (&w.beta, &sc.gb)],
+            &[
+                (&w.qkv, &sc.qkv),
+                (&w.gate, &sc.z),
+                (&w.alpha, &sc.ga),
+                (&w.beta, &sc.gb),
+            ],
             &sc.xn,
             xb,
             m,
         )?;
         pass.memory_barrier()?;
-        let p = GdnParams { conv_w: &w.conv, ssm_a: &w.ssm_a, dt_bias: &w.dt_bias, norm: &w.norm };
+        let p = GdnParams {
+            conv_w: &w.conv,
+            ssm_a: &w.ssm_a,
+            dt_bias: &w.dt_bias,
+            norm: &w.norm,
+        };
         k::gdn(
             ctx,
             pass,
@@ -942,8 +1076,13 @@ impl Qwen36Model {
                 )?;
             }
         } else {
-            ensure!(self.kv_format == KvFormat::Bf16, "prompt attention reads bf16 caches");
-            attn::sdpa_prefill(ctx, pass, &q, &kc.values, &vc.values, &out, pos0, scale)?;
+            ensure!(
+                self.kv_format == KvFormat::Bf16,
+                "prompt attention reads bf16 caches"
+            );
+            attn::sdpa_prefill(
+                ctx, pass, &q, &kc.values, &vc.values, &out, pos0, scale,
+            )?;
         }
         pass.memory_barrier()?;
         k::attn_gate(ctx, pass, &sc.attn, &sc.qg, &sc.y, m, nq)?;
@@ -968,9 +1107,25 @@ impl Qwen36Model {
             let sets = [(&f.router, &sc.rlogits), (&f.sh_gate_inp, &sc.shg)];
             g::gemv_sets(ctx, pass, &sets, &sc.xn, m)?;
         } else {
-            k::router_logits(ctx, pass, &f.router, &f.sh_gate_inp, &sc.xn, &sc.rlogits, &sc.shg, m)?;
+            k::router_logits(
+                ctx,
+                pass,
+                &f.router,
+                &f.sh_gate_inp,
+                &sc.xn,
+                &sc.rlogits,
+                &sc.shg,
+                m,
+            )?;
         }
-        self.proj(ctx, pass, &[(&f.sh_gate, &sc.sfg), (&f.sh_up, &sc.sfu)], &sc.xn, xb, m)?;
+        self.proj(
+            ctx,
+            pass,
+            &[(&f.sh_gate, &sc.sfg), (&f.sh_up, &sc.sfu)],
+            &sc.xn,
+            xb,
+            m,
+        )?;
         pass.memory_barrier()?;
         k::router(ctx, pass, &sc.rlogits, &sc.rsel, &sc.rw, m, cfg.n_expert, used)?;
         g::swiglu(ctx, pass, &sc.sfg, &sc.sfu, &sc.sfm, m * cfg.ff_shared, 0.0)?;
@@ -1022,9 +1177,28 @@ impl Qwen36Model {
         let xb = self.bf16_input(ctx, pass, sc, &sc.sfm, cfg.ff_shared, m)?;
         self.proj(ctx, pass, &[(&f.sh_down, &sc.sout)], &sc.sfm, xb, m)?;
         pass.memory_barrier()?;
-        k::moe_down(ctx, pass, &f.down, cfg.hidden, &sc.moe_mid, &sc.rsel, &sc.moe_out, m, used)?;
+        k::moe_down(
+            ctx,
+            pass,
+            &f.down,
+            cfg.hidden,
+            &sc.moe_mid,
+            &sc.rsel,
+            &sc.moe_out,
+            m,
+            used,
+        )?;
         pass.memory_barrier()?;
-        k::ffn_residual(ctx, pass, &sc.x, &sc.moe_out, &sc.sout, &sc.shg, m, cfg.hidden)?;
+        k::ffn_residual(
+            ctx,
+            pass,
+            &sc.x,
+            &sc.moe_out,
+            &sc.sout,
+            &sc.shg,
+            m,
+            cfg.hidden,
+        )?;
         pass.memory_barrier()
     }
 }

@@ -148,8 +148,7 @@ pub fn validate_specs(g: &Gguf, specs: &[Spec], groups: &[Vec<String>]) -> Resul
 
 /// [`validate_specs`] for the trunk.
 pub fn validate(g: &Gguf, c: &Config) -> Result<()> {
-    let groups: Vec<Vec<String>> = (0..c.n_layer)
-        .flat_map(|il| fused_groups(il, c.recurrent[il]))
-        .collect();
+    let groups: Vec<Vec<String>> =
+        (0..c.n_layer).flat_map(|il| fused_groups(il, c.recurrent[il])).collect();
     validate_specs(g, &expected(c), &groups)
 }

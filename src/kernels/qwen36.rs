@@ -211,7 +211,10 @@ pub fn attn_prep(
     for t in [q_out, k_out, v_out] {
         check(&[(t, DType::BF16)])?;
     }
-    ensure!(qg.numel() >= m * nq * 2 * d && q_out.numel() >= m * nq * d, "q of {m} rows");
+    ensure!(
+        qg.numel() >= m * nq * 2 * d && q_out.numel() >= m * nq * d,
+        "q of {m} rows"
+    );
     ensure!(
         k.numel() >= m * nkv * d
             && v.numel() >= m * nkv * d
@@ -257,7 +260,10 @@ pub fn attn_gate(
 ) -> Result<()> {
     check(&[(attn, DType::BF16), (qg, DType::F32), (y, DType::F32)])?;
     let n = nq * HEAD_DIM;
-    ensure!(attn.numel() >= m * n && y.numel() >= m * n && qg.numel() >= 2 * m * n, "gate");
+    ensure!(
+        attn.numel() >= m * n && y.numel() >= m * n && qg.numel() >= 2 * m * n,
+        "gate"
+    );
     let pipeline = ctx.pipeline("qwen36_attn_gate", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -280,9 +286,14 @@ pub fn router(
     k: usize,
 ) -> Result<()> {
     check(&[(logits, DType::F32), (sel, DType::U32), (weights, DType::F32)])?;
-    ensure!(n_expert <= 256 && k <= 32 && k <= n_expert, "router of {n_expert}, top {k}");
     ensure!(
-        logits.numel() >= m * n_expert && sel.numel() >= m * k && weights.numel() >= m * k,
+        n_expert <= 256 && k <= 32 && k <= n_expert,
+        "router of {n_expert}, top {k}"
+    );
+    ensure!(
+        logits.numel() >= m * n_expert
+            && sel.numel() >= m * k
+            && weights.numel() >= m * k,
         "router of {m} rows"
     );
     let pipeline = ctx.pipeline("qwen36_router", SOURCE, MslVersion::V3_1)?;
@@ -310,7 +321,9 @@ pub fn ffn_residual(
         check(&[(t, DType::F32)])?;
     }
     ensure!(
-        x.numel() >= m * hidden && moe.numel() >= m * hidden && shared.numel() >= m * hidden,
+        x.numel() >= m * hidden
+            && moe.numel() >= m * hidden
+            && shared.numel() >= m * hidden,
         "residual of {m} rows"
     );
     let pipeline = ctx.pipeline("qwen36_ffn_residual", SOURCE, MslVersion::V3_1)?;
@@ -340,16 +353,31 @@ pub fn router_logits(
         "router weights must be F32"
     );
     let (kk, e) = (router.cols, router.rows);
-    ensure!(shared_gate.cols == kk && shared_gate.rows == 1, "shared expert gate shape");
+    ensure!(
+        shared_gate.cols == kk && shared_gate.rows == 1,
+        "shared expert gate shape"
+    );
     ensure!(kk.is_multiple_of(4), "router rows of {kk}");
     check(&[(x, DType::F32), (out, DType::F32), (gout, DType::F32)])?;
-    ensure!(x.numel() >= m * kk && out.numel() >= m * e && gout.numel() >= m, "router rows");
+    ensure!(
+        x.numel() >= m * kk && out.numel() >= m * e && gout.numel() >= m,
+        "router rows"
+    );
     let pipeline = ctx.pipeline("qwen36_router_logits", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
-        &[router.t.binding(), shared_gate.t.binding(), x.binding(), out.binding(), gout.binding()],
+        &[
+            router.t.binding(),
+            shared_gate.t.binding(),
+            x.binding(),
+            out.binding(),
+            gout.binding(),
+        ],
         &[&u32_bytes(kk), &u32_bytes(e), &u32_bytes(m)],
-        Grid::Threadgroups { groups: (m.div_ceil(4), (e + 1).div_ceil(8), 1), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups {
+            groups: (m.div_ceil(4), (e + 1).div_ceil(8), 1),
+            threadgroup: (256, 1, 1),
+        },
     )
 }
 
@@ -365,7 +393,10 @@ pub fn shared_gate(
     hidden: usize,
 ) -> Result<()> {
     check(&[(shared, DType::F32), (g, DType::F32), (y, DType::F32)])?;
-    ensure!(shared.numel() >= m * hidden && y.numel() >= m * hidden, "shared gate rows");
+    ensure!(
+        shared.numel() >= m * hidden && y.numel() >= m * hidden,
+        "shared gate rows"
+    );
     let pipeline = ctx.pipeline("qwen36_shared_gate", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -393,7 +424,10 @@ pub fn moe_down(
     check(&[(mid, DType::F32), (out, DType::F32), (sel, DType::U32)])?;
     ensure!(down.cols == 256 || down.cols == 512, "down rows of {}", down.cols);
     ensure!(down.rows.is_multiple_of(hidden), "down rows {} of {hidden}", down.rows);
-    ensure!(out.numel() >= m * hidden && mid.numel() >= m * used * down.cols, "down shapes");
+    ensure!(
+        out.numel() >= m * hidden && mid.numel() >= m * used * down.cols,
+        "down shapes"
+    );
     let name = match down.ty {
         GgmlType::Q4K => "qwen36_moe_down_q4_k",
         GgmlType::Q8_0 => "qwen36_moe_down_q8_0",
@@ -410,7 +444,10 @@ pub fn moe_down(
             &u32_bytes(down.row_bytes),
             &u32_bytes(used),
         ],
-        Grid::Threadgroups { groups: (hidden.div_ceil(rows_per_tg), m, 1), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups {
+            groups: (hidden.div_ceil(rows_per_tg), m, 1),
+            threadgroup: (256, 1, 1),
+        },
     )
 }
 
@@ -433,7 +470,9 @@ pub fn mtp_cat(
         check(&[(t, DType::F32)])?;
     }
     ensure!(
-        e.numel() >= m * hidden && h.numel() >= m * hidden && cat.numel() >= 2 * m * hidden,
+        e.numel() >= m * hidden
+            && h.numel() >= m * hidden
+            && cat.numel() >= 2 * m * hidden,
         "MTP input of {m} rows"
     );
     let pipeline = ctx.pipeline("qwen36_mtp_cat", SOURCE, MslVersion::V3_1)?;
