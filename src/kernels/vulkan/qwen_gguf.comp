@@ -413,9 +413,28 @@ void main() {
 // inv_rms f32 [G]. Params: 7 H, 8 G, 9 R, 10 NI, 11 eps, 12 w_bias, 13 down
 // row bytes, 14 inject row bytes.
 // ---------------------------------------------------------------------------
-#ifdef KERNEL_qg_hc_read_down_f16
-shared float qg_part[8];
-shared float qg_rms[8];
+#if defined(KERNEL_qg_hc_read_down_f16) || defined(KERNEL_qg_hc_read_down_f16_m2) || \
+    defined(KERNEL_qg_hc_read_down_f16_m3) || defined(KERNEL_qg_hc_read_down_f16_m4) || \
+    defined(KERNEL_qg_hc_read_up_mix_f16) || defined(KERNEL_qg_hc_read_up_mix_f16_m2) || \
+    defined(KERNEL_qg_hc_read_up_mix_f16_m3) || defined(KERNEL_qg_hc_read_up_mix_f16_m4)
+// Rows of the read (the kernel's constant): one for decode, up to four for
+// a verify pass, every weight load shared by the rows. Row i of hyper,
+// mixed, inv_rms, down and inject is at i times its row length.
+#if defined(KERNEL_qg_hc_read_down_f16_m2) || defined(KERNEL_qg_hc_read_up_mix_f16_m2)
+#define HC_M 2u
+#elif defined(KERNEL_qg_hc_read_down_f16_m3) || defined(KERNEL_qg_hc_read_up_mix_f16_m3)
+#define HC_M 3u
+#elif defined(KERNEL_qg_hc_read_down_f16_m4) || defined(KERNEL_qg_hc_read_up_mix_f16_m4)
+#define HC_M 4u
+#else
+#define HC_M 1u
+#endif
+#endif
+
+#if defined(KERNEL_qg_hc_read_down_f16) || defined(KERNEL_qg_hc_read_down_f16_m2) || \
+    defined(KERNEL_qg_hc_read_down_f16_m3) || defined(KERNEL_qg_hc_read_down_f16_m4)
+shared float qg_part[8u * HC_M];
+shared float qg_rms[8u * HC_M];
 void main() {
     const uint H = arg_u32(7), G = arg_u32(8), R = arg_u32(9), NI = arg_u32(10);
     const float eps = arg_f32(11), w_bias = arg_f32(12);
@@ -424,49 +443,48 @@ void main() {
     if (row >= R + NI) return;
     const bool is_inj = row >= R;
     const uint r = is_inj ? row - R : row;
+    const uint wide = G * H;
     const uint64_t W = (is_inj ? arg(3) : arg(2)) + uint64_t(r) * (is_inj ? arg_u32(14) : arg_u32(13));
-    U32x4 xw = U32x4(arg(0)), nw = U32x4(arg(1)), ww = U32x4(W);
-    float acc_w = 0.0, acc_x2 = 0.0;
+    U32x4 nw = U32x4(arg(1)), ww = U32x4(W);
+    float acc_w[HC_M], acc_x2[HC_M];
+    [[unroll]] for (uint i = 0u; i < HC_M; i++) { acc_w[i] = 0.0; acc_x2[i] = 0.0; }
     const uint blocks = H / 8u;
-    for (uint i = g * blocks + lane; i < (g + 1u) * blocks; i += 32u) {
-        const uvec4 xv = xw.v[i], nv = nw.v[i], wv = ww.v[i];
-        [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            const vec2 x = vec2(uintBitsToFloat(xv[c] << 16u), uintBitsToFloat(xv[c] & 0xffff0000u));
-            const vec2 n = vec2(uintBitsToFloat(nv[c] << 16u), uintBitsToFloat(nv[c] & 0xffff0000u));
-            const vec2 w = unpackHalf2x16(wv[c]);
-            const vec2 xn = x * (w_bias + n);
-            acc_w += w.x * xn.x + w.y * xn.y;
-            acc_x2 += x.x * x.x + x.y * x.y;
+    for (uint b = g * blocks + lane; b < (g + 1u) * blocks; b += 32u) {
+        const uvec4 nv = nw.v[b], wv = ww.v[b];
+        [[unroll]] for (uint i = 0u; i < HC_M; i++) {
+            const uvec4 xv = U32x4(arg(0) + 2u * uint64_t(i * wide)).v[b];
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                const vec2 x = vec2(uintBitsToFloat(xv[c] << 16u), uintBitsToFloat(xv[c] & 0xffff0000u));
+                const vec2 n = vec2(uintBitsToFloat(nv[c] << 16u), uintBitsToFloat(nv[c] & 0xffff0000u));
+                const vec2 w = unpackHalf2x16(wv[c]);
+                const vec2 xn = x * (w_bias + n);
+                acc_w[i] += w.x * xn.x + w.y * xn.y;
+                acc_x2[i] += x.x * x.x + x.y * x.y;
+            }
         }
     }
-    acc_w = subgroupAdd(acc_w);
-    acc_x2 = subgroupAdd(acc_x2);
-    if (lane == 0u) {
-        const float inv = inversesqrt(acc_x2 / float(H) + eps);
-        qg_part[g] = acc_w * inv;
-        qg_rms[g] = inv;
+    [[unroll]] for (uint i = 0u; i < HC_M; i++) {
+        const float sw = subgroupAdd(acc_w[i]);
+        const float sx = subgroupAdd(acc_x2[i]);
+        if (lane == 0u) {
+            const float inv = inversesqrt(sx / float(H) + eps);
+            qg_part[i * 8u + g] = sw * inv;
+            qg_rms[i * 8u + g] = inv;
+        }
     }
     barrier();
-    if (tid == 0u) {
+    if (tid < HC_M) {
         float total = 0.0;
-        for (uint s = 0u; s < G; s++) total += qg_part[s];
-        BF16(is_inj ? arg(5) : arg(4)).v[r] = bfloat16_t(total);
+        for (uint s = 0u; s < G; s++) total += qg_part[tid * 8u + s];
+        if (is_inj) BF16(arg(5)).v[tid * NI + r] = bfloat16_t(total);
+        else BF16(arg(4)).v[tid * R + r] = bfloat16_t(total);
     }
-    if (row == 0u && tid < G) F32(arg(6)).v[tid] = qg_rms[tid];
+    if (row == 0u && tid < G * HC_M) F32(arg(6)).v[tid] = qg_rms[(tid / G) * 8u + tid % G];
 }
 #endif
 
-// ---------------------------------------------------------------------------
-// qg_hc_read_up_mix_f16: mixed[c] = bf16(sum_g sigmoid(up_g[c]) hn_g[c] / G)
-// with up_g[c] = bf16(W_up[g H + c] . bf16(silu(down / G))) and hn_g[c] =
-// bf16(x[g H + c] inv_rms[g] (w_bias + w[g H + c])). A subgroup per column
-// c: lanes 8 g .. 8 g + 7 walk stream g's weight row, 8 values a step.
-// Grid (H / 8) threadgroups of 256. G <= 4.
-// Buffers: 0 up F16 [G*H][R], 1 down bf16 [R], 2 hyper bf16, 3 norm bf16,
-// 4 inv_rms f32 [G], 5 mixed bf16 [H]. Params: 6 H, 7 G, 8 R, 9 row bytes,
-// 10 w_bias.
-// ---------------------------------------------------------------------------
-#ifdef KERNEL_qg_hc_read_up_mix_f16
+#if defined(KERNEL_qg_hc_read_up_mix_f16) || defined(KERNEL_qg_hc_read_up_mix_f16_m2) || \
+    defined(KERNEL_qg_hc_read_up_mix_f16_m3) || defined(KERNEL_qg_hc_read_up_mix_f16_m4)
 void main() {
     const uint H = arg_u32(6), G = arg_u32(7), R = arg_u32(8), row_bytes = arg_u32(9);
     const float w_bias = arg_f32(10);
@@ -474,37 +492,44 @@ void main() {
     const uint lane = gl_SubgroupInvocationID, g = lane >> 3u, sub = lane & 7u;
     if (c >= H) return;
     const float inv_g = 1.0 / float(G);
-    float acc = 0.0;
+    float acc[HC_M];
+    [[unroll]] for (uint i = 0u; i < HC_M; i++) acc[i] = 0.0;
     if (g < G) {
         U32x4 ww = U32x4(arg(0) + uint64_t(g * H + c) * row_bytes);
-        U32x4 dw = U32x4(arg(1));
         for (uint b = sub; b < R / 8u; b += 8u) {
-            const uvec4 wv = ww.v[b], dv = dw.v[b];
-            [[unroll]] for (uint q = 0u; q < 4u; q++) {
-                const vec2 d = vec2(uintBitsToFloat(dv[q] << 16u), uintBitsToFloat(dv[q] & 0xffff0000u)) * inv_g;
-                const vec2 a = vec2(float(bfloat16_t(d.x / (1.0 + exp(-d.x)))),
-                                    float(bfloat16_t(d.y / (1.0 + exp(-d.y)))));
-                const vec2 w = unpackHalf2x16(wv[q]);
-                acc += w.x * a.x + w.y * a.y;
+            const uvec4 wv = ww.v[b];
+            [[unroll]] for (uint i = 0u; i < HC_M; i++) {
+                const uvec4 dv = U32x4(arg(1) + 2u * uint64_t(i * R)).v[b];
+                [[unroll]] for (uint q = 0u; q < 4u; q++) {
+                    const vec2 d = vec2(uintBitsToFloat(dv[q] << 16u), uintBitsToFloat(dv[q] & 0xffff0000u)) * inv_g;
+                    const vec2 a = vec2(float(bfloat16_t(d.x / (1.0 + exp(-d.x)))),
+                                        float(bfloat16_t(d.y / (1.0 + exp(-d.y)))));
+                    const vec2 w = unpackHalf2x16(wv[q]);
+                    acc[i] += w.x * a.x + w.y * a.y;
+                }
             }
         }
     }
-    acc += subgroupShuffleXor(acc, 4u);
-    acc += subgroupShuffleXor(acc, 2u);
-    acc += subgroupShuffleXor(acc, 1u);
-    float up[4];
-    [[unroll]] for (uint s = 0u; s < 4u; s++) up[s] = subgroupBroadcast(acc, 8u * s);
-    if (lane == 0u) {
-        precise float m = 0.0;
-        for (uint s = 0u; s < G; s++) {
-            const float logit = float(bfloat16_t(up[s]));
-            const float gate = 1.0 / (1.0 + exp(-logit));
-            const float x = float(BF16(arg(2)).v[s * H + c]);
-            const float n = float(BF16(arg(3)).v[s * H + c]);
-            const float hn = float(bfloat16_t(x * F32(arg(4)).v[s] * (w_bias + n)));
-            m = fma(gate, hn, m);
+    [[unroll]] for (uint i = 0u; i < HC_M; i++) {
+        float v = acc[i];
+        v += subgroupShuffleXor(v, 4u);
+        v += subgroupShuffleXor(v, 2u);
+        v += subgroupShuffleXor(v, 1u);
+        float up[4];
+        [[unroll]] for (uint s = 0u; s < 4u; s++) up[s] = subgroupBroadcast(v, 8u * s);
+        if (lane == 0u) {
+            const uint wide = G * H;
+            precise float m = 0.0;
+            for (uint s = 0u; s < G; s++) {
+                const float logit = float(bfloat16_t(up[s]));
+                const float gate = 1.0 / (1.0 + exp(-logit));
+                const float x = float(BF16(arg(2) + 2u * uint64_t(i * wide)).v[s * H + c]);
+                const float n = float(BF16(arg(3)).v[s * H + c]);
+                const float hn = float(bfloat16_t(x * F32(arg(4)).v[i * G + s] * (w_bias + n)));
+                m = fma(gate, hn, m);
+            }
+            BF16(arg(5) + 2u * uint64_t(i * H)).v[c] = bfloat16_t(m / float(G));
         }
-        BF16(arg(5)).v[c] = bfloat16_t(m / float(G));
     }
 }
 #endif

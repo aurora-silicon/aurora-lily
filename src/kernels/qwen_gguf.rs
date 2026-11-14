@@ -551,10 +551,10 @@ pub fn moe_grouped(
     )
 }
 
-/// The hyper-connection read of one row over F16 mixers, fused in two
-/// kernels (the decode step's): `down` (`[R]`), `inj` (`[NI]`) and
-/// `inv_rms` (`[G]`) from the normalized stream, then `mixed` (`[H]`) from
-/// the up logits. The weights: down `[R][G*H]`, inject `[NI][G*H]`, up
+/// The hyper-connection read of `m` (<= 4) rows over F16 mixers, fused in
+/// two kernels (decode and verify passes): `down` (`[m, R]`), `inj`
+/// (`[m, NI]`) and `inv_rms` (`[m, G]`) from the normalized stream, then
+/// `mixed` (`[m, H]`) from the up logits. The weights: down `[R][G*H]`, inject `[NI][G*H]`, up
 /// `[G*H][R]`, all F16.
 #[allow(clippy::too_many_arguments)]
 pub fn hc_read_f16(
@@ -573,7 +573,9 @@ pub fn hc_read_f16(
     g: usize,
     eps: f32,
     w_bias: f32,
+    m: usize,
 ) -> Result<()> {
+    ensure!((1..=4).contains(&m), "fused hc read of {m} rows");
     let wide = g * h;
     let (r, ni) = (down.rows, inject.map_or(0, |w| w.rows));
     ensure!(
@@ -589,7 +591,19 @@ pub fn hc_read_f16(
         ensure!(t.dtype() == DType::BF16, "hc read tensors are bfloat");
     }
     let inj = inject.unwrap_or(down);
-    let pipeline = ctx.pipeline("qg_hc_read_down_f16", SOURCE, MslVersion::V3_1)?;
+    const DOWN: [&str; 4] = [
+        "qg_hc_read_down_f16",
+        "qg_hc_read_down_f16_m2",
+        "qg_hc_read_down_f16_m3",
+        "qg_hc_read_down_f16_m4",
+    ];
+    const UP: [&str; 4] = [
+        "qg_hc_read_up_mix_f16",
+        "qg_hc_read_up_mix_f16_m2",
+        "qg_hc_read_up_mix_f16_m3",
+        "qg_hc_read_up_mix_f16_m4",
+    ];
+    let pipeline = ctx.pipeline(DOWN[m - 1], SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[
@@ -614,7 +628,7 @@ pub fn hc_read_f16(
         Grid::Threadgroups { groups: (r + ni, 1, 1), threadgroup: (32 * g, 1, 1) },
     )?;
     pass.level_barrier(&[out_down, out_inj, inv_rms])?;
-    let pipeline = ctx.pipeline("qg_hc_read_up_mix_f16", SOURCE, MslVersion::V3_1)?;
+    let pipeline = ctx.pipeline(UP[m - 1], SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[

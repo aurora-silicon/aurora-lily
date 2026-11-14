@@ -404,14 +404,14 @@ fn grouped_experts_match_the_gathers() {
 }
 
 /// The fused F16 hyper-connection read against its arithmetic on the CPU, at
-/// the model's shape (4 streams of 2560, rank 320, 4 inject rows).
+/// the model's shape (4 streams of 2560, rank 320, 4 inject rows), one row
+/// (decode) and three (a verify pass).
 #[test]
 fn fused_hc_read_matches_cpu() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(44);
     let (h, g, r, ni) = (2560usize, 4usize, 320usize, 4usize);
     let wide = g * h;
-    let (x, tx) = bf16_input(&ctx, &mut rng, wide);
     let nw: Vec<f32> =
         (0..wide).map(|_| round_bf16(rng.gen_range(-0.3..0.3))).collect();
     let tn = Tensor::from_f32_as_bf16(&ctx, &nw, &[wide]).unwrap();
@@ -426,63 +426,75 @@ fn fused_hc_read_matches_cpu() {
         decode(GgmlType::F16, &raw_i),
         decode(GgmlType::F16, &raw_u),
     );
-    let od = Tensor::zeros(&ctx, &[r], DType::BF16).unwrap();
-    let oi = Tensor::zeros(&ctx, &[ni], DType::BF16).unwrap();
-    let inv = Tensor::zeros(&ctx, &[g], DType::F32).unwrap();
-    let mixed = Tensor::zeros(&ctx, &[h], DType::BF16).unwrap();
     let eps = 1e-6f32;
-    run(&ctx, |p| {
-        hc_read_f16(
-            &ctx,
-            p,
-            &tx,
-            &tn,
-            &wd,
-            Some(&wi),
-            &wu,
-            &od,
-            &oi,
-            &inv,
-            &mixed,
-            h,
-            g,
-            eps,
-            1.0,
-        )
-        .unwrap()
-    });
-    let inv_c: Vec<f32> = (0..g)
-        .map(|s| {
-            let ms =
-                x[s * h..(s + 1) * h].iter().map(|v| v * v).sum::<f32>() / h as f32;
-            1.0 / (ms + eps).sqrt()
-        })
-        .collect();
-    let xn: Vec<f32> = (0..wide).map(|i| x[i] * inv_c[i / h] * (1.0 + nw[i])).collect();
-    let down: Vec<f32> =
-        (0..r).map(|j| round_bf16(dot(&cd[j * wide..(j + 1) * wide], &xn))).collect();
-    let inj: Vec<f32> =
-        (0..ni).map(|j| round_bf16(dot(&ci[j * wide..(j + 1) * wide], &xn))).collect();
-    let act: Vec<f32> = down
-        .iter()
-        .map(|&d| {
-            let d = d / g as f32;
-            round_bf16(d / (1.0 + (-d).exp()))
-        })
-        .collect();
-    let mix: Vec<f32> = (0..h)
-        .map(|c| {
-            let mut m = 0f32;
-            for s in 0..g {
-                let row = s * h + c;
-                let up = round_bf16(dot(&cu[row * r..(row + 1) * r], &act));
-                m += 1.0 / (1.0 + (-up).exp()) * round_bf16(xn[row]);
+    for m in [1usize, 3] {
+        let (x, tx) = bf16_input(&ctx, &mut rng, m * wide);
+        let od = Tensor::zeros(&ctx, &[m * r], DType::BF16).unwrap();
+        let oi = Tensor::zeros(&ctx, &[m * ni], DType::BF16).unwrap();
+        let inv = Tensor::zeros(&ctx, &[m * g], DType::F32).unwrap();
+        let mixed = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
+        run(&ctx, |p| {
+            hc_read_f16(
+                &ctx,
+                p,
+                &tx,
+                &tn,
+                &wd,
+                Some(&wi),
+                &wu,
+                &od,
+                &oi,
+                &inv,
+                &mixed,
+                h,
+                g,
+                eps,
+                1.0,
+                m,
+            )
+            .unwrap()
+        });
+        let (mut e_inv, mut e_down, mut e_inj, mut e_mix) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for row in 0..m {
+            let x = &x[row * wide..(row + 1) * wide];
+            let inv_c: Vec<f32> = (0..g)
+                .map(|s| {
+                    let ms = x[s * h..(s + 1) * h].iter().map(|v| v * v).sum::<f32>()
+                        / h as f32;
+                    1.0 / (ms + eps).sqrt()
+                })
+                .collect();
+            let xn: Vec<f32> =
+                (0..wide).map(|i| x[i] * inv_c[i / h] * (1.0 + nw[i])).collect();
+            let down: Vec<f32> = (0..r)
+                .map(|j| round_bf16(dot(&cd[j * wide..(j + 1) * wide], &xn)))
+                .collect();
+            let act: Vec<f32> = down
+                .iter()
+                .map(|&d| {
+                    let d = d / g as f32;
+                    round_bf16(d / (1.0 + (-d).exp()))
+                })
+                .collect();
+            for c in 0..h {
+                let mut mm = 0f32;
+                for s in 0..g {
+                    let at = s * h + c;
+                    let up = round_bf16(dot(&cu[at * r..(at + 1) * r], &act));
+                    mm += 1.0 / (1.0 + (-up).exp()) * round_bf16(xn[at]);
+                }
+                e_mix.push(round_bf16(mm / g as f32));
             }
-            round_bf16(m / g as f32)
-        })
-        .collect();
-    assert_close(&inv.to_f32().unwrap(), &inv_c, 1e-6, 1e-4);
-    assert_close(&od.to_f32().unwrap(), &down, 1e-3, 1.6e-2);
-    assert_close(&oi.to_f32().unwrap(), &inj, 1e-3, 1.6e-2);
-    assert_close(&mixed.to_f32().unwrap(), &mix, 1e-3, 1.6e-2);
+            e_inj.extend(
+                (0..ni).map(|j| round_bf16(dot(&ci[j * wide..(j + 1) * wide], &xn))),
+            );
+            e_down.extend(down);
+            e_inv.extend(inv_c);
+        }
+        assert_close(&inv.to_f32().unwrap(), &e_inv, 1e-6, 1e-4);
+        assert_close(&od.to_f32().unwrap(), &e_down, 1e-3, 1.6e-2);
+        assert_close(&oi.to_f32().unwrap(), &e_inj, 1e-3, 1.6e-2);
+        assert_close(&mixed.to_f32().unwrap(), &e_mix, 1e-3, 1.6e-2);
+    }
 }

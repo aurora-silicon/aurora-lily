@@ -3217,6 +3217,31 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
+        // GGUF F16 mixers: the fused read up to four rows (verify passes).
+        if let Some((down, up, inject)) = hc.gguf_parts()
+            && m <= crate::kernels::qwen_gguf::GEMV_MAX_ROWS
+            && std::env::var_os("LILY_QWEN_HC_UNFUSED").is_none()
+        {
+            crate::kernels::qwen_gguf::hc_read_f16(
+                ctx,
+                pass,
+                hyper,
+                &hc.norm,
+                down,
+                inject,
+                up,
+                &out.down,
+                &out.inj,
+                &out.inv_rms,
+                &out.mixed,
+                h,
+                g,
+                cfg.rms_norm_eps,
+                NORM_WEIGHT_BIAS,
+                m,
+            )?;
+            return pass.level_barrier(&[&out.mixed]);
+        }
         if let Some((down, up, inject)) = hc.affine()
             && m <= HC_FUSED_MAX_ROWS
             && fused_read_supported(down, up, inject, h, g)
@@ -4276,6 +4301,7 @@ impl Qwen4ExpModel {
                     g,
                     cfg.rms_norm_eps,
                     NORM_WEIGHT_BIAS,
+                    1,
                 )?;
                 return pass.level_barrier(&[&out.mixed]);
             }
