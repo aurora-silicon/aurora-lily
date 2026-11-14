@@ -201,9 +201,30 @@ pub fn window_ends(r: usize, pos0: usize, m: usize) -> (usize, usize) {
 /// projections `kv`, `sc` (`[m][width]`, scores without the position bias)
 /// and the ring; then the ring updated with the step's last positions.
 /// `table` holds the layer's (YaRN) RoPE of positions from `table_lo`.
-/// Two dependency levels: the pool, then the ring.
+/// Two dependency levels: [`comp_pool`], then [`comp_ring`].
 #[allow(clippy::too_many_arguments)]
 pub fn compress(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    c: &CompressorGpu<'_>,
+    kv: &Tensor,
+    sc: &Tensor,
+    cache: &Tensor,
+    table: &Tensor,
+    table_lo: usize,
+    pos0: usize,
+    m: usize,
+    eps: f32,
+) -> Result<()> {
+    comp_pool(ctx, pass, c, kv, sc, cache, table, table_lo, pos0, m, eps)?;
+    pass.memory_barrier()?;
+    comp_ring(ctx, pass, c, kv, sc, pos0, m)
+}
+
+/// The pool of [`compress`]: the windows ending in this step into `cache`
+/// (nothing when none ends).
+#[allow(clippy::too_many_arguments)]
+pub fn comp_pool(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     c: &CompressorGpu<'_>,
@@ -224,44 +245,59 @@ pub fn compress(
     ensure!(kv.numel() >= m * w && sc.numel() >= m * w, "compressor projections");
     ensure!(c.ring_kv.numel() >= ring * w && c.ring_sc.numel() >= ring * w, "ring");
     let (e0, n) = window_ends(c.ratio, pos0, m);
-    if n > 0 {
-        ensure!(
-            cache.numel() >= (e0 + 1 + (n - 1) * c.ratio) / c.ratio * c.dim,
-            "compressed cache of {} values",
-            cache.numel()
-        );
-        ensure!(e0 + 1 >= c.ratio + table_lo, "RoPE table starts after the window");
-        ensure!(
-            table.numel() >= (e0 + (n - 1) * c.ratio + 2 - c.ratio - table_lo) * 64,
-            "RoPE table"
-        );
-        let pipeline = ctx.pipeline("ds4_comp_pool", SOURCE, MslVersion::V3_1)?;
-        pass.dispatch_at(
-            &pipeline,
-            &[
-                kv.binding(),
-                sc.binding(),
-                c.ape.binding(),
-                c.ring_kv.binding(),
-                c.ring_sc.binding(),
-                c.norm.binding(),
-                table.binding(),
-                cache.binding(),
-            ],
-            &[
-                &u32_bytes(c.dim),
-                &u32_bytes(c.ratio),
-                &u32_bytes(pos0),
-                &u32_bytes(e0),
-                &u32_bytes(table_lo),
-                &u32_bytes(usize::from(c.indexer)),
-                &f32_bytes(eps),
-            ],
-            Grid::Threadgroups { groups: (n, 1, 1), threadgroup: (c.dim, 1, 1) },
-        )?;
+    if n == 0 {
+        return Ok(());
     }
-    pass.memory_barrier()?;
-    // The ring keeps the raw scores; the pool adds the position bias.
+    ensure!(
+        cache.numel() >= (e0 + 1 + (n - 1) * c.ratio) / c.ratio * c.dim,
+        "compressed cache of {} values",
+        cache.numel()
+    );
+    ensure!(e0 + 1 >= c.ratio + table_lo, "RoPE table starts after the window");
+    ensure!(
+        table.numel() >= (e0 + (n - 1) * c.ratio + 2 - c.ratio - table_lo) * 64,
+        "RoPE table"
+    );
+    let pipeline = ctx.pipeline("ds4_comp_pool", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            kv.binding(),
+            sc.binding(),
+            c.ape.binding(),
+            c.ring_kv.binding(),
+            c.ring_sc.binding(),
+            c.norm.binding(),
+            table.binding(),
+            cache.binding(),
+        ],
+        &[
+            &u32_bytes(c.dim),
+            &u32_bytes(c.ratio),
+            &u32_bytes(pos0),
+            &u32_bytes(e0),
+            &u32_bytes(table_lo),
+            &u32_bytes(usize::from(c.indexer)),
+            &f32_bytes(eps),
+        ],
+        Grid::Threadgroups { groups: (n, 1, 1), threadgroup: (c.dim, 1, 1) },
+    )
+}
+
+/// The ring of [`compress`]: the step's last `lanes * ratio` positions'
+/// projections (raw scores: the pool adds the position bias), after the
+/// pool has read the ring.
+pub fn comp_ring(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    c: &CompressorGpu<'_>,
+    kv: &Tensor,
+    sc: &Tensor,
+    pos0: usize,
+    m: usize,
+) -> Result<()> {
+    let w = c.width();
+    let ring = c.lanes() * c.ratio;
     let j0 = m.saturating_sub(ring);
     let pipeline = ctx.pipeline("ds4_comp_ring", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(

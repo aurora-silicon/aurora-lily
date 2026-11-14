@@ -30,14 +30,14 @@ pub const PREFILL_ROWS: usize = 2048;
 /// a region of their own).
 const REGION_BYTES: u64 = 1 << 30;
 
-/// The tensors of the file, mapped.
-struct Mapped {
+/// The tensors of a GGUF file, mapped (GLM's and DeepSeek's models).
+pub(crate) struct Mapped {
     tensors: std::collections::HashMap<String, (Buffer, usize, TensorInfo)>,
     buffers: Vec<Buffer>,
 }
 
 impl Mapped {
-    fn map(ctx: &MetalContext, g: &Gguf) -> Result<Self> {
+    pub(crate) fn map(ctx: &MetalContext, g: &Gguf) -> Result<Self> {
         let mut order: Vec<&TensorInfo> = g.tensors.iter().collect();
         order.sort_by_key(|t| t.offset);
         let mut tensors = std::collections::HashMap::new();
@@ -66,18 +66,22 @@ impl Mapped {
         Ok(Self { tensors, buffers })
     }
 
-    fn get(&self, name: &str) -> Result<&(Buffer, usize, TensorInfo)> {
+    pub(crate) fn buffers(&self) -> Vec<Buffer> {
+        self.buffers.clone()
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Result<&(Buffer, usize, TensorInfo)> {
         self.tensors.get(name).with_context(|| format!("GGUF has no tensor {name}"))
     }
 
-    fn q(&self, name: &str) -> Result<QWeight> {
+    pub(crate) fn q(&self, name: &str) -> Result<QWeight> {
         let (buf, at, t) = self.get(name)?;
         let whole = Tensor::from_buffer(buf.clone(), &[buf.length()], DType::I8)?;
         let view = whole.view(*at, &[t.bytes as usize])?;
         QWeight::new(view, t.ty, t.row_len(), t.rows())
     }
 
-    fn f32(&self, name: &str) -> Result<Tensor> {
+    pub(crate) fn f32(&self, name: &str) -> Result<Tensor> {
         let (buf, at, t) = self.get(name)?;
         ensure!(t.ty == GgmlType::F32, "{name} is {:?}, expected F32", t.ty);
         ensure!(at % 4 == 0, "{name} is not 4-byte aligned in its mapping");
@@ -87,7 +91,7 @@ impl Mapped {
     }
 
     /// Raw bytes as I8 (the BF16 `pool_ape`).
-    fn bytes(&self, name: &str) -> Result<Tensor> {
+    pub(crate) fn bytes(&self, name: &str) -> Result<Tensor> {
         let (buf, at, t) = self.get(name)?;
         let whole = Tensor::from_buffer(buf.clone(), &[buf.length()], DType::I8)?;
         whole.view(*at, &[t.bytes as usize])
