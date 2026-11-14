@@ -2388,19 +2388,24 @@ fn moe_grouped_timing() {
         let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
         let out = zeros(&ctx, m * hidden);
         let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
-        let mut best = f64::MAX;
-        for _ in 0..3 {
-            let pass = ctx.begin().unwrap();
-            moe_grouped(
-                &ctx, &pass, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m,
-                used, experts, 10.0,
-            )
-            .unwrap();
-            let t = std::time::Instant::now();
-            pass.commit_wait().unwrap();
-            best = best.min(t.elapsed().as_secs_f64());
+        for tile_rows in [64, 128] {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let pass = ctx.begin().unwrap();
+                moe_grouped_with(
+                    &ctx, &pass, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs,
+                    m, used, experts, 10.0, true, tile_rows,
+                )
+                .unwrap();
+                let t = std::time::Instant::now();
+                pass.commit_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            println!(
+                "moe grouped {label:20} m {m:4} tiles {tile_rows:3}: {:8.1} us",
+                best * 1e6
+            );
         }
-        println!("moe grouped {label:20} m {m:4}: {:8.1} us", best * 1e6);
     }
 }
 
@@ -2451,14 +2456,15 @@ fn gemm_timing() {
 }
 
 /// The fused gate/up/SwiGLU expert GEMM gives the separate GEMMs' and
-/// SwiGLU's values bit for bit: experts with 16, 32, 48, 64 and 65 pairs
-/// (one, two, three and four working subgroups, and a second tile), small
-/// ones, an unused one; the clamp off, tight and loose.
+/// SwiGLU's values bit for bit, with tiles of 64 rows and of 128 (the
+/// same again): experts with 16, 32, 48, 64, 65, 100 and 129 pairs (one
+/// to four working subgroups, a second tile), small ones, unused ones;
+/// the clamp off, tight and loose.
 #[test]
 fn moe_grouped_fused_matches_separate() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(74);
-    let (experts, hidden, ff, used, m) = (12, 1024, 512, 8, 40);
+    let (experts, hidden, ff, used, m) = (12, 1024, 512, 8, 60);
     let mk = |rng: &mut StdRng, ty, cols, rows| {
         let raw = random_blocks(rng, ty, rows * cols);
         QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
@@ -2466,9 +2472,8 @@ fn moe_grouped_fused_matches_separate() {
     let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
-    // 320 pairs: experts 0-4 take 16, 32, 48, 64 and 65, expert 5 none,
-    // experts 6-11 the other 95, in a scrambled order.
-    let counts = [16usize, 32, 48, 64, 65, 0, 16, 16, 16, 16, 16, 15];
+    // 480 pairs in a scrambled order.
+    let counts = [16usize, 32, 48, 64, 65, 0, 129, 100, 16, 10, 0, 0];
     assert_eq!(counts.iter().sum::<usize>(), m * used);
     let mut sel: Vec<u32> = counts
         .iter()
@@ -2486,20 +2491,22 @@ fn moe_grouped_fused_matches_separate() {
     let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
     for limit in [0.0f32, 1e-3, 10.0] {
         let mut got = Vec::new();
-        for fused in [true, false] {
+        for (fused, tile_rows) in [(true, 64), (false, 64), (true, 128), (false, 128)] {
             let out = zeros(&ctx, m * hidden);
             run(&ctx, |p| {
                 moe_grouped_with(
                     &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m,
-                    used, experts, limit, fused,
+                    used, experts, limit, fused, tile_rows,
                 )
                 .unwrap()
             });
             got.push((gs.mid.to_f32().unwrap(), out.to_f32().unwrap()));
         }
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
-        assert_eq!(bits(&got[0].0), bits(&got[1].0), "mid, limit {limit}");
-        assert_eq!(bits(&got[0].1), bits(&got[1].1), "out, limit {limit}");
+        for k in 1..got.len() {
+            assert_eq!(bits(&got[0].0), bits(&got[k].0), "mid, limit {limit}, {k}");
+            assert_eq!(bits(&got[0].1), bits(&got[k].1), "out, limit {limit}, {k}");
+        }
     }
 }
 

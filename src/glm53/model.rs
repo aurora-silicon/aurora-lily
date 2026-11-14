@@ -24,7 +24,7 @@ use crate::tensor::{DType, Tensor};
 pub const MAX_ROWS: usize = k::GEMV_MAX_ROWS;
 
 /// Rows a prefill step takes (projections on the matrix units).
-pub const PREFILL_ROWS: usize = 1024;
+pub const PREFILL_ROWS: usize = 2048;
 
 /// Mapped regions are at most this large (single tensors larger than it get
 /// a region of their own).
