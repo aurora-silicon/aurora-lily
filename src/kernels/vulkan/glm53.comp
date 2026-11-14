@@ -872,8 +872,16 @@ void main() {
 // 7 a_log, 8 dt_bias, 9 conv_state, 10 conv snapshot, 11 edges (chunks
 // past the first). Params: 12 n_heads, 13 n_rows, 14 lower_bound,
 // 15 snap_row: after that token the conv window is also copied to the
-// snapshot (speculative decoding's rollback; ~0u for none), 16 chunk.
+// snapshot (speculative decoding's rollback; ~0u for none), 16 chunk,
+// 17 edges used. glm53_kda_chunk_prepare, the same compiled with
+// CUMULATIVE, leaves the chunk's cumulative log decay in buffer 3 (the sum
+// of lower_bound * sigmoid(..) from the chunk's first token through this
+// one) instead of the decay, for glm53_kda_chunk_wy.
 // ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_kda_chunk_prepare
+#define KERNEL_glm53_kda_prefill_prepare
+#define CUMULATIVE
+#endif
 #ifdef KERNEL_glm53_kda_prefill_prepare
 shared float sq[128];
 shared float sk[128];
@@ -915,6 +923,9 @@ void main() {
     const float a = exp(F32(arg(7)).v[head]);
     const uint first = c * chunk;
     const uint last = min(first + chunk, n_rows);
+#ifdef CUMULATIVE
+    float log_decay = 0.0;
+#endif
     for (uint token = first; token < last; token++) {
         const uint64_t index = uint64_t(token) * projection + channel;
         const float q_new = F32(arg(0) + 4u * index).v[0];
@@ -944,7 +955,12 @@ void main() {
         sk[tid] = k_acc / (1.0 + exp(-k_acc));
         F32(arg(2) + 4u * index).v[0] = v_acc / (1.0 + exp(-v_acc));
         const float gate = raw_gate + dt;
+#ifdef CUMULATIVE
+        log_decay += lower_bound * (1.0 / (1.0 + exp(-a * gate)));
+        F32(arg(3) + 4u * index).v[0] = log_decay;
+#else
         F32(arg(3) + 4u * index).v[0] = exp(lower_bound * (1.0 / (1.0 + exp(-a * gate))));
+#endif
         barrier();
         const float q_sumsq = subgroupAdd(sq[tid] * sq[tid]);
         const float k_sumsq = subgroupAdd(sk[tid] * sk[tid]);
@@ -1040,6 +1056,300 @@ void main() {
         }
     }
     F32x4(sp).v[0] = h;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// KDA over a prompt run in chunks of 32 tokens: the delta rule's chunked
+// (WY) form, as Qwen's gdn_chunk_* kernels, with KDA's decay per key and in
+// f32 on the ALU. In a chunk (tokens t = 0..31, g_t the chunk's cumulative
+// log decay, a vector over keys; S_0 the state [key][value] before it):
+//   M[t][s] = sum_k x_t,k k_s,k exp(g_t,k - g_s,k), x = k (s < t), q (s <= t)
+//   T = (I + diag(beta) M_kk)^-1,  T' = T diag(beta)
+//   Wb = T' (k * exp(g)),  Uv = T' v,  U = Uv - Wb S_0
+//   o_t = (q_t * exp(g_t)) S_0 + sum_{s <= t} M_qk[t][s] u_s
+//   S_32 = diag(exp(g_31)) S_0 + sum_s (k_s * exp(g_31 - g_s)) u_s^T
+// (the recurrence's h_t = d_t h_{t-1} + beta_t k_t (v_t - k_t.d_t h_{t-1})
+// unrolled over the chunk). M's sums run as k or q times exp(g - g_r) by
+// k times exp(g_r - g), r = token 16: with the decay's log above -5 a token
+// no factor passes e^80 (f32 ends at e^88; glm53.rs keeps the bound), and
+// each pair's product is the decay between its tokens.
+// The prepare stage (cumulative) leaves g in the decay buffer; tokens past
+// the run are padded with g's last value and zero q, k, v, beta.
+//
+// glm53_kda_chunk_wy: Grid (chunks, heads), 128 threads, one chunk of one
+// head, in place: q -> q * exp(g), k -> k * exp(g_31 - g), v -> Uv,
+// g -> Wb; the scratch gets M_qk (s <= t, else 0) [32][32] and exp(g_31)
+// [128] per (chunk, head). Buffers: 0 q, 1 k, 2 v, 3 g, 4 raw beta,
+// 5 scratch. Params: 6 n_heads, 7 n_rows.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_kda_chunk_wy
+#define KC 32u
+// A slice of 32 keys: wy_a[key][p] = (k_t, q_t, k_t+1, q_t+1) exp(g - g_r)
+// of tokens t = 2 p, wy_b[key][p] = k_s exp(g_r - g_s) of s = 4 p ..
+shared vec4 wy_a[32u * KC / 2u];
+shared vec4 wy_b[32u * KC / 4u];
+shared vec4 wy_lt[KC * KC / 4u];  // [s][t]: beta_t M_kk[t][s] (s < t), then T'[t][s]
+shared float wy_beta[KC];
+void main() {
+    const uint D = 128u;
+    const uint n_heads = arg_u32(6);
+    const uint n_rows = arg_u32(7);
+    const uint c = gl_WorkGroupID.x, head = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint projection = n_heads * D;
+    const uint t0 = c * KC;
+    const uint nt = min(KC, n_rows - t0);
+    const uint ref = min(16u, nt - 1u);
+    // Element (t, key) of the chunk's head block is base + t * projection + key.
+    const uint base = t0 * projection + head * D;
+    const uint scratch = (c * n_heads + head) * (KC * KC + D);
+    if (tid < KC) {
+        wy_beta[tid] = tid < nt ? 1.0 / (1.0 + exp(-F32(arg(4)).v[(t0 + tid) * n_heads + head])) : 0.0;
+    }
+    // M_kk and M_qk over slices of 32 keys: thread (key kl, tokens 8 tq ..)
+    // stages a slice's factors, thread (rows 2 pt, 2 pt + 1; columns 4 ps ..)
+    // accumulates its block unless the block is wholly above the diagonal.
+    // A slice's loads are issued while the one before it multiplies.
+    const uint kl = tid & 31u, tq = tid >> 5u;
+    const uint pt = tid >> 3u, ps = tid & 7u;
+    const bool below = 4u * ps <= 2u * pt + 1u;
+    vec4 mk0 = vec4(0.0), mk1 = vec4(0.0), mq0 = vec4(0.0), mq1 = vec4(0.0);
+    float gr, gs[8], ks[8], qs[8];
+#define WY_LOAD_SLICE(slice)                                                          \
+    {                                                                                 \
+        const uint key = (slice) + kl;                                                \
+        gr = F32(arg(3)).v[base + ref * projection + key];                            \
+        [[unroll]] for (uint i = 0u; i < 8u; i++) {                                   \
+            const uint at = base + min(8u * tq + i, nt - 1u) * projection + key;      \
+            gs[i] = F32(arg(3)).v[at];                                                \
+            ks[i] = F32(arg(1)).v[at];                                                \
+            qs[i] = F32(arg(0)).v[at];                                                \
+        }                                                                             \
+    }
+    WY_LOAD_SLICE(0u)
+    for (uint slice = 0u; slice < D; slice += 32u) {
+        {
+            float up[8], down[8], kv[8], qv[8];
+            [[unroll]] for (uint i = 0u; i < 8u; i++) {
+                const bool real = 8u * tq + i < nt;
+                kv[i] = real ? ks[i] : 0.0;
+                qv[i] = real ? qs[i] : 0.0;
+                up[i] = exp(gs[i] - gr);
+                down[i] = exp(gr - gs[i]);
+            }
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                wy_a[kl * (KC / 2u) + 4u * tq + i] =
+                    vec4(kv[2u * i], qv[2u * i], kv[2u * i + 1u], qv[2u * i + 1u])
+                    * vec4(up[2u * i], up[2u * i], up[2u * i + 1u], up[2u * i + 1u]);
+            }
+            [[unroll]] for (uint i = 0u; i < 2u; i++) {
+                wy_b[kl * (KC / 4u) + 2u * tq + i] =
+                    vec4(kv[4u * i], kv[4u * i + 1u], kv[4u * i + 2u], kv[4u * i + 3u])
+                    * vec4(down[4u * i], down[4u * i + 1u], down[4u * i + 2u], down[4u * i + 3u]);
+            }
+        }
+        barrier();
+        if (slice + 32u < D) WY_LOAD_SLICE(slice + 32u)
+        if (below) {
+            for (uint j = 0u; j < 32u; j += 4u) {
+                vec4 a[4], b[4];
+                [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                    a[u] = wy_a[(j + u) * (KC / 2u) + pt];
+                    b[u] = wy_b[(j + u) * (KC / 4u) + ps];
+                }
+                [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                    mk0 = fma(vec4(a[u].x), b[u], mk0);
+                    mq0 = fma(vec4(a[u].y), b[u], mq0);
+                    mk1 = fma(vec4(a[u].z), b[u], mk1);
+                    mq1 = fma(vec4(a[u].w), b[u], mq1);
+                }
+            }
+        }
+        barrier();
+    }
+#undef WY_LOAD_SLICE
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {
+        const uint t = 2u * pt + h;
+        const vec4 mk = h == 0u ? mk0 : mk1, mq = h == 0u ? mq0 : mq1;
+        vec4 pq;
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            const uint s = 4u * ps + j;
+            // L transposed: column s of L is row s of wy_lt.
+            const float l = s < t ? wy_beta[t] * mk[j] : 0.0;
+            wy_lt[s * (KC / 4u) + t / 4u][t & 3u] = l;
+            pq[j] = s <= t ? mq[j] : 0.0;
+        }
+        F32x4(arg(5)).v[(scratch + t * KC + 4u * ps) / 4u] = pq;
+    }
+    barrier();
+    // T = (I + L)^-1 by forward substitution, a column a thread, each solved
+    // row's multiple of its column of L added to the rows below it.
+    float x[KC];
+    if (tid < KC) {
+        float acc[KC];
+        [[unroll]] for (uint i = 0u; i < KC; i++) acc[i] = 0.0;
+        [[unroll]] for (uint j = 0u; j < KC; j++) {
+            x[j] = j == tid ? 1.0 : (j < tid ? 0.0 : -acc[j]);
+            [[unroll]] for (uint q = (j + 1u) / 4u; q < KC / 4u; q++) {
+                const vec4 l = wy_lt[j * (KC / 4u) + q];
+                [[unroll]] for (uint e = 0u; e < 4u; e++) {
+                    if (4u * q + e > j) acc[4u * q + e] = fma(l[e], x[j], acc[4u * q + e]);
+                }
+            }
+        }
+    }
+    barrier();
+    if (tid < KC) {
+        // Row s = tid of wy_lt becomes column s of T' = T diag(beta).
+        const float bc = wy_beta[tid];
+        [[unroll]] for (uint q = 0u; q < KC / 4u; q++) {
+            wy_lt[tid * (KC / 4u) + q] = vec4(x[4u * q], x[4u * q + 1u], x[4u * q + 2u], x[4u * q + 3u]) * bc;
+        }
+    }
+    barrier();
+    // Wb = T' (k exp(g)) and Uv = T' v: thread (keys 4 kq .., rows 8 tq ..),
+    // T' lower triangular (its rows above s are 0 in wy_lt's row s). Then,
+    // once every thread has read the chunk, each writes its rows in place:
+    // Wb over g, Uv over v, q exp(g) over q, k exp(g_31 - g) over k.
+    {
+        const uint kq = tid & 31u;
+        const uint col = base + 4u * kq;
+        vec4 aw[8], au[8];
+        [[unroll]] for (uint r = 0u; r < 8u; r++) {
+            aw[r] = vec4(0.0);
+            au[r] = vec4(0.0);
+        }
+        const vec4 glast = F32x4(arg(3)).v[(col + (nt - 1u) * projection) / 4u];
+        for (uint s = 0u; s < KC; s++) {
+            const uint at = (col + min(s, nt - 1u) * projection) / 4u;
+            const vec4 g = F32x4(arg(3)).v[at], k = F32x4(arg(1)).v[at], v = F32x4(arg(2)).v[at];
+            const vec4 t0 = wy_lt[s * (KC / 4u) + 2u * tq], t1 = wy_lt[s * (KC / 4u) + 2u * tq + 1u];
+            const vec4 b = s < nt ? k * exp(g) : vec4(0.0);
+            const vec4 vv = s < nt ? v : vec4(0.0);
+            [[unroll]] for (uint r = 0u; r < 4u; r++) {
+                aw[r] = fma(vec4(t0[r]), b, aw[r]);
+                au[r] = fma(vec4(t0[r]), vv, au[r]);
+                aw[4u + r] = fma(vec4(t1[r]), b, aw[4u + r]);
+                au[4u + r] = fma(vec4(t1[r]), vv, au[4u + r]);
+            }
+        }
+        barrier();
+        [[unroll]] for (uint r = 0u; r < 8u; r++) {
+            const uint t = 8u * tq + r;
+            if (t < nt) {
+                const uint at = (col + t * projection) / 4u;
+                const vec4 g = F32x4(arg(3)).v[at], q = F32x4(arg(0)).v[at], k = F32x4(arg(1)).v[at];
+                F32x4(arg(3)).v[at] = aw[r];
+                F32x4(arg(2)).v[at] = au[r];
+                F32x4(arg(0)).v[at] = q * exp(g);
+                F32x4(arg(1)).v[at] = k * exp(glast - g);
+            }
+        }
+        if (tq == 0u) F32x4(arg(5)).v[(scratch + KC * KC) / 4u + kq] = exp(glast);
+    }
+}
+#endif
+
+// glm53_kda_chunk_scan: Grid (128 / 32 value blocks, heads), 128 threads:
+// the chunks in order for 32 value columns of one head, the f32 state block
+// [128 keys][32 values] in registers (thread: keys 8 kq .., values 4 vq ..)
+// and its copy in threadgroup memory. Buffers: 0 q (q exp(g)), 1 k
+// (k exp(g_31 - g)), 2 Uv, 3 Wb, 4 scratch, 5 state [heads][value][key],
+// 6 out (pre-norm o). Params: 7 n_heads, 8 n_rows.
+#ifdef KERNEL_glm53_kda_chunk_scan
+#define KC 32u
+#define NB 32u
+shared vec4 sc_s[128u * NB / 4u];  // S_0 [key][value]
+shared vec4 sc_u[KC * NB / 4u];    // U [t][value]
+void main() {
+    const uint D = 128u;
+    const uint n_heads = arg_u32(7);
+    const uint n_rows = arg_u32(8);
+    const uint v0 = gl_WorkGroupID.x * NB, head = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint projection = n_heads * D;
+    const uint kq = tid >> 3u, vq = tid & 7u;
+    // The chunk products: thread (rows 2 kq, 2 kq + 1; values 4 vq ..).
+    const uint ta = 2u * kq, tb = 2u * kq + 1u;
+    const uint64_t st = arg(5) + 4u * (uint64_t(head) * D * D);
+    vec4 s_reg[8];
+    [[unroll]] for (uint j = 0u; j < 4u; j++) {
+        const uint value = v0 + 4u * vq + j;
+        const vec4 a = F32x4(st).v[(value * D + 8u * kq) / 4u];
+        const vec4 b = F32x4(st).v[(value * D + 8u * kq) / 4u + 1u];
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            s_reg[i][j] = a[i];
+            s_reg[4u + i][j] = b[i];
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < 8u; i++) sc_s[(8u * kq + i) * (NB / 4u) + vq] = s_reg[i];
+    barrier();
+    for (uint t0 = 0u; t0 < n_rows; t0 += KC) {
+        const uint nt = min(KC, n_rows - t0);
+        const uint base = t0 * projection + head * D;
+        const uint scratch = ((t0 / KC) * n_heads + head) * (KC * KC + D);
+        const uint ra = base + min(ta, nt - 1u) * projection;
+        const uint rb = base + min(tb, nt - 1u) * projection;
+        // Wb S_0 and (q exp(g)) S_0.
+        vec4 ua = vec4(0.0), ub = vec4(0.0), oa = vec4(0.0), ob = vec4(0.0);
+        for (uint k = 0u; k < D; k += 4u) {
+            const vec4 wa = F32x4(arg(3)).v[(ra + k) / 4u], wb = F32x4(arg(3)).v[(rb + k) / 4u];
+            const vec4 qa = F32x4(arg(0)).v[(ra + k) / 4u], qb = F32x4(arg(0)).v[(rb + k) / 4u];
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                const vec4 s = sc_s[(k + i) * (NB / 4u) + vq];
+                ua = fma(vec4(wa[i]), s, ua);
+                ub = fma(vec4(wb[i]), s, ub);
+                oa = fma(vec4(qa[i]), s, oa);
+                ob = fma(vec4(qb[i]), s, ob);
+            }
+        }
+        const vec4 uva = F32x4(arg(2)).v[(ra + v0) / 4u + vq];
+        const vec4 uvb = F32x4(arg(2)).v[(rb + v0) / 4u + vq];
+        sc_u[ta * (NB / 4u) + vq] = ta < nt ? uva - ua : vec4(0.0);
+        sc_u[tb * (NB / 4u) + vq] = tb < nt ? uvb - ub : vec4(0.0);
+        barrier();
+        // o += M_qk U.
+        for (uint s = 0u; s < KC; s += 4u) {
+            const vec4 pa = F32x4(arg(4)).v[(scratch + ta * KC + s) / 4u];
+            const vec4 pb = F32x4(arg(4)).v[(scratch + tb * KC + s) / 4u];
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                const vec4 u = sc_u[(s + i) * (NB / 4u) + vq];
+                oa = fma(vec4(pa[i]), u, oa);
+                ob = fma(vec4(pb[i]), u, ob);
+            }
+        }
+        if (ta < nt) F32x4(arg(6)).v[(ra + v0) / 4u + vq] = oa;
+        if (tb < nt) F32x4(arg(6)).v[(rb + v0) / 4u + vq] = ob;
+        // S = diag(exp(g_31)) S_0 + (k exp(g_31 - g))^T U.
+        const vec4 ga = F32x4(arg(4)).v[(scratch + KC * KC + 8u * kq) / 4u];
+        const vec4 gb = F32x4(arg(4)).v[(scratch + KC * KC + 8u * kq) / 4u + 1u];
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            s_reg[i] *= ga[i];
+            s_reg[4u + i] *= gb[i];
+        }
+        for (uint s = 0u; s < KC; s++) {
+            const uint rs = (base + min(s, nt - 1u) * projection + 8u * kq) / 4u;
+            const vec4 ka = F32x4(arg(1)).v[rs], kb = F32x4(arg(1)).v[rs + 1u];
+            const vec4 u = sc_u[s * (NB / 4u) + vq];
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                s_reg[i] = fma(vec4(ka[i]), u, s_reg[i]);
+                s_reg[4u + i] = fma(vec4(kb[i]), u, s_reg[4u + i]);
+            }
+        }
+        [[unroll]] for (uint i = 0u; i < 8u; i++) sc_s[(8u * kq + i) * (NB / 4u) + vq] = s_reg[i];
+        barrier();
+    }
+    [[unroll]] for (uint j = 0u; j < 4u; j++) {
+        const uint value = v0 + 4u * vq + j;
+        vec4 a, b;
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            a[i] = s_reg[i][j];
+            b[i] = s_reg[4u + i][j];
+        }
+        F32x4(st).v[(value * D + 8u * kq) / 4u] = a;
+        F32x4(st).v[(value * D + 8u * kq) / 4u + 1u] = b;
+    }
 }
 #endif
 

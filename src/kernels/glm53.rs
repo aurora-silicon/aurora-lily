@@ -1003,8 +1003,17 @@ pub struct KdaSnapshot<'a> {
     pub state: &'a Tensor,
 }
 
+/// The decay's log is above `lower_bound` a token; the chunked form's
+/// factors reach e^(-16 lower_bound), so it takes bounds down to this one
+/// (e^80; f32 ends at e^88).
+pub const KDA_WY_MIN_BOUND: f32 = -5.0;
+
 /// KDA for `rows` consecutive tokens of one sequence: the one-token kernel
-/// for a single row without a snapshot, else prepare / recurrence / output.
+/// for a single row without a snapshot; prepare, then the chunked form
+/// (glm53_kda_chunk_wy and _scan) for runs of more than [`KDA_CHUNK`] rows
+/// without a snapshot, else the token-serial recurrence; then output.
+/// The chunked form sums in another order than the recurrence (1 024 rows
+/// a layer: 4.4 ms recurrence, see kda_decode_timing; 2026-11-14).
 #[allow(clippy::too_many_arguments)]
 pub fn kda(
     ctx: &MetalContext,
@@ -1017,11 +1026,172 @@ pub fn kda(
     rows: usize,
     snap: Option<KdaSnapshot<'_>>,
 ) -> Result<()> {
+    if snap.is_none() && rows > KDA_CHUNK && p.lower_bound >= KDA_WY_MIN_BOUND {
+        return kda_wy(ctx, pass, p, x, conv_state, state, out, rows);
+    }
     kda_chunked(ctx, pass, p, x, conv_state, state, out, rows, snap, KDA_CHUNK)
 }
 
-/// [`kda`] with prompt runs' prepare stage walking `chunk` tokens a
-/// threadgroup (tests compare chunkings bit for bit).
+/// The chunked form of [`kda`] (runs of more than [`KDA_CHUNK`] rows, no
+/// snapshot). Its scratch is the edges tensor, which the prepare stage has
+/// read by then: [`KDA_CHUNK`]^2 + 128 f32 a chunk and head.
+#[allow(clippy::too_many_arguments)]
+fn kda_wy(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    p: &KdaParams<'_>,
+    x: &KdaInputs<'_>,
+    conv_state: &Tensor,
+    state: &Tensor,
+    out: &Tensor,
+    rows: usize,
+) -> Result<()> {
+    check_f32(&[x.q, x.k, x.v, x.gate, x.beta, x.out_gate, conv_state, state, out])?;
+    let proj = p.heads * 128;
+    ensure!(
+        state.numel() >= p.heads * 128 * 128 && conv_state.numel() >= 9 * proj,
+        "KDA state"
+    );
+    let chunks = rows.div_ceil(KDA_CHUNK);
+    let Some(scratch) = x.edges else {
+        anyhow::bail!("KDA run of {rows} rows without edges");
+    };
+    ensure!(
+        scratch.numel() >= chunks * p.heads * (KDA_CHUNK * KDA_CHUNK + 128)
+            && scratch.numel() >= chunks * 9 * proj,
+        "KDA edges"
+    );
+    kda_prepare(ctx, pass, p, x, conv_state, rows, None, KDA_CHUNK, true)?;
+    pass.memory_barrier()?;
+    let wy = ctx.pipeline("glm53_kda_chunk_wy", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &wy,
+        &[
+            x.q.binding(),
+            x.k.binding(),
+            x.v.binding(),
+            x.gate.binding(),
+            x.beta.binding(),
+            scratch.binding(),
+        ],
+        &[&u32_bytes(p.heads), &u32_bytes(rows)],
+        Grid::Threadgroups { groups: (chunks, p.heads, 1), threadgroup: (128, 1, 1) },
+    )?;
+    pass.memory_barrier()?;
+    let scan = ctx.pipeline("glm53_kda_chunk_scan", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &scan,
+        &[
+            x.q.binding(),
+            x.k.binding(),
+            x.v.binding(),
+            x.gate.binding(),
+            scratch.binding(),
+            state.binding(),
+            out.binding(),
+        ],
+        &[&u32_bytes(p.heads), &u32_bytes(rows)],
+        Grid::Threadgroups { groups: (4, p.heads, 1), threadgroup: (128, 1, 1) },
+    )?;
+    pass.memory_barrier()?;
+    kda_output(ctx, pass, p, x, out, rows)
+}
+
+/// The prepare stage of a prompt run (and the edge copy before it):
+/// `cumulative` leaves the chunk's cumulative log decay in place of the
+/// decay (the chunked form's input; `chunk` must then be KDA_CHUNK).
+#[allow(clippy::too_many_arguments)]
+fn kda_prepare(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    p: &KdaParams<'_>,
+    x: &KdaInputs<'_>,
+    conv_state: &Tensor,
+    rows: usize,
+    snap: Option<(usize, &Tensor)>,
+    chunk: usize,
+    cumulative: bool,
+) -> Result<()> {
+    let proj = p.heads * 128;
+    let (snap_row, snap_conv) = snap.unwrap_or((u32::MAX as usize, conv_state));
+    let chunks = rows.div_ceil(chunk);
+    let edges = match x.edges {
+        Some(e) if chunks > 1 => {
+            ensure!(e.numel() >= chunks * 9 * proj, "KDA edges");
+            let k =
+                ctx.pipeline("glm53_kda_prefill_edges", SOURCE, MslVersion::V3_1)?;
+            pass.dispatch_at(
+                &k,
+                &[
+                    x.q.binding(),
+                    x.k.binding(),
+                    x.v.binding(),
+                    conv_state.binding(),
+                    e.binding(),
+                ],
+                &[&u32_bytes(proj), &u32_bytes(chunk)],
+                Grid::Threadgroups {
+                    groups: ((9 * proj).div_ceil(256), chunks, 1),
+                    threadgroup: (256, 1, 1),
+                },
+            )?;
+            pass.memory_barrier()?;
+            e
+        }
+        None if chunks > 1 => anyhow::bail!("KDA run of {rows} rows without edges"),
+        _ => conv_state,
+    };
+    let name = if cumulative { "glm53_kda_chunk_prepare" } else { "glm53_kda_prefill_prepare" };
+    let prepare = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &prepare,
+        &[
+            x.q.binding(),
+            x.k.binding(),
+            x.v.binding(),
+            x.gate.binding(),
+            p.q_conv.binding(),
+            p.k_conv.binding(),
+            p.v_conv.binding(),
+            p.a_log.binding(),
+            p.dt_bias.binding(),
+            conv_state.binding(),
+            snap_conv.binding(),
+            edges.binding(),
+        ],
+        &[
+            &u32_bytes(p.heads),
+            &u32_bytes(rows),
+            &f32_bytes(p.lower_bound),
+            &u32_bytes(snap_row),
+            &u32_bytes(chunk),
+            &u32_bytes(usize::from(chunks > 1)),
+        ],
+        Grid::Threadgroups { groups: (p.heads, chunks, 1), threadgroup: (128, 1, 1) },
+    )
+}
+
+/// The output stage: normalizes and gates `out` in place.
+fn kda_output(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    p: &KdaParams<'_>,
+    x: &KdaInputs<'_>,
+    out: &Tensor,
+    rows: usize,
+) -> Result<()> {
+    let output = ctx.pipeline("glm53_kda_prefill_output", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &output,
+        &[out.binding(), x.out_gate.binding(), p.o_norm.binding()],
+        &[&u32_bytes(p.heads), &f32_bytes(p.eps)],
+        Grid::Threadgroups { groups: (rows, p.heads, 1), threadgroup: (128, 1, 1) },
+    )
+}
+
+/// [`kda`] with the token-serial recurrence, prompt runs' prepare stage
+/// walking `chunk` tokens a threadgroup (tests compare chunkings bit for
+/// bit).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn kda_chunked(
     ctx: &MetalContext,
@@ -1036,12 +1206,12 @@ pub(crate) fn kda_chunked(
     chunk: usize,
 ) -> Result<()> {
     ensure!(chunk >= 3, "KDA prepare chunks of {chunk} tokens");
-    let (snap_row, snap_conv, snap_state) = match &snap {
+    let (snap_row, snap_state) = match &snap {
         Some(s) => {
             ensure!(s.row < rows, "KDA snapshot after row {} of {rows}", s.row);
-            (s.row, s.conv, s.state)
+            (s.row, s.state)
         }
-        None => (u32::MAX as usize, conv_state, state),
+        None => (u32::MAX as usize, state),
     };
     check_f32(&[x.q, x.k, x.v, x.gate, x.beta, x.out_gate, conv_state, state, out])?;
     let proj = p.heads * 128;
@@ -1074,61 +1244,8 @@ pub(crate) fn kda_chunked(
             Grid::Threadgroups { groups: (1, p.heads, 1), threadgroup: (128, 1, 1) },
         );
     }
-    let chunks = rows.div_ceil(chunk);
-    let edges = match x.edges {
-        Some(e) if chunks > 1 => {
-            ensure!(e.numel() >= chunks * 9 * proj, "KDA edges");
-            let k =
-                ctx.pipeline("glm53_kda_prefill_edges", SOURCE, MslVersion::V3_1)?;
-            pass.dispatch_at(
-                &k,
-                &[
-                    x.q.binding(),
-                    x.k.binding(),
-                    x.v.binding(),
-                    conv_state.binding(),
-                    e.binding(),
-                ],
-                &[&u32_bytes(proj), &u32_bytes(chunk)],
-                Grid::Threadgroups {
-                    groups: ((9 * proj).div_ceil(256), chunks, 1),
-                    threadgroup: (256, 1, 1),
-                },
-            )?;
-            pass.memory_barrier()?;
-            e
-        }
-        None if chunks > 1 => anyhow::bail!("KDA run of {rows} rows without edges"),
-        _ => conv_state,
-    };
-    let prepare =
-        ctx.pipeline("glm53_kda_prefill_prepare", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
-        &prepare,
-        &[
-            x.q.binding(),
-            x.k.binding(),
-            x.v.binding(),
-            x.gate.binding(),
-            p.q_conv.binding(),
-            p.k_conv.binding(),
-            p.v_conv.binding(),
-            p.a_log.binding(),
-            p.dt_bias.binding(),
-            conv_state.binding(),
-            snap_conv.binding(),
-            edges.binding(),
-        ],
-        &[
-            &u32_bytes(p.heads),
-            &u32_bytes(rows),
-            &f32_bytes(p.lower_bound),
-            &u32_bytes(snap_row),
-            &u32_bytes(chunk),
-            &u32_bytes(usize::from(chunks > 1)),
-        ],
-        Grid::Threadgroups { groups: (p.heads, chunks, 1), threadgroup: (128, 1, 1) },
-    )?;
+    let snap_prep = snap.as_ref().map(|s| (s.row, s.conv));
+    kda_prepare(ctx, pass, p, x, conv_state, rows, snap_prep, chunk, false)?;
     pass.memory_barrier()?;
     let recurrence =
         ctx.pipeline("glm53_kda_prefill_recurrence", SOURCE, MslVersion::V3_1)?;
@@ -1148,13 +1265,7 @@ pub(crate) fn kda_chunked(
         Grid::Threadgroups { groups: (p.heads, 32, 1), threadgroup: (128, 1, 1) },
     )?;
     pass.memory_barrier()?;
-    let output = ctx.pipeline("glm53_kda_prefill_output", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
-        &output,
-        &[out.binding(), x.out_gate.binding(), p.o_norm.binding()],
-        &[&u32_bytes(p.heads), &f32_bytes(p.eps)],
-        Grid::Threadgroups { groups: (rows, p.heads, 1), threadgroup: (128, 1, 1) },
-    )
+    kda_output(ctx, pass, p, x, out, rows)
 }
 
 /// Stores `rows` normalized latent rows (`rmsnorm(kv_raw, w)`, 512 wide) as

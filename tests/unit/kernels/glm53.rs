@@ -453,6 +453,17 @@ fn kda_case(rng: &mut StdRng, heads: usize) -> KdaCase {
 /// Runs `tokens` KDA tokens on the GPU in chunks of `chunk` rows and on the
 /// CPU one by one.
 fn kda_compare(tokens: usize, chunk: usize, seed: u64) {
+    kda_compare_gates(tokens, chunk, seed, -3.0, 3.0);
+}
+
+/// [`kda_compare`] with the raw gates drawn from `gate_lo..gate_hi`.
+fn kda_compare_gates(
+    tokens: usize,
+    chunk: usize,
+    seed: u64,
+    gate_lo: f32,
+    gate_hi: f32,
+) {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(seed);
     let mut cfg = crate::glm53::Config::glm53_flash();
@@ -497,7 +508,7 @@ fn kda_compare(tokens: usize, chunk: usize, seed: u64) {
         let q = f32s(&mut rng, n * p, -2.0, 2.0);
         let k = f32s(&mut rng, n * p, -2.0, 2.0);
         let v = f32s(&mut rng, n * p, -2.0, 2.0);
-        let g = f32s(&mut rng, n * p, -3.0, 3.0);
+        let g = f32s(&mut rng, n * p, gate_lo, gate_hi);
         let b = f32s(&mut rng, n * heads, -2.0, 2.0);
         let og = f32s(&mut rng, n * p, -2.0, 2.0);
         let (tq, tk, tv, tg, tb, tog) = (t(&q), t(&k), t(&v), t(&g), t(&b), t(&og));
@@ -535,6 +546,18 @@ fn kda_compare(tokens: usize, chunk: usize, seed: u64) {
         done += n;
     }
     assert_close(&state.to_f32().unwrap(), &st.s, 1e-4, 1e-3);
+}
+
+/// Prompt runs of more than KDA_CHUNK rows take the chunked form: whole
+/// and partial chunks, a run continuing another's state, and gates at the
+/// decay's extremes (the strongest decay is where the chunked form's
+/// factors are largest).
+#[test]
+fn kda_chunked_form_matches_cpu() {
+    kda_compare_gates(130, 65, 61, -3.0, 3.0);
+    kda_compare_gates(100, 100, 62, -3.0, 3.0);
+    kda_compare_gates(128, 64, 63, 20.0, 30.0);
+    kda_compare_gates(66, 33, 64, -30.0, -20.0);
 }
 
 #[test]
