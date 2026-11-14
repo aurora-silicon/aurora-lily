@@ -25,8 +25,10 @@ use crate::tensor::{DType, Tensor};
 pub const MAX_ROWS: usize = k::GEMV_MAX_ROWS;
 
 /// Rows a prompt run takes. The sliding-window layers' rings hold the
-/// window plus one run.
-pub const PREFILL_ROWS: usize = 512;
+/// window plus one run, and the scratch is sized by it: 256 rows keep the
+/// 16 GB tier's configuration (UD-IQ2_M, 8K context) under its 11 GB
+/// budget (512 rows: 10.84 GB with one checkpoint, 256: 10.71).
+pub const PREFILL_ROWS: usize = 256;
 
 struct LayerW {
     attn_norm: Tensor,
@@ -225,6 +227,8 @@ pub struct Gemma4State {
     pub pos: usize,
     pub capacity: usize,
     pub layers: Vec<LayerCache>,
+    /// The sliding window: what a snapshot keeps of each ring.
+    pub window: usize,
 }
 
 impl Gemma4State {
@@ -242,7 +246,7 @@ impl Gemma4State {
                 })
             })
             .collect::<Result<_>>()?;
-        Ok(Self { pos: 0, capacity, layers })
+        Ok(Self { pos: 0, capacity, layers, window: cfg.window })
     }
 
     /// Bytes of the caches.

@@ -55,6 +55,32 @@ enum Cmd {
         #[arg(long)]
         think: bool,
     },
+    /// State check on real weights: after a prompt of `n` tokens (from the
+    /// cases file's first case, repeated), a snapshot; greedy steps; then
+    /// back to the snapshot (and, on a second state, the global caches'
+    /// prefix copied plus the snapshot), the same steps again. Every step's
+    /// logits must be bit-identical to the first run's.
+    StateCheck {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        cases: PathBuf,
+        #[arg(long, default_value_t = 3000)]
+        n: usize,
+        #[arg(long, default_value_t = 24)]
+        steps: usize,
+    },
+    /// GPU memory of a configuration: the loaded weights, the scratch and
+    /// one session for `ctx` tokens with `checkpoints` snapshots, exactly
+    /// (the backend's allocation counter).
+    Mem {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value_t = 8192)]
+        ctx: usize,
+        #[arg(long, default_value_t = 1)]
+        checkpoints: usize,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -85,6 +111,10 @@ fn run() -> Result<()> {
             generate(&model, &parse_tokens(&tokens)?, n)
         }
         Cmd::Chat { model, prompt, n, think } => chat(&model, &prompt, n, think),
+        Cmd::StateCheck { model, cases, n, steps } => {
+            state_check(&model, &cases, n, steps)
+        }
+        Cmd::Mem { model, ctx, checkpoints } => mem(&model, ctx, checkpoints),
     }
 }
 
@@ -276,5 +306,80 @@ fn chat(path: &PathBuf, prompt: &str, n: usize, think: bool) -> Result<()> {
     }
     println!("{}", tok.decode(&out, false)?);
     eprintln!("stop {next}");
+    Ok(())
+}
+
+fn state_check(path: &PathBuf, cases: &PathBuf, n: usize, steps: usize) -> Result<()> {
+    use lily::engine::DecodeStateApi;
+    let text = std::fs::read_to_string(cases)?;
+    let line = text.lines().find(|l| !l.starts_with('#')).context("no case")?;
+    let ids = parse_tokens(line.split('\t').nth(2).context("case ids")?)?;
+    let prompt: Vec<u32> = ids.iter().copied().cycle().take(n).collect();
+    let ctx = MetalContext::new()?;
+    let model = Gemma4Model::load(&ctx, path)?;
+    let vocab = model.cfg.vocab;
+    let cap = n + steps + 8;
+    let sc = model.new_scratch(&ctx, cap)?;
+    let run = |st: &mut lily::gemma4::Gemma4State| -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::new();
+        let mut next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+        for _ in 0..steps {
+            model.forward(&ctx, st, &sc, &[next], Logits::Last)?;
+            let l = sc.logits.to_f32()?[..vocab].to_vec();
+            next = argmax(&l) as u32;
+            out.push(l);
+        }
+        Ok(out)
+    };
+    let mut st = model.new_state(&ctx, cap)?;
+    model.prefill(&ctx, &mut st, &sc, &prompt)?;
+    let last = sc.logits.to_f32()?[..vocab].to_vec();
+    let snap = st.snapshot(&ctx)?;
+    let first = run(&mut st)?;
+    st.restore(&ctx, &snap)?;
+    sc.logits_last.write_bytes(bytemuck::cast_slice(&last))?;
+    let again = run(&mut st)?;
+    let mut other = model.new_state(&ctx, 16)?;
+    other.copy_prefix_from(&ctx, &st, n)?;
+    other.restore(&ctx, &snap)?;
+    other.ensure_capacity(&ctx, cap)?;
+    sc.logits_last.write_bytes(bytemuck::cast_slice(&last))?;
+    let copied = run(&mut other)?;
+    let same = |a: &[Vec<f32>], b: &[Vec<f32>]| {
+        a.iter()
+            .zip(b)
+            .all(|(x, y)| x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()))
+    };
+    println!(
+        "prompt {n}, {steps} steps: restored {}, prefix-copied {}",
+        if same(&first, &again) { "bit-identical" } else { "DIFFERENT" },
+        if same(&first, &copied) { "bit-identical" } else { "DIFFERENT" }
+    );
+    ensure!(same(&first, &again) && same(&first, &copied), "state check failed");
+    Ok(())
+}
+
+fn mem(path: &PathBuf, tokens: usize, checkpoints: usize) -> Result<()> {
+    use lily::engine::DecodeStateApi;
+    let ctx = MetalContext::new()?;
+    let base = ctx.current_allocated();
+    let model = Gemma4Model::load(&ctx, path)?;
+    let w = ctx.current_allocated() - base;
+    let sc = model.new_scratch(&ctx, tokens)?;
+    let s = ctx.current_allocated() - base - w;
+    let st = model.new_state(&ctx, tokens)?;
+    let snaps: Vec<_> =
+        (0..checkpoints).map(|_| st.snapshot(&ctx)).collect::<Result<_>>()?;
+    let total = ctx.current_allocated() - base;
+    let gb = |b: usize| b as f64 / 1e9;
+    println!(
+        "weights {:.3} GB, scratch {:.3} GB, session ({tokens} tokens) {:.3} GB, {checkpoints} checkpoints {:.3} GB: total {:.3} GB ({total} B)",
+        gb(w),
+        gb(s),
+        gb(st.bytes()),
+        gb(total - w - s - st.bytes()),
+        gb(total)
+    );
+    drop((snaps, sc));
     Ok(())
 }

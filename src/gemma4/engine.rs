@@ -37,7 +37,24 @@ fn clone_tensor(ctx: &MetalContext, t: &Tensor) -> Result<Tensor> {
     Ok(c)
 }
 
-/// The sliding-window rings at one position.
+/// Copies `bytes` from `src` at byte `from` to `dst` at byte `to` through
+/// host memory (both shared-storage, the GPU idle on them).
+fn host_copy_at(src: &Tensor, from: usize, dst: &Tensor, to: usize, bytes: usize) {
+    assert!(from + bytes <= src.byte_len() && to + bytes <= dst.byte_len());
+    // SAFETY: both ranges lie inside host-visible buffers (asserted); the
+    // GPU is idle on them by the callers' contracts.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            src.contents_ptr().add(from),
+            dst.contents_ptr().add(to),
+            bytes,
+        );
+    }
+}
+
+/// The sliding-window rings at one position: each ring's last `window`
+/// positions (fewer at the start) in position order, in a window-sized
+/// buffer.
 pub struct Gemma4Snapshot {
     pos: usize,
     tensors: Vec<Tensor>,
@@ -53,8 +70,28 @@ impl SnapshotApi for Gemma4Snapshot {
     }
 }
 
-fn rings(st: &Gemma4State) -> Vec<&Tensor> {
-    st.layers.iter().filter(|l| l.swa).flat_map(|l| [&l.k, &l.v]).collect()
+/// Each ring tensor with its slots and bytes per slot.
+fn rings(st: &Gemma4State) -> Vec<(&Tensor, usize, usize)> {
+    st.layers
+        .iter()
+        .filter(|l| l.swa)
+        .flat_map(|l| {
+            let per_slot = l.k.byte_len() / l.slots;
+            [(&l.k, l.slots, per_slot), (&l.v, l.slots, per_slot)]
+        })
+        .collect()
+}
+
+/// The slot ranges (start slot, count) that hold positions `lo..pos` of a
+/// ring of `slots`, in position order: one range, or two across the wrap.
+fn ring_ranges(lo: usize, pos: usize, slots: usize) -> Vec<(usize, usize)> {
+    let n = pos - lo;
+    let start = lo % slots;
+    if start + n <= slots {
+        vec![(start, n)]
+    } else {
+        vec![(start, slots - start), (0, n - (slots - start))]
+    }
 }
 
 impl DecodeStateApi for Gemma4State {
@@ -110,10 +147,19 @@ impl DecodeStateApi for Gemma4State {
     }
 
     fn snapshot(&self, ctx: &MetalContext) -> Result<Gemma4Snapshot> {
-        let tensors = rings(self)
-            .into_iter()
-            .map(|t| clone_tensor(ctx, t))
-            .collect::<Result<_>>()?;
+        let lo = self.pos.saturating_sub(self.window);
+        let mut tensors = Vec::new();
+        for (ring, slots, per_slot) in rings(self) {
+            // A fixed size (the window's), whatever the position: the
+            // server sizes checkpoints from the shapes.
+            let t = Tensor::zeros(ctx, &[self.window * per_slot / 2], DType::F16)?;
+            let mut at = 0;
+            for (start, count) in ring_ranges(lo, self.pos, slots) {
+                host_copy_at(ring, start * per_slot, &t, at, count * per_slot);
+                at += count * per_slot;
+            }
+            tensors.push(t);
+        }
         Ok(Gemma4Snapshot { pos: self.pos, tensors })
     }
 
@@ -123,8 +169,15 @@ impl DecodeStateApi for Gemma4State {
         snapshot: &Gemma4Snapshot,
     ) -> Result<()> {
         ensure!(snapshot.pos <= self.capacity, "snapshot past the state's capacity");
-        for (dst, src) in rings(self).into_iter().zip(&snapshot.tensors) {
-            host_copy(src, dst, src.byte_len());
+        let lo = snapshot.pos.saturating_sub(self.window);
+        for ((ring, slots, per_slot), src) in
+            rings(self).into_iter().zip(&snapshot.tensors)
+        {
+            let mut at = 0;
+            for (start, count) in ring_ranges(lo, snapshot.pos, slots) {
+                host_copy_at(src, at, ring, start * per_slot, count * per_slot);
+                at += count * per_slot;
+            }
         }
         self.pos = snapshot.pos;
         Ok(())
@@ -243,9 +296,8 @@ impl LanguageModel for Gemma4Model {
             .sum()
     }
 
-    /// One snapshot of the sliding-window rings (a session's checkpoint):
-    /// the tiers' budgets are a few GB, far below the server's Qwen-sized
-    /// floor.
+    /// One session's sliding-window rings: the tiers' budgets are well
+    /// below the server's Qwen-sized floor.
     fn cache_budget_floor(&self) -> Option<usize> {
         let slots = super::model::ring_slots(&self.cfg);
         Some(
@@ -253,6 +305,22 @@ impl LanguageModel for Gemma4Model {
                 .filter(|&il| self.cfg.swa[il])
                 .map(|il| 4 * slots * self.cfg.kv_width(il))
                 .sum(),
+        )
+    }
+
+    /// The global layers' caches for `capacity` tokens, the rings, and
+    /// `checkpoints` snapshots of the rings' windows.
+    fn session_bytes(&self, capacity: usize, checkpoints: usize) -> Option<u64> {
+        let cfg = &self.cfg;
+        let slots = super::model::ring_slots(cfg);
+        let ring: usize = (0..cfg.n_layer)
+            .filter(|&il| cfg.swa[il])
+            .map(|il| 4 * cfg.kv_width(il))
+            .sum();
+        Some(
+            (self.bytes_per_token() * capacity
+                + ring * slots
+                + checkpoints * ring * cfg.window) as u64,
         )
     }
 
