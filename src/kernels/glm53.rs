@@ -689,6 +689,7 @@ pub fn top_prob(
 ) -> Result<()> {
     check_f32(&[logits, out])?;
     ensure!(logits.numel() >= n && n > 0, "top probability of {n} logits");
+    ensure!(out.numel() >= 1, "top probability into an empty tensor");
     let pipeline = ctx.pipeline("glm53_top_prob", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,

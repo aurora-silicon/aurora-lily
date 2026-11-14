@@ -34,7 +34,15 @@ template are read from it).
   0.3 GB of recurrent state), so this is a cap, not an allocation.
 - `--pin-weights off`: pinning would lock all 96.5 GB of weights in memory.
 - `--mtp-drafts 1`: speculative decoding with the model's own MTP block, one
-  draft a step.
+  draft a step. A draft is proposed only when its probability under the MTP
+  head (softmax at temperature 1 over the whole vocabulary, before the
+  request's penalties or truncation) is at least 0.3; otherwise the step is
+  an ordinary one-row step. This is an empirical scheduling heuristic for
+  greedy decoding on the M5 Max (a two-row verify pass costs about 37 ms
+  against 28 for one row, so a draft pays above about 30% acceptance;
+  greedy drafts below 0.3 were accepted about a quarter of the time), not a
+  calibrated acceptance probability under every sampler.
+  It changes which steps verify a draft, not the sampling rule.
 - One model on the machine at a time: the GLM loader takes the instance lock
   (`src/instance.rs`) before mapping anything, like every other loader, and
   GLM and Qwen3.8-Flash-Next do not fit in 128 GB together.

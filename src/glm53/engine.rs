@@ -254,13 +254,16 @@ impl Glm53Model {
 }
 
 /// A draft whose probability under the MTP head is below this is not
-/// proposed. A verify pass of two rows costs about 37 ms against 28 for one
-/// row (M5 Max, 2026-11-14), so a draft pays when it is accepted more than
-/// about 30% of the time; drafts of probability 0.2-0.3 were accepted 34%
-/// of the time, below 0.2 20%, from 0.5 up more than half. Skipping the
-/// drafts below 0.3 (two interleaved runs): raw Italian 36.7 -> 38.7
-/// tok/s, raw English 37.2 -> 37.9, raw C 45.2 -> 45.8, chat prose 43.1 ->
-/// 44.0, chat code unchanged (48.1).
+/// proposed. An empirical scheduling heuristic on the raw MTP confidence
+/// (the head's softmax at temperature 1 over the whole vocabulary, before
+/// the request's penalties or truncation), not a calibrated acceptance
+/// probability under every sampler. A verify pass of two rows costs about
+/// 37 ms against 28 for one row (M5 Max, 2026-11-14), so a draft pays when
+/// it is accepted more than about 30% of the time; greedy drafts of
+/// probability 0.2-0.3 were accepted 34% of the time, below 0.2 20%, from
+/// 0.5 up more than half. Skipping the drafts below 0.3 (two interleaved
+/// greedy runs): raw Italian 36.7 -> 38.7 tok/s, raw English 37.2 -> 37.9,
+/// raw C 45.2 -> 45.8, chat prose 43.1 -> 44.0, chat code unchanged (48.1).
 const DRAFT_MIN_PROB: f32 = 0.3;
 
 impl Glm53Model {
