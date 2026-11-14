@@ -24,3 +24,20 @@ pub fn tokenizer_json(g: &Gguf) -> Result<String> {
 pub fn chat_template(g: &Gguf) -> Result<String> {
     Ok(g.str("tokenizer.chat_template")?.to_string())
 }
+
+/// Turn-ending ids: the file's eos (`<|im_end|>`) and its padding token
+/// (`<|endoftext|>`, the HF config's eos).
+pub fn stop_ids(g: &Gguf) -> Result<Vec<u32>> {
+    let vocab = g.u64(&format!("{}.vocab_size", super::gguf::ARCH))?;
+    let mut ids = Vec::new();
+    for key in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.padding_token_id"] {
+        if let Ok(id) = g.u64(key) {
+            ensure!(id < vocab, "{key} {id} is outside the vocabulary of {vocab}");
+            if !ids.contains(&(id as u32)) {
+                ids.push(id as u32);
+            }
+        }
+    }
+    ensure!(!ids.is_empty(), "the GGUF names no eos token");
+    Ok(ids)
+}

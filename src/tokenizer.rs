@@ -149,7 +149,9 @@ impl Tokenizer {
                 .map_err(|e| anyhow::anyhow!("{e}"))
                 .context("building the GGUF's tokenizer")?;
             let template = crate::qwen4exp::tokenizer::chat_template(&g)?;
-            return Self::new(inner, &serde_json::Value::Null, template);
+            let mut t = Self::new(inner, &serde_json::Value::Null, template)?;
+            t.add_stop_tokens(&crate::qwen4exp::tokenizer::stop_ids(&g)?);
+            return Ok(t);
         }
         if g.architecture()? == crate::qwen36::config::ARCH {
             return Self::from_gguf_qwen36(&g);
