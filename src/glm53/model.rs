@@ -39,7 +39,17 @@ pub(crate) struct Mapped {
 
 impl Mapped {
     pub(crate) fn map(ctx: &MetalContext, g: &Gguf) -> Result<Self> {
-        let mut order: Vec<&TensorInfo> = g.tensors.iter().collect();
+        Self::map_only(ctx, g, |_| true)
+    }
+
+    /// [`Self::map`] of the tensors `keep` selects only (Qwen3.6's MTP file
+    /// also carries copies of the embedding and LM head it does not need).
+    pub(crate) fn map_only(
+        ctx: &MetalContext,
+        g: &Gguf,
+        keep: impl Fn(&TensorInfo) -> bool,
+    ) -> Result<Self> {
+        let mut order: Vec<&TensorInfo> = g.tensors.iter().filter(|t| keep(t)).collect();
         order.sort_by_key(|t| t.offset);
         let mut tensors = std::collections::HashMap::new();
         let mut buffers = Vec::new();

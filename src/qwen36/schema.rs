@@ -9,7 +9,7 @@ use super::config::Config;
 use crate::gguf::{GgmlType, Gguf};
 
 /// Types the projection paths decode: the decode GEMV and the prompt GEMM.
-const DENSE: &[GgmlType] = &[GgmlType::Q8_0, GgmlType::Q4K];
+pub(crate) const DENSE: &[GgmlType] = &[GgmlType::Q8_0, GgmlType::Q4K];
 /// Types the routed-expert kernels and the embedding decode.
 const BLOCKS: &[GgmlType] = &[GgmlType::Q8_0, GgmlType::Q4K];
 const F32: &[GgmlType] = &[GgmlType::F32];

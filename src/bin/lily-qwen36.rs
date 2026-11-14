@@ -56,6 +56,21 @@ enum Cmd {
         #[arg(long, num_args = 1..)]
         text: Vec<PathBuf>,
     },
+    /// Greedy speculative decoding with the MTP head through the engine
+    /// interface, against plain greedy decoding of the same prompt (the
+    /// first `prompt_len` ids of a file).
+    Spec {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        ids: PathBuf,
+        #[arg(long, default_value_t = 1024)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        #[arg(long, default_value_t = 2)]
+        runs: usize,
+    },
     /// Speed: prefill the first `prompt_len` ids of a file, then decode `n`
     /// tokens greedily; `runs` times, each on a fresh state.
     Bench {
@@ -103,6 +118,9 @@ fn run() -> Result<()> {
                 println!("{}", s.join(" "));
             }
             Ok(())
+        }
+        Cmd::Spec { model, ids, prompt_len, n, runs } => {
+            spec(&model, &read_ids(&ids)?, prompt_len, n, runs)
         }
         Cmd::Bench { model, ids, prompt_len, n, runs } => {
             bench(&model, &read_ids(&ids)?, prompt_len, n, runs)
@@ -314,4 +332,66 @@ fn profile_report(steps: usize) {
         );
     }
     eprintln!("  {:7.3}  kernels summed per step", total / n * 1e3);
+}
+
+fn spec(path: &PathBuf, ids: &[u32], prompt_len: usize, n: usize, runs: usize) -> Result<()> {
+    use lily::engine::{Draw, LanguageModel, LoadOptions};
+    use lily::kernels::sample::SamplingParams;
+    anyhow::ensure!(ids.len() >= prompt_len, "{} ids for a prompt of {prompt_len}", ids.len());
+    let ctx = MetalContext::new()?;
+    let opts = LoadOptions { mtp_drafts: 1, ..Default::default() };
+    let model = <Qwen36Model as LanguageModel>::load(&ctx, path, &opts)?;
+    anyhow::ensure!(model.mtp.is_some(), "no MTP head found");
+    let cap = prompt_len + n + 16;
+    let greedy = SamplingParams::greedy();
+    let mut st = LanguageModel::new_state(&model, &ctx, cap)?;
+    let mut sc = model.new_scratch_with_capacity(&ctx, cap)?;
+    let prompt = &ids[..prompt_len];
+    // Plain greedy reference through the same prefill.
+    st.reset();
+    LanguageModel::prefill(&model, &ctx, &mut st, &mut sc, prompt, Some(Draw { params: &greedy, step: 0 }))?;
+    let mut plain = vec![sc.next_token.to_u32()?[0]];
+    let t0 = Instant::now();
+    while plain.len() < n {
+        model.forward(&ctx, &mut st, &mut sc, &[*plain.last().expect("one")], Logits::Last)?;
+        plain.push(argmax(&sc.logits_last.to_f32()?) as u32);
+    }
+    let plain_dt = t0.elapsed().as_secs_f64();
+    for run in 0..runs {
+        st.reset();
+        LanguageModel::prefill(&model, &ctx, &mut st, &mut sc, prompt, Some(Draw { params: &greedy, step: 0 }))?;
+        let mut out = vec![sc.next_token.to_u32()?[0]];
+        let t0 = Instant::now();
+        let (mut drafted, mut accepted, mut steps) = (0usize, 0usize, 0usize);
+        let mut proposals = model.draft_initial(&ctx, &mut st, &mut sc, out[0], 1, &greedy, 1)?;
+        while out.len() < n {
+            let pending = *out.last().expect("one");
+            let (draws, pass) =
+                model.verify(&ctx, &mut st, &mut sc, pending, &proposals, &greedy, out.len(), 1)?;
+            let mut kept = 0;
+            for (j, &t) in draws.iter().enumerate() {
+                out.push(t);
+                kept = j;
+                if j >= proposals.len() || proposals[j] != t {
+                    break;
+                }
+            }
+            drafted += proposals.len();
+            accepted += kept;
+            steps += 1;
+            proposals = model.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pass)?;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        out.truncate(n);
+        let same = out.iter().zip(&plain).take_while(|(a, b)| a == b).count();
+        println!(
+            "run {run}: spec {} tokens {:.2}s = {:.1} tok/s ({steps} steps, accepted {accepted}/{drafted} = {:.0}%); plain {:.1} tok/s; same tokens for {same}/{n}",
+            n - 1,
+            dt,
+            (n - 1) as f64 / dt,
+            100.0 * accepted as f64 / drafted.max(1) as f64,
+            (n - 1) as f64 / plain_dt,
+        );
+    }
+    Ok(())
 }

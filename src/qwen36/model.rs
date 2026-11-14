@@ -82,6 +82,23 @@ pub struct Qwen36Model {
     output_norm: Tensor,
     /// K/V cache element format.
     pub kv_format: KvFormat,
+    /// The multi-token-prediction head, when loaded ([`Self::load_mtp`]).
+    pub mtp: Option<MtpW>,
+}
+
+/// The MTP block (`blk.<n_layer>` of the `mtp-*.gguf` beside the model): a
+/// full-attention block with its MoE, fed by `eh_proj` of the next token's
+/// normed embedding and the trunk's normed hidden state; its own head norm,
+/// the trunk's embedding and LM head (the file's copies of both are the
+/// same weights and are not mapped).
+pub struct MtpW {
+    layer: LayerW,
+    eh_proj: QWeight,
+    enorm: Tensor,
+    hnorm: Tensor,
+    head_norm: Tensor,
+    mapped: Mapped,
+    pub path: std::path::PathBuf,
 }
 
 fn load_block(m: &Mapped, il: usize, recurrent: bool) -> Result<LayerW> {
@@ -160,16 +177,86 @@ impl Qwen36Model {
             output,
             output_norm,
             kv_format: KvFormat::Bf16,
+            mtp: None,
         })
+    }
+
+    /// The MTP file for the model at `path`: `LILY_QWEN36_MTP`, else the one
+    /// `mtp-*.gguf` in its directory of the same architecture and width.
+    pub fn find_mtp(&self, path: &Path) -> Result<Option<std::path::PathBuf>> {
+        if let Some(p) = std::env::var_os("LILY_QWEN36_MTP") {
+            return Ok(Some(p.into()));
+        }
+        let Some(dir) = path.parent() else { return Ok(None) };
+        let mut found = Vec::new();
+        for e in std::fs::read_dir(dir)? {
+            let p = e?.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !(name.starts_with("mtp-") && name.ends_with(".gguf")) {
+                continue;
+            }
+            let g = Gguf::open(&p)?;
+            let arch = super::config::ARCH;
+            if g.architecture()? == arch
+                && g.u64(&format!("{arch}.embedding_length"))? as usize == self.cfg.hidden
+            {
+                found.push(p);
+            }
+        }
+        found.sort();
+        Ok(found.into_iter().next())
+    }
+
+    /// Maps the MTP block of `path` (its `blk.<n_layer>` tensors only).
+    pub fn load_mtp(&mut self, ctx: &MetalContext, path: &Path) -> Result<()> {
+        let g = Gguf::open(path)?;
+        let arch = super::config::ARCH;
+        ensure!(g.architecture()? == arch, "{} is not a {arch} GGUF", path.display());
+        ensure!(
+            g.u64(&format!("{arch}.nextn_predict_layers"))? == 1,
+            "{} has no single MTP layer",
+            path.display()
+        );
+        let il = self.cfg.n_layer;
+        let h = self.cfg.hidden;
+        let mut specs = super::schema::block(&self.cfg, il, false);
+        let f32_ = &[crate::gguf::GgmlType::F32][..];
+        let spec = |n: &str, d: &[u64], t| super::schema::Spec {
+            name: format!("blk.{il}.nextn.{n}.weight"),
+            dims: d.to_vec(),
+            types: t,
+        };
+        specs.push(spec("eh_proj", &[2 * h as u64, h as u64], super::schema::DENSE));
+        for n in ["enorm", "hnorm", "shared_head_norm"] {
+            specs.push(spec(n, &[h as u64], f32_));
+        }
+        super::schema::validate_specs(&g, &specs, &super::schema::fused_groups(il, false))?;
+        let prefix = format!("blk.{il}.");
+        let mapped = Mapped::map_only(ctx, &g, |t| t.name.starts_with(&prefix))?;
+        let n = |s: &str| format!("blk.{il}.nextn.{s}.weight");
+        self.mtp = Some(MtpW {
+            layer: load_block(&mapped, il, false)?,
+            eh_proj: mapped.q(&n("eh_proj"))?,
+            enorm: mapped.f32(&n("enorm"))?,
+            hnorm: mapped.f32(&n("hnorm"))?,
+            head_norm: mapped.f32(&n("shared_head_norm"))?,
+            mapped,
+            path: path.to_path_buf(),
+        });
+        Ok(())
     }
 
     /// The buffers holding the mapped file.
     pub fn weight_buffers(&self) -> Vec<Buffer> {
-        self.mapped.buffers()
+        let mut b = self.mapped.buffers();
+        if let Some(m) = &self.mtp {
+            b.extend(m.mapped.buffers());
+        }
+        b
     }
 
     pub fn new_state(&self, ctx: &MetalContext, capacity: usize) -> Result<Qwen36State> {
-        Qwen36State::new(ctx, &self.cfg, self.kv_format, capacity)
+        Qwen36State::new(ctx, &self.cfg, self.kv_format, capacity, self.mtp.is_some())
     }
 
     pub fn new_scratch(&self, ctx: &MetalContext) -> Result<Scratch> {
@@ -185,11 +272,26 @@ pub enum LayerState {
     Attn { k: KvCache, v: KvCache },
 }
 
+/// The MTP head's per-session state: its K/V caches (row `p` holds the pair
+/// of the trunk's hidden state at `p - 1` and the token at `p`, llama.cpp's
+/// layout), the trunk's normed hidden row the next pair takes
+/// (`pending_h`, the row at `pos - 1`), and the next row to write.
+pub struct MtpState {
+    pub k: KvCache,
+    pub v: KvCache,
+    pub pending_h: Tensor,
+    pub pos: usize,
+}
+
 /// A session: caches and recurrent state at position `pos`.
 pub struct Qwen36State {
     pub pos: usize,
     pub capacity: usize,
     pub layers: Vec<LayerState>,
+    pub mtp: Option<MtpState>,
+    /// A verify pass that fed rows from this position and the draws of its
+    /// rows, until `finish_speculation` decides what stays.
+    pub(crate) spec: Option<(usize, usize, Vec<u32>)>,
 }
 
 impl Qwen36State {
@@ -198,6 +300,7 @@ impl Qwen36State {
         cfg: &Config,
         format: KvFormat,
         capacity: usize,
+        mtp: bool,
     ) -> Result<Self> {
         let capacity = capacity.next_multiple_of(4);
         let ch = cfg.gdn_qkv();
@@ -221,7 +324,18 @@ impl Qwen36State {
                 })
             })
             .collect::<Result<_>>()?;
-        Ok(Self { pos: 0, capacity, layers })
+        let mtp = if mtp {
+            let c = || KvCache::zeros(ctx, format, cfg.n_head_kv, capacity, cfg.head_dim);
+            Some(MtpState {
+                k: c()?,
+                v: c()?,
+                pending_h: Tensor::zeros(ctx, &[cfg.hidden], DType::F32)?,
+                pos: 0,
+            })
+        } else {
+            None
+        };
+        Ok(Self { pos: 0, capacity, layers, mtp, spec: None })
     }
 
     /// Zeroes the recurrent state and rewinds (GPU idle).
@@ -232,7 +346,12 @@ impl Qwen36State {
                 s.zero_fill();
             }
         }
+        if let Some(m) = &mut self.mtp {
+            m.pending_h.zero_fill();
+            m.pos = 0;
+        }
         self.pos = 0;
+        self.spec = None;
     }
 
     /// Makes the GDN states saved after a verify pass's first row current.
@@ -286,7 +405,17 @@ pub struct Scratch {
     sfm: Tensor,
     sout: Tensor,
     // Head
-    hidden_norm: Tensor,
+    pub hidden_norm: Tensor,
+    // MTP
+    /// `[PREFILL_ROWS + 1][hidden]`: a prompt run's MTP inputs, row 0 the
+    /// session's pending row, row `i + 1` the run's row `i` normed.
+    hbuf: Tensor,
+    /// `[rows][2 hidden]`: normed embedding | normed hidden.
+    cat: Tensor,
+    /// The MTP head's normed last row.
+    mtp_hn: Tensor,
+    /// U32[2]: the MTP step's input token (0) and its greedy draft (1).
+    pub mtp_io: Tensor,
     pub logits: Tensor,
     /// The last (or only) row's logits: `logits[0..vocab]`.
     pub logits_last: Tensor,
@@ -313,7 +442,7 @@ impl Scratch {
         let used = cfg.n_expert_used;
         // The split decode's partials, for any context (bounded: 2 MB).
         let splits = attn::sdpa_split_scratch_splits(attn::MAX_SEQ);
-        let widest = [h, inner, hq, cfg.ff_shared].into_iter().max().unwrap_or(h);
+        let widest = [2 * h, inner, hq, cfg.ff_shared].into_iter().max().unwrap_or(h);
         let logits = f(MAX_ROWS * cfg.vocab)?;
         Ok(Self {
             logits_last: logits.view(0, &[cfg.vocab])?,
@@ -350,6 +479,10 @@ impl Scratch {
             sfm: f(r * cfg.ff_shared)?,
             sout: f(r * h)?,
             hidden_norm: f(MAX_ROWS * h)?,
+            hbuf: f((r + 1) * h)?,
+            cat: f(r * 2 * h)?,
+            mtp_hn: f(h)?,
+            mtp_io: u(2)?,
             logits,
             sampler: SamplerScratch::new(ctx, cfg.vocab)?,
             next_token: u(2)?,
@@ -498,29 +631,132 @@ impl Qwen36Model {
             pass.memory_barrier()?;
         }
         for il in layers.clone() {
-            let l = &self.layers[il];
-            g::rmsnorm(ctx, pass, &sc.x, Some(&l.attn_norm), &sc.xn, m, cfg.hidden, cfg.rms_eps)?;
-            pass.memory_barrier()?;
-            match (&l.mixer, &st.layers[il]) {
-                (Mixer::Gdn(w), LayerState::Gdn { conv, s, conv_alt, s_alt }) => {
-                    let snap = snap.map(|row| GdnSnapshot { row, conv: conv_alt, s: s_alt });
-                    self.gdn(ctx, pass, sc, w, &GdnState { conv, s }, snap.as_ref(), m)?;
-                }
-                (Mixer::Attn(w), LayerState::Attn { k: kc, v: vc }) => {
-                    self.attention(ctx, pass, sc, w, kc, vc, st.pos, m)?;
-                }
-                _ => anyhow::bail!("layer {il}'s state does not match its kind"),
-            }
-            g::add(ctx, pass, &sc.x, &sc.mix, &sc.x, m * cfg.hidden)?;
-            pass.memory_barrier()?;
-            g::rmsnorm(ctx, pass, &sc.x, Some(&l.post_norm), &sc.xn, m, cfg.hidden, cfg.rms_eps)?;
-            pass.memory_barrier()?;
-            self.ffn(ctx, pass, sc, &l.ffn, m)?;
+            self.encode_block(ctx, pass, sc, &self.layers[il], &st.layers[il], st.pos, snap, m)?;
         }
         if layers.end < cfg.n_layer {
             return Ok(());
         }
         self.encode_head(ctx, pass, sc, m, logits)
+    }
+
+    /// One block on `sc.x`'s `m` rows at positions `pos0..`: norm, mixer,
+    /// residual, norm, FFN (with its residual).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_block(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        sc: &Scratch,
+        l: &LayerW,
+        ls: &LayerState,
+        pos0: usize,
+        snap: Option<usize>,
+        m: usize,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        g::rmsnorm(ctx, pass, &sc.x, Some(&l.attn_norm), &sc.xn, m, cfg.hidden, cfg.rms_eps)?;
+        pass.memory_barrier()?;
+        match (&l.mixer, ls) {
+            (Mixer::Gdn(w), LayerState::Gdn { conv, s, conv_alt, s_alt }) => {
+                let snap = snap.map(|row| GdnSnapshot { row, conv: conv_alt, s: s_alt });
+                self.gdn(ctx, pass, sc, w, &GdnState { conv, s }, snap.as_ref(), m)?;
+            }
+            (Mixer::Attn(w), LayerState::Attn { k: kc, v: vc }) => {
+                self.attention(ctx, pass, sc, w, kc, vc, pos0, m)?;
+            }
+            _ => anyhow::bail!("a block's state does not match its kind"),
+        }
+        g::add(ctx, pass, &sc.x, &sc.mix, &sc.x, m * cfg.hidden)?;
+        pass.memory_barrier()?;
+        g::rmsnorm(ctx, pass, &sc.x, Some(&l.post_norm), &sc.xn, m, cfg.hidden, cfg.rms_eps)?;
+        pass.memory_barrier()?;
+        self.ffn(ctx, pass, sc, &l.ffn, m)
+    }
+
+    /// The MTP head over `m` pairs (llama.cpp's `graph_mtp`): pair `r` is
+    /// token `tokens[r]` with the trunk's normed hidden row `hin[r]` (the row
+    /// before the token's position), written to the head's cache row
+    /// `pos0 + r`. With `draft`, the last pair's greedy next token goes to
+    /// `sc.mtp_io[1]`. Uses `sc.x` as its residual stream (after the trunk's
+    /// head has read it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_mtp(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        st: &Qwen36State,
+        sc: &Scratch,
+        tokens: &Tensor,
+        hin: &Tensor,
+        pos0: usize,
+        m: usize,
+        draft: bool,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        let w = self.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no MTP head loaded"))?;
+        let ms = st.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no MTP state"))?;
+        ensure!((1..=PREFILL_ROWS).contains(&m), "MTP over {m} pairs");
+        ensure!(pos0 + m <= st.capacity, "MTP rows past the state's capacity");
+        k::embed(ctx, pass, &self.embed, tokens, &sc.xn, m)?;
+        pass.memory_barrier()?;
+        k::mtp_cat(ctx, pass, &sc.xn, hin, &w.enorm, &w.hnorm, &sc.cat, m, cfg.hidden, cfg.rms_eps)?;
+        pass.memory_barrier()?;
+        let xb = self.bf16_input(ctx, pass, sc, &sc.cat, 2 * cfg.hidden, m)?;
+        self.proj(ctx, pass, &[(&w.eh_proj, &sc.x)], &sc.cat, xb, m)?;
+        pass.memory_barrier()?;
+        let ls = LayerState::Attn { k: ms.k.clone(), v: ms.v.clone() };
+        self.encode_block(ctx, pass, sc, &w.layer, &ls, pos0, None, m)?;
+        if !draft {
+            return Ok(());
+        }
+        let x = sc.x.view((m - 1) * cfg.hidden, &[cfg.hidden])?;
+        g::rmsnorm(ctx, pass, &x, Some(&w.head_norm), &sc.mtp_hn, 1, cfg.hidden, cfg.rms_eps)?;
+        pass.memory_barrier()?;
+        self.proj(ctx, pass, &[(&self.output, &sc.logits)], &sc.mtp_hn, None, 1)?;
+        pass.memory_barrier()?;
+        let out = sc.mtp_io.view(1, &[1])?;
+        crate::kernels::sample::sample_f32(
+            ctx,
+            pass,
+            &sc.logits_last,
+            &sc.sampler,
+            &crate::kernels::sample::SamplingParams::greedy(),
+            0,
+            &out,
+        )?;
+        pass.memory_barrier()
+    }
+
+    /// For a prompt run with the MTP head: the run's rows normed into
+    /// `sc.hbuf` rows `1..=m` (row 0, the session's pending row, staged by
+    /// the caller), then the head over the run's pairs at `pos0..`.
+    pub(crate) fn encode_mtp_prompt(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        st: &Qwen36State,
+        sc: &Scratch,
+        pos0: usize,
+        m: usize,
+    ) -> Result<()> {
+        let h = self.cfg.hidden;
+        let rows = sc.hbuf.view(h, &[m * h])?;
+        g::rmsnorm(ctx, pass, &sc.x, Some(&self.output_norm), &rows, m, h, self.cfg.rms_eps)?;
+        pass.memory_barrier()?;
+        let hin = sc.hbuf.view(0, &[m * h])?;
+        self.encode_mtp(ctx, pass, st, sc, &sc.tokens, &hin, pos0, m, false)
+    }
+
+    /// Copies hidden row `row` of `src` (`[rows][hidden]`) into `dst`
+    /// through host memory (GPU idle on both).
+    pub(crate) fn copy_row(&self, src: &Tensor, row: usize, dst: &Tensor) -> Result<()> {
+        let h = self.cfg.hidden;
+        let v = src.view(row * h, &[h])?;
+        dst.write_bytes(v.contents())
+    }
+
+    pub(crate) fn hbuf(sc: &Scratch) -> &Tensor {
+        &sc.hbuf
     }
 
     fn encode_head(

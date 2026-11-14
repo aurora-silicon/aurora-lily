@@ -414,6 +414,37 @@ pub fn moe_down(
     )
 }
 
+/// The MTP head's input rows: `cat[r] = [rmsnorm(e[r]) * enorm |
+/// rmsnorm(h[r]) * hnorm]` over `m` rows of `hidden`.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_cat(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    e: &Tensor,
+    h: &Tensor,
+    enorm: &Tensor,
+    hnorm: &Tensor,
+    cat: &Tensor,
+    m: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<()> {
+    for t in [e, h, enorm, hnorm, cat] {
+        check(&[(t, DType::F32)])?;
+    }
+    ensure!(
+        e.numel() >= m * hidden && h.numel() >= m * hidden && cat.numel() >= 2 * m * hidden,
+        "MTP input of {m} rows"
+    );
+    let pipeline = ctx.pipeline("qwen36_mtp_cat", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[e.binding(), h.binding(), enorm.binding(), hnorm.binding(), cat.binding()],
+        &[&u32_bytes(hidden), &f32_bytes(eps)],
+        Grid::Threadgroups { groups: (m, 2, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/qwen36.rs"]
 mod tests;

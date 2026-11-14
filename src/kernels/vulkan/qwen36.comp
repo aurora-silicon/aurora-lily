@@ -454,3 +454,38 @@ void main() {
     if (t == 0u && r < H) F32(arg(3)).v[i * H + r] = acc;
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// The MTP head's input: cat[r] = [rmsnorm(e[r]) * enorm | rmsnorm(h[r]) *
+// hnorm] (llama.cpp concatenates the embedding first). Grid (m, 2), 256
+// threads. Buffers: 0 e [m][H], 1 h [m][H], 2 enorm, 3 hnorm, 4 cat
+// [m][2H]. Params: 5 H, 6 eps.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_qwen36_mtp_cat
+shared float partial[8];
+void main() {
+    const uint H = arg_u32(5);
+    const float eps = arg_f32(6);
+    const uint r = gl_WorkGroupID.x;
+    const uint half_ = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint64_t src = (half_ == 0u ? arg(0) : arg(1)) + 4u * uint64_t(r) * H;
+    const uint64_t w = half_ == 0u ? arg(2) : arg(3);
+    float acc = 0.0;
+    for (uint c = tid; c < H; c += 256u) {
+        const float v = F32(src).v[c];
+        acc += v * v;
+    }
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) partial[gl_SubgroupID] = acc;
+    barrier();
+    float total = 0.0;
+    [[unroll]] for (uint s = 0u; s < 8u; s++) total += partial[s];
+    const float scale = inversesqrt(total / float(H) + eps);
+    const uint64_t dst = arg(4) + 4u * (uint64_t(r) * 2u * H + half_ * H);
+    for (uint c = tid; c < H; c += 256u) {
+        precise float n = F32(src).v[c] * scale;
+        F32(dst).v[c] = n * F32(w).v[c];
+    }
+}
+#endif

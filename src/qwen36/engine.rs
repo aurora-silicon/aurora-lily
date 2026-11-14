@@ -10,8 +10,8 @@ use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
 };
 use crate::kernels::attention::KvCache;
-use crate::kernels::sample::sample_f32;
-use crate::metal::{EncodedPass, MetalContext};
+use crate::kernels::sample::{SamplingParams, sample_f32};
+use crate::metal::{EncodedPass, MetalContext, PendingPass};
 use crate::tensor::Tensor;
 
 /// Copies `src`'s first `bytes` into `dst` through host memory (both
@@ -68,7 +68,8 @@ impl SnapshotApi for Qwen36Snapshot {
     }
 }
 
-/// The tensors a snapshot holds, in a fixed order.
+/// The tensors a snapshot holds, in a fixed order: the GDN windows and
+/// states, the MTP head's pending row.
 fn recurrent(st: &Qwen36State) -> Vec<&Tensor> {
     st.layers
         .iter()
@@ -76,7 +77,39 @@ fn recurrent(st: &Qwen36State) -> Vec<&Tensor> {
             LayerState::Gdn { conv, s, .. } => vec![conv, s],
             LayerState::Attn { .. } => vec![],
         })
+        .chain(st.mtp.as_ref().map(|m| &m.pending_h))
         .collect()
+}
+
+/// The K/V caches of a state that grow with its capacity.
+fn caches_mut(st: &mut Qwen36State) -> Vec<&mut KvCache> {
+    let mut v: Vec<&mut KvCache> = Vec::new();
+    for l in &mut st.layers {
+        if let LayerState::Attn { k, v: vv } = l {
+            v.push(k);
+            v.push(vv);
+        }
+    }
+    if let Some(m) = &mut st.mtp {
+        v.push(&mut m.k);
+        v.push(&mut m.v);
+    }
+    v
+}
+
+fn caches(st: &Qwen36State) -> Vec<&KvCache> {
+    let mut v: Vec<&KvCache> = Vec::new();
+    for l in &st.layers {
+        if let LayerState::Attn { k, v: vv } = l {
+            v.push(k);
+            v.push(vv);
+        }
+    }
+    if let Some(m) = &st.mtp {
+        v.push(&m.k);
+        v.push(&m.v);
+    }
+    v
 }
 
 impl DecodeStateApi for Qwen36State {
@@ -104,16 +137,13 @@ impl DecodeStateApi for Qwen36State {
             return Ok(());
         }
         let capacity = tokens.max(self.capacity * 2).next_multiple_of(4);
-        for l in &mut self.layers {
-            if let LayerState::Attn { k, v } = l {
-                for c in [k, v] {
-                    let (heads, _, d) = c.kv().shape();
-                    let format = c.kv().format()?;
-                    let n = KvCache::zeros(ctx, format, heads, capacity, d)?;
-                    copy_cache_rows(c, &n, self.pos);
-                    *c = n;
-                }
-            }
+        let rows = self.pos.max(self.mtp.as_ref().map_or(0, |m| m.pos)).min(self.capacity);
+        for c in caches_mut(self) {
+            let (heads, _, d) = c.kv().shape();
+            let format = c.kv().format()?;
+            let n = KvCache::zeros(ctx, format, heads, capacity, d)?;
+            copy_cache_rows(c, &n, rows);
+            *c = n;
         }
         self.capacity = capacity;
         Ok(())
@@ -128,7 +158,8 @@ impl DecodeStateApi for Qwen36State {
                 }
                 LayerState::Attn { k, v } => k.bytes() + v.bytes(),
             })
-            .sum()
+            .sum::<usize>()
+            + self.mtp.as_ref().map_or(0, |m| m.k.bytes() + m.v.bytes() + m.pending_h.byte_len())
     }
 
     fn snapshot(&self, ctx: &MetalContext) -> Result<Qwen36Snapshot> {
@@ -143,6 +174,10 @@ impl DecodeStateApi for Qwen36State {
             host_copy(src, dst, src.byte_len());
         }
         self.pos = snapshot.pos;
+        if let Some(m) = &mut self.mtp {
+            m.pos = snapshot.pos;
+        }
+        self.spec = None;
         Ok(())
     }
 
@@ -154,13 +189,12 @@ impl DecodeStateApi for Qwen36State {
     ) -> Result<()> {
         ensure!(tokens <= from.pos, "prefix of {tokens} from a state at {}", from.pos);
         self.ensure_capacity(ctx, tokens)?;
-        for (dst, src) in self.layers.iter().zip(&from.layers) {
-            if let (LayerState::Attn { k: dk, v: dv }, LayerState::Attn { k: sk, v: sv }) =
-                (dst, src)
-            {
-                copy_cache_rows(sk, dk, tokens);
-                copy_cache_rows(sv, dv, tokens);
-            }
+        ensure!(
+            self.mtp.is_some() == from.mtp.is_some(),
+            "prefix copy between states with and without the MTP head"
+        );
+        for (dst, src) in caches(self).into_iter().zip(caches(from)) {
+            copy_cache_rows(src, dst, tokens);
         }
         Ok(())
     }
@@ -205,13 +239,29 @@ impl Qwen36Model {
             scratch.stage_tokens(chunk)?;
             let logits = if last && draw.is_some() { Logits::Last } else { Logits::None };
             let sc: &Scratch = scratch;
-            self.run_rows(ctx, state, sc, chunk.len(), logits, None, |pass| {
+            let mtp = self.mtp.is_some() && state.mtp.is_some();
+            if let Some(m) = &state.mtp {
+                // The head's pairs of this run start with the session's
+                // pending row.
+                Qwen36Model::hbuf(sc).view(0, &[self.cfg.hidden])?.write_bytes(m.pending_h.contents())?;
+            }
+            let pos0 = state.pos;
+            let st: &Qwen36State = state;
+            self.run_rows(ctx, st, sc, chunk.len(), logits, None, |pass| {
                 if let (true, Some(d)) = (last, draw) {
                     let out = sc.next_token.view(0, &[1])?;
                     sample_f32(ctx, pass, &sc.logits_last, sc.sampler(), d.params, d.step, &out)?;
                 }
+                if mtp {
+                    pass.memory_barrier()?;
+                    self.encode_mtp_prompt(ctx, pass, st, sc, pos0, chunk.len())?;
+                }
                 Ok(())
             })?;
+            if let Some(m) = &mut state.mtp {
+                self.copy_row(Qwen36Model::hbuf(sc), chunk.len(), &m.pending_h)?;
+                m.pos = pos0 + chunk.len();
+            }
             state.pos += chunk.len();
             fed += chunk.len();
         }
@@ -225,8 +275,140 @@ impl LanguageModel for Qwen36Model {
 
     const MODEL_ID: &'static str = "qwen3.6-35b-a3b";
 
-    fn load(ctx: &MetalContext, path: &Path, _options: &LoadOptions) -> Result<Self> {
-        Qwen36Model::load(ctx, path)
+    fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
+        let mut model = Qwen36Model::load(ctx, path)?;
+        if options.mtp_drafts > 0 {
+            match model.find_mtp(path)? {
+                Some(p) => {
+                    model.load_mtp(ctx, &p)?;
+                    eprintln!("qwen3.6: MTP head from {}", p.display());
+                }
+                None => eprintln!(
+                    "qwen3.6: no mtp-*.gguf beside {}: decoding without drafts",
+                    path.display()
+                ),
+            }
+        }
+        Ok(model)
+    }
+
+    /// One draft a step: the MTP block predicts one token ahead.
+    fn max_drafts(&self) -> usize {
+        usize::from(self.mtp.is_some())
+    }
+
+    fn draft_initial(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Qwen36State,
+        scratch: &mut Scratch,
+        first: u32,
+        _drafts: usize,
+        _params: &SamplingParams,
+        _step0: usize,
+    ) -> Result<Vec<u32>> {
+        let p = state.pos;
+        state.ensure_capacity(ctx, p + 2)?;
+        let m = state.mtp.as_mut().ok_or_else(|| anyhow::anyhow!("no MTP state"))?;
+        // The pair (hidden at p - 1, first) at head row p; a head that fell
+        // behind (rows fed without it) resumes here.
+        m.pos = p;
+        crate::glm53::model::write_words(&scratch.mtp_io, &[first])?;
+        Qwen36Model::hbuf(scratch).view(0, &[self.cfg.hidden])?.write_bytes(m.pending_h.contents())?;
+        let sc: &Scratch = scratch;
+        let st: &Qwen36State = state;
+        let pass = self.begin(ctx)?;
+        let token = sc.mtp_io.view(0, &[1])?;
+        let hin = Qwen36Model::hbuf(sc).view(0, &[self.cfg.hidden])?;
+        self.encode_mtp(ctx, &pass, st, sc, &token, &hin, p, 1, true)?;
+        pass.commit_wait()?;
+        if let Some(m) = &mut state.mtp {
+            m.pos = p + 1;
+        }
+        Ok(vec![scratch.mtp_io.to_u32()?[1]])
+    }
+
+    fn verify<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        state: &mut Qwen36State,
+        scratch: &mut Scratch,
+        pending: u32,
+        drafts: &[u32],
+        params: &SamplingParams,
+        step0: usize,
+        _next_drafts: usize,
+    ) -> Result<(Vec<u32>, PendingPass<'a>)> {
+        let rows = 1 + drafts.len();
+        ensure!(rows <= 2, "Qwen3.6 verifies one draft a step, got {}", drafts.len());
+        ensure!(state.spec.is_none(), "a verify pass is already pending");
+        state.ensure_capacity(ctx, state.pos + rows + 1)?;
+        let toks: Vec<u32> = std::iter::once(pending).chain(drafts.iter().copied()).collect();
+        crate::glm53::model::write_words(&scratch.spec_tokens, &toks)?;
+        crate::glm53::model::write_words(&scratch.tokens, &toks)?;
+        // The GDN keeps its state after row 0 aside: the rollback if row 1's
+        // draft is rejected.
+        let snap = (rows > 1).then_some(0);
+        let vocab = self.cfg.vocab;
+        let sc: &Scratch = scratch;
+        self.run_rows(ctx, state, sc, rows, Logits::All, snap, |pass| {
+            for r in 0..rows {
+                let logits = sc.logits.view(r * vocab, &[vocab])?;
+                let out = sc.draws.view(r, &[1])?;
+                sample_f32(ctx, pass, &logits, sc.sampler(), params, step0 + r, &out)?;
+                pass.memory_barrier()?;
+            }
+            Ok(())
+        })?;
+        let draws = scratch.draws.to_u32()?[..rows].to_vec();
+        state.spec = Some((state.pos, rows, draws.clone()));
+        state.pos += rows;
+        Ok((draws, ctx.begin()?.commit()?))
+    }
+
+    fn finish_speculation(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Qwen36State,
+        scratch: &mut Scratch,
+        accepted: usize,
+        propose: bool,
+        draft: PendingPass<'_>,
+    ) -> Result<Vec<u32>> {
+        draft.wait()?;
+        let (pos0, rows, draws) =
+            state.spec.take().ok_or_else(|| anyhow::anyhow!("no verify pass pending"))?;
+        ensure!(accepted < rows, "{accepted} accepted of {} drafts", rows - 1);
+        state.pos = pos0 + 1 + accepted;
+        if accepted + 1 < rows {
+            // Back to the state after row 0.
+            state.take_gdn_snapshots();
+        }
+        for &token in &draws[accepted + 1..] {
+            scratch.sampler().uncount(token);
+        }
+        // The head's pairs of the kept rows: (hidden row r, draw r) at head
+        // row pos0 + 1 + r; with `propose` also the last draw's (the new
+        // pending token), whose greedy next token is the draft.
+        let pairs = if propose { accepted + 1 } else { accepted };
+        if pairs > 0 {
+            let sc: &Scratch = scratch;
+            let st: &Qwen36State = state;
+            let h = self.cfg.hidden;
+            let pass = self.begin(ctx)?;
+            let tokens = sc.draws.view(0, &[pairs])?;
+            let hin = sc.hidden_norm.view(0, &[pairs * h])?;
+            self.encode_mtp(ctx, &pass, st, sc, &tokens, &hin, pos0 + 1, pairs, propose)?;
+            pass.commit_wait()?;
+        }
+        let m = state.mtp.as_mut().ok_or_else(|| anyhow::anyhow!("no MTP state"))?;
+        m.pos = pos0 + 1 + pairs;
+        if !propose {
+            // At rest: the next pair takes the last kept row's hidden state.
+            self.copy_row(&scratch.hidden_norm, accepted, &m.pending_h)?;
+            return Ok(Vec::new());
+        }
+        Ok(vec![scratch.mtp_io.to_u32()?[1]])
     }
 
     fn max_position_embeddings(&self) -> usize {
