@@ -271,15 +271,21 @@ fn gguf_project_mat(
     if m <= qwen_gguf::GEMV_MAX_ROWS {
         return gguf_gemv_sets(ctx, pass, a, &[(g, c)], m);
     }
-    ensure!(g.parts.len() == 1, "a GGUF stack in a GEMM goes out as its slices");
+    let (n, k) = (g.out_features(), g.in_features());
+    // The GEMM writes one part's whole bfloat16 rows from a staged copy:
+    // anything else (a stack, f32 output, a weight larger than the staging,
+    // the LM head of a batched step) goes by the GEMV, four rows at a time.
+    if g.parts.len() != 1 || c.dtype() != DType::BF16 || scratch.numel() < n * k {
+        for r in (0..m).step_by(qwen_gguf::GEMV_MAX_ROWS) {
+            let rows = (m - r).min(qwen_gguf::GEMV_MAX_ROWS);
+            let a_r = a.view(r * k, &[rows, k])?;
+            let c_r = c.view(r * n, &[rows * n])?;
+            gguf_gemv_sets(ctx, pass, &a_r, &[(g, &c_r)], rows)?;
+        }
+        return Ok(());
+    }
     let w = &g.parts[0];
-    let (n, k) = (w.rows, w.cols);
-    ensure!(
-        scratch.numel() >= n * k && scratch.dtype() == DType::BF16,
-        "dequant scratch holds {} bf16 elements, needs {}",
-        scratch.numel(),
-        n * k
-    );
+    ensure!(scratch.dtype() == DType::BF16, "dequant scratch is {:?}", scratch.dtype());
     let staged = scratch.view(0, &[n, k])?;
     qwen_gguf::dequant_bf16(ctx, pass, w, &staged)?;
     pass.level_barrier(&[&staged])?;
