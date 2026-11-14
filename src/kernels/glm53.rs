@@ -129,6 +129,8 @@ fn moe_name(gate_up: bool, ty: GgmlType) -> Result<&'static str> {
         (true, GgmlType::Iq2Xxs) => "glm53_moe_gate_up_iq2_xxs",
         (true, GgmlType::Q4K) => "glm53_moe_gate_up_q4_k",
         (true, GgmlType::Q2K) => "glm53_moe_gate_up_q2_k",
+        (true, GgmlType::Q8_0) => "glm53_moe_gate_up_q8_0",
+        (false, GgmlType::Q8_0) => "glm53_moe_down_q8_0",
         (false, GgmlType::Q2K) => "glm53_moe_down_q2_k",
         (false, GgmlType::Q4K) => "glm53_moe_down_q4_k",
         (false, GgmlType::Iq2Xxs) => "glm53_moe_down_iq2_xxs",
@@ -583,6 +585,10 @@ fn moe_grouped_with(
                 (GgmlType::Iq2Xxs, true) => "glm53_gemm_moe_iq2_xxs_r128",
                 (GgmlType::Q2K, false) => "glm53_gemm_moe_q2_k",
                 (GgmlType::Q2K, true) => "glm53_gemm_moe_q2_k_r128",
+                (GgmlType::Q4K, false) => "glm53_gemm_moe_q4_k",
+                (GgmlType::Q4K, true) => "glm53_gemm_moe_q4_k_r128",
+                (GgmlType::Q8_0, false) => "glm53_gemm_moe_q8_0",
+                (GgmlType::Q8_0, true) => "glm53_gemm_moe_q8_0_r128",
                 (other, _) => anyhow::bail!("no grouped expert GEMM over {other:?}"),
             };
             ensure!(

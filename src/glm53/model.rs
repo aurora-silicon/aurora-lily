@@ -30,7 +30,8 @@ pub const PREFILL_ROWS: usize = 2048;
 /// a region of their own).
 const REGION_BYTES: u64 = 1 << 30;
 
-/// The tensors of a GGUF file, mapped (GLM's and DeepSeek's models).
+/// The tensors of a GGUF file, mapped (GLM's, DeepSeek's and Qwen3.6's
+/// models).
 pub(crate) struct Mapped {
     tensors: std::collections::HashMap<String, (Buffer, usize, TensorInfo)>,
     buffers: Vec<Buffer>,
@@ -38,7 +39,18 @@ pub(crate) struct Mapped {
 
 impl Mapped {
     pub(crate) fn map(ctx: &MetalContext, g: &Gguf) -> Result<Self> {
-        let mut order: Vec<&TensorInfo> = g.tensors.iter().collect();
+        Self::map_only(ctx, g, |_| true)
+    }
+
+    /// [`Self::map`] of the tensors `keep` selects only (Qwen3.6's MTP file
+    /// also carries copies of the embedding and LM head it does not need).
+    pub(crate) fn map_only(
+        ctx: &MetalContext,
+        g: &Gguf,
+        keep: impl Fn(&TensorInfo) -> bool,
+    ) -> Result<Self> {
+        let mut order: Vec<&TensorInfo> =
+            g.tensors.iter().filter(|t| keep(t)).collect();
         order.sort_by_key(|t| t.offset);
         let mut tensors = std::collections::HashMap::new();
         let mut buffers = Vec::new();

@@ -89,11 +89,11 @@ use tools::ParsedToolCall;
 /// this. The body buffer is zero-filled pages until read into.
 const MAX_REQUEST_BYTES: usize = 1 << 30;
 /// Recurrent-state checkpoints kept per session (the newest ones).
-const CHECKPOINTS_PER_SESSION: usize = 3;
+pub(crate) const CHECKPOINTS_PER_SESSION: usize = 3;
 /// Decode checkpoints a generation holds and a session keeps of its latest
 /// request (113 MB each on the full model): a 2 048-token interval stays at
 /// that spacing up to an 8 192-token answer and thins to 4 096 up to 16 384.
-const DECODE_CHECKPOINTS_PER_SESSION: usize = 4;
+pub(crate) const DECODE_CHECKPOINTS_PER_SESSION: usize = 4;
 /// Completed requests `GET /v1/timings` remembers (a ring buffer; a client
 /// polls it right after its request, so a handful of entries is plenty).
 const TIMINGS_LOG_CAPACITY: usize = 32;
@@ -1083,7 +1083,22 @@ impl<M: LanguageModel> Engine<M> {
         let paged = model.paged_storage_bytes();
         let gb = |bytes: usize| bytes as f64 / 1e9;
         let budget = match (options.cache_bytes, model.session_reserve()) {
-            (Some(b), _) => b,
+            // An explicit budget too stays within --memory-limit-gb.
+            (Some(b), _) => {
+                let (budget, limited) =
+                    cap_cache_budget(b, model.memory_limit(), allocated);
+                if limited {
+                    eprintln!(
+                        "session cache budget: --cache-bytes {:.1} GB lowered to {:.1} GB = the {:.1} GB \
+                         footprint target of --memory-limit-gb - {:.1} GB allocated",
+                        gb(b),
+                        gb(budget),
+                        gb(model.memory_limit().unwrap_or(0) as usize),
+                        gb(allocated),
+                    );
+                }
+                budget
+            }
             // The expert cache's plan kept exactly one full session free:
             // budget that, not the working-set arithmetic, whose floor would
             // come on top of the plan and eat the reserve it keeps for the
@@ -1703,6 +1718,12 @@ fn gguf_config(path: &Path) -> Result<Value> {
         config["max_position_embeddings"] =
             serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
     }
+    if arch == crate::qwen36::config::ARCH {
+        let stops = crate::qwen36::tokenizer::stop_ids(&g)?;
+        config["eos_token_id"] = serde_json::json!(stops);
+        config["max_position_embeddings"] =
+            serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
+    }
     Ok(config)
 }
 
@@ -1913,10 +1934,14 @@ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
         crate::deepseek4::config::ARCH => {
             run_with::<crate::deepseek4::Ds4Model>(model_dir, options, signals)
         }
+        crate::qwen36::config::ARCH => {
+            run_with::<crate::qwen36::Qwen36Model>(model_dir, options, signals)
+        }
         other => anyhow::bail!(
             "unsupported model_type {other:?}; lily serves qwen4_exp \
-             (Qwen3.8-Flash-Next), a glm5-next GGUF (GLM 5.3 Flash) and a \
-             deepseek4 GGUF (DeepSeek V4 Flash)"
+             (Qwen3.8-Flash-Next), a glm5-next GGUF (GLM 5.3 Flash), a \
+             deepseek4 GGUF (DeepSeek V4 Flash) and a qwen35moe GGUF \
+             (Qwen3.6-35B-A3B)"
         ),
     }
 }

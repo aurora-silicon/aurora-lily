@@ -56,6 +56,14 @@ uint glm53_bf16_bits(float f) {
 #define KERNEL_glm53_gemm_moe_gate_up_iq2_xxs
 #define GM_SUB 32u
 #endif
+#ifdef KERNEL_glm53_gemm_moe_q4_k_r128
+#define KERNEL_glm53_gemm_moe_q4_k
+#define GM_SUB 32u
+#endif
+#ifdef KERNEL_glm53_gemm_moe_q8_0_r128
+#define KERNEL_glm53_gemm_moe_q8_0
+#define GM_SUB 32u
+#endif
 #ifndef GM_SUB
 #define GM_SUB 16u
 #endif
@@ -63,7 +71,8 @@ uint glm53_bf16_bits(float f) {
 #if defined(KERNEL_glm53_gemm_q8_0) || defined(KERNEL_glm53_gemm_q4_k) || \
     defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32) || \
     defined(KERNEL_glm53_gemm_f16) || defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
-    defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs)
+    defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q4_k) || \
+    defined(KERNEL_glm53_gemm_moe_q8_0)
 #define GM_STEP 64u
 // Vector (k - k0) / 2 * 16 + n / 4 of a step's tile holds weights k and
 // k + 1 of the tile's rows n .. n + 3 (quant_grouped.glsl's qg_tile).
@@ -387,7 +396,8 @@ void main() {
 // 12 limit.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
-    defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs)
+    defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q4_k) || \
+    defined(KERNEL_glm53_gemm_moe_q8_0)
 #ifdef KERNEL_glm53_gemm_moe_gate_up_iq2_xxs
 #define GM_GATE_UP 1
 #define GM_P 8u
@@ -412,6 +422,43 @@ void gm_decode8(uint64_t row, uint k, out float w[8]) {
         const vec2 v = unpackHalf2x16(g[p]);
         w[p] = scale * v.x;
         w[p + 4u] = scale * v.y;
+    }
+#elif defined(KERNEL_glm53_gemm_moe_q4_k)
+    // Qwen3.6's experts. Block k / 256, sub-block j: its 6-bit scale and
+    // min, the low (even j) or high nibbles of bytes l .. l + 8 of the
+    // pair's 32 (glm53_decode_q4_k's values).
+    const uint v = k & 255u, j = v >> 5u, l = v & 31u;
+    const uint64_t b = row + uint64_t(k >> 8u) * 144u;
+    const uint dd = U32(b).v[0];
+    const float d = glm53_h2f(dd & 0xffffu);
+    const float dmin = glm53_h2f(dd >> 16u);
+    const uvec3 sw = uvec3(U32(b + 4u).v[0], U32(b + 8u).v[0], U32(b + 12u).v[0]);
+    #define Q4K_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
+    uint sc, mn;
+    if (j < 4u) {
+        sc = Q4K_BYTE(j) & 63u;
+        mn = Q4K_BYTE(j + 4u) & 63u;
+    } else {
+        sc = (Q4K_BYTE(j + 4u) & 0xfu) | ((Q4K_BYTE(j - 4u) >> 6u) << 4u);
+        mn = (Q4K_BYTE(j + 4u) >> 4u) | ((Q4K_BYTE(j) >> 6u) << 4u);
+    }
+    #undef Q4K_BYTE
+    const float scale = d * float(sc);
+    const float minv = dmin * float(mn);
+    const uint shift = (j & 1u) * 4u;
+    const uvec2 q = U32x2(b + 16u + (j >> 1u) * 32u + l).v[0];
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        w[i] = scale * float((q[i >> 2u] >> (8u * (i & 3u) + shift)) & 0xfu) - minv;
+    }
+#elif defined(KERNEL_glm53_gemm_moe_q8_0)
+    // Block k / 32 (34 bytes, 2-byte aligned), bytes k % 32 .. + 8.
+    const uint64_t b = row + uint64_t(k >> 5u) * 34u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint64_t q = b + 2u + (k & 31u);
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(U16(q).v[i]);
+        w[2u * i] = d * float(int(pair << 24) >> 24);
+        w[2u * i + 1u] = d * float(int(pair << 16) >> 24);
     }
 #else
     // Block k / 256, half h, shift j, bytes l .. l + 8 of the half's 32;
