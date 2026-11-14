@@ -1269,7 +1269,32 @@ impl<M: LanguageModel> Engine<M> {
         // warm-up is done, and runs while the engine serves: the first
         // requests do not wait for 32 GB of reads, and a row they need before
         // the preload reaches it is read on demand.
+        // The default preload only where the page cache can hold the table
+        // beside what the GPU allocated and a 12 GB reserve for the system:
+        // on a 64 GB machine serving the 45 GB Q2 GGUF it cannot, and reading
+        // 27 GB through a full page cache would only evict what it read.
+        // `--ngram-lock` asks for it regardless.
+        let preload_fits = |table_bytes: u64| {
+            const RESERVE: u64 = 12 << 30;
+            crate::qwen4exp::weights::physical_memory().is_none_or(|ram| {
+                ram.saturating_sub(ctx.current_allocated() as u64)
+                    >= table_bytes + RESERVE
+            })
+        };
         let preload = match model.paged_table() {
+            Some(table)
+                if options.ngram_preload
+                    && !options.ngram_lock
+                    && !preload_fits(table.bytes()) =>
+            {
+                eprintln!(
+                    "paged weights: {:.1} GB do not fit the page cache beside {:.1} GB allocated; not \
+                     preloading them (rows are read on demand; --ngram-lock preloads anyway)",
+                    table.bytes() as f64 / 1e9,
+                    ctx.current_allocated() as f64 / 1e9
+                );
+                None
+            }
             Some(table) if options.ngram_preload || options.ngram_lock => {
                 let lock = options.ngram_lock;
                 eprintln!(
