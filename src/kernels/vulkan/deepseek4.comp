@@ -22,61 +22,43 @@
 
 #define DS4_NEG_INF (-1.0e30)
 
-// The value of E4M3FN code i, sign excluded (ds4 dsv4_e4m3fn_value_cpu).
-float ds4_e4m3_value(int i) {
-    const int e = (i >> 3) & 15;
-    const int mt = i & 7;
-    return e == 0 ? float(mt) * 0.001953125 : ldexp(1.0 + float(mt) * 0.125, e - 7);
-}
+// 2^n for a normal exponent n, from its bits. (ldexp with a computed
+// exponent gave wrong values here: the FP8 test's codes landed in the
+// subnormal range, 2026-11-14.)
+float ds4_pow2(int n) { return uintBitsToFloat(uint(clamp(n, -126, 127) + 127) << 23u); }
 
 // x rounded to the nearest E4M3FN value, ties to the even code, clamped to
-// +-448 (ds4 dsv4_e4m3fn_dequant_cpu: the same search).
+// +-448: ds4's dsv4_e4m3fn_dequant_cpu searches the code table; a code's
+// parity is its mantissa's, and neighbours' differences are exact, so the
+// search is round-half-even in units of the value's step: 2^-9 below 2^-6
+// (subnormals), else 2^(exponent - 3). (The search as written gave codes
+// far off on this compiler, 2026-11-14.)
 float ds4_e4m3_round(float x) {
-    const float sgn = x < 0.0 ? -1.0 : 1.0;
     const float ax = min(abs(x), 448.0);
-    int lo = 0, hi = 126;
-    [[unroll]] for (int it = 0; it < 7; it++) {
-        if (lo < hi) {
-            const int mid = (lo + hi + 1) >> 1;
-            if (ds4_e4m3_value(mid) <= ax) lo = mid;
-            else hi = mid - 1;
-        }
+    float q;
+    if (ax < 0.015625) {
+        q = roundEven(ax * 512.0) * 0.001953125;
+    } else {
+        const int e = int((floatBitsToUint(ax) >> 23u) & 0xffu) - 127;
+        q = roundEven(ax * ds4_pow2(3 - e)) * ds4_pow2(e - 3);
     }
-    int best = lo;
-    if (best < 126) {
-        const float bd = abs(ax - ds4_e4m3_value(best));
-        const float nd = abs(ax - ds4_e4m3_value(best + 1));
-        if (nd < bd || (nd == bd && ((best + 1) & 1) == 0 && (best & 1) != 0)) best++;
-    }
-    return sgn * ds4_e4m3_value(best);
+    return x < 0.0 ? -q : q;
 }
 
-// The value of E2M1 code i: 0, 0.5, 1, 1.5, 2, 3, 4, 6.
-float ds4_e2m1_value(int i) {
-    return i < 2 ? float(i) * 0.5 : ldexp(1.0 + float(i & 1) * 0.5, (i >> 1) - 1);
-}
-
-// x rounded to the nearest E2M1 value, ties to the even code, clamped to
-// +-6 (ds4 dsv4_e2m1fn_dequant_cpu).
+// x rounded to the nearest E2M1 value (0, 0.5, 1, 1.5, 2, 3, 4, 6), ties to
+// the even code, clamped to +-6 (ds4 dsv4_e2m1fn_dequant_cpu): steps of 0.5
+// below 2, 1 below 4, then 2.
 float ds4_e2m1_round(float x) {
-    const float sgn = x < 0.0 ? -1.0 : 1.0;
     const float ax = min(abs(x), 6.0);
-    int best = 0;
-    float bd = ax;
-    [[unroll]] for (int i = 1; i < 8; i++) {
-        const float d = abs(ax - ds4_e2m1_value(i));
-        if (d < bd || (d == bd && (i & 1) == 0 && (best & 1) != 0)) {
-            best = i;
-            bd = d;
-        }
-    }
-    return sgn * ds4_e2m1_value(best);
+    const float step = ax < 2.0 ? 0.5 : (ax < 4.0 ? 1.0 : 2.0);
+    const float q = roundEven(ax / step) * step;
+    return x < 0.0 ? -q : q;
 }
 
 // The power-of-two scale of a block whose largest magnitude is amax:
 // 2^ceil(log2(amax / top)).
 float ds4_pow2_scale(float amax, float top) {
-    return ldexp(1.0, int(ceil(log2(amax / top))));
+    return ds4_pow2(int(ceil(log2(amax / top))));
 }
 
 // One rotated pair, as the reference computes it: (x0 c - x1 s, x0 s + x1

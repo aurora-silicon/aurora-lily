@@ -270,3 +270,40 @@ fn output_collapse_by_hand() {
         assert!((out[d] - want).abs() < 1e-6);
     }
 }
+
+/// The GPU kernels round with the closed form (round-half-even in units of
+/// the value's step); it equals ds4's code search on every code, every
+/// midpoint and the values around them.
+#[test]
+fn closed_form_rounding_equals_the_search() {
+    fn e4m3(x: f32) -> f32 {
+        let ax = x.abs().min(448.0);
+        let q = if ax < 0.015625 {
+            (ax * 512.0).round_ties_even() * 0.001953125
+        } else {
+            let e = ((ax.to_bits() >> 23) & 0xff) as i32 - 127;
+            (ax * 2f32.powi(3 - e)).round_ties_even() * 2f32.powi(e - 3)
+        };
+        if x < 0.0 { -q } else { q }
+    }
+    fn e2m1(x: f32) -> f32 {
+        let ax = x.abs().min(6.0);
+        let step = if ax < 2.0 { 0.5 } else if ax < 4.0 { 1.0 } else { 2.0 };
+        let q = (ax / step).round_ties_even() * step;
+        if x < 0.0 { -q } else { q }
+    }
+    let mut xs = Vec::new();
+    for c in 0..127u32 {
+        let (a, b) = (e4m3fn_value(c), e4m3fn_value(c + 1));
+        for v in [a, (a + b) / 2.0, b] {
+            xs.extend([v, f32::from_bits(v.to_bits() + 1), f32::from_bits(v.to_bits().max(1) - 1)]);
+        }
+    }
+    xs.extend((0..200_000).map(|i| (i as f32 - 100_000.0) * 0.0047));
+    for &x in &xs {
+        for v in [x, -x] {
+            assert_eq!(e4m3(v).to_bits(), e4m3fn_round(v).to_bits(), "e4m3 {v:e}");
+            assert_eq!(e2m1(v).to_bits(), e2m1fn_round(v).to_bits(), "e2m1 {v:e}");
+        }
+    }
+}
