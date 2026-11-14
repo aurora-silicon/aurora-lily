@@ -198,8 +198,8 @@ impl Ds4Model {
 pub struct CompState {
     /// f16 `[cap][dim]`: the compressed rows.
     pub cache: Tensor,
-    ring_kv: Tensor,
-    ring_sc: Tensor,
+    pub(crate) ring_kv: Tensor,
+    pub(crate) ring_sc: Tensor,
 }
 
 impl CompState {
@@ -229,12 +229,32 @@ pub struct LayerState {
 
 /// A session: caches at position `pos`.
 pub struct Ds4State {
+    pub(crate) cfg: Config,
     pub pos: usize,
     pub capacity: usize,
     pub layers: Vec<LayerState>,
     /// Indexer scores `[PREFILL_ROWS][score_cap]`.
-    scores: Tensor,
-    score_cap: usize,
+    pub(crate) scores: Tensor,
+    pub(crate) score_cap: usize,
+    /// RoPE tables of positions `0..capacity` (`kernels::deepseek4::rope_table`):
+    /// the plain layers' and the compressed layers' (YaRN). Built once, so a
+    /// step encoded while the one before runs writes nothing the GPU reads.
+    pub(crate) rope_plain: Tensor,
+    pub(crate) rope_yarn: Tensor,
+}
+
+/// The RoPE tables of positions `0..n`.
+pub(crate) fn rope_tables(
+    ctx: &MetalContext,
+    cfg: &Config,
+    n: usize,
+) -> Result<(Tensor, Tensor)> {
+    let plain = d::rope_table(&cfg.rope(0), 0, n);
+    let yarn = d::rope_table(&cfg.rope(2), 0, n);
+    Ok((
+        Tensor::from_f32(ctx, &plain, &[plain.len()])?,
+        Tensor::from_f32(ctx, &yarn, &[yarn.len()])?,
+    ))
 }
 
 impl Ds4State {
@@ -255,12 +275,16 @@ impl Ds4State {
             })
             .collect::<Result<_>>()?;
         let score_cap = capacity / 4 + 1;
+        let (rope_plain, rope_yarn) = rope_tables(ctx, cfg, capacity)?;
         Ok(Self {
+            cfg: cfg.clone(),
             pos: 0,
             capacity,
             layers,
             scores: Tensor::zeros(ctx, &[PREFILL_ROWS * score_cap], DType::F32)?,
             score_cap,
+            rope_plain,
+            rope_yarn,
         })
     }
 
@@ -297,8 +321,6 @@ pub struct Scratch {
     iw: Tensor,
     isel: Tensor,
     icount: Tensor,
-    rope_plain: Tensor,
-    rope_yarn: Tensor,
     fg: Tensor,
     fu: Tensor,
     fmid: Tensor,
@@ -312,6 +334,11 @@ pub struct Scratch {
     hidden_norm: Tensor,
     /// `[MAX_ROWS][vocab]`.
     pub logits: Tensor,
+    /// The last (or only) row's logits: `logits[0..vocab]`.
+    pub logits_last: Tensor,
+    pub(crate) sampler: crate::kernels::sample::SamplerScratch,
+    /// U32[2]: the ping-pong slots the in-graph sampler draws into.
+    pub next_token: Tensor,
 }
 
 impl Scratch {
@@ -320,6 +347,7 @@ impl Scratch {
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let u = |n: usize| Tensor::zeros(ctx, &[n], DType::U32);
         let hd = cfg.head_dim;
+        let logits = f(MAX_ROWS * cfg.vocab)?;
         Ok(Self {
             tokens: u(m)?,
             h: f(m * cfg.hc_dim())?,
@@ -343,8 +371,6 @@ impl Scratch {
             iw: f(m * cfg.indexer_heads)?,
             isel: u(m * TOP_K)?,
             icount: u(m)?,
-            rope_plain: f(m * cfg.n_rot)?,
-            rope_yarn: f((m + 128) * cfg.n_rot)?,
             fg: f(m * cfg.ff_expert)?,
             fu: f(m * cfg.ff_expert)?,
             fmid: f(m * cfg.ff_expert)?,
@@ -362,11 +388,14 @@ impl Scratch {
             opre: f(m * cfg.n_hc)?,
             hidden: f(m * cfg.hidden)?,
             hidden_norm: f(m * cfg.hidden)?,
-            logits: f(MAX_ROWS * cfg.vocab)?,
+            logits_last: logits.view(0, &[cfg.vocab])?,
+            logits,
+            sampler: crate::kernels::sample::SamplerScratch::new(ctx, cfg.vocab)?,
+            next_token: u(2)?,
         })
     }
 
-    fn stage_tokens(&self, tokens: &[u32]) -> Result<()> {
+    pub(crate) fn stage_tokens(&self, tokens: &[u32]) -> Result<()> {
         crate::glm53::model::write_words(&self.tokens, tokens)
     }
 }
@@ -397,13 +426,13 @@ pub struct LayerTrace {
     pub h: Vec<f32>,
 }
 
-/// The run's position bookkeeping, fixed when it is encoded.
+/// A run being encoded: its first position, rows and token ids (on the
+/// GPU).
 #[derive(Clone, Copy)]
-struct Run {
+struct Run<'t> {
     pos0: usize,
     m: usize,
-    /// The first position of the YaRN table.
-    yarn_lo: usize,
+    tokens: &'t Tensor,
 }
 
 fn read(t: &Tensor, n: usize) -> Result<Vec<f32>> {
@@ -455,14 +484,14 @@ impl Ds4Model {
         self.run(ctx, st, sc, tokens, Logits::Last, Some(trace))
     }
 
-    fn run(
+    pub(crate) fn run(
         &self,
         ctx: &MetalContext,
         st: &mut Ds4State,
         sc: &Scratch,
         tokens: &[u32],
         logits: Logits,
-        mut trace: Option<&mut Vec<LayerTrace>>,
+        trace: Option<&mut Vec<LayerTrace>>,
     ) -> Result<()> {
         let cfg = &self.cfg;
         let m = tokens.len();
@@ -478,103 +507,145 @@ impl Ds4Model {
             ensure!((t as usize) < cfg.vocab, "token {t} outside the vocabulary");
         }
         sc.stage_tokens(tokens)?;
-        // RoPE tables: plain at the run's positions; YaRN from the first
-        // position a compressed row of this run starts at.
-        let yarn_lo = (pos0 + 1).saturating_sub(128);
-        let plain = d::rope_table(&cfg.rope(0), pos0, m);
-        let yarn = d::rope_table(&cfg.rope(2), yarn_lo, pos0 + m - yarn_lo);
-        sc.rope_plain
-            .view(0, &[plain.len()])?
-            .write_bytes(bytemuck::cast_slice(&plain))?;
-        sc.rope_yarn
-            .view(0, &[yarn.len()])?
-            .write_bytes(bytemuck::cast_slice(&yarn))?;
-        let r = Run { pos0, m, yarn_lo };
+        if let Some(trace) = trace {
+            self.run_traced(ctx, st, sc, m, trace)?;
+            st.pos += m;
+            return Ok(());
+        }
+        let n = cfg.n_layer;
+        if m <= MAX_ROWS {
+            let pass = ctx.begin_concurrent()?;
+            self.encode_layers(ctx, &pass, st, sc, &sc.tokens, m, 0..n, logits)?;
+            pass.commit_wait()?;
+        } else {
+            // A pass a layer keeps a command buffer's GPU time short: the
+            // driver times one from its submission.
+            for il in 0..n {
+                let pass = ctx.begin_concurrent()?;
+                self.encode_layers(
+                    ctx,
+                    &pass,
+                    st,
+                    sc,
+                    &sc.tokens,
+                    m,
+                    il..il + 1,
+                    logits,
+                )?;
+                pass.commit_wait()?;
+            }
+        }
+        st.pos += m;
+        Ok(())
+    }
+
+    /// Encodes layers `layers` of a run of `m` rows at the state's position
+    /// into `pass`, the token ids read from `tokens` (U32) on the GPU,
+    /// without advancing the state: the embedding when they start at layer
+    /// 0, the final HC post and the head when they end at the last layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_layers(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        st: &Ds4State,
+        sc: &Scratch,
+        tokens: &Tensor,
+        m: usize,
+        layers: std::ops::Range<usize>,
+        logits: Logits,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        ensure!((1..=PREFILL_ROWS).contains(&m), "run of {m} rows");
+        ensure!(st.pos + m <= st.capacity, "state capacity {}", st.capacity);
+        ensure!(layers.end <= cfg.n_layer, "layers {layers:?}");
+        let r = Run { pos0: st.pos, m, tokens };
+        if layers.start == 0 {
+            d::embed(ctx, pass, &self.embed, tokens, &sc.h, m)?;
+            pass.memory_barrier()?;
+        }
+        for il in layers.clone() {
+            let l = &self.layers[il];
+            // Each HC pre applies the HC post of the sublayer before it.
+            let prev = (il > 0).then_some(&sc.ffn_out);
+            self.hc_pre(ctx, pass, sc, &l.hc[0], &l.attn_norm, m, prev)?;
+            self.attention(ctx, pass, st, sc, l, il, r)?;
+            self.hc_pre(ctx, pass, sc, &l.hc[1], &l.ffn_norm, m, Some(&sc.attn_out))?;
+            self.ffn(ctx, pass, sc, l, r)?;
+        }
+        if layers.end < cfg.n_layer {
+            return Ok(());
+        }
+        k::hc_post(ctx, pass, &sc.h, &sc.ffn_out, &sc.split, &sc.h, m, cfg.hidden)?;
+        pass.memory_barrier()?;
+        self.head(ctx, pass, sc, m, logits)
+    }
+
+    /// A run committing after every sublayer and reading its intermediates
+    /// back (the tokens staged in `sc.tokens`).
+    fn run_traced(
+        &self,
+        ctx: &MetalContext,
+        st: &Ds4State,
+        sc: &Scratch,
+        m: usize,
+        trace: &mut Vec<LayerTrace>,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        let r = Run { pos0: st.pos, m, tokens: &sc.tokens };
         let mut pass = ctx.begin_concurrent()?;
         d::embed(ctx, &pass, &self.embed, &sc.tokens, &sc.h, m)?;
         pass.memory_barrier()?;
         for il in 0..cfg.n_layer {
             let l = &self.layers[il];
-            if trace.is_some() {
-                self.hc_pre(ctx, &pass, sc, &l.hc[0], &l.attn_norm, m, None)?;
-                pass.commit_wait()?;
-                pass = ctx.begin_concurrent()?;
-                let attn_in = read(&sc.xn, m * cfg.hidden)?;
-                self.attention(ctx, &pass, st, sc, l, il, r)?;
-                k::hc_post(
-                    ctx,
-                    &pass,
-                    &sc.h,
-                    &sc.attn_out,
-                    &sc.split,
-                    &sc.h,
-                    m,
-                    cfg.hidden,
-                )?;
-                pass.memory_barrier()?;
-                self.hc_pre(ctx, &pass, sc, &l.hc[1], &l.ffn_norm, m, None)?;
-                pass.commit_wait()?;
-                pass = ctx.begin_concurrent()?;
-                let ffn_in = read(&sc.xn, m * cfg.hidden)?;
-                self.ffn(ctx, &pass, sc, l, m)?;
-                k::hc_post(
-                    ctx,
-                    &pass,
-                    &sc.h,
-                    &sc.ffn_out,
-                    &sc.split,
-                    &sc.h,
-                    m,
-                    cfg.hidden,
-                )?;
-                pass.memory_barrier()?;
-                pass.commit_wait()?;
-                pass = ctx.begin_concurrent()?;
-                let tr = trace.as_mut().expect("tracing");
-                tr.push(LayerTrace {
-                    attn_in,
-                    q: read(&sc.q, m * cfg.q_dim())?,
-                    kv: read(&sc.kv, m * cfg.head_dim)?,
-                    heads: read(&sc.heads, m * cfg.q_dim())?,
-                    attn_out: read(&sc.attn_out, m * cfg.hidden)?,
-                    ffn_in,
-                    ffn_out: read(&sc.ffn_out, m * cfg.hidden)?,
-                    sel: sc.rsel.to_u32()?[..m * cfg.n_expert_used].to_vec(),
-                    h: read(&sc.h, m * cfg.hc_dim())?,
-                });
-                continue;
-            }
-            // Each HC pre applies the HC post of the sublayer before it.
-            let prev = (il > 0).then_some(&sc.ffn_out);
-            self.hc_pre(ctx, &pass, sc, &l.hc[0], &l.attn_norm, m, prev)?;
+            self.hc_pre(ctx, &pass, sc, &l.hc[0], &l.attn_norm, m, None)?;
+            pass.commit_wait()?;
+            pass = ctx.begin_concurrent()?;
+            let attn_in = read(&sc.xn, m * cfg.hidden)?;
             self.attention(ctx, &pass, st, sc, l, il, r)?;
-            self.hc_pre(ctx, &pass, sc, &l.hc[1], &l.ffn_norm, m, Some(&sc.attn_out))?;
-            self.ffn(ctx, &pass, sc, l, m)?;
-            if il + 1 == cfg.n_layer {
-                k::hc_post(
-                    ctx,
-                    &pass,
-                    &sc.h,
-                    &sc.ffn_out,
-                    &sc.split,
-                    &sc.h,
-                    m,
-                    cfg.hidden,
-                )?;
-                pass.memory_barrier()?;
-            }
-            // A pass every few layers (every layer for a prompt run) keeps
-            // a command buffer's GPU time short: the driver times one from
-            // its submission.
-            if il % 8 == 7 || m > MAX_ROWS {
-                pass.commit_wait()?;
-                pass = ctx.begin_concurrent()?;
-            }
+            k::hc_post(
+                ctx,
+                &pass,
+                &sc.h,
+                &sc.attn_out,
+                &sc.split,
+                &sc.h,
+                m,
+                cfg.hidden,
+            )?;
+            pass.memory_barrier()?;
+            self.hc_pre(ctx, &pass, sc, &l.hc[1], &l.ffn_norm, m, None)?;
+            pass.commit_wait()?;
+            pass = ctx.begin_concurrent()?;
+            let ffn_in = read(&sc.xn, m * cfg.hidden)?;
+            self.ffn(ctx, &pass, sc, l, r)?;
+            k::hc_post(
+                ctx,
+                &pass,
+                &sc.h,
+                &sc.ffn_out,
+                &sc.split,
+                &sc.h,
+                m,
+                cfg.hidden,
+            )?;
+            pass.memory_barrier()?;
+            pass.commit_wait()?;
+            pass = ctx.begin_concurrent()?;
+            trace.push(LayerTrace {
+                attn_in,
+                q: read(&sc.q, m * cfg.q_dim())?,
+                kv: read(&sc.kv, m * cfg.head_dim)?,
+                heads: read(&sc.heads, m * cfg.q_dim())?,
+                attn_out: read(&sc.attn_out, m * cfg.hidden)?,
+                ffn_in,
+                ffn_out: read(&sc.ffn_out, m * cfg.hidden)?,
+                sel: sc.rsel.to_u32()?[..m * cfg.n_expert_used].to_vec(),
+                h: read(&sc.h, m * cfg.hc_dim())?,
+            });
         }
-        self.head(ctx, &pass, sc, m, logits)?;
-        pass.commit_wait()?;
-        st.pos += m;
-        Ok(())
+        self.head(ctx, &pass, sc, m, Logits::Last)?;
+        pass.commit_wait()
     }
 
     /// `y_s = w_s x` for `m` rows: one GEMV dispatch per set and chunk of
@@ -678,8 +749,9 @@ impl Ds4Model {
         let (pos0, m) = (r.pos0, r.m);
         let ls = &st.layers[il];
         let yarn = cfg.ratio(il) != 0;
+        // The state's RoPE tables are indexed by position.
         let (table, t0) =
-            if yarn { (&sc.rope_yarn, pos0 - r.yarn_lo) } else { (&sc.rope_plain, 0) };
+            if yarn { (&st.rope_yarn, pos0) } else { (&st.rope_plain, pos0) };
         // Level 1: the projections of xn.
         self.proj(ctx, pass, &[(&l.q_a, &sc.qr), (&l.kv, &sc.kv)], &sc.xn, m)?;
         match (&l.comp, &l.indexer) {
@@ -761,8 +833,8 @@ impl Ds4Model {
                 &sc.ckv,
                 &sc.csc,
                 &s.cache,
-                &sc.rope_yarn,
-                r.yarn_lo,
+                &st.rope_yarn,
+                0,
                 pos0,
                 m,
                 cfg.rms_eps,
@@ -776,8 +848,8 @@ impl Ds4Model {
                 &sc.ikv,
                 &sc.isc,
                 &s.cache,
-                &sc.rope_yarn,
-                r.yarn_lo,
+                &st.rope_yarn,
+                0,
                 pos0,
                 m,
                 cfg.rms_eps,
@@ -813,7 +885,7 @@ impl Ds4Model {
             HeadOp::NormRope,
         )?;
         if sparse {
-            d::indexer_q(ctx, pass, &sc.iq, &sc.rope_yarn, t0, m, cfg.indexer_heads)?;
+            d::indexer_q(ctx, pass, &sc.iq, &st.rope_yarn, t0, m, cfg.indexer_heads)?;
         }
         pass.memory_barrier()?;
         let rows = if sparse {
@@ -923,9 +995,10 @@ impl Ds4Model {
         pass: &ComputePass<'_>,
         sc: &Scratch,
         l: &LayerW,
-        m: usize,
+        r: Run<'_>,
     ) -> Result<()> {
         let cfg = &self.cfg;
+        let m = r.m;
         let lim = cfg.swiglu_limit;
         let used = cfg.n_expert_used;
         self.proj(ctx, pass, &[(&l.router, &sc.rlogits)], &sc.xn, m)?;
@@ -937,7 +1010,7 @@ impl Ds4Model {
             &sc.rlogits,
             l.bias.as_ref(),
             l.hash.as_ref(),
-            &sc.tokens,
+            r.tokens,
             &sc.rsel,
             &sc.rw,
             m,

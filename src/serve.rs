@@ -1692,7 +1692,12 @@ fn gguf_config(path: &Path) -> Result<Value> {
     let g = crate::gguf::Gguf::open(path)?;
     let arch = g.architecture()?.to_string();
     let mut config = serde_json::json!({ "model_type": arch });
-    if arch == crate::glm53::config::ARCH {
+    if arch == crate::deepseek4::config::ARCH {
+        let stops = crate::deepseek4::tokenizer::stop_ids(&g)?;
+        config["eos_token_id"] = serde_json::json!(stops);
+        config["max_position_embeddings"] =
+            serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
+    } else if arch == crate::glm53::config::ARCH {
         let stops = crate::glm53::tokenizer::stop_ids(&g)?;
         config["eos_token_id"] = serde_json::json!(stops);
         config["max_position_embeddings"] =
@@ -1905,9 +1910,13 @@ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
         crate::glm53::config::ARCH => {
             run_with::<crate::glm53::Glm53Model>(model_dir, options, signals)
         }
+        crate::deepseek4::config::ARCH => {
+            run_with::<crate::deepseek4::Ds4Model>(model_dir, options, signals)
+        }
         other => anyhow::bail!(
             "unsupported model_type {other:?}; lily serves qwen4_exp \
-             (Qwen3.8-Flash-Next) and a glm5-next GGUF (GLM 5.3 Flash)"
+             (Qwen3.8-Flash-Next), a glm5-next GGUF (GLM 5.3 Flash) and a \
+             deepseek4 GGUF (DeepSeek V4 Flash)"
         ),
     }
 }

@@ -4,9 +4,11 @@
 //! lily loads ds4's published GGUF as it is.
 
 pub mod config;
+pub mod engine;
 pub mod model;
 pub mod reference;
 pub mod schema;
 pub mod tokenizer;
 
 pub use config::Config;
+pub use model::Ds4Model;

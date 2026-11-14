@@ -160,6 +160,7 @@ impl Tokenizer {
         let mut t = Self::new(inner, &serde_json::Value::Null, template)?;
         if deepseek {
             t.add_stop_tokens(&crate::deepseek4::tokenizer::stop_ids(&g)?);
+            t.tool_grammar = crate::serve::tools::ToolGrammar::Dsml;
         } else {
             t.add_stop_tokens(&crate::glm53::tokenizer::stop_ids(&g)?);
             t.tool_grammar = crate::serve::tools::ToolGrammar::Glm;

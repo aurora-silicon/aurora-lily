@@ -4,12 +4,10 @@
 
 use anyhow::Result;
 
-use super::tools::{ParsedToolCall, ToolGrammar, ToolSchema, parse_tool_call_as};
+use super::tools::{ParsedToolCall, ToolGrammar, ToolSchema, parse_tool_calls_as};
 use crate::thinking::ReasoningScan;
 
 const THINK_END: &str = "</think>";
-const TOOL_START: &str = "<tool_call>";
-const TOOL_END: &str = "</tool_call>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -112,7 +110,8 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
         }
         let mut scan = self.reasoning_scan.clone();
         let mut scanned = 0;
-        for (i, _) in self.buf.match_indices(TOOL_START) {
+        let (tool_start, _) = self.tool_grammar.markers();
+        for (i, _) in self.buf.match_indices(tool_start) {
             scan.feed(&self.buf[scanned..i]);
             if scan.call_may_start() {
                 return Some(i);
@@ -211,12 +210,13 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                     let hold = if final_flush {
                         0
                     } else {
-                        let tool_hold =
-                            if self.tool_call_ends_thinking && self.tools.is_some() {
-                                partial_suffix_len(&self.buf, TOOL_START)
-                            } else {
-                                0
-                            };
+                        let tool_hold = if self.tool_call_ends_thinking
+                            && self.tools.is_some()
+                        {
+                            partial_suffix_len(&self.buf, self.tool_grammar.markers().0)
+                        } else {
+                            0
+                        };
                         partial_suffix_len(&self.buf, THINK_END)
                             .max(tool_hold)
                             .max(trailing_newlines(&self.buf))
@@ -235,8 +235,9 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                 }
                 Phase::Content => {
                     let tools_on = self.tools.is_some() && !self.raw;
+                    let (tool_start, _) = self.tool_grammar.markers();
                     let tool_idx =
-                        if tools_on { self.buf.find(TOOL_START) } else { None };
+                        if tools_on { self.buf.find(tool_start) } else { None };
                     let stop_idx = self
                         .stop_strings
                         .iter()
@@ -253,7 +254,7 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                     }
                     if let Some(idx) = tool_idx {
                         let before = self.buf[..idx].trim_end().to_string();
-                        let rest = self.buf[idx + TOOL_START.len()..].to_string();
+                        let rest = self.buf[idx + tool_start.len()..].to_string();
                         self.emit_text(&mut events, &before, Phase::Content);
                         self.phase = Phase::ToolBlock;
                         self.buf = rest;
@@ -265,7 +266,12 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                             // A `<tool_call>` may still arrive, split across
                             // tokens or after the whitespace the template puts
                             // between content and call.
-                            hold = partial_suffix_len(&self.buf, TOOL_START)
+                            // The whitespace before a partial marker is held
+                            // with it (DSML's opening tag arrives as
+                            // "\n\n<｜DSML｜tool" then "_calls>").
+                            let partial = partial_suffix_len(&self.buf, tool_start);
+                            let before = &self.buf[..self.buf.len() - partial];
+                            hold = (partial + trailing_whitespace(before))
                                 .max(trailing_whitespace(&self.buf));
                         }
                         let stop_hold = self
@@ -282,11 +288,12 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                     return events;
                 }
                 Phase::ToolBlock => {
-                    let Some(idx) = self.buf.find(TOOL_END) else {
+                    let (tool_start, tool_end) = self.tool_grammar.markers();
+                    let Some(idx) = self.buf.find(tool_end) else {
                         if final_flush {
                             // Unterminated block: give the client the raw text.
                             let raw = format!(
-                                "{TOOL_START}{}",
+                                "{tool_start}{}",
                                 std::mem::take(&mut self.buf)
                             );
                             self.phase = Phase::Content;
@@ -295,17 +302,19 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                         return events;
                     };
                     let block = self.buf[..idx].to_string();
-                    let rest = self.buf[idx + TOOL_END.len()..].to_string();
+                    let rest = self.buf[idx + tool_end.len()..].to_string();
                     self.buf = rest;
                     self.phase = Phase::Content;
                     let tools = self.tools.as_deref().unwrap_or(&[]);
-                    match parse_tool_call_as(self.tool_grammar, &block, tools) {
-                        Ok(call) => {
-                            self.tool_calls_emitted += 1;
-                            events.push(Event::ToolCall(call));
+                    match parse_tool_calls_as(self.tool_grammar, &block, tools) {
+                        Ok(calls) => {
+                            for call in calls {
+                                self.tool_calls_emitted += 1;
+                                events.push(Event::ToolCall(call));
+                            }
                         }
                         Err(_) => {
-                            let raw = format!("{TOOL_START}{block}{TOOL_END}");
+                            let raw = format!("{tool_start}{block}{tool_end}");
                             self.emit_text(&mut events, &raw, Phase::Content);
                         }
                     }

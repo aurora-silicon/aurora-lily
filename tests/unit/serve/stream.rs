@@ -469,3 +469,49 @@ fn tool_calls_parse_in_the_model_s_grammar() {
         assert!(content.contains("some prose"), "{content:?}");
     }
 }
+
+/// DeepSeek V4's DSML block: its start marker split over tokens, two
+/// invokes in one block, typed and string parameters.
+#[test]
+fn dsml_block_of_two_invokes_becomes_two_calls() {
+    const DS: &[&str] = &[
+        "Let me check.",
+        "\n\n<｜DSML｜tool",
+        "_calls>\n<｜DSML｜invoke name=\"f\">\n",
+        "<｜DSML｜parameter name=\"x\" string=\"false\">3</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n<｜DSML｜invoke name=\"g\">\n",
+        "<｜DSML｜parameter name=\"s\" string=\"true\">a <b> &</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    ];
+    let tools = ToolSchema::from_request(&[
+        serde_json::json!({"type": "function", "function": {
+        "name": "f", "parameters": {"properties": {"x": {"type": "integer"}}}}}),
+        serde_json::json!({"type": "function", "function": {
+        "name": "g", "parameters": {"properties": {"s": {"type": "string"}}}}}),
+    ])
+    .unwrap();
+    let mut p = OutputParser::new(
+        detok(DS),
+        ParserConfig {
+            thinking_open: false,
+            tools: Some(tools),
+            stop_strings: vec![],
+            raw: false,
+            tool_call_ends_thinking: false,
+        },
+    )
+    .with_tool_grammar(ToolGrammar::Dsml);
+    let events = run(&mut p, &[0, 1, 2, 3, 4, 5, 6]);
+    let (_, content, calls) = text_of(&events);
+    assert_eq!(content, "Let me check.");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        (calls[0].name.as_str(), calls[0].arguments.as_str()),
+        ("f", r#"{"x":3}"#)
+    );
+    assert_eq!(
+        (calls[1].name.as_str(), calls[1].arguments.as_str()),
+        ("g", r#"{"s":"a <b> &"}"#)
+    );
+    assert_eq!(p.tool_calls_emitted(), 2);
+}
