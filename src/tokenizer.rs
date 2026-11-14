@@ -136,22 +136,35 @@ impl Tokenizer {
         Self::new(inner, &config, template)
     }
 
-    /// GLM's tokenizer and template from a GGUF file's metadata
-    /// (`crate::glm53::tokenizer`). The template renders an empty reasoning
+    /// GLM's or DeepSeek V4's tokenizer and template from a GGUF file's
+    /// metadata (`crate::glm53::tokenizer`, `crate::deepseek4::tokenizer`). The template renders an empty reasoning
     /// block into earlier assistant turns itself, so lily's nothink rewrite
     /// of history is off.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn from_gguf(path: &Path) -> Result<Self> {
         let g = crate::gguf::Gguf::open(path)?;
-        let json = crate::glm53::tokenizer::tokenizer_json(&g)?;
+        let deepseek = g.architecture()? == crate::deepseek4::config::ARCH;
+        let json = if deepseek {
+            crate::deepseek4::tokenizer::tokenizer_json(&g)?
+        } else {
+            crate::glm53::tokenizer::tokenizer_json(&g)?
+        };
         let inner = tokenizers::Tokenizer::from_bytes(json.as_bytes())
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("building the GGUF's tokenizer")?;
-        let template = crate::glm53::tokenizer::chat_template(&g)?;
+        let template = if deepseek {
+            crate::deepseek4::tokenizer::chat_template(&g)?
+        } else {
+            crate::glm53::tokenizer::chat_template(&g)?
+        };
         let mut t = Self::new(inner, &serde_json::Value::Null, template)?;
-        t.add_stop_tokens(&crate::glm53::tokenizer::stop_ids(&g)?);
+        if deepseek {
+            t.add_stop_tokens(&crate::deepseek4::tokenizer::stop_ids(&g)?);
+        } else {
+            t.add_stop_tokens(&crate::glm53::tokenizer::stop_ids(&g)?);
+            t.tool_grammar = crate::serve::tools::ToolGrammar::Glm;
+        }
         t.legacy_nothink_rewrite = false;
-        t.tool_grammar = crate::serve::tools::ToolGrammar::Glm;
         Ok(t)
     }
 
@@ -218,6 +231,16 @@ impl Tokenizer {
         // and `'`, so the tools block and every non-string tool argument
         // would render differently from the reference.
         env.add_filter("tojson", py_tojson);
+        // DeepSeek's template parses tool arguments given as a JSON string.
+        env.add_filter("from_json", |s: String| -> Result<Value, JinjaError> {
+            let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| {
+                JinjaError::new(
+                    JinjaErrorKind::InvalidOperation,
+                    format!("from_json: {e}"),
+                )
+            })?;
+            Ok(Value::from_serialize(v))
+        });
         env.add_template_owned("chat", template)
             .context("compiling the checkpoint's chat template")?;
         env.add_template_owned(MARKED_TEMPLATE, marked)

@@ -288,7 +288,13 @@ fn closed_form_rounding_equals_the_search() {
     }
     fn e2m1(x: f32) -> f32 {
         let ax = x.abs().min(6.0);
-        let step = if ax < 2.0 { 0.5 } else if ax < 4.0 { 1.0 } else { 2.0 };
+        let step = if ax < 2.0 {
+            0.5
+        } else if ax < 4.0 {
+            1.0
+        } else {
+            2.0
+        };
         let q = (ax / step).round_ties_even() * step;
         if x < 0.0 { -q } else { q }
     }
@@ -296,7 +302,11 @@ fn closed_form_rounding_equals_the_search() {
     for c in 0..127u32 {
         let (a, b) = (e4m3fn_value(c), e4m3fn_value(c + 1));
         for v in [a, (a + b) / 2.0, b] {
-            xs.extend([v, f32::from_bits(v.to_bits() + 1), f32::from_bits(v.to_bits().max(1) - 1)]);
+            xs.extend([
+                v,
+                f32::from_bits(v.to_bits() + 1),
+                f32::from_bits(v.to_bits().max(1) - 1),
+            ]);
         }
     }
     xs.extend((0..200_000).map(|i| (i as f32 - 100_000.0) * 0.0047));

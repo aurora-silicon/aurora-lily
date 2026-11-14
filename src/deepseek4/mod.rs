@@ -7,5 +7,6 @@ pub mod config;
 pub mod model;
 pub mod reference;
 pub mod schema;
+pub mod tokenizer;
 
 pub use config::Config;
