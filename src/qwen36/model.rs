@@ -84,6 +84,9 @@ pub struct Qwen36Model {
     pub kv_format: KvFormat,
     /// The multi-token-prediction head, when loaded ([`Self::load_mtp`]).
     pub mtp: Option<MtpW>,
+    /// `--memory-limit-gb`: what the server's session cache budget is
+    /// capped to leave (the 32 GB tier runs with 24).
+    pub memory_limit: Option<u64>,
 }
 
 /// The MTP block (`blk.<n_layer>` of the `mtp-*.gguf` beside the model): a
@@ -178,6 +181,7 @@ impl Qwen36Model {
             output_norm,
             kv_format: KvFormat::Bf16,
             mtp: None,
+            memory_limit: None,
         })
     }
 

@@ -277,6 +277,7 @@ impl LanguageModel for Qwen36Model {
 
     fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
         let mut model = Qwen36Model::load(ctx, path)?;
+        model.memory_limit = options.memory_limit;
         if options.mtp_drafts > 0 {
             match model.find_mtp(path)? {
                 Some(p) => {
@@ -288,6 +289,15 @@ impl LanguageModel for Qwen36Model {
                     path.display()
                 ),
             }
+        }
+        if let Some(limit) = model.memory_limit {
+            let weights: usize = model.weight_buffers().iter().map(|b| b.length()).sum();
+            ensure!(
+                weights as u64 <= limit,
+                "--memory-limit-gb {:.1} is below the model's {:.1} GB of weights",
+                limit as f64 / 1e9,
+                weights as f64 / 1e9
+            );
         }
         Ok(model)
     }
@@ -424,9 +434,13 @@ impl LanguageModel for Qwen36Model {
     }
 
     fn bytes_per_token(&self) -> usize {
-        // K and V rows of every full-attention layer.
-        2 * self.cfg.attn_layers() * self.kv_format.row_bytes(self.cfg.head_dim)
-            * self.cfg.n_head_kv
+        // K and V rows of every full-attention layer and the MTP head's.
+        let layers = self.cfg.attn_layers() + usize::from(self.mtp.is_some());
+        2 * layers * self.kv_format.row_bytes(self.cfg.head_dim) * self.cfg.n_head_kv
+    }
+
+    fn memory_limit(&self) -> Option<u64> {
+        self.memory_limit
     }
 
     fn kv_format(&self) -> crate::kernels::attention::KvFormat {
