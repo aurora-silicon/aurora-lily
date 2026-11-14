@@ -645,6 +645,13 @@ pub trait LanguageModel: Sized {
         crate::kernels::attention::KvFormat::Bf16
     }
 
+    /// The least session-cache budget the server derives or accepts in
+    /// `--cache-bytes`; `None` for the server's floor of the K/V format
+    /// (sized for Qwen3.8's caches).
+    fn cache_budget_floor(&self) -> Option<usize> {
+        None
+    }
+
     /// A tag identifying the on-disk layout of this model's sessions (model,
     /// cache shapes, optional heads); `None` when sessions cannot be
     /// persisted. Files written under a different tag are never read.

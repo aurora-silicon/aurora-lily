@@ -244,3 +244,34 @@ fn dsml_calls_parse_and_malformed_blocks_are_errors() {
         assert!(parse_dsml_tool_calls(bad, &[]).is_err(), "{bad:?}");
     }
 }
+
+#[test]
+fn parses_gemma_calls() {
+    let q = "<|\"|>";
+    let block = format!(
+        "call:read_file{{follow:true,maybe:null,mode:{q}b{q},offset:42,path:{q}src/a, b.rs{q},tags:[{q}x{q},{q}y{q}]}}"
+    );
+    let call = parse_gemma_tool_call(&block, &schemas()).expect("parse");
+    assert_eq!(call.name, "read_file");
+    let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+    assert_eq!(
+        args,
+        serde_json::json!({"follow": true, "maybe": null, "mode": "b", "offset": 42,
+            "path": "src/a, b.rs", "tags": ["x", "y"]})
+    );
+    // Nested objects, no arguments, and a string where the schema wants a number.
+    let call = parse_gemma_tool_call(
+        &format!("call:read_file{{offset:{q}7{q},opts:{{a:1,b:{{c:[]}}}}}}"),
+        &schemas(),
+    )
+    .expect("nested");
+    let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+    assert_eq!(
+        args,
+        serde_json::json!({"offset": 7, "opts": {"a": 1, "b": {"c": []}}})
+    );
+    let call = parse_gemma_tool_call("call:noargs{}", &schemas()).expect("no args");
+    assert_eq!(call.arguments, "{}");
+    assert!(parse_gemma_tool_call("I will call it", &schemas()).is_err());
+    assert!(parse_gemma_tool_call("call:read_file{path:", &schemas()).is_err());
+}

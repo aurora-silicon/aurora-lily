@@ -43,6 +43,18 @@ enum Cmd {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Chat: renders one user message with the GGUF's template (lily's
+    /// tokenizer), prints its token ids, and decodes greedily.
+    Chat {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        #[arg(long)]
+        think: bool,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -72,6 +84,7 @@ fn run() -> Result<()> {
         Cmd::Generate { model, tokens, n } => {
             generate(&model, &parse_tokens(&tokens)?, n)
         }
+        Cmd::Chat { model, prompt, n, think } => chat(&model, &prompt, n, think),
     }
 }
 
@@ -227,5 +240,41 @@ fn generate(path: &PathBuf, tokens: &[u32], n: usize) -> Result<()> {
         tokens.len(),
         n as f64 / dt
     );
+    Ok(())
+}
+
+fn chat(path: &PathBuf, prompt: &str, n: usize, think: bool) -> Result<()> {
+    use lily::tokenizer::{ChatRender, Tokenizer};
+    let tok = Tokenizer::from_gguf(path)?;
+    let messages = [serde_json::json!({"role": "user", "content": prompt})];
+    let render = ChatRender {
+        messages: &messages,
+        tools: None,
+        enable_thinking: think,
+        reasoning_effort: None,
+        preserve_thinking: None,
+    };
+    eprintln!("{:?}", tok.render(&render)?);
+    let ids = tok.encode_chat(&render)?;
+    println!(
+        "ids\t{}",
+        ids.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+    );
+    let ctx = MetalContext::new()?;
+    let model = Gemma4Model::load(&ctx, path)?;
+    let vocab = model.cfg.vocab;
+    let cap = ids.len() + n + 8;
+    let sc = model.new_scratch(&ctx, cap)?;
+    let mut st = model.new_state(&ctx, cap)?;
+    model.prefill(&ctx, &mut st, &sc, &ids)?;
+    let mut out = Vec::new();
+    let mut next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+    while out.len() < n && !tok.stop_tokens().contains(&next) {
+        out.push(next);
+        model.forward(&ctx, &mut st, &sc, &[next], Logits::Last)?;
+        next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+    }
+    println!("{}", tok.decode(&out, false)?);
+    eprintln!("stop {next}");
     Ok(())
 }

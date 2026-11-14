@@ -130,7 +130,17 @@ fn check_memory_options(
     small_machine: bool,
     cache_bytes: Option<usize>,
     max_batch: Option<usize>,
+    model_floor: Option<usize>,
 ) -> Result<()> {
+    if let (Some(floor), Some(bytes)) = (model_floor, cache_bytes) {
+        ensure!(
+            bytes >= floor,
+            "--cache-bytes {:.2} GB: this model's sessions need at least {:.2} GB",
+            bytes as f64 / 1e9,
+            floor as f64 / 1e9
+        );
+        return Ok(());
+    }
     if small_machine {
         ensure!(
             kv_format == KvFormat::Q8,
@@ -978,6 +988,7 @@ impl<M: LanguageModel> Engine<M> {
             model.expert_cache_stats().is_some(),
             options.cache_bytes,
             options.max_batch,
+            model.cache_budget_floor(),
         )?;
         let drafts = options.mtp_drafts.min(model.max_drafts());
         let requested_batch = options.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
@@ -1116,7 +1127,8 @@ impl<M: LanguageModel> Engine<M> {
                 reserve as usize
             }
             (None, None) => {
-                let floor = budget_floor(model.kv_format());
+                let floor =
+                    model.cache_budget_floor().unwrap_or_else(|| budget_floor(model.kv_format()));
                 let (derived, floored) =
                     derive_cache_budget(working_set, allocated, paged, floor);
                 let (budget, limited) =
@@ -1745,7 +1757,8 @@ fn read_config(model_dir: &Path) -> Result<Value> {
     serde_json::from_slice(&bytes).context("parsing config.json")
 }
 
-/// What `config.json` would say of a GGUF checkpoint (GLM 5.3 Flash), from
+/// What `config.json` would say of a GGUF checkpoint (GLM 5.3 Flash,
+/// Gemma 4), from
 /// its metadata: the model type is the architecture, the stop ids its eos,
 /// eot and eom tokens.
 fn gguf_config(path: &Path) -> Result<Value> {
@@ -1768,6 +1781,11 @@ fn gguf_config(path: &Path) -> Result<Value> {
             serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
     } else if arch == crate::glm53::config::ARCH {
         let stops = crate::glm53::tokenizer::stop_ids(&g)?;
+        config["eos_token_id"] = serde_json::json!(stops);
+        config["max_position_embeddings"] =
+            serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
+    } else if arch == crate::gemma4::config::ARCH {
+        let stops = crate::gemma4::tokenizer::stop_ids(&g)?;
         config["eos_token_id"] = serde_json::json!(stops);
         config["max_position_embeddings"] =
             serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
@@ -1991,11 +2009,14 @@ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
         crate::qwen36::config::ARCH => {
             run_with::<crate::qwen36::Qwen36Model>(model_dir, options, signals)
         }
+        crate::gemma4::config::ARCH => {
+            run_with::<crate::gemma4::Gemma4Model>(model_dir, options, signals)
+        }
         other => anyhow::bail!(
             "unsupported model_type {other:?}; lily serves qwen4_exp \
              (Qwen3.8-Flash-Next), a glm5-next GGUF (GLM 5.3 Flash), a \
-             deepseek4 GGUF (DeepSeek V4 Flash) and a qwen35moe GGUF \
-             (Qwen3.6-35B-A3B)"
+             deepseek4 GGUF (DeepSeek V4 Flash), a qwen35moe GGUF \
+             (Qwen3.6-35B-A3B) and a gemma4 GGUF (Gemma 4 26B-A4B)"
         ),
     }
 }

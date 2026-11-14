@@ -88,6 +88,8 @@ pub struct Tokenizer {
     legacy_nothink_rewrite: bool,
     /// The syntax of the model's tool calls (GLM's for a GGUF tokenizer).
     tool_grammar: crate::serve::tools::ToolGrammar,
+    /// The template's `bos_token` (Gemma's starts the prompt with it).
+    bos_token: Option<String>,
 }
 
 /// Everything a chat prompt render needs, in the template's own vocabulary.
@@ -136,8 +138,9 @@ impl Tokenizer {
         Self::new(inner, &config, template)
     }
 
-    /// GLM's or DeepSeek V4's tokenizer and template from a GGUF file's
-    /// metadata (`crate::glm53::tokenizer`, `crate::deepseek4::tokenizer`). The template renders an empty reasoning
+    /// GLM's, DeepSeek V4's or Gemma 4's tokenizer and template from a GGUF
+    /// file's metadata (`crate::glm53::tokenizer`, `crate::deepseek4::tokenizer`,
+    /// `crate::gemma4::tokenizer`; Qwen3.6's below). The template renders an empty reasoning
     /// block into earlier assistant turns itself, so lily's nothink rewrite
     /// of history is off.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -155,6 +158,19 @@ impl Tokenizer {
         }
         if g.architecture()? == crate::qwen36::config::ARCH {
             return Self::from_gguf_qwen36(&g);
+        }
+        if g.architecture()? == crate::gemma4::config::ARCH {
+            use crate::gemma4::tokenizer as gt;
+            let inner =
+                tokenizers::Tokenizer::from_bytes(gt::tokenizer_json(&g)?.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .context("building the GGUF's tokenizer")?;
+            let mut t = Self::new(inner, &serde_json::Value::Null, gt::chat_template(&g)?)?;
+            t.add_stop_tokens(&gt::stop_ids(&g)?);
+            t.legacy_nothink_rewrite = false;
+            t.tool_grammar = crate::serve::tools::ToolGrammar::Gemma;
+            t.bos_token = Some("<bos>".to_string());
+            return Ok(t);
         }
         let deepseek = g.architecture()? == crate::deepseek4::config::ARCH;
         let json = if deepseek {
@@ -290,6 +306,7 @@ impl Tokenizer {
             stop_tokens,
             legacy_nothink_rewrite,
             tool_grammar: Default::default(),
+            bos_token: None,
         })
     }
 
@@ -414,6 +431,15 @@ impl Tokenizer {
         }
         if let Some(flag) = chat.preserve_thinking {
             extra.insert("preserve_thinking".into(), serde_json::Value::Bool(flag));
+        }
+        if let Some(bos) = &self.bos_token {
+            // The marked template takes the special token as its mark.
+            let text = if name == MARKED_TEMPLATE {
+                mark_specials(bos, &self.specials)
+            } else {
+                bos.clone()
+            };
+            extra.insert("bos_token".into(), serde_json::Value::String(text));
         }
         if !extra.is_empty() {
             ctx = minijinja::context! { ..ctx, ..Value::from_serialize(serde_json::Value::Object(extra)) };

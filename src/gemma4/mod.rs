@@ -3,7 +3,9 @@
 //! the published GGUF files as they are.
 
 pub mod config;
+pub mod engine;
 pub mod model;
+pub mod tokenizer;
 
 pub use config::Config;
 pub use model::{Gemma4Model, Gemma4State, Logits, Scratch};
