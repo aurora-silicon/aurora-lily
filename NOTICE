@@ -156,6 +156,16 @@ https://github.com/antirez/ds4
   tools/reference/deepseek4/ops_golden.c compiles ds4's own functions out
   of ds4.c to compute its golden values.
 
+  lily also serves Qwen3.8-Flash-Next from ds4's published Q2 GGUF
+  (src/qwen4exp/gguf.rs, src/kernels/qwen_gguf.rs,
+  src/kernels/vulkan/qwen_gguf*.comp): the file's layout as ds4's converter
+  (gguf-tools/qwen4_exp_convert.py, on llama.cpp's conversion/qwen4exp.py
+  and qwen.py, MIT, the ggml authors) writes it, which the loader undoes
+  (the GDN value-head reorder, folded norms, -exp(A_log), the padded Q2_K
+  down rows, the draft head's eh_proj), the MXFP4 decoder (ggml's
+  dequantize_row_mxfp4), and ds4's no-thinking chat prompt for scoring its
+  official continuation fixtures (src/bin/lily-qwen.rs).
+
   MIT License
 
   Copyright (c) 2026 The ds4.c authors
