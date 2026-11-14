@@ -62,7 +62,7 @@ uint glm53_bf16_bits(float f) {
 
 #if defined(KERNEL_glm53_gemm_q8_0) || defined(KERNEL_glm53_gemm_q4_k) || \
     defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32) || \
-    defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
+    defined(KERNEL_glm53_gemm_f16) || defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
     defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs)
 #define GM_STEP 64u
 // Vector (k - k0) / 2 * 16 + n / 4 of a step's tile holds weights k and
@@ -94,13 +94,16 @@ uint gm_round_w(float f) { return floatBitsToUint(f) + 0x8000u; }
 #endif
 
 #if defined(KERNEL_glm53_gemm_q8_0) || defined(KERNEL_glm53_gemm_q4_k) || \
-    defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32)
+    defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32) || \
+    defined(KERNEL_glm53_gemm_f16)
 #if defined(KERNEL_glm53_gemm_q8_0)
 #define GEMM_TYPE GLM53_Q8_0
 #elif defined(KERNEL_glm53_gemm_q4_k)
 #define GEMM_TYPE GLM53_Q4_K
 #elif defined(KERNEL_glm53_gemm_bf16)
 #define GEMM_TYPE GLM53_BF16
+#elif defined(KERNEL_glm53_gemm_f16)
+#define GEMM_TYPE GLM53_F16
 #else
 #define GEMM_TYPE GLM53_F32
 #endif
@@ -144,6 +147,13 @@ void gd_decode8(uint64_t row, uint k, out float w[8]) {
         [[unroll]] for (uint c = 0u; c < 4u; c++) {
             w[2u * c] = uintBitsToFloat(v[c] << 16u);
             w[2u * c + 1u] = uintBitsToFloat(v[c] & 0xffff0000u);
+        }
+    } else if (GEMM_TYPE == GLM53_F16) {
+        const uvec4 v = U32x4(row + 2u * k).v[0];
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            const vec2 h = unpackHalf2x16(v[c]);
+            w[2u * c] = h.x;
+            w[2u * c + 1u] = h.y;
         }
     } else {
         const vec4 v0 = F32x4(row + 4u * k).v[0], v1 = F32x4(row + 4u * k + 16u).v[0];

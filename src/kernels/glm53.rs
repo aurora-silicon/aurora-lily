@@ -69,13 +69,14 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
             ]
         };
     }
-    const NAMES: [[&str; GEMV_MAX_ROWS]; 6] = [
+    const NAMES: [[&str; GEMV_MAX_ROWS]; 7] = [
         rows!("q8_0"),
         rows!("q4_k"),
         rows!("q2_k"),
         rows!("iq2_xxs"),
         rows!("bf16"),
         rows!("f32"),
+        rows!("f16"),
     ];
     ensure!((1..=GEMV_MAX_ROWS).contains(&m), "GEMV of {m} rows");
     let t = match ty {
@@ -85,7 +86,8 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
         GgmlType::Iq2Xxs => 3,
         GgmlType::Bf16 => 4,
         GgmlType::F32 => 5,
-        GgmlType::F16 | GgmlType::I32 => anyhow::bail!("no GLM GEMV over {ty:?}"),
+        GgmlType::F16 => 6,
+        GgmlType::I32 => anyhow::bail!("no GEMV over {ty:?}"),
     };
     Ok(NAMES[t][m - 1])
 }
@@ -258,6 +260,7 @@ fn gemm_name(ty: GgmlType) -> Result<&'static str> {
         GgmlType::Q4K => "glm53_gemm_q4_k",
         GgmlType::Bf16 => "glm53_gemm_bf16",
         GgmlType::F32 => "glm53_gemm_f32",
+        GgmlType::F16 => "glm53_gemm_f16",
         other => anyhow::bail!("no GLM GEMM over {other:?}"),
     })
 }

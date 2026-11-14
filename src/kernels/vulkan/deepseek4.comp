@@ -1,0 +1,726 @@
+#version 460
+// DeepSeek V4 Flash kernels (src/kernels/deepseek4.rs dispatches them; the
+// CPU reference is src/deepseek4/reference.rs). Activations are f32, caches
+// f16. The projections, routed experts, HC and norms are GLM 5.3's kernels
+// (glm53.comp); these are the operations DeepSeek V4 adds. Their semantics
+// are ds4's (antirez, MIT; ds4.c CPU reference and metal/dsv4_*.metal): the
+// FP8 KV round trip (dsv4_fp8_kv_quantize_row_inplace_cpu,
+// kernel_dsv4_kv_fp8_store_f32), the indexer's Hadamard + FP4 simulation
+// (kernel_dsv4_indexer_hadamard_fp4_f32), the compressor
+// (compressor_decode_one, compressor_pool_decode_state), the indexer
+// scores (indexer_allowed_decode_one), sink attention
+// (layer_attention_mixed_one), the router (layer_router_probs_one,
+// layer_hash_selected_experts, layer_topk_selected_experts_from_probs) and
+// the output HC collapse (output_hc_head_one).
+//
+// RoPE angles come from a table the host fills per step (cos and sin of
+// each rotated pair, magnitude included, in f32 as the CPU reference
+// computes them): the GPU's trigonometry is less exact than libm at the
+// angles of long positions, and a table keeps every kernel's rotation the
+// reference's. A table row is the n_rot / 2 pairs (c, s) of one position.
+#include "common.glsl"
+
+#define DS4_NEG_INF (-1.0e30)
+
+// The value of E4M3FN code i, sign excluded (ds4 dsv4_e4m3fn_value_cpu).
+float ds4_e4m3_value(int i) {
+    const int e = (i >> 3) & 15;
+    const int mt = i & 7;
+    return e == 0 ? float(mt) * 0.001953125 : ldexp(1.0 + float(mt) * 0.125, e - 7);
+}
+
+// x rounded to the nearest E4M3FN value, ties to the even code, clamped to
+// +-448 (ds4 dsv4_e4m3fn_dequant_cpu: the same search).
+float ds4_e4m3_round(float x) {
+    const float sgn = x < 0.0 ? -1.0 : 1.0;
+    const float ax = min(abs(x), 448.0);
+    int lo = 0, hi = 126;
+    [[unroll]] for (int it = 0; it < 7; it++) {
+        if (lo < hi) {
+            const int mid = (lo + hi + 1) >> 1;
+            if (ds4_e4m3_value(mid) <= ax) lo = mid;
+            else hi = mid - 1;
+        }
+    }
+    int best = lo;
+    if (best < 126) {
+        const float bd = abs(ax - ds4_e4m3_value(best));
+        const float nd = abs(ax - ds4_e4m3_value(best + 1));
+        if (nd < bd || (nd == bd && ((best + 1) & 1) == 0 && (best & 1) != 0)) best++;
+    }
+    return sgn * ds4_e4m3_value(best);
+}
+
+// The value of E2M1 code i: 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+float ds4_e2m1_value(int i) {
+    return i < 2 ? float(i) * 0.5 : ldexp(1.0 + float(i & 1) * 0.5, (i >> 1) - 1);
+}
+
+// x rounded to the nearest E2M1 value, ties to the even code, clamped to
+// +-6 (ds4 dsv4_e2m1fn_dequant_cpu).
+float ds4_e2m1_round(float x) {
+    const float sgn = x < 0.0 ? -1.0 : 1.0;
+    const float ax = min(abs(x), 6.0);
+    int best = 0;
+    float bd = ax;
+    [[unroll]] for (int i = 1; i < 8; i++) {
+        const float d = abs(ax - ds4_e2m1_value(i));
+        if (d < bd || (d == bd && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            bd = d;
+        }
+    }
+    return sgn * ds4_e2m1_value(best);
+}
+
+// The power-of-two scale of a block whose largest magnitude is amax:
+// 2^ceil(log2(amax / top)).
+float ds4_pow2_scale(float amax, float top) {
+    return ldexp(1.0, int(ceil(log2(amax / top))));
+}
+
+// One rotated pair, as the reference computes it: (x0 c - x1 s, x0 s + x1
+// c), s negated for the inverse rotation.
+vec2 ds4_rotate(vec2 x, vec2 cs, bool inverse) {
+    const float s = inverse ? -cs.y : cs.y;
+    precise float a = x.x * cs.x;
+    precise float b = x.y * s;
+    precise float c = x.x * s;
+    precise float d = x.y * cs.x;
+    precise float r0 = a - b;
+    precise float r1 = c + d;
+    return vec2(r0, r1);
+}
+
+// ---------------------------------------------------------------------------
+// The token embedding (F16 table) into all four streams.
+// Grid (hidden, m). Buffers: 0 table f16 [vocab][hidden], 1 tokens u32 [m],
+// 2 streams f32 [m][4][hidden]. Params: 3 hidden.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_embed_f16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint hidden = arg_u32(3);
+    const uint d = gl_GlobalInvocationID.x;
+    const uint i = gl_GlobalInvocationID.y;
+    if (d >= hidden) return;
+    const uint tok = U32(arg(1)).v[i];
+    const float v = float(F16(arg(0) + 2u * uint64_t(tok) * hidden).v[d]);
+    const uint64_t H = arg(2) + 16u * uint64_t(i) * hidden;
+    [[unroll]] for (uint s = 0u; s < 4u; s++) F32(H).v[s * hidden + d] = v;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Per-head RMSNorm without weight (when do_norm) then RoPE of the head's
+// last n_rot dims, in place, for heads of up to 512 values: the queries
+// (norm + rope), the attention output (inverse rope), the indexer queries
+// (rope). Thread t holds values 2t and 2t + 1. Grid (heads, m), 256
+// threads. Buffers: 0 x f32 [m][heads][dim], 1 rope table [rows][n_rot/2]
+// vec2. Params: 2 dim, 3 n_rot, 4 eps, 5 do_norm, 6 inverse, 7 table row
+// of x's row 0.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_head_norm_rope
+shared float red[8];
+void main() {
+    const uint dim = arg_u32(2);
+    const uint n_rot = arg_u32(3);
+    const float eps = arg_f32(4);
+    const bool do_norm = arg_u32(5) != 0u;
+    const bool inverse = arg_u32(6) != 0u;
+    const uint t0 = arg_u32(7);
+    const uint h = gl_WorkGroupID.x;
+    const uint i = gl_WorkGroupID.y;
+    const uint heads = gl_NumWorkGroups.x;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint64_t X = arg(0) + 4u * (uint64_t(i) * heads + h) * dim;
+    const bool live = 2u * tid < dim;
+    vec2 v = live ? vec2(F32(X).v[2u * tid], F32(X).v[2u * tid + 1u]) : vec2(0.0);
+    if (do_norm) {
+        float ss = v.x * v.x + v.y * v.y;
+        ss = subgroupAdd(ss);
+        if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = ss;
+        barrier();
+        float total = gl_SubgroupInvocationID < 8u ? red[gl_SubgroupInvocationID] : 0.0;
+        total = subgroupAdd(total);
+        const float scale = inversesqrt(total / float(dim) + eps);
+        v *= scale;
+    }
+    const uint n_nope = dim - n_rot;
+    if (live && 2u * tid >= n_nope) {
+        const uint k = tid - n_nope / 2u;
+        const uint64_t T = arg(1) + 8u * (uint64_t(t0 + i) * (n_rot / 2u) + k);
+        v = ds4_rotate(v, vec2(F32(T).v[0], F32(T).v[1]), inverse);
+    }
+    if (live) {
+        F32(X).v[2u * tid] = v.x;
+        F32(X).v[2u * tid + 1u] = v.y;
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The raw KV row of each step row: RoPE of its tail, the FP8 round trip of
+// the other dims in blocks of 64 (subgroup s holds block s: two values a
+// lane), then the f16 copy the attention reads (kv_run row i) and the f32
+// result back in kv. 512 dims, 64 rotated. Grid (m), 256 threads.
+// Buffers: 0 kv f32 [m][512] (normalized), 1 kv_run f16 [m][512], 2 rope
+// table. Params: 3 table row of row 0.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_kv_store
+void main() {
+    const uint i = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint t0 = arg_u32(3);
+    const uint64_t X = arg(0) + 4u * uint64_t(i) * 512u;
+    vec2 v = vec2(F32(X).v[2u * tid], F32(X).v[2u * tid + 1u]);
+    if (gl_SubgroupID == 7u) {
+        const uint k = tid - 224u;
+        const uint64_t T = arg(2) + 8u * (uint64_t(t0 + i) * 32u + k);
+        v = ds4_rotate(v, vec2(F32(T).v[0], F32(T).v[1]), false);
+    } else {
+        const float amax = max(subgroupMax(max(abs(v.x), abs(v.y))), 1.0e-4);
+        const float scale = ds4_pow2_scale(amax, 448.0);
+        v.x = ds4_e4m3_round(clamp(v.x / scale, -448.0, 448.0)) * scale;
+        v.y = ds4_e4m3_round(clamp(v.y / scale, -448.0, 448.0)) * scale;
+    }
+    F32(X).v[2u * tid] = v.x;
+    F32(X).v[2u * tid + 1u] = v.y;
+    const uint64_t R = arg(1) + 2u * uint64_t(i) * 512u;
+    F16(R).v[2u * tid] = float16_t(v.x);
+    F16(R).v[2u * tid + 1u] = float16_t(v.y);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The raw window ring: kv_run rows j0.. of the step (positions pos0 + j)
+// into slot (pos0 + j) % 128 of the layer's ring, after the attention read
+// the ring. Grid (512, m - j0). Buffers: 0 kv_run f16, 1 ring f16
+// [128][512]. Params: 2 pos0, 3 j0.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_ring_store
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint d = gl_GlobalInvocationID.x;
+    const uint j = arg_u32(3) + gl_GlobalInvocationID.y;
+    const uint slot = (arg_u32(2) + j) % 128u;
+    F16(arg(1)).v[slot * 512u + d] = F16(arg(0)).v[j * 512u + d];
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The 128-point Hadamard transform (scaled 1/sqrt(128)) of hs[0..128] and
+// the FP4 round trip per 32 values (subgroup = block of 32), thread t
+// holding value t (t < 128; the threadgroup has at least 128 threads and
+// every thread calls it). Returns value t.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_ds4_indexer_q) || defined(KERNEL_ds4_comp_pool)
+shared float hs[512];
+float ds4_hadamard_fp4(uint t) {
+    for (uint stride = 1u; stride < 128u; stride <<= 1u) {
+        float a = 0.0, b = 0.0;
+        uint base = 0u;
+        const bool owner = t < 128u && (t & stride) == 0u;
+        if (owner) {
+            base = (t & ~(2u * stride - 1u)) + (t & (stride - 1u));
+            a = hs[base];
+            b = hs[base + stride];
+        }
+        barrier();
+        if (owner) {
+            hs[base] = a + b;
+            hs[base + stride] = a - b;
+        }
+        barrier();
+    }
+    const float v = t < 128u ? hs[t] * 0.08838834764831845 : 0.0;
+    const float amax = max(subgroupMax(abs(v)), 7.052966104933725e-38);
+    const float scale = ds4_pow2_scale(amax, 6.0);
+    return ds4_e2m1_round(clamp(v / scale, -6.0, 6.0)) * scale;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Indexer queries: RoPE of each 128-wide head's last 64 dims, then the
+// Hadamard + FP4 simulation, in place. Grid (heads, m), 128 threads.
+// Buffers: 0 q f32 [m][heads][128], 1 rope table. Params: 2 table row of
+// row 0.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_indexer_q
+void main() {
+    const uint h = gl_WorkGroupID.x;
+    const uint i = gl_WorkGroupID.y;
+    const uint t = gl_LocalInvocationIndex;
+    const uint t0 = arg_u32(2);
+    const uint64_t X = arg(0) + 4u * (uint64_t(i) * gl_NumWorkGroups.x + h) * 128u;
+    hs[t] = F32(X).v[t];
+    barrier();
+    if (t < 32u) {
+        const uint64_t T = arg(1) + 8u * (uint64_t(t0 + i) * 32u + t);
+        const vec2 r = ds4_rotate(vec2(hs[64u + 2u * t], hs[65u + 2u * t]),
+                                  vec2(F32(T).v[0], F32(T).v[1]), false);
+        hs[64u + 2u * t] = r.x;
+        hs[65u + 2u * t] = r.y;
+    }
+    barrier();
+    F32(X).v[t] = ds4_hadamard_fp4(t);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The compressor's windows ending in this step: for window end e (e0, e0 +
+// ratio, ...; one threadgroup each, a thread per output dim j), the softmax
+// pool over the window's rows per dim (ratio 4: the previous window's rows
+// at lane 0, column j, with the current ones at lane 1, column dim + j;
+// ratio 128: the window's rows), RMSNorm with `norm`, RoPE at the window's
+// first position, the cache's simulation (FP8 for attention rows, Hadamard
+// + FP4 for indexer rows) and the f16 store into cache row (e + 1) / ratio
+// - 1. A position p >= pos0 reads the step's projections (row p - pos0),
+// an earlier one the layer's ring (slot p % (lanes * ratio)); scores get the
+// position bias ape[p % ratio]. Grid (windows), dim threads (512 or 128).
+// Buffers: 0 kv proj f32 [m][width], 1 score proj f32 [m][width], 2 ape f16
+// [ratio][width], 3 ring kv f32 [lanes * ratio][width], 4 ring score, 5
+// norm f32 [dim], 6 rope table (row of position p: p - table_lo), 7 cache
+// f16 [cap][dim]. Params: 8 dim, 9 ratio, 10 pos0, 11 e0, 12 table_lo, 13
+// indexer, 14 eps.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_comp_pool
+shared float red[16];
+void main() {
+    const uint dim = arg_u32(8);
+    const uint r = arg_u32(9);
+    const uint pos0 = arg_u32(10);
+    const uint e = arg_u32(11) + gl_WorkGroupID.x * r;
+    const uint table_lo = arg_u32(12);
+    const bool indexer = arg_u32(13) != 0u;
+    const float eps = arg_f32(14);
+    const uint lanes = r == 4u ? 2u : 1u;
+    const uint width = lanes * dim;
+    const uint ring = lanes * r;
+    const uint j = gl_LocalInvocationIndex;
+    // Entry (p, column c): projection and biased score.
+    #define DS4_KV(p, c) ((p) >= pos0 ? F32(arg(0)).v[((p) - pos0) * width + (c)] \
+                                      : F32(arg(3)).v[((p) % ring) * width + (c)])
+    #define DS4_SC(p, c) (((p) >= pos0 ? F32(arg(1)).v[((p) - pos0) * width + (c)] \
+                                       : F32(arg(4)).v[((p) % ring) * width + (c)]))
+    const uint first = e + 1u - r;
+    const bool prev = lanes == 2u && first >= r;
+    float mx = DS4_NEG_INF;
+    for (uint q = 0u; q < r; q++) {
+        const uint pc = first + q;
+        const float ape_c = float(F16(arg(2)).v[(pc % r) * width + (lanes - 1u) * dim + j]);
+        mx = max(mx, DS4_SC(pc, (lanes - 1u) * dim + j) + ape_c);
+        if (prev) {
+            const uint pp = pc - r;
+            const float ape_p = float(F16(arg(2)).v[(pp % r) * width + j]);
+            mx = max(mx, DS4_SC(pp, j) + ape_p);
+        }
+    }
+    float den = 0.0, sum = 0.0;
+    for (uint q = 0u; q < r; q++) {
+        const uint pc = first + q;
+        const float ape_c = float(F16(arg(2)).v[(pc % r) * width + (lanes - 1u) * dim + j]);
+        const float wc = exp(DS4_SC(pc, (lanes - 1u) * dim + j) + ape_c - mx);
+        if (prev) {
+            const uint pp = pc - r;
+            const float ape_p = float(F16(arg(2)).v[(pp % r) * width + j]);
+            const float wp = exp(DS4_SC(pp, j) + ape_p - mx);
+            den += wp + wc;
+            sum += wp * DS4_KV(pp, j);
+        } else {
+            den += wc;
+        }
+        sum += wc * DS4_KV(pc, (lanes - 1u) * dim + j);
+    }
+    float v = den > 0.0 ? sum / den : 0.0;
+    // RMSNorm over the dim threads.
+    float ss = subgroupAdd(v * v);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = ss;
+    barrier();
+    const uint nsg = dim / 32u;
+    float total = gl_SubgroupInvocationID < nsg ? red[gl_SubgroupInvocationID] : 0.0;
+    total = subgroupAdd(total);
+    v = v * inversesqrt(total / float(dim) + eps) * F32(arg(5)).v[j];
+    hs[j] = v;
+    barrier();
+    // RoPE of the last 64 dims at the window's first position.
+    const uint n_nope = dim - 64u;
+    vec2 rr = vec2(0.0);
+    if (j < 32u) {
+        const uint64_t T = arg(6) + 8u * (uint64_t(first - table_lo) * 32u + j);
+        rr = ds4_rotate(vec2(hs[n_nope + 2u * j], hs[n_nope + 2u * j + 1u]),
+                        vec2(F32(T).v[0], F32(T).v[1]), false);
+    }
+    barrier();
+    if (j < 32u) {
+        hs[n_nope + 2u * j] = rr.x;
+        hs[n_nope + 2u * j + 1u] = rr.y;
+    }
+    barrier();
+    if (indexer) {
+        v = ds4_hadamard_fp4(j);
+    } else {
+        v = hs[j];
+        if (j < n_nope) {
+            // Blocks of 64: two subgroups each.
+            const float am = subgroupMax(abs(v));
+            if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = am;
+        }
+        barrier();
+        if (j < n_nope) {
+            const uint b = gl_SubgroupID & ~1u;
+            const float amax = max(max(red[b], red[b + 1u]), 1.0e-4);
+            const float scale = ds4_pow2_scale(amax, 448.0);
+            v = ds4_e4m3_round(clamp(v / scale, -448.0, 448.0)) * scale;
+        }
+    }
+    const uint row = (e + 1u) / r - 1u;
+    F16(arg(7) + 2u * uint64_t(row) * dim).v[j] = float16_t(v);
+    #undef DS4_KV
+    #undef DS4_SC
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The compressor ring after the step: projection rows j0.. (positions pos0
+// + j) into ring slot (pos0 + j) % (lanes * ratio). Grid (width, m - j0).
+// Buffers: 0 kv proj, 1 score proj, 2 ring kv, 3 ring score. Params: 4
+// width, 5 ring rows, 6 pos0, 7 j0.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_comp_ring
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint width = arg_u32(4);
+    const uint c = gl_GlobalInvocationID.x;
+    const uint j = arg_u32(7) + gl_GlobalInvocationID.y;
+    if (c >= width) return;
+    const uint slot = (arg_u32(6) + j) % arg_u32(5);
+    F32(arg(2)).v[slot * width + c] = F32(arg(0)).v[j * width + c];
+    F32(arg(3)).v[slot * width + c] = F32(arg(1)).v[j * width + c];
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Indexer scores of step row i over its compressed rows c < (pos0 + i + 1)
+// / 4: sum_h max(q_h . k_c, 0) * w_h * scale. One subgroup a row c (a lane
+// holds 4 dims), 8 a threadgroup. Grid (ceil(cap / 8), m), 256 threads.
+// Buffers: 0 q f32 [m][heads][128] (simulated), 1 w f32 [m][heads], 2 keys
+// f16 [cap][128], 3 scores f32 [m][cap]. Params: 4 cap, 5 pos0, 6 scale, 7
+// heads.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_indexer_scores
+void main() {
+    const uint cap = arg_u32(4);
+    const uint pos0 = arg_u32(5);
+    const float scale = arg_f32(6);
+    const uint heads = arg_u32(7);
+    const uint i = gl_WorkGroupID.y;
+    const uint c = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    const uint n = (pos0 + i + 1u) / 4u;
+    if (c >= min(n, cap)) return;
+    const uint lane = gl_SubgroupInvocationID;
+    const uvec2 kr = U32x2(arg(2) + 2u * (uint64_t(c) * 128u + 4u * lane)).v[0];
+    const vec4 k = vec4(unpackHalf2x16(kr.x), unpackHalf2x16(kr.y));
+    const uint64_t Q = arg(0) + 4u * uint64_t(i) * heads * 128u;
+    const uint64_t W = arg(1) + 4u * uint64_t(i) * heads;
+    float s = 0.0;
+    for (uint h = 0u; h < heads; h++) {
+        const vec4 q = F32x4(Q + 4u * (h * 128u + 4u * lane)).v[0];
+        const float d = subgroupAdd(dot(q, k));
+        s += max(d, 0.0) * (F32(W).v[h] * scale);
+    }
+    if (lane == 0u) F32(arg(3) + 4u * uint64_t(i) * cap).v[c] = s;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The indexer's selection of step row i: the k best of its n = (pos0 + i +
+// 1) / 4 scores (ties to the lower row), in ascending row order; all n
+// rows when n <= k. count[i] gets the number kept. A radix select of the
+// k-th largest key, then an ordered compaction (GLM's glm53_indexer_topk
+// without the pool expansion). Grid (m), 1024 threads. Buffers: 0 scores
+// [m][cap], 1 sel u32 [m][k], 2 count u32 [m]. Params: 3 cap, 4 pos0, 5 k.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_topk
+shared uint hist[256];
+shared uint prefix_sh;
+shared uint need_sh;
+shared uint part_sh[2 * 32];
+uint ds4_key(float f) {
+    const uint u = floatBitsToUint(f);
+    return (u & 0x80000000u) != 0u ? ~u : u | 0x80000000u;
+}
+void main() {
+    const uint P = arg_u32(3);
+    const uint pos0 = arg_u32(4);
+    const uint k = arg_u32(5);
+    const uint i = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint n = min((pos0 + i + 1u) / 4u, P);
+    const uint64_t SC = arg(0) + 4u * uint64_t(i) * P;
+    const uint64_t SEL = arg(1) + 4u * uint64_t(i) * k;
+    uint thresh = 0u;
+    if (n > k) {
+        if (tid == 0u) { prefix_sh = 0u; need_sh = k; }
+        barrier();
+        for (int digit = 3; digit >= 0; digit--) {
+            if (tid < 256u) hist[tid] = 0u;
+            barrier();
+            const uint prefix = prefix_sh;
+            const uint shift = uint(digit) * 8u;
+            const uint hi_mask = digit == 3 ? 0u : (0xffffffffu << (shift + 8u));
+            for (uint p = tid; p < n; p += 1024u) {
+                const uint key = ds4_key(F32(SC).v[p]);
+                if ((key & hi_mask) == (prefix & hi_mask)) atomicAdd(hist[(key >> shift) & 0xffu], 1u);
+            }
+            barrier();
+            const uint need = need_sh;
+            const uint hb = tid < 256u ? hist[tid] : 0u;
+            const uint incl = subgroupInclusiveAdd(hb);
+            if (tid < 256u && gl_SubgroupInvocationID == 31u) part_sh[gl_SubgroupID] = incl;
+            barrier();
+            if (tid < 256u) {
+                uint before = 0u, total = 0u;
+                [[unroll]] for (uint g = 0u; g < 8u; g++) {
+                    const uint v = part_sh[g];
+                    before += g < gl_SubgroupID ? v : 0u;
+                    total += v;
+                }
+                const uint upto = before + incl;
+                const uint at_or_above = total - upto + hb;
+                const uint above = total - upto;
+                if ((at_or_above >= need || tid == 0u) && (tid == 255u || above < need)) {
+                    prefix_sh = prefix | (tid << shift);
+                    need_sh = need - above;
+                }
+            }
+            barrier();
+        }
+        thresh = prefix_sh;
+    }
+    const uint per = (n + 1023u) / 1024u;
+    const uint begin = min(tid * per, n);
+    const uint end = min(begin + per, n);
+    uint gt = 0u, eq = 0u;
+    for (uint p = begin; p < end; p++) {
+        const uint key = ds4_key(F32(SC).v[p]);
+        gt += uint(key > thresh || n <= k);
+        eq += uint(key == thresh && n > k);
+    }
+    const uint gx = subgroupExclusiveAdd(gt), ex = subgroupExclusiveAdd(eq);
+    if (gl_SubgroupInvocationID == 31u) {
+        part_sh[gl_SubgroupID] = gx + gt;
+        part_sh[32u + gl_SubgroupID] = ex + eq;
+    }
+    barrier();
+    uint gbase = 0u, ebase = 0u, total_gt = 0u;
+    for (uint g = 0u; g < 32u; g++) {
+        const uint a = part_sh[g], b = part_sh[32u + g];
+        gbase += g < gl_SubgroupID ? a : 0u;
+        ebase += g < gl_SubgroupID ? b : 0u;
+        total_gt += a;
+    }
+    const uint kept = min(k, n);
+    const uint eq_take = kept - min(total_gt, kept);
+    uint g_at = gbase + gx, e_at = ebase + ex;
+    for (uint p = begin; p < end; p++) {
+        const uint key = ds4_key(F32(SC).v[p]);
+        bool keep;
+        if (n <= k) keep = true;
+        else if (key > thresh) keep = true;
+        else keep = key == thresh && e_at < eq_take;
+        const uint slot = g_at + min(e_at, eq_take);
+        if (key == thresh && n > k) e_at++;
+        else if (keep) g_at++;
+        if (keep) U32(SEL).v[slot] = p;
+    }
+    if (tid == 0u) U32(arg(2)).v[i] = kept;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Sink attention of head h of step row i (position p = pos0 + i) over its
+// raw window (positions max(0, p - 127)..p: the step's kv_run rows for p >=
+// pos0, the ring for earlier ones) and its compressed rows (with sel: the
+// count[i] rows sel[i][..]; without: rows c < (p + 1) / ratio, none when
+// ratio is 0). Keys are values. The 8 subgroups take every 8th row with an
+// online softmax each (a lane holds 16 dims), merged with the head's sink
+// at the end. Grid (heads, m), 256 threads. Buffers: 0 q f32 [m][heads][512],
+// 1 kv_run f16 [m][512], 2 ring f16 [128][512], 3 comp f16 [cap][512], 4 sel
+// u32 [m][S], 5 count u32 [m], 6 sinks f32 [heads], 7 out f32
+// [m][heads][512]. Params: 8 pos0, 9 ratio, 10 use_sel, 11 S, 12 scale.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_attend
+shared float sm_m[8];
+shared float sm_l[8];
+shared float sm_acc[8 * 512];
+void main() {
+    const uint pos0 = arg_u32(8);
+    const uint ratio = arg_u32(9);
+    const bool use_sel = arg_u32(10) != 0u;
+    const uint S = arg_u32(11);
+    const float scale = arg_f32(12);
+    const uint h = gl_WorkGroupID.x;
+    const uint i = gl_WorkGroupID.y;
+    const uint heads = gl_NumWorkGroups.x;
+    const uint p = pos0 + i;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    const uint n_raw = min(p + 1u, 128u);
+    const uint n_comp = ratio == 0u ? 0u
+        : (use_sel ? U32(arg(5)).v[i] : (p + 1u) / ratio);
+    const uint total = n_raw + n_comp;
+    const uint64_t Q = arg(0) + 4u * ((uint64_t(i) * heads + h) * 512u + 16u * lane);
+    vec4 q[4];
+    [[unroll]] for (uint c = 0u; c < 4u; c++) q[c] = F32x4(Q + 16u * c).v[0];
+    float m = DS4_NEG_INF, l = 0.0;
+    vec4 acc[4];
+    [[unroll]] for (uint c = 0u; c < 4u; c++) acc[c] = vec4(0.0);
+    for (uint r = sg; r < total; r += 8u) {
+        uint64_t K;
+        if (r < n_raw) {
+            const uint pr = p + 1u - n_raw + r;
+            K = pr >= pos0 ? arg(1) + 1024u * uint64_t(pr - pos0)
+                           : arg(2) + 1024u * uint64_t(pr % 128u);
+        } else {
+            const uint c = r - n_raw;
+            const uint row = use_sel ? U32(arg(4) + 4u * uint64_t(i) * S).v[c] : c;
+            K = arg(3) + 1024u * uint64_t(row);
+        }
+        const uvec4 a = U32x4(K + 32u * lane).v[0];
+        const uvec4 b = U32x4(K + 32u * lane + 16u).v[0];
+        vec4 kv[4];
+        kv[0] = vec4(unpackHalf2x16(a.x), unpackHalf2x16(a.y));
+        kv[1] = vec4(unpackHalf2x16(a.z), unpackHalf2x16(a.w));
+        kv[2] = vec4(unpackHalf2x16(b.x), unpackHalf2x16(b.y));
+        kv[3] = vec4(unpackHalf2x16(b.z), unpackHalf2x16(b.w));
+        float d = 0.0;
+        [[unroll]] for (uint c = 0u; c < 4u; c++) d += dot(q[c], kv[c]);
+        const float s = subgroupAdd(d) * scale;
+        const float mn = max(m, s);
+        const float f = exp(m - mn);
+        const float w = exp(s - mn);
+        l = l * f + w;
+        [[unroll]] for (uint c = 0u; c < 4u; c++) acc[c] = acc[c] * f + w * kv[c];
+        m = mn;
+    }
+    if (lane == 0u) {
+        sm_m[sg] = m;
+        sm_l[sg] = l;
+    }
+    [[unroll]] for (uint c = 0u; c < 4u; c++) {
+        [[unroll]] for (uint e = 0u; e < 4u; e++) sm_acc[sg * 512u + 16u * lane + 4u * c + e] = acc[c][e];
+    }
+    barrier();
+    const float sink = F32(arg(6)).v[h];
+    float M = sink;
+    [[unroll]] for (uint s = 0u; s < 8u; s++) M = max(M, sm_m[s]);
+    float L = exp(sink - M);
+    float fs[8];
+    [[unroll]] for (uint s = 0u; s < 8u; s++) {
+        fs[s] = exp(sm_m[s] - M);
+        L += sm_l[s] * fs[s];
+    }
+    const uint tid = gl_LocalInvocationIndex;
+    const uint64_t O = arg(7) + 4u * (uint64_t(i) * heads + h) * 512u;
+    [[unroll]] for (uint e = 0u; e < 2u; e++) {
+        const uint dd = 2u * tid + e;
+        float o = 0.0;
+        [[unroll]] for (uint s = 0u; s < 8u; s++) o += sm_acc[s * 512u + dd] * fs[s];
+        F32(O).v[dd] = o / L;
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The router of step row i: scores sqrt(softplus(logit)); hash layers take
+// the token's table row, the others the top k of score + bias (ties to the
+// lower id); weights the selected scores over their sum (floored at
+// 6.1e-5) times scale, summed in selection order. One subgroup a row.
+// Grid (m), 32 threads. Buffers: 0 logits f32 [m][E], 1 bias f32 [E], 2
+// hash table i32 [vocab][k], 3 tokens u32 [m], 4 sel u32 [m][k], 5 weights
+// f32 [m][k]. Params: 6 E (<= 256), 7 k, 8 scale, 9 hash.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_router
+float ds4_router_score(float l) {
+    const float sp = l > 20.0 ? l : (l < -20.0 ? exp(l) : log(1.0 + exp(l)));
+    return sqrt(sp);
+}
+void main() {
+    const uint E = arg_u32(6);
+    const uint k = arg_u32(7);
+    const float scale = arg_f32(8);
+    const bool hash = arg_u32(9) != 0u;
+    const uint i = gl_WorkGroupID.x;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint64_t L = arg(0) + 4u * uint64_t(i) * E;
+    float pr[8], key[8];
+    [[unroll]] for (uint q = 0u; q < 8u; q++) {
+        const uint e = lane + 32u * q;
+        pr[q] = e < E ? ds4_router_score(F32(L).v[e]) : 0.0;
+        key[q] = e < E ? (hash ? 0.0 : pr[q] + F32(arg(1)).v[e]) : -3.0e38;
+    }
+    uint sel_mine = 0xffffffffu;
+    float w_mine = 0.0;
+    float sum = 0.0;
+    for (uint s = 0u; s < k; s++) {
+        uint e_s;
+        float p_s;
+        if (hash) {
+            const uint tok = U32(arg(3)).v[i];
+            e_s = uint(I32(arg(2) + 4u * uint64_t(tok) * k).v[s]);
+            // The score of expert e_s: its lane's register q = e_s / 32.
+            float pv = 0.0;
+            [[unroll]] for (uint q = 0u; q < 8u; q++) pv = (q == e_s / 32u) ? pr[q] : pv;
+            p_s = subgroupShuffle(pv, e_s % 32u);
+        } else {
+            // Best key of this lane (lowest id on ties), then of the subgroup.
+            float bk = -3.0e38;
+            uint be = 0xffffffffu;
+            [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                if (key[q] > bk) { bk = key[q]; be = lane + 32u * q; }
+            }
+            const float top = subgroupMax(bk);
+            e_s = subgroupMin(bk == top ? be : 0xffffffffu);
+            float pv = 0.0;
+            [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                if (lane + 32u * q == e_s) { pv = pr[q]; key[q] = -3.0e38; }
+            }
+            p_s = subgroupMax(lane == e_s % 32u ? pv : -1.0);
+        }
+        sum += p_s;
+        if (lane == s) { sel_mine = e_s; w_mine = p_s; }
+    }
+    sum = max(sum, 6.103515625e-5);
+    if (lane < k) {
+        U32(arg(4)).v[i * k + lane] = sel_mine;
+        F32(arg(5)).v[i * k + lane] = w_mine / sum * scale;
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The output head's HC collapse: w[s] = sigmoid(pre[s] * scale + base[s])
+// + eps and out = sum_s w[s] * H[s]. Grid (hidden, m). Buffers: 0 pre f32
+// [m][4], 1 scale f32 [1], 2 base f32 [4], 3 H f32 [m][4][hidden], 4 out
+// [m][hidden]. Params: 5 hidden, 6 eps.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_out_collapse
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint hidden = arg_u32(5);
+    const float eps = arg_f32(6);
+    const uint d = gl_GlobalInvocationID.x;
+    const uint i = gl_GlobalInvocationID.y;
+    if (d >= hidden) return;
+    const float sc = F32(arg(1)).v[0];
+    const uint64_t H = arg(3) + 16u * uint64_t(i) * hidden;
+    float acc = 0.0;
+    [[unroll]] for (uint s = 0u; s < 4u; s++) {
+        const float z = F32(arg(0)).v[4u * i + s] * sc + F32(arg(2)).v[s];
+        const float w = 1.0 / (1.0 + exp(-z)) + eps;
+        acc += F32(H).v[s * hidden + d] * w;
+    }
+    F32(arg(4) + 4u * uint64_t(i) * hidden).v[d] = acc;
+}
+#endif

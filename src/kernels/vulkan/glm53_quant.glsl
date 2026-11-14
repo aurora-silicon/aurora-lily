@@ -10,6 +10,7 @@
 
 // Type ids (GGUF): the kernels take the type as a compile-time constant.
 #define GLM53_F32 0u
+#define GLM53_F16 1u
 #define GLM53_Q8_0 8u
 #define GLM53_Q2_K 10u
 #define GLM53_Q4_K 12u
@@ -124,7 +125,7 @@ void glm53_decode_iq2_xxs(uint64_t row, uint t, out float w[32]) {
     }
 }
 
-// --- BF16 and F32 rows (16-byte aligned here). ---
+// --- BF16, F16 and F32 rows (16-byte aligned here). ---
 void glm53_decode_bf16(uint64_t row, uint t, out float w[32]) {
     const uint64_t b = row + uint64_t(t) * 64u;
     [[unroll]] for (uint q = 0u; q < 4u; q++) {
@@ -132,6 +133,18 @@ void glm53_decode_bf16(uint64_t row, uint t, out float w[32]) {
         [[unroll]] for (uint c = 0u; c < 4u; c++) {
             w[8u * q + 2u * c] = uintBitsToFloat(v[c] << 16u);
             w[8u * q + 2u * c + 1u] = uintBitsToFloat(v[c] & 0xffff0000u);
+        }
+    }
+}
+
+void glm53_decode_f16(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t) * 64u;
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        const uvec4 v = U32x4(b + 16u * q).v[0];
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            const vec2 h = unpackHalf2x16(v[c]);
+            w[8u * q + 2u * c] = h.x;
+            w[8u * q + 2u * c + 1u] = h.y;
         }
     }
 }
@@ -151,6 +164,7 @@ void glm53_decode(uint ty, uint64_t row, uint t, out float w[32]) {
     else if (ty == GLM53_Q2_K) glm53_decode_q2_k(row, t, w);
     else if (ty == GLM53_IQ2_XXS) glm53_decode_iq2_xxs(row, t, w);
     else if (ty == GLM53_BF16) glm53_decode_bf16(row, t, w);
+    else if (ty == GLM53_F16) glm53_decode_f16(row, t, w);
     else glm53_decode_f32(row, t, w);
 }
 
