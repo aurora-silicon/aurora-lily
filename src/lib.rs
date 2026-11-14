@@ -100,6 +100,8 @@ pub mod npy;
 #[cfg(target_os = "linux")]
 pub mod priority;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod qwen36;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod qwen4exp;
 pub mod refops;
 pub mod safetensors;

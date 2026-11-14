@@ -129,6 +129,8 @@ fn moe_name(gate_up: bool, ty: GgmlType) -> Result<&'static str> {
         (true, GgmlType::Iq2Xxs) => "glm53_moe_gate_up_iq2_xxs",
         (true, GgmlType::Q4K) => "glm53_moe_gate_up_q4_k",
         (true, GgmlType::Q2K) => "glm53_moe_gate_up_q2_k",
+        (true, GgmlType::Q8_0) => "glm53_moe_gate_up_q8_0",
+        (false, GgmlType::Q8_0) => "glm53_moe_down_q8_0",
         (false, GgmlType::Q2K) => "glm53_moe_down_q2_k",
         (false, GgmlType::Q4K) => "glm53_moe_down_q4_k",
         (false, GgmlType::Iq2Xxs) => "glm53_moe_down_iq2_xxs",

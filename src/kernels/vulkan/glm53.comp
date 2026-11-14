@@ -251,9 +251,12 @@ float glm53_moe_act(float g, float u, float limit, float we) {
     return sv;
 }
 
-#if defined(KERNEL_glm53_moe_gate_up_q4_k) || defined(KERNEL_glm53_moe_gate_up_q2_k)
+#if defined(KERNEL_glm53_moe_gate_up_q4_k) || defined(KERNEL_glm53_moe_gate_up_q2_k) || \
+    defined(KERNEL_glm53_moe_gate_up_q8_0)
 #if defined(KERNEL_glm53_moe_gate_up_q4_k)
 #define MOE_TYPE GLM53_Q4_K
+#elif defined(KERNEL_glm53_moe_gate_up_q8_0)
+#define MOE_TYPE GLM53_Q8_0
 #else
 #define MOE_TYPE GLM53_Q2_K
 #endif
@@ -409,9 +412,12 @@ void main() {
 // when has_add; may be out). Params: 5 F (the down rows' length), 6 H,
 // 7 row_bytes, 8 used, 9 has_add.
 // ---------------------------------------------------------------------------
-#if defined(KERNEL_glm53_moe_down_q4_k) || defined(KERNEL_glm53_moe_down_iq2_xxs)
+#if defined(KERNEL_glm53_moe_down_q4_k) || defined(KERNEL_glm53_moe_down_iq2_xxs) || \
+    defined(KERNEL_glm53_moe_down_q8_0)
 #if defined(KERNEL_glm53_moe_down_q4_k)
 #define MOE_TYPE GLM53_Q4_K
+#elif defined(KERNEL_glm53_moe_down_q8_0)
+#define MOE_TYPE GLM53_Q8_0
 #else
 #define MOE_TYPE GLM53_IQ2_XXS
 #endif

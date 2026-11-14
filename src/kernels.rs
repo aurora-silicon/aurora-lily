@@ -9,6 +9,7 @@ pub mod gdn;
 pub mod gemm;
 pub mod deepseek4;
 pub mod glm53;
+pub mod qwen36;
 pub mod hc;
 pub mod moe;
 pub mod norm;
