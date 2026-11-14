@@ -11,12 +11,24 @@ fn write_table(
     name: &str,
     tensors: &[(String, Vec<u64>, GgmlType)],
 ) -> std::path::PathBuf {
+    write_patched(name, tensors, &[])
+}
+
+/// [`write_table`] with I32 values written into the data: (tensor, element
+/// index, value); every other element reads 0.
+fn write_patched(
+    name: &str,
+    tensors: &[(String, Vec<u64>, GgmlType)],
+    patches: &[(&str, usize, i32)],
+) -> std::path::PathBuf {
     let mut f = Vec::from(&b"GGUF"[..]);
     f.extend(3u32.to_le_bytes());
     f.extend((tensors.len() as u64).to_le_bytes());
     f.extend(0u64.to_le_bytes());
     let mut offset = 0u64;
+    let mut offsets = std::collections::HashMap::new();
     for (n, dims, ty) in tensors {
+        offsets.insert(n.as_str(), offset);
         f.extend((n.len() as u64).to_le_bytes());
         f.extend(n.as_bytes());
         f.extend((dims.len() as u32).to_le_bytes());
@@ -38,6 +50,10 @@ fn write_table(
     use std::io::Write;
     (&file).write_all(&f).unwrap();
     file.set_len(data + offset).unwrap();
+    use std::os::unix::fs::FileExt;
+    for &(t, i, v) in patches {
+        file.write_all_at(&v.to_le_bytes(), data + offsets[t] + 4 * i as u64).unwrap();
+    }
     path
 }
 
@@ -49,7 +65,15 @@ fn table(c: &Config) -> Vec<(String, Vec<u64>, GgmlType)> {
 }
 
 fn check(name: &str, t: &[(String, Vec<u64>, GgmlType)]) -> Result<()> {
-    let path = write_table(name, t);
+    check_patched(name, t, &[])
+}
+
+fn check_patched(
+    name: &str,
+    t: &[(String, Vec<u64>, GgmlType)],
+    patches: &[(&str, usize, i32)],
+) -> Result<()> {
+    let path = write_patched(name, t, patches);
     let r = Gguf::open(&path).and_then(|g| validate(&g, &Config::deepseek4_flash()));
     std::fs::remove_file(&path).ok();
     r
@@ -103,6 +127,33 @@ fn wrong_tables_are_refused() {
     assert!(
         format!("{:#}", check("extra", &extra).unwrap_err()).contains("1329 tensors")
     );
+}
+
+/// A hash-routing expert id outside `0..256` is refused, on any token row.
+#[test]
+fn hash_ids_out_of_range_are_refused() {
+    let c = Config::deepseek4_flash();
+    let t = table(&c);
+    let table = "blk.1.ffn_gate_tid2eid.weight";
+    // Token 777's fourth expert (row-major [vocab][6]).
+    let at = 777 * c.n_expert_used + 3;
+    check_patched("hash-ok", &t, &[(table, at, 255)]).unwrap();
+    for bad in [-1, 256, i32::MAX] {
+        let e = check_patched("hash-bad", &t, &[(table, at, bad)]).unwrap_err();
+        let e = format!("{e:#}");
+        assert!(e.contains("token 777") && e.contains(&format!("expert {bad}")), "{e}");
+        // The CPU reference's reader refuses it too.
+        let path = write_patched("hash-ref", &t, &[(table, at, bad)]);
+        let g = Gguf::open(&path).unwrap();
+        let e = crate::deepseek4::reference::RefModel::hash_tables(&c, &g).unwrap_err();
+        assert!(format!("{e:#}").contains(&format!("expert id {bad}")), "{e:#}");
+        std::fs::remove_file(&path).ok();
+    }
+    let last = "blk.2.ffn_gate_tid2eid.weight";
+    let e =
+        check_patched("hash-last", &t, &[(last, c.vocab * c.n_expert_used - 1, 300)])
+            .unwrap_err();
+    assert!(format!("{e:#}").contains(&format!("token {}", c.vocab - 1)), "{e:#}");
 }
 
 /// The published support file's metadata.

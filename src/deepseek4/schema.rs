@@ -139,8 +139,9 @@ pub fn fused_groups(c: &Config) -> Vec<Vec<String>> {
 
 /// Checks every tensor the model reads: present, of the expected rank and
 /// dimensions, of a type its kernels decode, at an aligned offset; that the
-/// tensors of each fused group share a type; and that the file has no
-/// tensor the model would ignore (an unknown tensor means a different graph).
+/// tensors of each fused group share a type; that the file has no tensor
+/// the model would ignore (an unknown tensor means a different graph); and
+/// the hash layers' expert ids ([`validate_hash_tables`]).
 pub fn validate(g: &Gguf, c: &Config) -> Result<()> {
     let specs = expected(c);
     check_specs(g, &specs, &fused_groups(c))?;
@@ -150,6 +151,28 @@ pub fn validate(g: &Gguf, c: &Config) -> Result<()> {
         g.tensors.len(),
         specs.len()
     );
+    validate_hash_tables(g, c)
+}
+
+/// The hash layers route a token to the experts its table row names, and
+/// the kernels use those ids in weight addresses: every id must be in
+/// `0..n_expert`. Reads the tables (I32 `[vocab][n_expert_used]`, 9.3 MB).
+pub fn validate_hash_tables(g: &Gguf, c: &Config) -> Result<()> {
+    for il in 0..c.n_hash_layer {
+        let name = format!("blk.{il}.ffn_gate_tid2eid.weight");
+        let ids = g.read_rows_i32(g.require(&name)?, 0..c.vocab)?;
+        if let Some(i) = ids
+            .iter()
+            .position(|&e| usize::try_from(e).map_or(true, |e| e >= c.n_expert))
+        {
+            bail!(
+                "{name}: token {} names expert {}, outside 0..{}",
+                i / c.n_expert_used,
+                ids[i],
+                c.n_expert
+            );
+        }
+    }
     Ok(())
 }
 

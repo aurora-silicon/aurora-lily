@@ -15,7 +15,7 @@
 //! `output_hc_head_one`. ds4 rounds every cached row (raw window, compressed
 //! rows, indexer rows) to f16; the reference does too.
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Result, ensure};
 use rayon::prelude::*;
 
 use super::config::{Config, Rope};
@@ -773,7 +773,10 @@ impl<'s> RefModel<'s> {
                 let t = g.require(&format!("blk.{il}.ffn_gate_tid2eid.weight"))?;
                 g.read_rows_i32(t, 0..t.rows())?
                     .into_iter()
-                    .map(|v| usize::try_from(v).context("negative expert id"))
+                    .map(|v| match usize::try_from(v) {
+                        Ok(e) if e < cfg.n_expert => Ok(e),
+                        _ => anyhow::bail!("expert id {v} outside 0..{}", cfg.n_expert),
+                    })
                     .collect()
             })
             .collect()
