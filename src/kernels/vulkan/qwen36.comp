@@ -308,7 +308,11 @@ void main() {
     sum = 0.0;
     for (uint s = 0u; s < 8u; s++) sum += red[s];
     barrier();
-    float p = e < E ? ex / sum : -1.0;
+    // Probabilities are in [0, 1]; a non-finite row's (NaN) are -1, lanes
+    // past E -2 and taken experts -3, so every pick is an expert below E
+    // (K <= E), the lowest-numbered remaining one on a non-finite row.
+    float p = e < E ? ex / sum : -2.0;
+    if (isnan(p)) p = -1.0;
     for (uint r = 0u; r < K; r++) {
         // The largest p, ties to the lower index: max over (p, -index).
         float best = subgroupMax(p);
@@ -330,14 +334,16 @@ void main() {
             U32(arg(1)).v[row * K + r] = bi;
             chosen_p[r] = bp;
         }
-        if (e == bi) p = -1.0;
+        if (e == bi) p = -3.0;
         barrier();
     }
     if (e < K) {
+        // A non-finite row's experts get weight 0 (its output is the
+        // shared expert's, non-finite too).
         float total = 0.0;
-        for (uint r = 0u; r < K; r++) total += chosen_p[r];
+        for (uint r = 0u; r < K; r++) total += max(chosen_p[r], 0.0);
         total = max(total, 6.103515625e-5);
-        F32(arg(2)).v[row * K + e] = chosen_p[e] / total;
+        F32(arg(2)).v[row * K + e] = max(chosen_p[e], 0.0) / total;
     }
 }
 #endif

@@ -6,7 +6,6 @@ use anyhow::{Context, Result, ensure};
 
 use crate::gguf::{Gguf, Value};
 
-
 /// The GGUF architecture name.
 pub const ARCH: &str = "qwen35moe";
 
@@ -73,9 +72,12 @@ impl Config {
         ensure!(arch == Some(ARCH), "GGUF architecture {arch:?}, expected {ARCH:?}");
         let key = |k: &str| format!("{ARCH}.{k}");
         let int = |k: &str| -> Result<u64> {
-            get(k).with_context(|| format!("GGUF metadata {k} missing"))?.as_u64().with_context(
-                || format!("GGUF metadata {k} is not a non-negative integer"),
-            )
+            get(k)
+                .with_context(|| format!("GGUF metadata {k} missing"))?
+                .as_u64()
+                .with_context(|| {
+                    format!("GGUF metadata {k} is not a non-negative integer")
+                })
         };
         // Bounded to `max` before it sizes anything.
         let u = |k: &str, max: usize| -> Result<usize> {
@@ -110,7 +112,9 @@ impl Config {
                     })
                     .collect::<Result<Vec<_>>>()?
             }
-            Some(other) => anyhow::bail!("{ARCH}.attention.recurrent_layers is {other:?}"),
+            Some(other) => {
+                anyhow::bail!("{ARCH}.attention.recurrent_layers is {other:?}")
+            }
             // llama.cpp's default: every `full_attention_interval`-th layer
             // is full attention.
             None => {
@@ -127,18 +131,28 @@ impl Config {
         };
         // Semantics the graph does not implement.
         if let Some(v) = get(&key("rope.scaling.type")) {
-            ensure!(v.as_str() == Some("none"), "{ARCH}.rope.scaling.type {v:?} is not supported");
+            ensure!(
+                v.as_str() == Some("none"),
+                "{ARCH}.rope.scaling.type {v:?} is not supported"
+            );
         }
         for k in ["rope.scaling.factor", "attention.scale"] {
             if get(&key(k)).is_some() {
                 let v = f(k)?;
-                let neutral = if k == "attention.scale" { v == 0.0 } else { v == 1.0 || v == 0.0 };
+                let neutral = if k == "attention.scale" {
+                    v == 0.0
+                } else {
+                    v == 1.0 || v == 0.0
+                };
                 ensure!(neutral, "{ARCH}.{k} {v} is not supported");
             }
         }
         if get(&key("expert_weights_scale")).is_some() {
             let v = f("expert_weights_scale")?;
-            ensure!(v == 0.0 || v == 1.0, "{ARCH}.expert_weights_scale {v} is not supported");
+            ensure!(
+                v == 0.0 || v == 1.0,
+                "{ARCH}.expert_weights_scale {v} is not supported"
+            );
         }
         if get(&key("expert_gating_func")).is_some() {
             // LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX.
@@ -223,7 +237,8 @@ impl Config {
             ensure!(got == expected, "{name} is {got}, lily's kernels need {expected}");
         }
         ensure!(
-            (1..=MAX_LAYERS).contains(&self.n_layer) && self.recurrent.len() == self.n_layer,
+            (1..=MAX_LAYERS).contains(&self.n_layer)
+                && self.recurrent.len() == self.n_layer,
             "{} layers, {} recurrent_layers entries",
             self.n_layer,
             self.recurrent.len()
@@ -233,9 +248,15 @@ impl Config {
             "embedding_length {} (lily takes multiples of 256)",
             self.hidden
         );
-        ensure!((1..=MAX_VOCAB).contains(&self.vocab), "a vocabulary of {}", self.vocab);
         ensure!(
-            self.n_head > 0 && self.n_head_kv > 0 && self.n_head.is_multiple_of(self.n_head_kv),
+            (1..=MAX_VOCAB).contains(&self.vocab),
+            "a vocabulary of {}",
+            self.vocab
+        );
+        ensure!(
+            self.n_head > 0
+                && self.n_head_kv > 0
+                && self.n_head.is_multiple_of(self.n_head_kv),
             "{} query heads over {} KV heads",
             self.n_head,
             self.n_head_kv
@@ -247,7 +268,9 @@ impl Config {
             self.gdn_k_heads
         );
         ensure!(
-            self.rope_dim > 0 && self.rope_dim.is_multiple_of(2) && self.rope_dim <= self.head_dim,
+            self.rope_dim > 0
+                && self.rope_dim.is_multiple_of(2)
+                && self.rope_dim <= self.head_dim,
             "rotary dims {}",
             self.rope_dim
         );

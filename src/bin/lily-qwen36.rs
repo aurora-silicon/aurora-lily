@@ -193,6 +193,7 @@ fn nll(
     let (mut all_nll, mut all_n, mut all_hits) = (0f64, 0usize, 0usize);
     for f in files {
         let ids = read_ids(f)?;
+        lily::qwen36::model::check_tokens(&ids, vocab)?;
         let split = match split {
             Some(s) => s,
             None => {
@@ -412,6 +413,7 @@ fn spec(
         plain.push(a as u32);
     }
     let plain_dt = t0.elapsed().as_secs_f64();
+    let mut mismatches = 0;
     for run in 0..runs {
         st.reset();
         LanguageModel::prefill(
@@ -469,6 +471,11 @@ fn spec(
                 String::new()
             },
         );
+        mismatches += usize::from(same < n);
     }
+    anyhow::ensure!(
+        mismatches == 0,
+        "speculative decoding parted from plain greedy decoding in {mismatches} of {runs} runs"
+    );
     Ok(())
 }

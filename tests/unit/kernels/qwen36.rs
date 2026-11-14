@@ -330,6 +330,28 @@ fn router_matches_cpu() {
         assert_close(&wts[t * k..(t + 1) * k], &want, 1e-6, 1e-5);
     }
     assert_eq!(&sel[..2], &[3, 7]);
+
+    // A non-finite row (NaN logits) still selects experts below E, with
+    // zero weights; the rows beside it are unaffected.
+    let mut bad = logits.clone();
+    bad[e..2 * e].iter_mut().for_each(|l| *l = f32::NAN);
+    bad[2 * e + 5] = f32::INFINITY;
+    let lt = tensor(&ctx, &bad);
+    let sel2 = zeros(&ctx, m * k, DType::U32);
+    let wts2 = zeros(&ctx, m * k, DType::F32);
+    run(&ctx, |pass| router(&ctx, pass, &lt, &sel2, &wts2, m, e, k).unwrap());
+    let (sel2, wts2) = (sel2.to_u32().unwrap(), wts2.to_f32().unwrap());
+    for t in 1..3 {
+        let row = &sel2[t * k..(t + 1) * k];
+        assert!(row.iter().all(|&x| (x as usize) < e), "row {t}: {row:?}");
+        let mut uniq = row.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), k, "row {t}: {row:?}");
+        assert!(wts2[t * k..(t + 1) * k].iter().all(|&w| w == 0.0), "row {t}");
+    }
+    assert_eq!(&sel2[..k], &sel[..k]);
+    assert_eq!(&sel2[3 * k..], &sel[3 * k..]);
 }
 
 #[test]
@@ -405,8 +427,16 @@ fn moe_grouped_q4_k_q8_0_match_per_pair_kernels() {
     use crate::kernels::glm53::{MoeGroupScratch, moe_down, moe_gate_up, moe_grouped};
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(41);
-    let (experts, hidden, ff, used, m) = (12, 512, 512, 8, 70);
-    for ty in [GgmlType::Q4K, GgmlType::Q8_0] {
+    let (experts, hidden, ff, used) = (12, 512, 512, 8);
+    // 70 rows: 560 pairs, the 64-row tiles; 80 rows (640 pairs, past 48 an
+    // expert) with every row's slot 0 on expert 0: the 128-row tiles, one
+    // of them holding 80 pairs.
+    for (ty, m) in [
+        (GgmlType::Q4K, 70),
+        (GgmlType::Q8_0, 70),
+        (GgmlType::Q4K, 80),
+        (GgmlType::Q8_0, 80),
+    ] {
         let q = |rng: &mut StdRng, cols: usize, rows: usize| {
             let raw = random_blocks(rng, ty, cols * rows);
             QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
@@ -417,7 +447,13 @@ fn moe_grouped_q4_k_q8_0_match_per_pair_kernels() {
         let x = f32s(&mut rng, m * hidden, -2.0, 2.0);
         let sel: Vec<u32> = (0..m)
             .flat_map(|i| {
-                (0..used).map(move |s| ((i * (s + 1) + s * s) % experts) as u32)
+                (0..used).map(move |s| {
+                    if m == 80 && s == 0 {
+                        0
+                    } else {
+                        ((i * (s + 1) + s * s) % experts) as u32
+                    }
+                })
             })
             .collect();
         let wts = f32s(&mut rng, m * used, 0.1, 0.6);

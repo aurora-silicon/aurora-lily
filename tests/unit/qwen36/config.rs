@@ -73,8 +73,9 @@ fn the_published_header_parses() {
     let want = Config::qwen36_35b_a3b();
     assert_eq!(format!("{c:?}"), format!("{want:?}"));
     // Without the layer list, the interval gives the same layers.
-    let c = Config::from_metadata(&without("qwen35moe.attention.recurrent_layers"), VOCAB)
-        .unwrap();
+    let c =
+        Config::from_metadata(&without("qwen35moe.attention.recurrent_layers"), VOCAB)
+            .unwrap();
     assert_eq!(c.recurrent, want.recurrent);
     // The MTP file's list has one more (non-recurrent) entry: taken.
     let mut l: Vec<Value> = (0..40).map(|il| Value::Bool(il % 4 != 3)).collect();
