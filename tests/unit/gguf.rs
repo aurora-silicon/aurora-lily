@@ -164,6 +164,43 @@ fn open_reads_header_and_tensor_table() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// An I32 table (DeepSeek V4's hash routing) reads back as integers, and
+/// as exact f32 through the generic decoder; other types are refused.
+#[test]
+fn i32_tables_read_back() {
+    let mut f = Vec::new();
+    f.extend(b"GGUF");
+    f.extend(3u32.to_le_bytes());
+    f.extend(1u64.to_le_bytes()); // tensors
+    f.extend(0u64.to_le_bytes()); // metadata
+    f.extend(7u64.to_le_bytes());
+    f.extend(b"t.table");
+    f.extend(2u32.to_le_bytes());
+    f.extend(3u64.to_le_bytes());
+    f.extend(2u64.to_le_bytes());
+    f.extend(26u32.to_le_bytes()); // I32
+    f.extend(0u64.to_le_bytes());
+    while !f.len().is_multiple_of(32) {
+        f.push(0);
+    }
+    let vals = [5i32, 255, 0, -1, 17, 128];
+    for v in vals {
+        f.extend(v.to_le_bytes());
+    }
+    let dir =
+        std::env::temp_dir().join(format!("lily-gguf-i32-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.gguf");
+    std::fs::write(&path, &f).unwrap();
+    let g = Gguf::open(&path).unwrap();
+    let t = g.require("t.table").unwrap();
+    assert_eq!((t.ty, t.row_len(), t.rows(), t.bytes), (GgmlType::I32, 3, 2, 24));
+    assert_eq!(g.read_rows_i32(t, 1..2).unwrap(), [-1, 17, 128]);
+    assert_eq!(g.read_rows_f32(t, 0..2).unwrap(), vals.map(|v| v as f32));
+    assert!(g.read_rows_i32(t, 1..3).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Bytes of a GGUF v3 file: header counts, then `body` (metadata and the
 /// tensor table), padded with zeros to `len`.
 fn gguf_bytes(n_tensors: u64, n_kv: u64, body: &[u8], len: usize) -> Vec<u8> {

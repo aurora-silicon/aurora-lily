@@ -88,6 +88,8 @@ pub mod ablate {
         mask & (1 << group as u32) != 0
     }
 }
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod deepseek4;
 pub mod gguf;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod glm53;
@@ -99,6 +101,7 @@ pub mod npy;
 pub mod priority;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod qwen4exp;
+pub mod refops;
 pub mod safetensors;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod serve;

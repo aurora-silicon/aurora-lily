@@ -17,6 +17,19 @@ const SOURCE: &str = "";
 /// Rows of activations a GEMV takes at once.
 pub const GEMV_MAX_ROWS: usize = 4;
 
+/// Rows a Q8_0 or F16 GEMV takes at once (DeepSeek V4's verify passes and
+/// draft blocks); other types take [`GEMV_MAX_ROWS`].
+pub const GEMV_MAX_ROWS_WIDE: usize = 8;
+
+/// Rows a GEMV over weights of `ty` takes at once.
+pub fn gemv_max_rows(ty: GgmlType) -> usize {
+    if matches!(ty, GgmlType::Q8_0 | GgmlType::F16) {
+        GEMV_MAX_ROWS_WIDE
+    } else {
+        GEMV_MAX_ROWS
+    }
+}
+
 /// A GGUF weight on the GPU: `rows` rows of `cols` values of `ty`, read in
 /// place (`t` is a byte view, I8, over the mapped file or a test upload).
 #[derive(Clone)]
@@ -69,14 +82,34 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
             ]
         };
     }
-    const NAMES: [[&str; GEMV_MAX_ROWS]; 6] = [
+    const NAMES: [[&str; GEMV_MAX_ROWS]; 7] = [
         rows!("q8_0"),
         rows!("q4_k"),
         rows!("q2_k"),
         rows!("iq2_xxs"),
         rows!("bf16"),
         rows!("f32"),
+        rows!("f16"),
     ];
+    if m > GEMV_MAX_ROWS {
+        const WIDE: [[&str; 4]; 2] = [
+            [
+                "glm53_gemv_q8_0_m5",
+                "glm53_gemv_q8_0_m6",
+                "glm53_gemv_q8_0_m7",
+                "glm53_gemv_q8_0_m8",
+            ],
+            [
+                "glm53_gemv_f16_m5",
+                "glm53_gemv_f16_m6",
+                "glm53_gemv_f16_m7",
+                "glm53_gemv_f16_m8",
+            ],
+        ];
+        ensure!(m <= gemv_max_rows(ty), "GEMV of {m} rows over {ty:?}");
+        let t = usize::from(ty == GgmlType::F16);
+        return Ok(WIDE[t][m - GEMV_MAX_ROWS - 1]);
+    }
     ensure!((1..=GEMV_MAX_ROWS).contains(&m), "GEMV of {m} rows");
     let t = match ty {
         GgmlType::Q8_0 => 0,
@@ -85,7 +118,8 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
         GgmlType::Iq2Xxs => 3,
         GgmlType::Bf16 => 4,
         GgmlType::F32 => 5,
-        GgmlType::F16 => anyhow::bail!("no GLM GEMV over F16"),
+        GgmlType::F16 => 6,
+        GgmlType::I32 => anyhow::bail!("no GEMV over {ty:?}"),
     };
     Ok(NAMES[t][m - 1])
 }
@@ -179,8 +213,8 @@ fn gemv_dispatch(
     l: GemvLayout,
 ) -> Result<()> {
     ensure!((1..=4).contains(&sets.len()), "GEMV of {} sets", sets.len());
-    ensure!((1..=GEMV_MAX_ROWS).contains(&m), "GEMV of {m} rows");
     let w0 = sets[0].0;
+    ensure!((1..=gemv_max_rows(w0.ty)).contains(&m), "GEMV of {m} rows");
     check_f32(&[x])?;
     let tasks = w0.cols / 32;
     ensure!(
@@ -258,6 +292,7 @@ fn gemm_name(ty: GgmlType) -> Result<&'static str> {
         GgmlType::Q4K => "glm53_gemm_q4_k",
         GgmlType::Bf16 => "glm53_gemm_bf16",
         GgmlType::F32 => "glm53_gemm_f32",
+        GgmlType::F16 => "glm53_gemm_f16",
         other => anyhow::bail!("no GLM GEMM over {other:?}"),
     })
 }
@@ -578,8 +613,14 @@ fn moe_grouped_with(
                 },
             )
         };
-    ensure!(used.is_power_of_two(), "experts used {used}");
-    let shift = used.trailing_zeros() as usize;
+    ensure!((1..1 << 31).contains(&used), "experts used {used}");
+    // The pair's row: a shift for a power of two, else a division (the
+    // kernels' x_shift with bit 31 set).
+    let shift = if used.is_power_of_two() {
+        used.trailing_zeros() as usize
+    } else {
+        0x8000_0000 | used
+    };
     if gate.ty == GgmlType::Iq2Xxs && fuse_gate_up {
         // Gate, up and the SwiGLU in one GEMM: a tile is 32 columns of
         // each, written as the down GEMM's bfloat operand.
@@ -904,13 +945,20 @@ pub fn hc_post_mix(
 ) -> Result<()> {
     check_f32(&[streams, partial])?;
     ensure!(
-        fn_w.ty == GgmlType::Bf16 && fn_w.rows == 24 && fn_w.cols == 4 * hidden,
+        matches!(fn_w.ty, GgmlType::Bf16 | GgmlType::F16)
+            && fn_w.rows == 24
+            && fn_w.cols == 4 * hidden,
         "HC fn shape"
     );
     ensure!(hidden.is_multiple_of(64), "hidden {hidden}");
     ensure!(partial.numel() >= m * hc_mix_groups(hidden) * 25, "partials");
     let (block, split) = post.unwrap_or((streams, streams));
-    let pipeline = ctx.pipeline("glm53_hc_post_mix", SOURCE, MslVersion::V3_1)?;
+    let name = if fn_w.ty == GgmlType::F16 {
+        "glm53_hc_post_mix_f16"
+    } else {
+        "glm53_hc_post_mix"
+    };
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[

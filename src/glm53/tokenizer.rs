@@ -30,13 +30,27 @@ fn strings(g: &Gguf, key: &str) -> Result<Vec<String>> {
 
 /// The `tokenizer.json` of the file's vocabulary.
 pub fn tokenizer_json(g: &Gguf) -> Result<String> {
+    let vocab = g.u64(&format!("{}.vocab_size", super::config::ARCH))? as usize;
+    bpe_json(g, "glm4", &[GLM4_SPLIT], vocab)
+}
+
+/// A byte-level BPE `tokenizer.json` from a GGUF's `tokenizer.ggml.*`
+/// (`pre` the expected pre-tokenizer name, its rule the `splits` regexes
+/// applied in order, each isolating its matches), control tokens special
+/// and user-defined ones added but not special. GLM's and DeepSeek's.
+pub(crate) fn bpe_json(
+    g: &Gguf,
+    pre: &str,
+    splits: &[&str],
+    vocab: usize,
+) -> Result<String> {
     ensure!(
         g.str("tokenizer.ggml.model")? == "gpt2",
-        "GLM tokenizer model is not gpt2 BPE"
+        "tokenizer model is not gpt2 BPE"
     );
-    ensure!(g.str("tokenizer.ggml.pre")? == "glm4", "GLM pre-tokenizer is not glm4");
+    let got = g.str("tokenizer.ggml.pre")?;
+    ensure!(got == pre, "pre-tokenizer is {got}, expected {pre}");
     let tokens = strings(g, "tokenizer.ggml.tokens")?;
-    let vocab = g.u64(&format!("{}.vocab_size", super::config::ARCH))? as usize;
     ensure!(
         tokens.len() == vocab,
         "the tokenizer has {} tokens, the model's vocabulary {vocab}",
@@ -64,19 +78,22 @@ pub fn tokenizer_json(g: &Gguf) -> Result<String> {
             }));
         }
     }
+    let mut pretokenizers: Vec<Value> = splits
+        .iter()
+        .map(|r| {
+            json!({"type": "Split", "pattern": {"Regex": r}, "behavior": "Isolated", "invert": false})
+        })
+        .collect();
+    pretokenizers.push(json!({
+        "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false
+    }));
     let doc = json!({
         "version": "1.0",
         "truncation": null,
         "padding": null,
         "added_tokens": added,
         "normalizer": null,
-        "pre_tokenizer": {
-            "type": "Sequence",
-            "pretokenizers": [
-                {"type": "Split", "pattern": {"Regex": GLM4_SPLIT}, "behavior": "Isolated", "invert": false},
-                {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false},
-            ],
-        },
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": pretokenizers},
         "post_processor": null,
         "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true},
         "model": {

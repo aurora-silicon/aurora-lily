@@ -16,7 +16,7 @@
 //! value is kept as a string or parsed as JSON (numbers, booleans, objects,
 //! arrays), the way the reference parser in Qwen's own server does.
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use serde_json::{Map, Value};
 
 /// One function the request offered, reduced to what parsing needs.
@@ -88,6 +88,32 @@ pub enum ToolGrammar {
     /// GLM's `name<arg_key>k</arg_key><arg_value>v</arg_value>...`
     /// ([`parse_glm_tool_call`]).
     Glm,
+    /// DeepSeek V4's DSML: a `<｜DSML｜tool_calls>` block of `invoke`s
+    /// ([`parse_dsml_tool_calls`]).
+    Dsml,
+}
+
+impl ToolGrammar {
+    /// The text that opens and closes a tool-call block.
+    pub fn markers(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Qwen | Self::Glm => ("<tool_call>", "</tool_call>"),
+            Self::Dsml => ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"),
+        }
+    }
+}
+
+/// Parses a tool-call block in `grammar` into its calls (one, except
+/// DSML's).
+pub fn parse_tool_calls_as(
+    grammar: ToolGrammar,
+    block: &str,
+    tools: &[ToolSchema],
+) -> Result<Vec<ParsedToolCall>> {
+    match grammar {
+        ToolGrammar::Dsml => parse_dsml_tool_calls(block, tools),
+        _ => Ok(vec![parse_tool_call_as(grammar, block, tools)?]),
+    }
 }
 
 /// Parses a tool-call block in `grammar`.
@@ -99,6 +125,15 @@ pub fn parse_tool_call_as(
     match grammar {
         ToolGrammar::Qwen => parse_tool_call(block, tools),
         ToolGrammar::Glm => parse_glm_tool_call(block, tools),
+        ToolGrammar::Dsml => {
+            let mut calls = parse_dsml_tool_calls(block, tools)?;
+            ensure!(
+                calls.len() == 1,
+                "{} DSML calls where one was expected",
+                calls.len()
+            );
+            Ok(calls.remove(0))
+        }
     }
 }
 
@@ -191,6 +226,62 @@ pub fn parse_glm_tool_call(
         name: name.to_string(),
         arguments: serde_json::to_string(&Value::Object(arguments))?,
     })
+}
+
+/// Parses the inside of a DSML `tool_calls` block (DeepSeek V4's chat
+/// template writes it): `<｜DSML｜invoke name="f">` elements, each of
+/// `<｜DSML｜parameter name="k" string="true|false">v</｜DSML｜parameter>`
+/// (a JSON value unless `string="true"`), separated by newlines.
+pub fn parse_dsml_tool_calls(
+    block: &str,
+    tools: &[ToolSchema],
+) -> Result<Vec<ParsedToolCall>> {
+    const INVOKE: &str = "<｜DSML｜invoke name=\"";
+    const INVOKE_END: &str = "</｜DSML｜invoke>";
+    const PARAM: &str = "<｜DSML｜parameter name=\"";
+    const PARAM_END: &str = "</｜DSML｜parameter>";
+    let mut calls = Vec::new();
+    let mut cursor = block.trim();
+    while !cursor.is_empty() {
+        let rest =
+            cursor.strip_prefix(INVOKE).context("DSML block without an invoke")?;
+        let (name, rest) =
+            rest.split_once("\">").context("unterminated invoke name")?;
+        let (body, rest) =
+            rest.split_once(INVOKE_END).context("unterminated invoke")?;
+        let schema = tools.iter().find(|t| t.name == name);
+        let mut arguments = Map::new();
+        let mut params = body.trim();
+        while !params.is_empty() {
+            let p = params.strip_prefix(PARAM).context("malformed DSML parameter")?;
+            let (key, p) = p.split_once('"').context("unterminated parameter name")?;
+            let p = p.trim_start();
+            let (is_string, p) = if let Some(p) = p.strip_prefix("string=\"true\">") {
+                (true, p)
+            } else if let Some(p) = p.strip_prefix("string=\"false\">") {
+                (false, p)
+            } else {
+                bail!("DSML parameter without string=\"true|false\"");
+            };
+            let (value, p) =
+                p.split_once(PARAM_END).context("unterminated DSML parameter")?;
+            let typed = if is_string || schema.is_some_and(|s| s.param_is_string(key)) {
+                Value::String(value.to_string())
+            } else {
+                serde_json::from_str(value)
+                    .unwrap_or_else(|_| Value::String(value.to_string()))
+            };
+            arguments.insert(key.to_string(), typed);
+            params = p.trim_start();
+        }
+        calls.push(ParsedToolCall {
+            name: name.to_string(),
+            arguments: serde_json::to_string(&Value::Object(arguments))?,
+        });
+        cursor = rest.trim_start();
+    }
+    ensure!(!calls.is_empty(), "empty DSML tool-call block");
+    Ok(calls)
 }
 
 /// Parses OpenAI-style `tool_calls` on an incoming assistant message into

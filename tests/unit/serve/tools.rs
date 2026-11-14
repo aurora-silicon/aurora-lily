@@ -227,3 +227,20 @@ fn the_qwen_grammar_is_main_s_parser() {
     assert_eq!(a, b);
     assert_eq!(ToolGrammar::default(), ToolGrammar::Qwen);
 }
+
+#[test]
+fn dsml_calls_parse_and_malformed_blocks_are_errors() {
+    let block = "\n<｜DSML｜invoke name=\"read\">\n<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/a b</｜DSML｜parameter>\n<｜DSML｜parameter name=\"lines\" string=\"false\">[1, 2]</｜DSML｜parameter>\n</｜DSML｜invoke>\n";
+    let calls = parse_dsml_tool_calls(block, &[]).unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "read");
+    assert_eq!(calls[0].arguments, r#"{"path":"/tmp/a b","lines":[1,2]}"#);
+    for bad in [
+        "",
+        "<｜DSML｜invoke name=\"f\">",
+        "<｜DSML｜invoke name=\"f\"><｜DSML｜parameter name=\"x\">1</｜DSML｜parameter></｜DSML｜invoke>",
+        "text <｜DSML｜invoke name=\"f\"></｜DSML｜invoke>",
+    ] {
+        assert!(parse_dsml_tool_calls(bad, &[]).is_err(), "{bad:?}");
+    }
+}

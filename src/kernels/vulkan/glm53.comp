@@ -42,7 +42,9 @@ float glm53_group_sum(float v, uint width) {
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_glm53_gemv_q8_0_m1) || \
     defined(KERNEL_glm53_gemv_q8_0_m2) || \
-    defined(KERNEL_glm53_gemv_q8_0_m3) || defined(KERNEL_glm53_gemv_q8_0_m4)
+    defined(KERNEL_glm53_gemv_q8_0_m3) || defined(KERNEL_glm53_gemv_q8_0_m4) || \
+    defined(KERNEL_glm53_gemv_q8_0_m5) || defined(KERNEL_glm53_gemv_q8_0_m6) || \
+    defined(KERNEL_glm53_gemv_q8_0_m7) || defined(KERNEL_glm53_gemv_q8_0_m8)
 #define GEMV_TYPE GLM53_Q8_0
 #define GEMV_Q8_0 1
 #elif defined(KERNEL_glm53_gemv_q4_k_m1) || \
@@ -66,32 +68,56 @@ float glm53_group_sum(float v, uint width) {
     defined(KERNEL_glm53_gemv_f32_m2) || defined(KERNEL_glm53_gemv_f32_m3) || \
     defined(KERNEL_glm53_gemv_f32_m4)
 #define GEMV_TYPE GLM53_F32
+#elif defined(KERNEL_glm53_gemv_f16_m1) || \
+    defined(KERNEL_glm53_gemv_f16_m2) || defined(KERNEL_glm53_gemv_f16_m3) || \
+    defined(KERNEL_glm53_gemv_f16_m4) || defined(KERNEL_glm53_gemv_f16_m5) || \
+    defined(KERNEL_glm53_gemv_f16_m6) || defined(KERNEL_glm53_gemv_f16_m7) || \
+    defined(KERNEL_glm53_gemv_f16_m8)
+#define GEMV_TYPE GLM53_F16
 #endif
 #ifdef GEMV_TYPE
 #if defined(KERNEL_glm53_gemv_q8_0_m1) || \
     defined(KERNEL_glm53_gemv_q4_k_m1) || \
     defined(KERNEL_glm53_gemv_q2_k_m1) || \
     defined(KERNEL_glm53_gemv_iq2_xxs_m1) || \
-    defined(KERNEL_glm53_gemv_bf16_m1) || defined(KERNEL_glm53_gemv_f32_m1)
+    defined(KERNEL_glm53_gemv_bf16_m1) || defined(KERNEL_glm53_gemv_f32_m1) || \
+    defined(KERNEL_glm53_gemv_f16_m1)
 #define GEMV_M 1u
 #elif defined(KERNEL_glm53_gemv_q8_0_m2) || \
     defined(KERNEL_glm53_gemv_q4_k_m2) || \
     defined(KERNEL_glm53_gemv_q2_k_m2) || \
     defined(KERNEL_glm53_gemv_iq2_xxs_m2) || \
-    defined(KERNEL_glm53_gemv_bf16_m2) || defined(KERNEL_glm53_gemv_f32_m2)
+    defined(KERNEL_glm53_gemv_bf16_m2) || defined(KERNEL_glm53_gemv_f32_m2) || \
+    defined(KERNEL_glm53_gemv_f16_m2)
 #define GEMV_M 2u
 #elif defined(KERNEL_glm53_gemv_q8_0_m3) || \
     defined(KERNEL_glm53_gemv_q4_k_m3) || \
     defined(KERNEL_glm53_gemv_q2_k_m3) || \
     defined(KERNEL_glm53_gemv_iq2_xxs_m3) || \
-    defined(KERNEL_glm53_gemv_bf16_m3) || defined(KERNEL_glm53_gemv_f32_m3)
+    defined(KERNEL_glm53_gemv_bf16_m3) || defined(KERNEL_glm53_gemv_f32_m3) || \
+    defined(KERNEL_glm53_gemv_f16_m3)
 #define GEMV_M 3u
 #elif defined(KERNEL_glm53_gemv_q8_0_m4) || \
     defined(KERNEL_glm53_gemv_q4_k_m4) || \
     defined(KERNEL_glm53_gemv_q2_k_m4) || \
     defined(KERNEL_glm53_gemv_iq2_xxs_m4) || \
-    defined(KERNEL_glm53_gemv_bf16_m4) || defined(KERNEL_glm53_gemv_f32_m4)
+    defined(KERNEL_glm53_gemv_bf16_m4) || defined(KERNEL_glm53_gemv_f32_m4) || \
+    defined(KERNEL_glm53_gemv_f16_m4)
 #define GEMV_M 4u
+// Five to eight rows (DeepSeek V4's verify passes and draft blocks): Q8_0
+// and F16 only; the rows past four take accumulators acc4 .. acc7.
+#elif defined(KERNEL_glm53_gemv_q8_0_m5) || defined(KERNEL_glm53_gemv_f16_m5)
+#define GEMV_M 5u
+#define GEMV_WIDE 1
+#elif defined(KERNEL_glm53_gemv_q8_0_m6) || defined(KERNEL_glm53_gemv_f16_m6)
+#define GEMV_M 6u
+#define GEMV_WIDE 1
+#elif defined(KERNEL_glm53_gemv_q8_0_m7) || defined(KERNEL_glm53_gemv_f16_m7)
+#define GEMV_M 7u
+#define GEMV_WIDE 1
+#elif defined(KERNEL_glm53_gemv_q8_0_m8) || defined(KERNEL_glm53_gemv_f16_m8)
+#define GEMV_M 8u
+#define GEMV_WIDE 1
 #endif
 void main() {
     const uint64_t X = arg(0);
@@ -130,6 +156,9 @@ void main() {
     const uint64_t row = W + uint64_t(min(n, N - 1u)) * row_bytes;
     const uint g = min(n, N - 1u) / x_group;
     float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+#ifdef GEMV_WIDE
+    float acc4 = 0.0, acc5 = 0.0, acc6 = 0.0, acc7 = 0.0;
+#endif
 #ifdef GEMV_Q8_0
     // Q8_0: the block scale multiplies each row's sum of the task, not
     // every weight; at two rows this kernel is bound by its ALU work (kda_out
@@ -149,6 +178,12 @@ void main() {
         if (m > 1u) acc1 += d * glm53_task_dot(w, xt + 4u * uint64_t(x_row_stride));
         if (m > 2u) acc2 += d * glm53_task_dot(w, xt + 8u * uint64_t(x_row_stride));
         if (m > 3u) acc3 += d * glm53_task_dot(w, xt + 12u * uint64_t(x_row_stride));
+#ifdef GEMV_WIDE
+        if (m > 4u) acc4 += d * glm53_task_dot(w, xt + 16u * uint64_t(x_row_stride));
+        if (m > 5u) acc5 += d * glm53_task_dot(w, xt + 20u * uint64_t(x_row_stride));
+        if (m > 6u) acc6 += d * glm53_task_dot(w, xt + 24u * uint64_t(x_row_stride));
+        if (m > 7u) acc7 += d * glm53_task_dot(w, xt + 28u * uint64_t(x_row_stride));
+#endif
     }
 #else
     for (uint t = sub; t < tasks; t += width) {
@@ -159,17 +194,35 @@ void main() {
         if (m > 1u) acc1 += glm53_task_dot(w, xt + 4u * uint64_t(x_row_stride));
         if (m > 2u) acc2 += glm53_task_dot(w, xt + 8u * uint64_t(x_row_stride));
         if (m > 3u) acc3 += glm53_task_dot(w, xt + 12u * uint64_t(x_row_stride));
+#ifdef GEMV_WIDE
+        if (m > 4u) acc4 += glm53_task_dot(w, xt + 16u * uint64_t(x_row_stride));
+        if (m > 5u) acc5 += glm53_task_dot(w, xt + 20u * uint64_t(x_row_stride));
+        if (m > 6u) acc6 += glm53_task_dot(w, xt + 24u * uint64_t(x_row_stride));
+        if (m > 7u) acc7 += glm53_task_dot(w, xt + 28u * uint64_t(x_row_stride));
+#endif
     }
 #endif
     acc0 = glm53_group_sum(acc0, width);
     if (m > 1u) acc1 = glm53_group_sum(acc1, width);
     if (m > 2u) acc2 = glm53_group_sum(acc2, width);
     if (m > 3u) acc3 = glm53_group_sum(acc3, width);
+#ifdef GEMV_WIDE
+    if (m > 4u) acc4 = glm53_group_sum(acc4, width);
+    if (m > 5u) acc5 = glm53_group_sum(acc5, width);
+    if (m > 6u) acc6 = glm53_group_sum(acc6, width);
+    if (m > 7u) acc7 = glm53_group_sum(acc7, width);
+#endif
     if (live && sub == 0u) {
         F32(Y).v[n] = acc0;
         if (m > 1u) F32(Y).v[y_row_stride + n] = acc1;
         if (m > 2u) F32(Y).v[2u * y_row_stride + n] = acc2;
         if (m > 3u) F32(Y).v[3u * y_row_stride + n] = acc3;
+#ifdef GEMV_WIDE
+        if (m > 4u) F32(Y).v[4u * y_row_stride + n] = acc4;
+        if (m > 5u) F32(Y).v[5u * y_row_stride + n] = acc5;
+        if (m > 6u) F32(Y).v[6u * y_row_stride + n] = acc6;
+        if (m > 7u) F32(Y).v[7u * y_row_stride + n] = acc7;
+#endif
     }
 }
 #endif
@@ -1890,9 +1943,10 @@ void main() {
 // use, so a row at a time waited for memory 24 times (29 us a call; 2026-11-14).
 // Grid (hidden / 64, m), 32 threads. Buffers: 0 H [m][4][hidden], 1 block
 // [m][hidden], 2 split [m][24], 3 fn bf16, 4 partial [m][groups][25].
-// Params: 5 hidden, 6 has_post.
+// Params: 5 hidden, 6 has_post. glm53_hc_post_mix_f16 reads fn as f16
+// (DeepSeek V4's HC controls).
 // ---------------------------------------------------------------------------
-#ifdef KERNEL_glm53_hc_post_mix
+#if defined(KERNEL_glm53_hc_post_mix) || defined(KERNEL_glm53_hc_post_mix_f16)
 void main() {
     const uint hidden = arg_u32(5);
     const bool has_post = arg_u32(6) != 0u;
@@ -1931,8 +1985,14 @@ void main() {
     float mine = subgroupAdd(ss);
     [[unroll]] for (uint r = 0u; r < 24u; r++) {
         float acc = 0.0;
-        [[unroll]] for (uint s = 0u; s < 4u; s++)
+        [[unroll]] for (uint s = 0u; s < 4u; s++) {
+#ifdef KERNEL_glm53_hc_post_mix_f16
+            const vec2 wf = unpackHalf2x16(w[r][s]);
+            acc += wf.x * h[s].x + wf.y * h[s].y;
+#else
             acc += uintBitsToFloat(w[r][s] << 16u) * h[s].x + uintBitsToFloat(w[r][s] & 0xffff0000u) * h[s].y;
+#endif
+        }
         acc = subgroupAdd(acc);
         mine = lane == r ? acc : mine;
     }

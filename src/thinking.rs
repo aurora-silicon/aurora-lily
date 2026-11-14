@@ -223,8 +223,12 @@ impl Placed {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThinkingTokens {
     pub think_end: u32,
-    pub tool_call: u32,
-    pub tool_call_end: u32,
+    /// `<tool_call>` and `</tool_call>` when the vocabulary has them as
+    /// single tokens; without them (DeepSeek V4, whose DSML block opens with
+    /// a plain `<`) a tool call cannot end thinking, and the budget, the
+    /// nudges and the replaced end of turn work as everywhere.
+    pub tool_call: Option<u32>,
+    pub tool_call_end: Option<u32>,
     /// `</think>\n\n`: what a tool call that ends thinking gets in front.
     close_tag: Vec<u32>,
     /// The budget's close variants: preface, line end, `</think>\n\n`.
@@ -236,6 +240,11 @@ pub struct ThinkingTokens {
 }
 
 impl ThinkingTokens {
+    /// Whether a tool call can end thinking (the vocabulary has the tags).
+    pub fn tool_calls(&self) -> bool {
+        self.tool_call.is_some()
+    }
+
     /// The sequences for `texts`, with `encode` the tokenizer's plain
     /// encoding (it matches `</think>` as its token) and `is_added` whether
     /// an id is one of the vocabulary's added tokens (special or not). Each
@@ -246,8 +255,8 @@ impl ThinkingTokens {
     /// close the block, open a call or end the turn behind the loops' back.
     pub fn new(
         think_end: u32,
-        tool_call: u32,
-        tool_call_end: u32,
+        tool_call: Option<u32>,
+        tool_call_end: Option<u32>,
         texts: &ThinkingTexts,
         encode: impl Fn(&str) -> Result<Vec<u32>>,
         is_added: impl Fn(u32) -> bool,
@@ -257,7 +266,8 @@ impl ThinkingTokens {
         let mut close_tag = vec![think_end];
         close_tag.extend_from_slice(&paragraph);
         let close_text = "</think>\n\n";
-        let markers = [think_end, tool_call, tool_call_end];
+        let markers: Vec<u32> =
+            std::iter::once(think_end).chain(tool_call).chain(tool_call_end).collect();
         // `text` on a line of its own after each kind of seam, then `end`
         // and `tail` (ids and text); an empty text is just a line end where
         // one is needed.
@@ -489,7 +499,9 @@ impl ThinkingControl {
     /// Whether a `<tool_call>` emitted next would end the block: the rule
     /// is on and a call may start here ([`ReasoningScan::call_may_start`]).
     fn tool_call_would_close(&self) -> bool {
-        self.settings.tool_call_ends_thinking && self.scan.call_may_start()
+        self.tokens.tool_call.is_some()
+            && self.settings.tool_call_ends_thinking
+            && self.scan.call_may_start()
     }
 
     /// Where an insertion lands if it lands now, or `None` mid-line right
@@ -523,7 +535,7 @@ impl ThinkingControl {
             self.open = false;
             return Action::Keep;
         }
-        if token == tokens.tool_call && self.tool_call_would_close() {
+        if Some(token) == tokens.tool_call && self.tool_call_would_close() {
             self.open = false;
             self.closed =
                 Some(Closed { by: ClosedBy::ToolCall, thinking_tokens: self.counted });
@@ -844,9 +856,10 @@ impl ReasoningScan {
 }
 
 /// Whether a prompt's text ends inside a freshly opened reasoning block,
-/// the generation prompt the template writes with thinking on.
+/// the generation prompt the template writes with thinking on: `<think>\n`
+/// (Qwen, GLM) or `<think>` (DeepSeek V4).
 pub fn opens_thinking(prompt_tail: &str) -> bool {
-    prompt_tail.ends_with("<think>\n")
+    prompt_tail.ends_with("<think>\n") || prompt_tail.ends_with("<think>")
 }
 
 #[cfg(test)]

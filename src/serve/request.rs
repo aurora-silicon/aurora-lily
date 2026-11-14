@@ -886,7 +886,10 @@ impl<M: LanguageModel> Engine<M> {
                 tools: p.tools.clone(),
                 stop_strings: p.stop_strings.clone(),
                 raw: p.kind == Kind::Completion,
-                tool_call_ends_thinking: p.thinking.tool_call_ends_thinking,
+                // Only where a tool call can end thinking: the control and the
+                // parser agree.
+                tool_call_ends_thinking: p.thinking.tool_call_ends_thinking
+                    && self.thinking_tokens.as_ref().is_none_or(|t| t.tool_calls()),
             },
         )
         .with_tool_grammar(tokenizer.tool_grammar());
@@ -907,7 +910,7 @@ impl<M: LanguageModel> Engine<M> {
             None => {
                 if p.thinking.any() {
                     eprintln!(
-                        "thinking controls: requested, but the vocabulary lacks </think> or the tool call tags; ignored"
+                        "thinking controls: requested, but the vocabulary lacks </think>; ignored"
                     );
                 }
                 None

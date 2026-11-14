@@ -5,7 +5,8 @@ lily-qwen3.8-flash-next, a modified version of lily
 Copyright 2026 Fabio Greter
 
 lily on Linux, a modified version of lily-qwen3.8-flash-next: the Vulkan
-backend and its GLSL kernels, and GLM 5.3 Flash support
+backend and its GLSL kernels, GLM 5.3 Flash support and DeepSeek V4 Flash
+support
 Copyright 2026 Erik Bourget
 The files changed, and how, are recorded in this repository's git history.
 
@@ -107,6 +108,53 @@ https://github.com/antirez/ds4
 
   tools/reference/glm53/gguf_dequant_golden.c computes its golden values
   with ds4's formulas and quantizer (gguf-tools/quants.c).
+
+  lily serves DeepSeek V4 Flash from ds4's published GGUF and its DSpark
+  support file, and follows ds4's implementation of the model (ds4.c):
+  the shape checks (src/deepseek4/config.rs: DS4_SHAPE_FLASH,
+  config_validate_deepseek4_model, validate_compress_ratio_metadata,
+  validate_swiglu_clamp_metadata), the tensor schema
+  (src/deepseek4/schema.rs: weights_bind_layer, weights_validate_layout),
+  the graph and its CPU reference (src/deepseek4/model.rs, reference.rs:
+  layer_forward_raw_swa_one, layer_attention_mixed_one,
+  layer_grouped_out_one, output_hc_head_one), the tokenizer's split rules
+  and stop tokens (src/deepseek4/tokenizer.rs: bpe_tokenize_text,
+  vocab_load), and the DSpark drafter and its draft scheduler
+  (src/deepseek4/dspark.rs, engine.rs: metal_graph_eval_dspark_stage_block,
+  metal_graph_seed_dspark_stage_target_cache,
+  metal_graph_eval_dspark_base_logits, metal_graph_dspark_capture_hc,
+  dspark_markov_q8_0_argmax, dspark_eval_confidence_probe,
+  ds4_dspark_scheduler_*). The chat template is read from the GGUF; the
+  DSML tool-call parser (src/serve/tools.rs) is lily's own, written to the
+  template's format. These kernels in src/kernels/vulkan/deepseek4.comp,
+  dispatched by src/kernels/deepseek4.rs, are ported from ds4.c and its
+  Metal sources (metal/dsv4_kv.metal, dsv4_rope.metal, dsv4_hc.metal):
+
+    ds4_kv_store, the FP8 KV round trip
+      dsv4_fp8_kv_quantize_row_inplace_cpu, kernel_dsv4_kv_fp8_store_f32
+    ds4_indexer_q and the indexer rows of ds4_comp_pool, Hadamard and FP4
+      dsv4_indexer_qat_row_inplace_cpu, kernel_dsv4_indexer_hadamard_fp4_f32
+    ds4_comp_pool, ds4_comp_ring
+      compressor_decode_one, compressor_pool_decode_state
+    ds4_head_norm_rope (RoPE of the head tails with YaRN, and its inverse)
+      rope_tail_ext_inplace, rope_tail_layer_inplace
+    ds4_indexer_scores, ds4_topk
+      indexer_allowed_decode_one
+    ds4_attend (sink attention over raw and compressed rows, and DSpark's
+      non-causal block)
+      layer_attention_mixed_one, kernel_dsv4_flash_attn_*,
+      ds4_gpu_attention_noncausal_raw_batch_heads_tensor
+    ds4_router (sqrt-softplus scores, hash routing)
+      layer_router_probs_one, layer_hash_selected_experts,
+      layer_topk_selected_experts_from_probs
+    ds4_out_collapse, ds4_hc_capture
+      output_hc_head_one, kernel_dsv4_output_hc_weights4,
+      metal_graph_dspark_capture_hc
+    ds4_markov_prep
+      dspark_eval_confidence_probe
+
+  tools/reference/deepseek4/ops_golden.c compiles ds4's own functions out
+  of ds4.c to compute its golden values.
 
   MIT License
 
