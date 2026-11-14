@@ -4,11 +4,11 @@ This fork runs [lily](https://github.com/perplexityai/pplx-garden/tree/main/lily
 a compact inference server with hand-written GPU kernels, on **Linux on an
 Apple M5 Max**, through Vulkan, and serves more than one model family:
 
-| model | weights | Linux (Vulkan) | macOS (Metal) |
-|---|---|---|---|
-| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | lily's own 4-bit conversions (q4-xl, q4) | yes | yes |
-| GLM 5.3 Flash | antirez's Q2 GGUF, loaded as it is | yes | no |
-| DeepSeek V4 Flash | antirez's Q2 GGUF | in progress | no |
+| model | weights | status |
+|---|---|---|
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | lily's own 4-bit conversions (q4-xl, q4) | runs |
+| GLM 5.3 Flash | antirez's Q2 GGUF, loaded as it is | runs |
+| DeepSeek V4 Flash | antirez's Q2 GGUF | in progress |
 
 It is developed on a 16-inch M5 Max MacBook Pro with 128 GB (J716c) running
 the [aurora-silicon](https://github.com/aurora-silicon) Linux kernel and
@@ -26,9 +26,9 @@ Mesa's Honeykrisp Vulkan driver. The server is OpenAI-compatible
 - **[fabiogreter/lily-qwen3.8-flash-next](https://github.com/fabiogreter/lily-qwen3.8-flash-next)**,
   the fork this one is forked from: the Qwen3.8-Flash-Next graph and
   converter, the Metal 4 transport, speculative decoding with the model's own
-  draft head, the session cache, the expert cache for 64 GB machines, and the
-  decode and prefill kernel tuning on macOS. Everything about the Qwen model,
-  its checkpoints and macOS below is that work.
+  draft head, the session cache, and the decode and prefill kernel tuning
+  the Vulkan kernels follow. The Qwen model and its checkpoints below are
+  that work.
 - **[antirez/ds4](https://github.com/antirez/ds4)** (MIT): the reference
   implementation that GLM 5.3 Flash and DeepSeek V4 Flash follow, and the
   quantized GGUFs lily loads. lily's results are checked against ds4's official
@@ -76,7 +76,7 @@ In daily agent use, short turns spend most of their prefill time on fixed
 per-request costs, and decode is often faster than these numbers because
 agent output (tool calls, code copied from the context) drafts well.
 
-## Running it on Linux
+## Running it
 
 Requirements:
 
@@ -118,26 +118,6 @@ instance lock before mapping weights. [docs/glm53.md](docs/glm53.md) has
 GLM's checkpoint, memory, differences from ds4 and what is not implemented
 yet. [src/kernels/vulkan/PORTING.md](src/kernels/vulkan/PORTING.md) describes
 the Vulkan port.
-
-## Running it on macOS
-
-You need an M5 or newer (Apple GPU family 10), macOS 26, and 128 GB of
-unified memory, or 64 GB with the expert cache
-([docs/low-ram-experts.md](docs/low-ram-experts.md)). Only Qwen3.8-Flash-Next
-runs on Metal.
-
-```sh
-hf download fabiogreter/Qwen3.8-Flash-Next-lily-q4-xl \
-  --local-dir ~/models/Qwen3.8-Flash-Next-lily-q4-xl
-cargo build --release --locked
-./target/release/lily --model ~/models/Qwen3.8-Flash-Next-lily-q4-xl \
-  --bind 127.0.0.1:8000 --max-seq 131072
-```
-
-The upstream fork's macOS measurements (M5 Max, 128 GB, over HTTP, medians
-of three, 2026-10-12): prefill 2 400 to 2 500 tok/s from 4K to 64K of
-context, decode 98 to 103 tok/s with two drafts and 77 to 80 without.
-[docs/performance.md](docs/performance.md) has the full record.
 
 ## The Linux port
 
@@ -209,7 +189,7 @@ cargo test --locked
 ```
 
 runs the kernel tests against CPU references, the shader compilation test and
-the API tests on the local GPU (Metal on macOS, Vulkan on Linux); they need no
+the API tests on the local GPU through Vulkan; they need no
 checkpoint. Tests that need weights are ignored by default and take
 `LILY_MODEL_DIR_FLASH` (Qwen) or `LILY_GLM53_GGUF` (GLM).
 [CONTRIBUTING.md](CONTRIBUTING.md) has the gates.
