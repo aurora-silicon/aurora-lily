@@ -171,15 +171,10 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
-// Attention, decode (a few rows): row i (position pos0 + i) attends keys
-// [lo, pos] (lo = pos - window + 1 with a window, else 0), split in chunks
-// of 256 keys: threadgroup (c, h, i) takes keys lo + 256 c .., subgroup s
-// of them 32 in turn with an online softmax (scale 1), the eight subgroups
-// merged; writes the chunk's (max, sum, weighted values[d]) for
-// gemma4_attn_combine. Grid (chunks, H, m), 256 threads.
-// Buffers: 0 q [m][H][d], 1 K cache, 2 V cache, 3 partial
-// [m][H][chunks][d + 2]. Params: 4 d, 5 H, 6 kvh, 7 pos0, 8 ring,
-// 9 window (0: none), 10 chunks.
+// Attention over the f16 caches, scale 1, online softmax. A subgroup takes
+// two query heads of one KV head (h0 = 2 y, h0 + 1: the K and V rows are
+// loaded once for both); lane l holds elements PER l .. PER l + PER of a
+// head (PER = d / 32), so a K or V row is PER / 8 16-byte loads a lane.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_gemma4_attn_decode_256) || defined(KERNEL_gemma4_attn_prefill_256)
 #define G4_D 256u
@@ -187,79 +182,112 @@ void main() {
 #define G4_D 512u
 #endif
 #ifdef G4_D
-// The online-softmax step of one key for a subgroup: s the score (uniform).
-#define G4_ATTN_STEP(s, vrow)                                                 \
-    {                                                                       \
-        const float mn = max(mx, s);                                        \
-        const float a = exp(mx - mn), b = exp(s - mn);                      \
-        sum = sum * a + b;                                                  \
-        [[unroll]] for (uint j = 0u; j < 16u; j++) {                        \
-            if (j < per) acc[j] = acc[j] * a + b * float(F16(vrow).v[lane + 32u * j]); \
-        }                                                                   \
-        mx = mn;                                                            \
+#define G4_PER (G4_D / 32u)
+#define G4_V4 (G4_PER / 4u)
+
+// q[2][PER] of heads h0, h0 + 1 of row i.
+void g4_load_q(uint64_t Q, uint lane, out vec4 q[2][G4_V4]) {
+    [[unroll]] for (uint h = 0u; h < 2u; h++)
+        [[unroll]] for (uint j = 0u; j < G4_V4; j++)
+            q[h][j] = F32x4(Q + 4u * (uint64_t(h) * G4_D + G4_PER * lane)).v[j];
+}
+
+// A cache row's lane slice as floats.
+void g4_load_row(uint64_t row, uint lane, out vec4 r[G4_V4]) {
+    [[unroll]] for (uint j = 0u; j < G4_V4 / 2u; j++) {
+        const uvec4 w = U32x4(row + 2u * G4_PER * lane).v[j];
+        r[2u * j] = vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+        r[2u * j + 1u] = vec4(unpackHalf2x16(w.z), unpackHalf2x16(w.w));
     }
+}
+
+// One key for both heads: scores from the K slice, then the online-softmax
+// update with the V slice.
+#define G4_KEY(krow, vrow)                                                    \
+    {                                                                         \
+        vec4 kr[G4_V4];                                                       \
+        g4_load_row(krow, lane, kr);                                          \
+        vec4 vr[G4_V4];                                                       \
+        g4_load_row(vrow, lane, vr);                                          \
+        [[unroll]] for (uint h = 0u; h < 2u; h++) {                           \
+            float dot = 0.0;                                                  \
+            [[unroll]] for (uint j = 0u; j < G4_V4; j++) dot += dot4(q[h][j], kr[j]); \
+            const float s = subgroupAdd(dot);                                 \
+            const float mn = max(mx[h], s);                                   \
+            const float a = exp(mx[h] - mn), e = exp(s - mn);                 \
+            sum[h] = sum[h] * a + e;                                          \
+            [[unroll]] for (uint j = 0u; j < G4_V4; j++) acc[h][j] = acc[h][j] * a + e * vr[j]; \
+            mx[h] = mn;                                                       \
+        }                                                                     \
+    }
+
+float dot4(vec4 a, vec4 b) { return (a.x * b.x + a.y * b.y) + (a.z * b.z + a.w * b.w); }
 #endif
 
+// ---------------------------------------------------------------------------
+// Attention, decode (a few rows): row i (position pos0 + i) attends keys
+// [lo, pos] (lo = pos - window + 1 with a window, else 0), split in chunks
+// of 256 keys: threadgroup (c, y, i) takes keys lo + 256 c .. for heads
+// 2 y, 2 y + 1, subgroup s 32 of them in turn, the eight subgroups merged;
+// writes each head's chunk (max, sum, weighted values[d]) for
+// gemma4_attn_combine. Grid (chunks, H / 2, m), 256 threads.
+// Buffers: 0 q [m][H][d], 1 K cache, 2 V cache, 3 partial
+// [m][H][chunks][d + 2]. Params: 4 d, 5 H, 6 kvh, 7 pos0, 8 ring,
+// 9 window (0: none), 10 chunks.
+// ---------------------------------------------------------------------------
 #if defined(KERNEL_gemma4_attn_decode_256) || defined(KERNEL_gemma4_attn_decode_512)
 shared float g4_m[8], g4_l[8];
-shared float g4_acc[8][512];
+shared vec4 g4_acc[8][G4_D / 4u];
 void main() {
-    const uint d = G4_D;
     const uint H = arg_u32(5);
     const uint kvh = arg_u32(6);
     const uint pos0 = arg_u32(7);
     const uint ring = arg_u32(8);
     const uint window = arg_u32(9);
     const uint chunks = arg_u32(10);
-    const uint c = gl_WorkGroupID.x, h = gl_WorkGroupID.y, i = gl_WorkGroupID.z;
-    const uint kv = h / (H / kvh);
+    const uint c = gl_WorkGroupID.x, h0 = 2u * gl_WorkGroupID.y, i = gl_WorkGroupID.z;
+    const uint kv = h0 / (H / kvh);
     const uint lane = gl_SubgroupInvocationID, sg = gl_SubgroupID;
-    const uint per = G4_D / 32u;
     const uint pos = pos0 + i;
     const uint lo = (window != 0u && pos + 1u > window) ? pos + 1u - window : 0u;
-    const uint64_t Q = arg(0) + 4u * ((uint64_t(i) * H + h) * d);
-    float q[16];
-    [[unroll]] for (uint j = 0u; j < 16u; j++) q[j] = j < per ? F32(Q).v[lane + 32u * j] : 0.0;
-    float mx = -1.0 / 0.0, sum = 0.0;
-    float acc[16];
-    [[unroll]] for (uint j = 0u; j < 16u; j++) acc[j] = 0.0;
+    vec4 q[2][G4_V4];
+    g4_load_q(arg(0) + 4u * ((uint64_t(i) * H + h0) * G4_D), lane, q);
+    float mx[2] = float[2](-1.0 / 0.0, -1.0 / 0.0), sum[2] = float[2](0.0, 0.0);
+    vec4 acc[2][G4_V4];
+    [[unroll]] for (uint h = 0u; h < 2u; h++)
+        [[unroll]] for (uint j = 0u; j < G4_V4; j++) acc[h][j] = vec4(0.0);
     const uint first = lo + 256u * c + 32u * sg;
-    for (uint t = 0u; t < 32u; t++) {
-        const uint key = first + t;
-        if (key > pos) break;
-        const uint64_t off = 2u * ((uint64_t(key % ring) * kvh + kv) * d);
-        const uint64_t krow = arg(1) + off;
-        float dot = 0.0;
-        [[unroll]] for (uint j = 0u; j < 16u; j++) {
-            if (j < per) dot += q[j] * float(F16(krow).v[lane + 32u * j]);
+    const uint last = min(first + 32u, pos + 1u);
+    [[dont_unroll]] for (uint key = first; key < last; key++) {
+        const uint64_t off = 2u * ((uint64_t(key % ring) * kvh + kv) * G4_D);
+        G4_KEY(arg(1) + off, arg(2) + off)
+    }
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {
+        if (lane == 0u) {
+            g4_m[sg] = mx[h];
+            g4_l[sg] = sum[h];
         }
-        const float s = subgroupAdd(dot);
-        const uint64_t vrow = arg(2) + off;
-        G4_ATTN_STEP(s, vrow)
-    }
-    if (lane == 0u) {
-        g4_m[sg] = mx;
-        g4_l[sg] = sum;
-    }
-    [[unroll]] for (uint j = 0u; j < 16u; j++) if (j < per) g4_acc[sg][lane + 32u * j] = acc[j];
-    barrier();
-    float M = -1.0 / 0.0;
-    [[unroll]] for (uint s = 0u; s < 8u; s++) M = max(M, g4_m[s]);
-    const uint64_t P = arg(3) + 4u * (((uint64_t(i) * H + h) * chunks + c) * (d + 2u));
-    float L = 0.0;
-    float f[8];
-    [[unroll]] for (uint s = 0u; s < 8u; s++) {
-        f[s] = g4_m[s] == -1.0 / 0.0 ? 0.0 : exp(g4_m[s] - M);
-        L += g4_l[s] * f[s];
-    }
-    for (uint e = gl_LocalInvocationIndex; e < d; e += 256u) {
-        float a = 0.0;
-        [[unroll]] for (uint s = 0u; s < 8u; s++) a += g4_acc[s][e] * f[s];
-        F32(P).v[2u + e] = a;
-    }
-    if (gl_LocalInvocationIndex == 0u) {
-        F32(P).v[0] = M;
-        F32(P).v[1] = L;
+        [[unroll]] for (uint j = 0u; j < G4_V4; j++) g4_acc[sg][G4_V4 * lane + j] = acc[h][j];
+        barrier();
+        float M = -1.0 / 0.0;
+        [[unroll]] for (uint s = 0u; s < 8u; s++) M = max(M, g4_m[s]);
+        float L = 0.0;
+        float f[8];
+        [[unroll]] for (uint s = 0u; s < 8u; s++) {
+            f[s] = g4_m[s] == -1.0 / 0.0 ? 0.0 : exp(g4_m[s] - M);
+            L += g4_l[s] * f[s];
+        }
+        const uint64_t P = arg(3) + 4u * (((uint64_t(i) * H + h0 + h) * chunks + c) * (G4_D + 2u));
+        for (uint e = gl_LocalInvocationIndex; e < G4_D / 4u; e += 256u) {
+            vec4 a = vec4(0.0);
+            [[unroll]] for (uint s = 0u; s < 8u; s++) a += g4_acc[s][e] * f[s];
+            [[unroll]] for (uint k = 0u; k < 4u; k++) F32(P).v[2u + 4u * e + k] = a[k];
+        }
+        if (gl_LocalInvocationIndex == 0u) {
+            F32(P).v[0] = M;
+            F32(P).v[1] = L;
+        }
+        barrier();
     }
 }
 #endif
@@ -296,48 +324,41 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
-// Attention, prompt runs: a subgroup a row (eight rows a threadgroup, one
-// head), every key of the row's range in turn, online softmax.
-// Grid (ceil(m / 8), H), 256 threads.
+// Attention, prompt runs: a subgroup a row and a head pair (eight rows a
+// threadgroup), every key of the row's range in turn.
+// Grid (ceil(m / 8), H / 2), 256 threads.
 // Buffers: 0 q [m][H][d], 1 K cache, 2 V cache, 3 heads [m][H][d].
 // Params: 4 d, 5 H, 6 kvh, 7 pos0, 8 ring, 9 window, 10 m.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_gemma4_attn_prefill_256) || defined(KERNEL_gemma4_attn_prefill_512)
 void main() {
-    const uint d = G4_D;
     const uint H = arg_u32(5);
     const uint kvh = arg_u32(6);
     const uint pos0 = arg_u32(7);
     const uint ring = arg_u32(8);
     const uint window = arg_u32(9);
     const uint m = arg_u32(10);
-    const uint h = gl_WorkGroupID.y;
+    const uint h0 = 2u * gl_WorkGroupID.y;
     const uint i = gl_WorkGroupID.x * 8u + gl_SubgroupID;
     if (i >= m) return;
-    const uint kv = h / (H / kvh);
+    const uint kv = h0 / (H / kvh);
     const uint lane = gl_SubgroupInvocationID;
-    const uint per = G4_D / 32u;
     const uint pos = pos0 + i;
     const uint lo = (window != 0u && pos + 1u > window) ? pos + 1u - window : 0u;
-    const uint64_t Q = arg(0) + 4u * ((uint64_t(i) * H + h) * d);
-    float q[16];
-    [[unroll]] for (uint j = 0u; j < 16u; j++) q[j] = j < per ? F32(Q).v[lane + 32u * j] : 0.0;
-    float mx = -1.0 / 0.0, sum = 0.0;
-    float acc[16];
-    [[unroll]] for (uint j = 0u; j < 16u; j++) acc[j] = 0.0;
-    for (uint key = lo; key <= pos; key++) {
-        const uint64_t off = 2u * ((uint64_t(key % ring) * kvh + kv) * d);
-        const uint64_t krow = arg(1) + off;
-        float dot = 0.0;
-        [[unroll]] for (uint j = 0u; j < 16u; j++) {
-            if (j < per) dot += q[j] * float(F16(krow).v[lane + 32u * j]);
-        }
-        const float s = subgroupAdd(dot);
-        const uint64_t vrow = arg(2) + off;
-        G4_ATTN_STEP(s, vrow)
+    vec4 q[2][G4_V4];
+    g4_load_q(arg(0) + 4u * ((uint64_t(i) * H + h0) * G4_D), lane, q);
+    float mx[2] = float[2](-1.0 / 0.0, -1.0 / 0.0), sum[2] = float[2](0.0, 0.0);
+    vec4 acc[2][G4_V4];
+    [[unroll]] for (uint h = 0u; h < 2u; h++)
+        [[unroll]] for (uint j = 0u; j < G4_V4; j++) acc[h][j] = vec4(0.0);
+    [[dont_unroll]] for (uint key = lo; key <= pos; key++) {
+        const uint64_t off = 2u * ((uint64_t(key % ring) * kvh + kv) * G4_D);
+        G4_KEY(arg(1) + off, arg(2) + off)
     }
-    const uint64_t O = arg(3) + 4u * ((uint64_t(i) * H + h) * d);
-    [[unroll]] for (uint j = 0u; j < 16u; j++) if (j < per) F32(O).v[lane + 32u * j] = acc[j] / sum;
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {
+        const uint64_t O = arg(3) + 4u * ((uint64_t(i) * H + h0 + h) * G4_D + G4_PER * lane);
+        [[unroll]] for (uint j = 0u; j < G4_V4; j++) F32x4(O).v[j] = acc[h][j] / sum[h];
+    }
 }
 #endif
 

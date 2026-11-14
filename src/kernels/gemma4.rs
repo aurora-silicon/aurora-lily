@@ -80,7 +80,9 @@ impl AttnShape<'_> {
     /// `kernel` for this shape's head width (`<kernel>_256` or `_512`).
     fn name(&self, kernel: [&'static str; 2]) -> Result<&'static str> {
         ensure!(
-            self.kv_heads > 0 && self.heads.is_multiple_of(self.kv_heads),
+            self.kv_heads > 0
+                && self.heads.is_multiple_of(self.kv_heads)
+                && (self.heads / self.kv_heads).is_multiple_of(2),
             "{} heads over {} KV heads",
             self.heads,
             self.kv_heads
@@ -242,7 +244,7 @@ pub fn attention(
             &[q.binding(), a.k_cache.binding(), a.v_cache.binding(), heads.binding()],
             &params,
             Grid::Threadgroups {
-                groups: (m.div_ceil(8), a.heads, 1),
+                groups: (m.div_ceil(8), a.heads / 2, 1),
                 threadgroup: (256, 1, 1),
             },
         );
@@ -265,7 +267,7 @@ pub fn attention(
         &pipeline,
         &[q.binding(), a.k_cache.binding(), a.v_cache.binding(), partial.binding()],
         &params,
-        Grid::Threadgroups { groups: (chunks, a.heads, m), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups { groups: (chunks, a.heads / 2, m), threadgroup: (256, 1, 1) },
     )?;
     pass.memory_barrier()?;
     let combine = ctx.pipeline("gemma4_attn_combine", SOURCE, MslVersion::V3_1)?;
