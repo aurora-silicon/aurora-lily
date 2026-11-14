@@ -36,6 +36,10 @@ name = "lily-qwen36"
 path = "src/bin/lily-qwen36.rs"
 
 [[bin]]
+name = "lily-qwen"
+path = "src/bin/lily-qwen.rs"
+
+[[bin]]
 name = "lily-vision-probe"
 path = "src/bin/lily-vision-probe.rs"
 
