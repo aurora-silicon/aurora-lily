@@ -586,3 +586,7 @@ fn dspark_path(model: &Path) -> Result<std::path::PathBuf> {
     );
     Ok(found[0].clone())
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/deepseek4/engine.rs"]
+mod tests;
