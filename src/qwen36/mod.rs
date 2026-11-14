@@ -6,6 +6,7 @@
 pub mod config;
 pub mod model;
 pub mod schema;
+pub mod tokenizer;
 
 pub use config::Config;
 pub use model::{Logits, Qwen36Model, Qwen36State, Scratch};

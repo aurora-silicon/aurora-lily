@@ -143,6 +143,9 @@ impl Tokenizer {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn from_gguf(path: &Path) -> Result<Self> {
         let g = crate::gguf::Gguf::open(path)?;
+        if g.architecture()? == crate::qwen36::config::ARCH {
+            return Self::from_gguf_qwen36(&g);
+        }
         let deepseek = g.architecture()? == crate::deepseek4::config::ARCH;
         let json = if deepseek {
             crate::deepseek4::tokenizer::tokenizer_json(&g)?
@@ -166,6 +169,21 @@ impl Tokenizer {
             t.tool_grammar = crate::serve::tools::ToolGrammar::Glm;
         }
         t.legacy_nothink_rewrite = false;
+        Ok(t)
+    }
+
+    /// Qwen3.6's tokenizer and template from its GGUF (`crate::qwen36::
+    /// tokenizer`): Qwen's template, so lily's Qwen chat handling applies
+    /// as for Qwen3.8.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn from_gguf_qwen36(g: &crate::gguf::Gguf) -> Result<Self> {
+        let json = crate::qwen36::tokenizer::tokenizer_json(g)?;
+        let inner = tokenizers::Tokenizer::from_bytes(json.as_bytes())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("building the GGUF's tokenizer")?;
+        let template = crate::qwen36::tokenizer::chat_template(g)?;
+        let mut t = Self::new(inner, &serde_json::Value::Null, template)?;
+        t.add_stop_tokens(&crate::qwen36::tokenizer::stop_ids(g)?);
         Ok(t)
     }
 

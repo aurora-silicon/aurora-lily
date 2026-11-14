@@ -38,14 +38,37 @@ enum Cmd {
     Nll {
         #[arg(long)]
         model: PathBuf,
-        /// Token id files; `split` applies to each unless `--split-from`.
+        /// Token id files.
         #[arg(long, num_args = 1..)]
         ids: Vec<PathBuf>,
+        /// Prompt length; without it each file's `<name>.split` gives it.
         #[arg(long)]
-        split: usize,
+        split: Option<usize>,
         /// Write every token's line to `<file>.lily` instead of stdout.
         #[arg(long)]
         quiet: bool,
+    },
+    /// Token ids of text files (the GGUF's tokenizer, special tokens
+    /// parsed), one line each.
+    Tok {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, num_args = 1..)]
+        text: Vec<PathBuf>,
+    },
+    /// Speed: prefill the first `prompt_len` ids of a file, then decode `n`
+    /// tokens greedily; `runs` times, each on a fresh state.
+    Bench {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        ids: PathBuf,
+        #[arg(long, default_value_t = 1024)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
     },
 }
 
@@ -72,6 +95,18 @@ fn run() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Generate { model, ids, n } => generate(&model, &read_ids(&ids)?, n),
         Cmd::Nll { model, ids, split, quiet } => nll(&model, &ids, split, quiet),
+        Cmd::Tok { model, text } => {
+            let tok = lily::tokenizer::Tokenizer::from_gguf(&model)?;
+            for f in text {
+                let ids = tok.encode(&std::fs::read_to_string(&f)?)?;
+                let s: Vec<String> = ids.iter().map(u32::to_string).collect();
+                println!("{}", s.join(" "));
+            }
+            Ok(())
+        }
+        Cmd::Bench { model, ids, prompt_len, n, runs } => {
+            bench(&model, &read_ids(&ids)?, prompt_len, n, runs)
+        }
     }
 }
 
@@ -117,7 +152,7 @@ fn log_softmax_at(logits: &[f32], target: usize) -> f64 {
     logits[target] as f64 - mx - z.ln()
 }
 
-fn nll(path: &PathBuf, files: &[PathBuf], split: usize, quiet: bool) -> Result<()> {
+fn nll(path: &PathBuf, files: &[PathBuf], split: Option<usize>, quiet: bool) -> Result<()> {
     use std::io::Write as _;
     let ctx = MetalContext::new()?;
     let model = Qwen36Model::load(&ctx, path)?;
@@ -134,6 +169,10 @@ fn nll(path: &PathBuf, files: &[PathBuf], split: usize, quiet: bool) -> Result<(
     let (mut all_nll, mut all_n, mut all_hits) = (0f64, 0usize, 0usize);
     for f in files {
         let ids = read_ids(f)?;
+        let split = match split {
+            Some(s) => s,
+            None => std::fs::read_to_string(f.with_extension("split"))?.trim().parse()?,
+        };
         anyhow::ensure!(split >= 1 && split < ids.len(), "split {split} of {}", ids.len());
         st.reset();
         let t0 = Instant::now();
@@ -200,5 +239,41 @@ fn nll(path: &PathBuf, files: &[PathBuf], split: usize, quiet: bool) -> Result<(
         all_hits += hits;
     }
     println!("total mean {:.6} n {} hits {}", all_nll / all_n as f64, all_n, all_hits);
+    Ok(())
+}
+
+fn bench(path: &PathBuf, ids: &[u32], prompt_len: usize, n: usize, runs: usize) -> Result<()> {
+    anyhow::ensure!(ids.len() >= prompt_len, "{} ids for a prompt of {prompt_len}", ids.len());
+    let ctx = MetalContext::new()?;
+    let model = Qwen36Model::load(&ctx, path)?;
+    let cap = prompt_len + n + 8;
+    let mut st = model.new_state(&ctx, cap)?;
+    let mut sc = model.new_scratch(&ctx, cap)?;
+    for run in 0..runs {
+        st.reset();
+        let t0 = Instant::now();
+        model.prefill(&ctx, &mut st, &mut sc, &ids[..prompt_len])?;
+        let pf = t0.elapsed().as_secs_f64();
+        let mut next = argmax(&sc.logits_last.to_f32()?) as u32;
+        let mut out = vec![next];
+        let t0 = Instant::now();
+        for _ in 1..n {
+            model.forward(&ctx, &mut st, &mut sc, &[next], Logits::Last)?;
+            next = argmax(&sc.logits_last.to_f32()?) as u32;
+            out.push(next);
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let digest = out.iter().fold(0xcbf29ce484222325u64, |h, &t| {
+            (h ^ u64::from(t)).wrapping_mul(0x100000001b3)
+        });
+        println!(
+            "run {run}: prefill {prompt_len} in {:.3}s = {:.1} tok/s; decode {} steps {:.2} ms/step = {:.1} tok/s; digest {digest:016x}",
+            pf,
+            prompt_len as f64 / pf,
+            n - 1,
+            dt * 1e3 / (n - 1) as f64,
+            (n - 1) as f64 / dt
+        );
+    }
     Ok(())
 }

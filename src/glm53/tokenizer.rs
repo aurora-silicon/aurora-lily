@@ -44,6 +44,18 @@ pub(crate) fn bpe_json(
     splits: &[&str],
     vocab: usize,
 ) -> Result<String> {
+    bpe_json_normalized(g, pre, splits, vocab, Value::Null)
+}
+
+/// [`bpe_json`] with a normalizer (Qwen3.6's NFC,
+/// `crate::qwen36::tokenizer`).
+pub(crate) fn bpe_json_normalized(
+    g: &Gguf,
+    pre: &str,
+    splits: &[&str],
+    vocab: usize,
+    normalizer: Value,
+) -> Result<String> {
     ensure!(
         g.str("tokenizer.ggml.model")? == "gpt2",
         "tokenizer model is not gpt2 BPE"
@@ -92,7 +104,7 @@ pub(crate) fn bpe_json(
         "truncation": null,
         "padding": null,
         "added_tokens": added,
-        "normalizer": null,
+        "normalizer": normalizer,
         "pre_tokenizer": {"type": "Sequence", "pretokenizers": pretokenizers},
         "post_processor": null,
         "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true},
