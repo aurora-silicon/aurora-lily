@@ -31,15 +31,13 @@ use super::{
     Config, Ds4Model, Ds4State, EXACT_ROWS, HcW, LayerW, Mapped, Run, Scratch, d, k,
     load_layer,
 };
-use crate::gguf::{Gguf, Value};
+use crate::deepseek4::schema::{DsparkMeta, validate_dspark};
+use crate::gguf::Gguf;
 use crate::kernels::deepseek4::{CompRows, CompressorGpu, HeadOp, RawWindow};
 use crate::kernels::glm53::QWeight;
 use crate::kernels::sample::{SamplingParams, sample_f32};
 use crate::metal::{ComputePass, MetalContext};
 use crate::tensor::{DType, Tensor};
-
-/// The GGUF architecture of the support file.
-pub const ARCH: &str = "deepseek4-dspark";
 
 /// Proposals below this confidence end the block (ds4's Metal default).
 pub const CONFIDENCE: f32 = 0.6;
@@ -112,52 +110,19 @@ pub(crate) struct DsScratch {
     scores: Tensor,
 }
 
-fn u32_list(g: &Gguf, key: &str) -> Result<Vec<usize>> {
-    match g.get(key) {
-        Some(Value::Array(v)) => v
-            .iter()
-            .map(|x| x.as_u64().map(|v| v as usize).context("not an integer"))
-            .collect(),
-        _ => anyhow::bail!("{key} missing"),
-    }
-}
-
 impl Dspark {
     /// Opens and maps the support file, checked against the model.
     pub fn load(ctx: &MetalContext, path: &Path, cfg: &Config) -> Result<Self> {
         let gguf = Gguf::open(path)?;
-        ensure!(
-            gguf.architecture()? == ARCH,
-            "{} is not a DSpark support file",
-            path.display()
-        );
-        let u = |k: &str| -> Result<usize> {
-            Ok(gguf.u64(&format!("dspark.{k}"))? as usize)
-        };
-        let n_stages = u("stage_count")?;
-        ensure!(n_stages == u("n_layers")? && n_stages >= 1, "DSpark stage count");
-        let block = u("block_size")?;
-        ensure!((1..EXACT_ROWS).contains(&block), "DSpark block of {block}");
-        let rank = u("markov_rank")?;
-        let noise = u("noise_token_id")?;
-        ensure!(noise < cfg.vocab, "noise token {noise}");
-        let targets = u32_list(&gguf, "dspark.target_layer_ids")?;
-        // The features are captured as the following layer's HC pre applies
-        // the post, the last after the final post: consecutive layers ending
-        // at the model's last.
-        ensure!(
-            !targets.is_empty()
-                && targets
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &t)| t + targets.len() - i == cfg.n_layer),
-            "DSpark target layers {targets:?}"
-        );
+        let meta = DsparkMeta::read(&gguf, cfg, EXACT_ROWS - 1)
+            .with_context(|| format!("DSpark support file {}", path.display()))?;
+        validate_dspark(&gguf, cfg, &meta)
+            .with_context(|| format!("DSpark support file {}", path.display()))?;
         let mapped = Mapped::map(ctx, &gguf)?;
-        let stages = (0..n_stages)
+        let stages = (0..meta.stages)
             .map(|s| load_layer(&mapped, &format!("mtp.{s}"), 0, false, false))
             .collect::<Result<Vec<_>>>()?;
-        let last = format!("mtp.{}", n_stages - 1);
+        let last = format!("mtp.{}", meta.stages - 1);
         let f = |n: &str| mapped.f32(n);
         let q = |n: &str| mapped.q(n);
         let ds = Self {
@@ -174,23 +139,11 @@ impl Dspark {
             conf: q(&format!("{last}.confidence_head.proj.weight"))?,
             mapped,
             stages,
-            block,
-            noise: noise as u32,
-            targets,
+            block: meta.block,
+            noise: meta.noise as u32,
+            targets: meta.targets,
             threshold: CONFIDENCE,
         };
-        let h = cfg.hidden;
-        ensure!(
-            ds.main_proj.cols == ds.targets.len() * h && ds.main_proj.rows == h,
-            "DSpark main_proj shape"
-        );
-        ensure!(ds.w1.cols == rank && ds.w1.rows == cfg.vocab, "Markov w1 shape");
-        ensure!(ds.w2.cols == rank && ds.w2.rows == cfg.vocab, "Markov w2 shape");
-        ensure!(ds.conf.cols == h + rank && ds.conf.rows == 1, "confidence head shape");
-        ensure!(
-            ds.hc_head.fn_w.cols == cfg.hc_dim() && ds.hc_head.fn_w.rows == cfg.n_hc,
-            "DSpark hc_head shape"
-        );
         Ok(ds)
     }
 
