@@ -89,15 +89,26 @@ fn gemv_and_gemm_match_cpu_for_gemma4_types() {
                 assert_close(&y.to_f32().unwrap(), &expected, 1e-4, 1e-4);
             }
             if cols.is_multiple_of(64) {
-                // The GEMM rounds both operands to bfloat.
+                // The GEMM rounds both operands to bfloat: so does the
+                // reference.
                 let m = 37;
                 let x = f32s(&mut rng, m * cols, -1.0, 1.0);
                 let tx = tensor(&ctx, &x);
                 let y = zeros(&ctx, m * rows);
                 run(&ctx, |p| gemm(&ctx, p, &w, &tx, &y, m).unwrap());
+                // Weights to nearest with ties away from zero (gm_round_w),
+                // activations to nearest even.
+                let bf = |v: f32| half::bf16::from_f32(v).to_f32();
+                let bfw = |v: f32| f32::from_bits((v.to_bits() + 0x8000) & 0xffff_0000);
+                let wb = r::Mat {
+                    rows,
+                    cols,
+                    w: cpu.w.iter().map(|&v| bfw(v)).collect(),
+                };
+                let xb: Vec<f32> = x.iter().map(|&v| bf(v)).collect();
                 let expected: Vec<f32> =
-                    (0..m).flat_map(|i| cpu.mv(&x[i * cols..(i + 1) * cols])).collect();
-                assert_close(&y.to_f32().unwrap(), &expected, 2e-2, 2e-2);
+                    (0..m).flat_map(|i| wb.mv(&xb[i * cols..(i + 1) * cols])).collect();
+                assert_close(&y.to_f32().unwrap(), &expected, 1e-3, 1e-3);
             }
         }
     }

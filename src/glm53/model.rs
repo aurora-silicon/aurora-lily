@@ -30,11 +30,11 @@ pub const PREFILL_ROWS: usize = 2048;
 /// a region of their own).
 const REGION_BYTES: u64 = 1 << 30;
 
-/// The tensors of a GGUF file, mapped (GLM's, DeepSeek's and Qwen3.6's
-/// models).
+/// The tensors of a GGUF file, mapped (GLM's, DeepSeek's, Qwen3.6's and
+/// Gemma 4's models).
 pub(crate) struct Mapped {
     tensors: std::collections::HashMap<String, (Buffer, usize, TensorInfo)>,
-    buffers: Vec<Buffer>,
+    pub(crate) buffers: Vec<Buffer>,
 }
 
 impl Mapped {

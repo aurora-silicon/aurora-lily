@@ -1,0 +1,231 @@
+//! Gemma 4 bring-up tool: teacher-forced scoring of token-id cases (the
+//! format of `tools/reference/gemma4/llama_score.c`, so lily and llama.cpp
+//! score the same tokens with the same GGUF), and greedy generation.
+//!
+//! ```sh
+//! lily-gemma4 score --model gemma-4-26B-A4B-it-UD-Q5_K_M.gguf --cases cases.tsv [--base llama.lp]
+//! lily-gemma4 generate --model ... --tokens 2,105,2364 --n 32
+//! ```
+
+use std::path::PathBuf;
+use std::time::Instant;
+
+use anyhow::{Context as _, Result, ensure};
+use clap::{Parser, Subcommand};
+use half::f16;
+use lily::gemma4::model::{MAX_ROWS, PREFILL_ROWS};
+use lily::gemma4::{Gemma4Model, Logits};
+use lily::metal::MetalContext;
+
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Teacher-forced scoring: per case (`id<TAB>first<TAB>ids`) the mean
+    /// NLL of tokens first.. and the greedy agreement; with --base (a
+    /// llama_score --dump of the same cases) the KL divergence from it and
+    /// the top-1 agreement with it; --dump writes this run's log-softmax
+    /// rows in the same format.
+    Score {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        cases: PathBuf,
+        #[arg(long)]
+        base: Option<PathBuf>,
+        #[arg(long)]
+        dump: Option<PathBuf>,
+        /// Score only the first N cases.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Greedy generation from token ids.
+    Generate {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        tokens: String,
+        #[arg(long, default_value_t = 16)]
+        n: usize,
+    },
+}
+
+fn parse_tokens(s: &str) -> Result<Vec<u32>> {
+    s.split(',').map(|t| t.trim().parse::<u32>().context("token id")).collect()
+}
+
+fn main() -> std::process::ExitCode {
+    lily::instance::exit_code(run())
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    lily::instance::acquire()?;
+    match cli.cmd {
+        Cmd::Score { model, cases, base, dump, limit } => {
+            score(&model, &cases, base.as_deref(), dump.as_deref(), limit)
+        }
+        Cmd::Generate { model, tokens, n } => {
+            generate(&model, &parse_tokens(&tokens)?, n)
+        }
+    }
+}
+
+fn argmax(x: &[f32]) -> usize {
+    let mut b = 0;
+    for (i, &v) in x.iter().enumerate() {
+        if v > x[b] {
+            b = i;
+        }
+    }
+    b
+}
+
+fn log_softmax(row: &[f32]) -> Vec<f32> {
+    let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let s: f64 = row.iter().map(|&l| f64::from(l - mx).exp()).sum();
+    let ls = s.ln();
+    row.iter().map(|&l| (f64::from(l - mx) - ls) as f32).collect()
+}
+
+fn score(
+    path: &PathBuf,
+    cases: &PathBuf,
+    base: Option<&std::path::Path>,
+    dump: Option<&std::path::Path>,
+    limit: Option<usize>,
+) -> Result<()> {
+    use std::io::{Read as _, Write as _};
+    let text = std::fs::read_to_string(cases)?;
+    let mut list = Vec::new();
+    for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        ensure!(cols.len() == 3, "case line of {} columns", cols.len());
+        list.push((
+            cols[0].to_string(),
+            cols[1].parse::<usize>()?,
+            parse_tokens(cols[2])?,
+        ));
+    }
+    if let Some(n) = limit {
+        list.truncate(n);
+    }
+    let maxlen = list.iter().map(|c| c.2.len()).max().unwrap_or(1);
+    let ctx = MetalContext::new()?;
+    let model = Gemma4Model::load(&ctx, path)?;
+    let vocab = model.cfg.vocab;
+    let sc = model.new_scratch(&ctx, maxlen + 8)?;
+    let mut base =
+        base.map(std::fs::File::open).transpose()?.map(std::io::BufReader::new);
+    let mut dump =
+        dump.map(std::fs::File::create).transpose()?.map(std::io::BufWriter::new);
+    let mut hbuf = vec![0u8; 2 * vocab];
+    let (mut tn, mut tnll, mut tagree, mut tkld, mut tsame) =
+        (0usize, 0f64, 0usize, 0f64, 0usize);
+    println!("case\tscored\tnll\tagree\tkld\tsame_top\tprefill_s");
+    for (id, first, toks) in &list {
+        let (first, n) = (*first, toks.len());
+        ensure!(first >= 1 && first < n, "case {id}: first {first} of {n}");
+        let mut st = model.new_state(&ctx, n + 8)?;
+        let t = Instant::now();
+        if first > 1 {
+            model.prefill(&ctx, &mut st, &sc, &toks[..first - 1])?;
+        }
+        let pf = t.elapsed().as_secs_f64();
+        let (mut nll, mut agree, mut kld, mut same, mut scored) = (0f64, 0, 0f64, 0, 0);
+        for chunk_start in (first - 1..n - 1).step_by(MAX_ROWS) {
+            let end = (chunk_start + MAX_ROWS).min(n - 1);
+            model.forward(&ctx, &mut st, &sc, &toks[chunk_start..end], Logits::All)?;
+            let logits = sc.logits.to_f32()?;
+            for (r, p) in (chunk_start..end).enumerate() {
+                let lp = log_softmax(&logits[r * vocab..(r + 1) * vocab]);
+                let target = toks[p + 1] as usize;
+                nll -= f64::from(lp[target]);
+                let top = argmax(&lp);
+                agree += usize::from(top == target);
+                if let Some(d) = dump.as_mut() {
+                    for (i, &v) in lp.iter().enumerate() {
+                        hbuf[2 * i..2 * i + 2]
+                            .copy_from_slice(&f16::from_f32(v).to_bits().to_le_bytes());
+                    }
+                    d.write_all(&hbuf)?;
+                }
+                if let Some(b) = base.as_mut() {
+                    b.read_exact(&mut hbuf)?;
+                    let (mut k, mut btop, mut bmax) = (0f64, 0usize, f32::NEG_INFINITY);
+                    for (i, &v) in lp.iter().enumerate() {
+                        let bv = f16::from_bits(u16::from_le_bytes([
+                            hbuf[2 * i],
+                            hbuf[2 * i + 1],
+                        ]))
+                        .to_f32();
+                        if bv > bmax {
+                            bmax = bv;
+                            btop = i;
+                        }
+                        if bv > -60.0 {
+                            k += f64::from(bv).exp() * f64::from(bv - v);
+                        }
+                    }
+                    kld += k;
+                    same += usize::from(btop == top);
+                }
+                scored += 1;
+            }
+        }
+        println!(
+            "{id}\t{scored}\t{:.6}\t{:.2}%\t{:.6}\t{:.2}%\t{pf:.2}",
+            nll / scored as f64,
+            100.0 * agree as f64 / scored as f64,
+            kld / scored as f64,
+            100.0 * same as f64 / scored as f64
+        );
+        tn += scored;
+        tnll += nll;
+        tagree += agree;
+        tkld += kld;
+        tsame += same;
+    }
+    println!(
+        "total\t{tn}\t{:.6}\t{:.2}%\t{:.6}\t{:.2}%",
+        tnll / tn as f64,
+        100.0 * tagree as f64 / tn as f64,
+        tkld / tn as f64,
+        100.0 * tsame as f64 / tn as f64
+    );
+    let _ = PREFILL_ROWS;
+    Ok(())
+}
+
+fn generate(path: &PathBuf, tokens: &[u32], n: usize) -> Result<()> {
+    ensure!(!tokens.is_empty(), "no tokens");
+    let ctx = MetalContext::new()?;
+    let model = Gemma4Model::load(&ctx, path)?;
+    let vocab = model.cfg.vocab;
+    let cap = tokens.len() + n + 8;
+    let sc = model.new_scratch(&ctx, cap)?;
+    let mut st = model.new_state(&ctx, cap)?;
+    let t = Instant::now();
+    model.prefill(&ctx, &mut st, &sc, tokens)?;
+    let pf = t.elapsed().as_secs_f64();
+    let mut out = Vec::new();
+    let t = Instant::now();
+    let mut next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+    for _ in 0..n {
+        out.push(next);
+        model.forward(&ctx, &mut st, &sc, &[next], Logits::Last)?;
+        next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+    }
+    let dt = t.elapsed().as_secs_f64();
+    println!("{}", out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+    eprintln!(
+        "prompt {} tokens in {pf:.2} s; decode {n} tokens in {dt:.2} s ({:.2} tok/s)",
+        tokens.len(),
+        n as f64 / dt
+    );
+    Ok(())
+}
