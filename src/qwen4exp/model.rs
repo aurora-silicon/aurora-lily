@@ -4248,8 +4248,30 @@ impl Qwen4ExpModel {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
         let Some((down, up, inject)) = hc.affine() else {
-            // GGUF mixers take the unfused read; one row goes by the GEMVs,
-            // which stage nothing.
+            // GGUF F16 mixers: the fused F16 read (LILY_QWEN_HC_UNFUSED=1: the
+            // unfused one, by the GEMVs, which stage nothing).
+            if let Some((down, up, inject)) = hc.gguf_parts()
+                && std::env::var_os("LILY_QWEN_HC_UNFUSED").is_none()
+            {
+                crate::kernels::qwen_gguf::hc_read_f16(
+                    ctx,
+                    pass,
+                    hyper,
+                    &hc.norm,
+                    down,
+                    inject,
+                    up,
+                    &out.down,
+                    &out.inj,
+                    &out.inv_rms,
+                    &out.mixed,
+                    h,
+                    g,
+                    cfg.rms_norm_eps,
+                    NORM_WEIGHT_BIAS,
+                )?;
+                return pass.level_barrier(&[&out.mixed]);
+            }
             return self.hc_read_rows(ctx, pass, hc, hyper, out, 1, hyper);
         };
         hc_read_down_q8(

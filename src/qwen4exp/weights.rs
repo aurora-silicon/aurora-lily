@@ -52,6 +52,28 @@ pub struct HcWeights {
 }
 
 impl HcWeights {
+    /// The single-tensor GGUF down, up and inject projections, when the
+    /// mixer is a GGUF's.
+    pub fn gguf_parts(
+        &self,
+    ) -> Option<(
+        &crate::kernels::qwen_gguf::QWeight,
+        &crate::kernels::qwen_gguf::QWeight,
+        Option<&crate::kernels::qwen_gguf::QWeight>,
+    )> {
+        fn one(w: &LinearWeights) -> Option<&crate::kernels::qwen_gguf::QWeight> {
+            match w.gguf() {
+                Some(g) if g.parts.len() == 1 => Some(&g.parts[0]),
+                _ => None,
+            }
+        }
+        let inject = match &self.inject {
+            None => None,
+            Some(w) => Some(one(w)?),
+        };
+        Some((one(&self.down)?, one(&self.up)?, inject))
+    }
+
     /// The affine down, up and inject projections, when the mixer is in
     /// lily's checkpoint format (the fused read kernels' input).
     pub fn affine(

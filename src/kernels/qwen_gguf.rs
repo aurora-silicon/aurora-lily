@@ -521,6 +521,91 @@ pub fn moe_grouped(
     )
 }
 
+/// The hyper-connection read of one row over F16 mixers, fused in two
+/// kernels (the decode step's): `down` (`[R]`), `inj` (`[NI]`) and
+/// `inv_rms` (`[G]`) from the normalized stream, then `mixed` (`[H]`) from
+/// the up logits. The weights: down `[R][G*H]`, inject `[NI][G*H]`, up
+/// `[G*H][R]`, all F16.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_read_f16(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    hyper: &Tensor,
+    norm: &Tensor,
+    down: &QWeight,
+    inject: Option<&QWeight>,
+    up: &QWeight,
+    out_down: &Tensor,
+    out_inj: &Tensor,
+    inv_rms: &Tensor,
+    mixed: &Tensor,
+    h: usize,
+    g: usize,
+    eps: f32,
+    w_bias: f32,
+) -> Result<()> {
+    let wide = g * h;
+    let (r, ni) = (down.rows, inject.map_or(0, |w| w.rows));
+    ensure!(
+        g <= 4 && h.is_multiple_of(8) && r.is_multiple_of(8),
+        "hc read of {g} x {h}, rank {r}"
+    );
+    for w in [Some(down), inject, Some(up)].into_iter().flatten() {
+        ensure!(w.ty == GgmlType::F16, "fused hc read over {:?}", w.ty);
+    }
+    ensure!(down.cols == wide && up.rows == wide && up.cols == r, "hc read shapes");
+    ensure!(inject.is_none_or(|w| w.cols == wide), "hc inject shape");
+    for t in [hyper, norm, out_down, mixed] {
+        ensure!(t.dtype() == DType::BF16, "hc read tensors are bfloat");
+    }
+    let inj = inject.unwrap_or(down);
+    let pipeline = ctx.pipeline("qg_hc_read_down_f16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            hyper.binding(),
+            norm.binding(),
+            down.t.binding(),
+            inj.t.binding(),
+            out_down.binding(),
+            out_inj.binding(),
+            inv_rms.binding(),
+        ],
+        &[
+            &u32_bytes(h),
+            &u32_bytes(g),
+            &u32_bytes(r),
+            &u32_bytes(ni),
+            &eps.to_ne_bytes(),
+            &w_bias.to_ne_bytes(),
+            &u32_bytes(down.row_bytes),
+            &u32_bytes(inj.row_bytes),
+        ],
+        Grid::Threadgroups { groups: (r + ni, 1, 1), threadgroup: (32 * g, 1, 1) },
+    )?;
+    pass.level_barrier(&[out_down, out_inj, inv_rms])?;
+    let pipeline = ctx.pipeline("qg_hc_read_up_mix_f16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            up.t.binding(),
+            out_down.binding(),
+            hyper.binding(),
+            norm.binding(),
+            inv_rms.binding(),
+            mixed.binding(),
+        ],
+        &[
+            &u32_bytes(h),
+            &u32_bytes(g),
+            &u32_bytes(r),
+            &u32_bytes(up.row_bytes),
+            &w_bias.to_ne_bytes(),
+        ],
+        Grid::Threadgroups { groups: (h.div_ceil(8), 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/qwen_gguf.rs"]
 mod tests;
