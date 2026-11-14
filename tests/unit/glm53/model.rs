@@ -566,6 +566,7 @@ fn sampled_speculation_follows_its_proposals() {
         m.draft_min_prob = if i % 2 == 0 { 1.5 } else { 0.0 };
         proposals =
             m.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pend).unwrap();
+        assert_eq!(proposals.len(), i % 2, "step {i}: proposals after the threshold");
         assert_eq!(st.pos(), pos + 1 + kept, "step {i}: position");
         assert_eq!(&out[..], &toks[..out.len()], "step {i}: draws");
         let c = &counts[out.len() - 1];
@@ -576,6 +577,7 @@ fn sampled_speculation_follows_its_proposals() {
         "speculative: {empty} one-row steps, {proposed} drafts, {accepted} accepted"
     );
     assert!(empty > 0 && proposed > 0, "both kinds of step");
+    assert!(0 < accepted && accepted < proposed, "drafts both accepted and rejected");
     // Ordinary steps continue from the speculative state.
     for k in out.len()..out.len() + after {
         let t = sampled_step(&m, &ctx, &mut st, &sc, toks[k - 1], &params, k);
@@ -616,14 +618,34 @@ fn a_failed_step_is_recovered_from_a_snapshot() {
             })
             .unwrap()
     };
-    let before = kda0(&st);
+    // The last KDA layer: its pass is the one that fails.
+    let kda_last = |st: &Glm53State| {
+        st.layers[..m.cfg.n_trunk]
+            .iter()
+            .rev()
+            .find_map(|l| match l {
+                LayerState::Kda { s, .. } => Some(s.to_f32().unwrap()),
+                LayerState::Dsa { .. } => None,
+            })
+            .unwrap()
+    };
+    let (before, last_before) = (kda0(&st), kda_last(&st));
     sc.stage_tokens(&[token]).unwrap();
+    let ran = std::cell::Cell::new(false);
     let r = m.run_step(&ctx, &st, &sc, &sc.tokens, 1, Logits::Last, None, |_| {
+        ran.set(true);
         anyhow::bail!("injected failure")
     });
-    assert!(r.is_err(), "the step reports the failure");
+    assert!(ran.get(), "the tail ran");
+    let e = r.expect_err("the step reports the failure");
+    assert_eq!(
+        e.to_string(),
+        "injected failure",
+        "the injected error is the one returned"
+    );
     assert_eq!(st.pos(), p.len(), "the position is unchanged");
     assert_ne!(kda0(&st), before, "the first passes ran: the first KDA layer moved");
+    assert_eq!(kda_last(&st), last_before, "the failed last pass never ran");
     st.restore(&ctx, &snap).unwrap();
     assert_eq!(kda0(&st), before);
     m.forward(&ctx, &mut st, &mut sc, &[token], true).unwrap();
