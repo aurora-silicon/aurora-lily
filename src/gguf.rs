@@ -1,6 +1,6 @@
 //! GGUF files: the header (metadata and tensor table) and a CPU decoder for
-//! the block formats GLM 5.3 Flash's published Q2 file uses (F32, F16, BF16,
-//! Q8_0, Q4_K, Q2_K, IQ2_XXS).
+//! the block formats GLM 5.3 Flash's and DeepSeek V4 Flash's published Q2
+//! files use (F32, F16, BF16, Q8_0, Q4_K, Q2_K, IQ2_XXS, and I32 tables).
 //!
 //! The block layouts and the value formulas follow ggml as antirez's ds4
 //! (MIT) implements them (`ds4.c`: `q2_k_value_f32`, `ds4_vec_dot_q4_K_f32`,
@@ -26,6 +26,8 @@ pub enum GgmlType {
     Q2K = 10,
     Q4K = 12,
     Iq2Xxs = 16,
+    /// Integer tables (DeepSeek V4's hash routing); decoded as exact f32.
+    I32 = 26,
     Bf16 = 30,
 }
 
@@ -38,6 +40,7 @@ impl GgmlType {
             10 => Self::Q2K,
             12 => Self::Q4K,
             16 => Self::Iq2Xxs,
+            26 => Self::I32,
             30 => Self::Bf16,
             _ => return None,
         })
@@ -46,7 +49,7 @@ impl GgmlType {
     /// Values per block.
     pub fn block_values(self) -> usize {
         match self {
-            Self::F32 | Self::F16 | Self::Bf16 => 1,
+            Self::F32 | Self::F16 | Self::Bf16 | Self::I32 => 1,
             Self::Q8_0 => 32,
             Self::Q2K | Self::Q4K | Self::Iq2Xxs => QK_K,
         }
@@ -55,7 +58,7 @@ impl GgmlType {
     /// Bytes per block.
     pub fn block_bytes(self) -> usize {
         match self {
-            Self::F32 => 4,
+            Self::F32 | Self::I32 => 4,
             Self::F16 | Self::Bf16 => 2,
             Self::Q8_0 => 34,
             Self::Q2K => 84,
@@ -84,6 +87,7 @@ impl GgmlType {
             Self::Q2K => "Q2_K",
             Self::Q4K => "Q4_K",
             Self::Iq2Xxs => "IQ2_XXS",
+            Self::I32 => "I32",
             Self::Bf16 => "BF16",
         }
     }
@@ -480,6 +484,30 @@ impl Gguf {
     }
 }
 
+impl Gguf {
+    /// Rows `rows` of the I32 tensor `t` (`rows.len() * row_len` values).
+    pub fn read_rows_i32(
+        &self,
+        t: &TensorInfo,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Vec<i32>> {
+        ensure!(t.ty == GgmlType::I32, "{} is {:?}, not I32", t.name, t.ty);
+        ensure!(
+            rows.start <= rows.end && rows.end <= t.rows(),
+            "rows {rows:?} of {} ({} rows)",
+            t.name,
+            t.rows()
+        );
+        let rb = t.row_bytes();
+        let raw =
+            self.read_bytes(t.offset + (rows.start * rb) as u64, rows.len() * rb)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+            .collect())
+    }
+}
+
 /// A tensor entry checked: sizes without overflow, the offset a multiple
 /// of the alignment, the data inside the file.
 fn tensor_info(
@@ -544,6 +572,11 @@ pub fn dequantize(ty: GgmlType, raw: &[u8], out: &mut [f32]) -> Result<()> {
     for (blk, dst) in raw.chunks_exact(bb).zip(out.chunks_exact_mut(bv)) {
         match ty {
             GgmlType::F32 => dst[0] = f32::from_le_bytes(blk.try_into().unwrap()),
+            // Exact for |v| <= 2^24 (expert and token ids); read_rows_i32
+            // gives the integers themselves.
+            GgmlType::I32 => {
+                dst[0] = i32::from_le_bytes(blk.try_into().unwrap()) as f32
+            }
             GgmlType::F16 => dst[0] = f16_at(blk, 0),
             GgmlType::Bf16 => dst[0] = bf16::from_bits(le_u16(blk, 0)).to_f32(),
             GgmlType::Q8_0 => dequant_q8_0(blk, dst),

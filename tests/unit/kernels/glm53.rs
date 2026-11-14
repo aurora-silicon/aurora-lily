@@ -44,7 +44,11 @@ fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
             GgmlType::F32 => {
                 blk.copy_from_slice(&rng.gen_range(-0.1f32..0.1).to_le_bytes())
             }
-            GgmlType::F16 => unreachable!(),
+            GgmlType::F16 => {
+                let v = half::f16::from_f32(rng.gen_range(-0.1..0.1));
+                blk.copy_from_slice(&v.to_bits().to_le_bytes());
+            }
+            GgmlType::I32 => unreachable!(),
         }
     }
     b
