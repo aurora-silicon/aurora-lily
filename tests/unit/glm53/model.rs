@@ -134,6 +134,25 @@ fn speculative_cycle_after_a_long_prefill() {
     }
 }
 
+/// The routing search of `lily-glm53 spec-diff` looks only at the rows fed
+/// the same tokens (positions below `end`), skips rows one run lacks, and
+/// finds nothing when only later rows differ.
+#[test]
+fn first_routing_difference_stays_in_the_common_prefix() {
+    use std::collections::BTreeMap;
+    let rec = |rows: &[(usize, [u32; 2])]| -> BTreeMap<usize, Vec<Vec<u32>>> {
+        rows.iter().map(|&(p, l)| (p, vec![vec![l[0]], vec![l[1]]])).collect()
+    };
+    let a = rec(&[(10, [1, 2]), (11, [1, 2]), (12, [1, 2]), (13, [5, 6])]);
+    let b = rec(&[(10, [1, 2]), (12, [1, 9]), (13, [7, 6])]);
+    // Position 11 is only in `a`; 12 differs at layer 1; 13 at layer 0.
+    assert_eq!(first_routing_difference(&a, &b, 14), Some((12, 1)));
+    assert_eq!(first_routing_difference(&a, &b, 13), Some((12, 1)));
+    // Rows from 12 on were fed different tokens: unresolved.
+    assert_eq!(first_routing_difference(&a, &b, 12), None);
+    assert_eq!(first_routing_difference(&a, &a, 100), None);
+}
+
 /// Loads the published file for the real-weight tests.
 fn real_model(ctx: &MetalContext) -> Glm53Model {
     use crate::engine::{LanguageModel, LoadOptions};

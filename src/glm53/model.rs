@@ -688,8 +688,27 @@ pub struct StepLayer {
     /// Routed layers: each row's selected experts, as the GPU chose them.
     pub sel: Vec<u32>,
     /// Routed layers: each row's 8th-best minus 9th-best selection score
-    /// (sigmoid(logit) + bias), from the GPU's router logits.
+    /// (sigmoid(logit) + bias), reconstructed on the CPU (its own `exp`)
+    /// from the GPU's router logits: near-tie evidence, not the GPU's own
+    /// scores.
     pub margin: Vec<f32>,
+}
+
+/// The first fed position below `end`, and its layer, where two runs'
+/// routing records (by state position: per layer the sorted selected
+/// experts) differ; positions only one run has are skipped. `end` limits
+/// the search to the rows both runs fed with the same tokens: for outputs
+/// that first differ at decode token `d` after a prompt of `n` tokens it is
+/// `n + d` (position `n + d - 1` consumes the last common token).
+pub fn first_routing_difference(
+    a: &std::collections::BTreeMap<usize, Vec<Vec<u32>>>,
+    b: &std::collections::BTreeMap<usize, Vec<Vec<u32>>>,
+    end: usize,
+) -> Option<(usize, usize)> {
+    a.range(..end).find_map(|(&p, la)| {
+        let lb = b.get(&p)?;
+        la.iter().zip(lb).position(|(x, y)| x != y).map(|il| (p, il))
+    })
 }
 
 impl Glm53Model {

@@ -822,32 +822,48 @@ fn spec_diff(
             }
         }
     };
-    // Where the two runs first route a row differently.
+    // Where the two runs first route a row differently, among the rows fed
+    // the same tokens (fed position ids.len() + d - 1 draws output d).
+    let end = ids.len() + d;
+    let sets = |r: &std::collections::BTreeMap<usize, Rec>| {
+        r.iter()
+            .map(|(&p, l)| (p, l.iter().map(|x| x.0.clone()).collect::<Vec<_>>()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let first = lily::glm53::model::first_routing_difference(
+        &sets(&plain_rec),
+        &sets(&spec_rec),
+        end,
+    );
+    // The largest FFN-input difference (relative L2) at the common rows
+    // before it.
     let mut before = 0f64;
-    let mut first = None;
-    'pos: for (&p, pr) in &plain_rec {
+    for (&p, pr) in plain_rec.range(..end) {
         let Some(srec) = spec_rec.get(&p) else { continue };
-        for (il, ((s1, m1, x1), (s2, m2, x2))) in pr.iter().zip(srec).enumerate() {
-            let r = rel_l2(x2, x1);
-            if s1 != s2 {
-                let gone: Vec<u32> =
-                    s1.iter().filter(|e| !s2.contains(e)).copied().collect();
-                let came: Vec<u32> =
-                    s2.iter().filter(|e| !s1.contains(e)).copied().collect();
-                println!(
-                    "first routing difference: position {p} (token {}), layer {il}: plain {gone:?} -> speculative {came:?}; top-8 margin plain {m1:.3e}, speculative {m2:.3e}; FFN input relative L2 {r:.2e}; largest FFN-input difference at all earlier rows and layers {before:.2e}",
-                    p - ids.len()
-                );
-                first = Some(p);
-                break 'pos;
+        for (il, (x, y)) in pr.iter().zip(srec).enumerate() {
+            if first.is_some_and(|f| (p, il) >= f) {
+                break;
             }
-            before = before.max(r);
+            before = before.max(rel_l2(&y.2, &x.2));
         }
     }
-    if first.is_none() {
-        println!(
-            "no routing difference before the parting; largest FFN-input difference {before:.2e}"
-        );
+    match first {
+        Some((p, il)) => {
+            let (s1, m1, x1) = &plain_rec[&p][il];
+            let (s2, m2, x2) = &spec_rec[&p][il];
+            let gone: Vec<u32> =
+                s1.iter().filter(|e| !s2.contains(e)).copied().collect();
+            let came: Vec<u32> =
+                s2.iter().filter(|e| !s1.contains(e)).copied().collect();
+            println!(
+                "first routing difference among the rows fed the same tokens: position {p} (token {}), layer {il}: plain {gone:?} -> speculative {came:?}; CPU-reconstructed top-8 score gap plain {m1:.3e}, speculative {m2:.3e}; FFN input relative L2 {:.2e}; largest FFN-input relative L2 at all earlier common rows and layers {before:.2e}",
+                p - ids.len(),
+                rel_l2(x2, x1)
+            );
+        }
+        None => println!(
+            "unresolved: no routing difference among the rows fed the same tokens (before position {end}); largest FFN-input relative L2 there {before:.2e}"
+        ),
     }
     let small: Vec<(usize, usize, f32)> = plain_rec
         .iter()
@@ -858,7 +874,9 @@ fn spec_diff(
                 .map(move |(il, x)| (p, il, x.1))
         })
         .collect();
-    println!("plain rows with a top-8 margin below 1e-5: {small:?}");
+    println!(
+        "plain rows (whole run) with a CPU-reconstructed top-8 score gap below 1e-5: {small:?}"
+    );
     println!(
         "verify pass at position {} feeds {feed:?} (pending {pending}); its row {row} draws token {d}",
         st.pos
@@ -936,7 +954,7 @@ fn spec_diff(
         )
     };
     println!(
-        "layer  verify-vs-one-row: attn_out ffn_out experts   one-row-vs-plain: attn_out ffn_out experts   margins (verify / one-row / plain)"
+        "layer  verify vs one-row: attn_out ffn_out (relative L2) experts differing   one-row vs plain: the same   CPU-reconstructed top-8 score gaps (verify / one-row / plain)"
     );
     for il in 0..cfg.n_trunk {
         let (a2, f2, s2, m2) = pick(&two[il], row);
