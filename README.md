@@ -7,7 +7,7 @@ families, with at least one for each memory size:
 
 | machine | model | weights | drafts |
 |---|---|---|---|
-| 16 GB | Gemma 4 26B-A4B | unsloth's UD-IQ2_M GGUF | none at this size |
+| 16 GB | Gemma 4 26B-A4B | unsloth's UD-IQ2_M GGUF | optional (ggml-org's Q4_0 draft model, 7.9K context) |
 | 32 GB | Qwen3.6-35B-A3B | ggml-org's Q4_K_M GGUF | its MTP head |
 | 32 GB | Gemma 4 26B-A4B | unsloth's UD-Q5_K_M GGUF | Gemma's draft model |
 | 64 GB | Qwen3.6-35B-A3B | ggml-org's Q8_0 GGUF | its MTP head |
@@ -75,9 +75,9 @@ the server's own measure of the prompt.
 
 | machine | model | decode, 5 prompts | drafts accepted | prefill, long prompt | prefill, short prompts |
 |---|---|---:|---:|---:|---:|
-| 16 GB | Gemma 4 26B-A4B UD-IQ2_M | 91-100 | (no drafts) | 1 310 | 630-720 |
+| 16 GB | Gemma 4 26B-A4B UD-IQ2_M | 116-125 | (no drafts) | 2 520 | 770-860 |
 | 32 GB | Qwen3.6-35B-A3B Q4_K_M | 136-140 | 81-91% | 3 180 | 600-700 |
-| 32 GB | Gemma 4 26B-A4B UD-Q5_K_M | 123-138 | 66-86% | 1 110 | 380-470 |
+| 32 GB | Gemma 4 26B-A4B UD-Q5_K_M | 139-164 | 66-84% | 3 270 | 510-760 |
 | 64 GB | Qwen3.6-35B-A3B Q8_0 | 127-138 | 78-89% | 3 040 | 570-685 |
 | 64 GB | Qwen3.8-Flash-Next Q2 | 76-89 | 68-88% | 1 460 | 250-300 |
 | 128 GB | Qwen3.8-Flash-Next q4-xl | 97-118 | 67-89% | 1 680 | 190-440 |
@@ -97,8 +97,8 @@ own tool (`lily-bench`, `lily-qwen36`, `lily-qwen38`, `lily-glm53`,
 
 | model | prefill 1K / 4K | decode, no drafts | decode with drafts |
 |---|---:|---:|---:|
-| Gemma 4 UD-IQ2_M | 1 820 / 1 500 | ~92 | (121-124 with 2 drafts; off at the 16 GB setting) |
-| Gemma 4 UD-Q5_K_M | 1 340 / 1 170 | ~90 | 131-150 (2 drafts) |
+| Gemma 4 UD-IQ2_M | 3 920 / 3 750 | ~118 | 112-153 (2 drafts, Q4_0 draft model) |
+| Gemma 4 UD-Q5_K_M | 3 560 / 3 440 | ~100 | 122-164 (2 drafts) |
 | Qwen3.6-35B-A3B Q4_K_M | 3 300-3 600 / ~3 480 | ~105 | 131-157 (served) |
 | Qwen3.6-35B-A3B Q8_0 | 5-10% below Q4 | 5-10% below Q4 | |
 | Qwen3.8-Flash-Next Q2 | ~1 610 / ~1 900 | ~54 | 61-91 |
@@ -118,16 +118,16 @@ is the fastest decoder here.
 | GLM 5.3 Flash Q2 | ds4's 100 official continuations | 0.466, 89/100 | ds4 0.458-0.462, 89-90/100 |
 | DeepSeek V4 Flash Q2 | ds4's 100 official continuations | 0.395, 57/100 | ds4 0.398, 56/100 |
 | Qwen3.6-35B-A3B Q4_K_M | 24 long texts, NLL per token | 1.837, same top token as llama.cpp 97% | llama.cpp 1.839 on the same file |
-| Gemma 4 UD-Q5_K_M | KL divergence from llama.cpp on the same file (chat / human text) | 0.0018 / 0.0106 | |
-| Gemma 4 UD-IQ2_M | KL divergence from llama.cpp on the same file | 0.0077 / 0.0263 | |
+| Gemma 4 UD-Q5_K_M | KL divergence from llama.cpp on the same file (chat / human text) | 0.0018 / 0.0105 | |
+| Gemma 4 UD-IQ2_M | KL divergence from llama.cpp on the same file | 0.0077 / 0.0261 | |
 
 ### Memory
 
 | machine | configuration | everything on the GPU | longest context |
 |---|---|---:|---:|
-| 16 GB | Gemma 4 UD-IQ2_M, `--memory-limit-gb 10.2` | 11.0 GB | 14 592 |
+| 16 GB | Gemma 4 UD-IQ2_M, `--memory-limit-gb 10.2` | 11.0 GB | 22 784 (7 936 with the draft model) |
 | 32 GB | Qwen3.6 Q4_K_M, `--memory-limit-gb 22` | 23.6 GB | 52 088 |
-| 32 GB | Gemma 4 UD-Q5_K_M, `--memory-limit-gb 22` | 23.6 GB | 41 216 |
+| 32 GB | Gemma 4 UD-Q5_K_M, `--memory-limit-gb 22` | 23.6 GB | 45 056 |
 | 64 GB | Qwen3.6 Q8_0, `--memory-limit-gb 44` | 47.2 GB | 262 144 |
 | 64 GB | Qwen3.8-Flash-Next Q2, `--memory-limit-gb 44.7` | 48.0 GB | 32 760 |
 | 128 GB | Qwen3.8-Flash-Next q4-xl | 75 GB allocated, 32 GB n-gram table paged | 131 072 |
