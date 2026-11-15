@@ -326,7 +326,7 @@ impl Gemma4Draft {
 
     /// Encodes `n` chained greedy drafts at the state's position `p`: the
     /// first from the token in `io[0]` (staged by the caller) and the
-    /// target hidden `h` (row of `sc.h`), each next one from the draft
+    /// target hidden `h` (the state's `h_last`), each next one from the draft
     /// before it; draft `k` goes to `io[k + 1]`, its probability to
     /// `probs[k]`.
     #[allow(clippy::too_many_arguments)]

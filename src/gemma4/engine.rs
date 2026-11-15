@@ -49,10 +49,11 @@ fn host_copy_at(src: &Tensor, from: usize, dst: &Tensor, to: usize, bytes: usize
 
 /// The sliding-window rings at one position: each ring's last `window`
 /// positions (fewer at the start) in position order, in a window-sized
-/// buffer.
+/// buffer; and the draft model's input there.
 pub struct Gemma4Snapshot {
     pos: usize,
     tensors: Vec<Tensor>,
+    h_last: Tensor,
 }
 
 impl SnapshotApi for Gemma4Snapshot {
@@ -61,7 +62,8 @@ impl SnapshotApi for Gemma4Snapshot {
     }
 
     fn bytes(&self) -> usize {
-        self.tensors.iter().map(Tensor::byte_len).sum()
+        self.tensors.iter().map(Tensor::byte_len).sum::<usize>()
+            + self.h_last.byte_len()
     }
 }
 
@@ -161,7 +163,9 @@ impl DecodeStateApi for Gemma4State {
             }
             tensors.push(t);
         }
-        Ok(Gemma4Snapshot { pos: self.pos, tensors })
+        let h_last = Tensor::zeros(ctx, &[self.h_last.numel()], DType::F32)?;
+        host_copy(&self.h_last, &h_last, h_last.byte_len());
+        Ok(Gemma4Snapshot { pos: self.pos, tensors, h_last })
     }
 
     fn restore(
@@ -180,6 +184,7 @@ impl DecodeStateApi for Gemma4State {
                 at += count * per_slot;
             }
         }
+        host_copy(&snapshot.h_last, &self.h_last, self.h_last.byte_len());
         self.pos = snapshot.pos;
         Ok(())
     }
@@ -262,7 +267,6 @@ impl Gemma4Model {
                 Ok(())
             })?;
             state.pos += chunk.len();
-            state.h_row = chunk.len() - 1;
             fed += chunk.len();
         }
         Ok(fed)
@@ -286,16 +290,15 @@ pub(crate) fn drafts_fit(pos: usize, max_capacity: usize, n: usize) -> usize {
 
 impl Gemma4Model {
     /// Up to `n` greedy drafts following `token` (at the state's position),
-    /// from the target hidden in row `row` of the scratch; the proposals
-    /// end before the first draft below the probability gate, and at the
-    /// state's last rows. Waits.
+    /// from the state's last hidden (`h_last`); the proposals end before the
+    /// first draft below the probability gate, and at the state's last
+    /// rows. Waits.
     fn propose(
         &self,
         ctx: &MetalContext,
         state: &Gemma4State,
         scratch: &Scratch,
         token: u32,
-        row: usize,
         n: usize,
     ) -> Result<Vec<u32>> {
         let Some(draft) = &self.draft else { return Ok(Vec::new()) };
@@ -305,9 +308,8 @@ impl Gemma4Model {
             return Ok(Vec::new());
         }
         draft.stage_token(token)?;
-        let h = scratch.h_row(row, self.cfg.hidden)?;
         let pass = self.begin(ctx)?;
-        draft.encode(ctx, &pass, self, state, scratch, &h, n)?;
+        draft.encode(ctx, &pass, self, state, scratch, &state.h_last, n)?;
         pass.commit_wait()?;
         let (tokens, probs) = draft.read(n)?;
         let keep = probs.iter().take_while(|&&p| p >= self.draft_min_prob).count();
@@ -439,8 +441,7 @@ impl LanguageModel for Gemma4Model {
         _params: &SamplingParams,
         _step0: usize,
     ) -> Result<Vec<u32>> {
-        let row = state.h_row;
-        self.propose(ctx, state, scratch, first, row, drafts)
+        self.propose(ctx, state, scratch, first, drafts)
     }
 
     fn verify<'a>(
@@ -500,14 +501,19 @@ impl LanguageModel for Gemma4Model {
         // Rows past the accepted ones wrote cache slots that later
         // positions overwrite before anything reads them.
         state.pos = pos0 + 1 + accepted;
-        state.h_row = accepted;
+        // The pass left its last row's hidden in h_last; the draft model's
+        // input is the last kept row's (the GPU is idle on both).
+        if accepted + 1 < rows {
+            let h = scratch.h_row(accepted, self.cfg.hidden)?;
+            host_copy(&h, &state.h_last, state.h_last.byte_len());
+        }
         for &token in &draws[accepted + 1..] {
             scratch.sampler().uncount(token);
         }
         if !propose {
             return Ok(Vec::new());
         }
-        self.propose(ctx, state, scratch, draws[accepted], accepted, self.drafts)
+        self.propose(ctx, state, scratch, draws[accepted], self.drafts)
     }
 
     fn max_position_embeddings(&self) -> usize {
@@ -604,13 +610,11 @@ impl LanguageModel for Gemma4Model {
 
     fn prepare_step_inputs(
         &self,
-        state: &mut Gemma4State,
+        _state: &mut Gemma4State,
         _scratch: &Scratch,
         token: u32,
     ) -> Result<()> {
         check_tokens(&[token], self.cfg.vocab)?;
-        // A one-row step leaves its hidden in row 0.
-        state.h_row = 0;
         Ok(())
     }
 

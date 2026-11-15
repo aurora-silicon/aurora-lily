@@ -233,8 +233,8 @@ pub fn ring_slots(cfg: &Config) -> usize {
 }
 
 /// GPU bytes of one session's caches for `capacity` tokens (the global
-/// layers' f16 K and V), its sliding-window rings, and `checkpoints`
-/// snapshots of the rings' windows.
+/// layers' f16 K and V), its sliding-window rings and the draft model's
+/// input, and `checkpoints` snapshots of the rings' windows and that input.
 pub fn session_bytes(cfg: &Config, capacity: usize, checkpoints: usize) -> u64 {
     let per_row = |swa: bool| -> usize {
         (0..cfg.n_layer)
@@ -242,8 +242,10 @@ pub fn session_bytes(cfg: &Config, capacity: usize, checkpoints: usize) -> u64 {
             .map(|il| 4 * cfg.kv_width(il))
             .sum()
     };
+    // Each snapshot also keeps the draft model's input (4 B a hidden value).
     (per_row(false) * capacity
-        + per_row(true) * (ring_slots(cfg) + checkpoints * cfg.window)) as u64
+        + per_row(true) * (ring_slots(cfg) + checkpoints * cfg.window)
+        + 4 * cfg.hidden * (1 + checkpoints)) as u64
 }
 
 /// The most GPU memory one session holds on its way to `capacity` rows
@@ -275,9 +277,10 @@ pub struct Gemma4State {
     /// The rows the global layers' caches may grow to.
     pub max_capacity: usize,
     pub layers: Vec<LayerCache>,
-    /// The row of the scratch's `h` holding the post-norm hidden of the
-    /// last fed position (the draft model's input).
-    pub h_row: usize,
+    /// F32 [hidden]: the post-norm hidden of the last fed position, the
+    /// draft model's input (a snapshot keeps it, so a restored or forked
+    /// state drafts as the state it was taken from).
+    pub h_last: Tensor,
     /// A verify pass that fed rows from this position and the draws of its
     /// rows, until `finish_speculation` decides what stays.
     pub(crate) spec: Option<(usize, usize, Vec<u32>)>,
@@ -314,15 +317,16 @@ impl Gemma4State {
             capacity,
             max_capacity,
             layers,
-            h_row: 0,
+            h_last: Tensor::zeros(ctx, &[cfg.hidden], DType::F32)?,
             spec: None,
             window: cfg.window,
         })
     }
 
-    /// Bytes of the caches.
+    /// Bytes of the caches and the draft model's input.
     pub fn bytes(&self) -> usize {
-        self.layers.iter().map(|l| l.k.byte_len() + l.v.byte_len()).sum()
+        self.layers.iter().map(|l| l.k.byte_len() + l.v.byte_len()).sum::<usize>()
+            + self.h_last.byte_len()
     }
 }
 
@@ -513,7 +517,6 @@ impl Gemma4Model {
         sc.stage_tokens(tokens)?;
         self.run_rows(ctx, st, sc, m, logits, |_| Ok(()))?;
         st.pos += m;
-        st.h_row = m - 1;
         Ok(())
     }
 
@@ -606,6 +609,9 @@ impl Gemma4Model {
             self.encode_layer(ctx, pass, st, sc, il, m)?;
         }
         if layers.end == cfg.n_layer {
+            // The last row's hidden for the draft model, beside the head
+            // (both read the last layer's output).
+            g4::copy(ctx, pass, &sc.h_row(m - 1, cfg.hidden)?, &st.h_last, cfg.hidden)?;
             self.encode_head(ctx, pass, sc, m, logits)?;
         }
         Ok(())

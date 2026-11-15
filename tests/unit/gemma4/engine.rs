@@ -200,7 +200,10 @@ fn speculation_at_rest_restores_and_forks_like_plain_decoding() {
     agree(&b, "speculation with rests");
 
     // At rest after 20 tokens: snapshot, go on, restore, go on again; and a
-    // fork (prefix copy + snapshot) into a fresh state.
+    // fork (prefix copy + snapshot) into a fresh state with a scratch of
+    // its own. The draft model's input comes back with the snapshot, so
+    // the proposals after the restore and in the fork are the first run's
+    // (a stale input would change them, not the verified tokens).
     let first = prefill(&mut st, &mut sc);
     let (head, _) = speculate(&model, &ctx, &mut st, &mut sc, first, 20, Some(1));
     let at_rest = st.pos;
@@ -209,15 +212,19 @@ fn speculation_at_rest_restores_and_forks_like_plain_decoding() {
     assert_eq!(snap.pos(), at_rest);
     let rest = |r: Vec<u32>| [&head[..head.len() - 1], &r].concat();
     let go = |st: &mut Gemma4State, sc: &mut Scratch| {
-        speculate(&model, &ctx, st, sc, last, n - head.len() + 1, None).0
+        speculate(&model, &ctx, st, sc, last, n - head.len() + 1, None)
     };
-    let c1 = go(&mut st, &mut sc);
+    let (c1, p1) = go(&mut st, &mut sc);
     st.restore(&ctx, &snap).unwrap();
-    let c2 = go(&mut st, &mut sc);
+    let (c2, p2) = go(&mut st, &mut sc);
     let mut fork = LanguageModel::new_state(&model, &ctx, 64).unwrap();
     fork.copy_prefix_from(&ctx, &st, at_rest).unwrap();
     fork.restore(&ctx, &snap).unwrap();
-    let c3 = go(&mut fork, &mut sc);
+    let mut sc2 = LanguageModel::new_scratch_with_capacity(&model, &ctx, 2048).unwrap();
+    let (c3, p3) = go(&mut fork, &mut sc2);
+    assert!(p1.iter().any(|(_, d)| !d.is_empty()), "no proposals: {p1:?}");
+    assert_eq!(p1, p2, "proposals after the restore");
+    assert_eq!(p1, p3, "proposals in the fork");
     agree(&rest(c1), "after the snapshot");
     agree(&rest(c2), "after the restore");
     agree(&rest(c3), "in the fork");
