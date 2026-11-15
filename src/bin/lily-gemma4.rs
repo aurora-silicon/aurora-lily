@@ -70,9 +70,6 @@ enum Cmd {
         #[arg(long, default_value_t = 24)]
         steps: usize,
     },
-    /// GPU memory of a configuration: the loaded weights, the scratch and
-    /// one session for `ctx` tokens with `checkpoints` snapshots, exactly
-    /// (the backend's allocation counter).
     /// The context `--memory-limit-gb` fits, loading as the server does
     /// (prints the load's fit line): `checkpoints` snapshots a session.
     Fit {
@@ -85,6 +82,9 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         checkpoints: usize,
     },
+    /// GPU memory of a configuration: the loaded weights, the scratch and
+    /// one session for `ctx` tokens with `checkpoints` snapshots, exactly
+    /// (the backend's allocation counter).
     Mem {
         #[arg(long)]
         model: PathBuf,
