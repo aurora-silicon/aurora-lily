@@ -3,13 +3,14 @@
 //! 1.27 GB table off the GPU this way. The trunk's rows are copied by the
 //! host for the tokens it feeds, which it knows before each pass reads them
 //! (a prompt chunk, a verify pass, a decode step), so the trunk embeds
-//! exactly what the mapped table held. The draft head, when loaded, also
-//! embeds tokens only the GPU knows (the trunk's draws, its own proposals):
-//! those come from a resident copy of the rows of its narrow LM head
-//! (`spec.rs`; 505 MB, so the net saving with the head is 767 MB), where
-//! another id embeds as zeros, which can only cost its proposals
-//! acceptance. Its catch-up over a prompt chunk past position 0 uses the
-//! chunk's exact staged rows (`Qwen4ExpModel::mtp_catch_up`).
+//! exactly what the mapped table held. The draft head embeds the tokens the
+//! host staged from those rows too (a prompt chunk's, a verify pass's
+//! inputs and accepted drafts). Tokens the GPU draws within a draft pass
+//! (the step's new draw, the head's own proposals) come from a resident copy
+//! of the rows of its narrow LM head (`spec.rs`; 505 MB, so the net saving
+//! with the head is 767 MB), where another id embeds as zeros, which can
+//! only cost acceptance; the next draft pass rewrites such a new draw's row
+//! in the head's cache once it is the staged pending token.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;

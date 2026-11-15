@@ -1077,6 +1077,49 @@ fn narrow_embedding_reads_its_rows_and_zeros_between() {
     }
 }
 
+/// The draft pass's draws: a draw equal to the next input takes that
+/// input's staged row (also when the narrow table lacks it), any other
+/// draw (the last row's always) its narrow row or zeros.
+#[test]
+fn draws_take_the_next_inputs_staged_row_or_their_narrow_row() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(87);
+    let (h, low, spec, vocab) = (64usize, 10usize, 30usize, 36usize);
+    let n = low + (vocab - spec);
+    let raw = random_blocks(&mut rng, GgmlType::Bf16, n * h);
+    let table = QWeight::from_bytes(&ctx, &raw, GgmlType::Bf16, h, n).unwrap();
+    let cw = decode(GgmlType::Bf16, &raw);
+    let inputs: Vec<u32> = vec![3, 20, 31, 7];
+    let draws: Vec<u32> = vec![20, 31, 8, 21];
+    let m = inputs.len();
+    let staged_rows: Vec<f32> =
+        (0..m * h).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0)).to_f32()).collect();
+    let staged = Tensor::from_f32_as_bf16(&ctx, &staged_rows, &[m, h]).unwrap();
+    let u32s = |v: &[u32]| Tensor::from_bytes(&ctx, bytemuck::cast_slice(v), &[v.len()], DType::U32).unwrap();
+    let (tdraws, tinputs) = (u32s(&draws), u32s(&inputs));
+    let out = Tensor::zeros(&ctx, &[m, h], DType::BF16).unwrap();
+    run(&ctx, |p| {
+        embed_draws_bf16(&ctx, p, &table, low, spec, &tdraws, &tinputs, &staged, &out, m).unwrap()
+    });
+    let got = out.to_f32().unwrap();
+    let narrow = |id: usize| match id {
+        _ if id < low => cw[id * h..(id + 1) * h].to_vec(),
+        _ if id >= spec && id < vocab => cw[(low + id - spec) * h..(low + id - spec + 1) * h].to_vec(),
+        _ => vec![0.0; h],
+    };
+    // Rows 0 and 1 are accepted drafts (20 is outside the narrow rows);
+    // row 2 is not; row 3 is the last.
+    let want = [
+        staged_rows[h..2 * h].to_vec(),
+        staged_rows[2 * h..3 * h].to_vec(),
+        narrow(8),
+        narrow(21),
+    ];
+    for (r, w) in want.iter().enumerate() {
+        assert_eq!(got[r * h..(r + 1) * h], w[..], "row {r}");
+    }
+}
+
 /// The packed down kernel (`m <= 4`, 640 activations) gives a row the same
 /// bits wherever it sits in a call, for every down type it takes (the Q2
 /// file's Q2_K, the draft head's MXFP4, Q8_0) and for slot counts that end

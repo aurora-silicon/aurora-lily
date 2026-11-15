@@ -4,8 +4,8 @@
 //! from rows read from the file and the draft head from its resident narrow
 //! rows, and the outputs equal the mapped table's. The load is fitted to
 //! 44.7 GiB both ways, with 256-row prompt chunks so a prompt spans several,
-//! and a token outside the draft head's narrow LM head sits in a later
-//! chunk. Each run loads the file (45 GB): run alone.
+//! and tokens outside the draft head's narrow LM head sit in the first chunk
+//! and a later one. Each run loads the file (45 GB): run alone.
 
 use std::path::Path;
 
@@ -57,6 +57,7 @@ fn runs(paged: bool) -> Result<Runs> {
     let text = "The library keeps a short list of rules for its readers. ".repeat(120);
     let mut prompt = generator.tokenizer().encode(&text)?;
     prompt.truncate(700);
+    prompt[100] = OUTSIDE + 1;
     prompt[600] = OUTSIDE;
     let greedy = SamplingParams::greedy();
     let options = |drafts| GenerateOptions {
@@ -117,9 +118,9 @@ fn runs(paged: bool) -> Result<Runs> {
     })
 }
 
-/// Paged and mapped give the same tokens, proposals and acceptance (the
-/// prompt's tokens and draws are inside the narrow head but one, which sits
-/// past the first chunk, where the draft head embeds exactly too).
+/// Paged and mapped give the same tokens, proposals and acceptance (the draft
+/// head embeds the prompt's tokens and the accepted drafts exactly; the
+/// draws here are inside its narrow head).
 #[test]
 #[ignore = "requires LILY_QWEN38_Q2"]
 fn the_paged_embedding_gives_the_mapped_tables_outputs() -> Result<()> {

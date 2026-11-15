@@ -73,13 +73,16 @@ bytes) is not mapped for the GPU (`src/qwen4exp/embed.rs`):
   chunk's rows before its pass is committed, a decode step's into a one-row
   staging before the step runs (a parked decode step waits for the host before
   its first level). The trunk's embeddings are the mapped table's bit for bit.
-- The draft head also embeds tokens only the GPU knows (the trunk's draws, its
-  own proposals). It reads them from a resident copy of its narrow LM head's rows
-  (ids below 98 304 and the tokenizer's added tokens: 98 580 rows, 504 729 600
-  bytes), where any other id embeds as zeros: that can only cost proposals. Its
-  catch-up over a prompt chunk past position 0 uses the chunk's exact rows; the
-  first chunk's catch-up (its tokens shifted by one) takes the narrow rows. Text
-  in another script drafts less well this way: Italian 61/134 -> 55/146 drafts
+- The draft head embeds every token the host has staged from the exact rows: a
+  prompt chunk's tokens and a verify pass's inputs (an accepted draft is the
+  next input). Tokens the GPU draws within a draft pass, the step's new draw and
+  the head's own proposals, come from a resident copy of its narrow LM head's
+  rows (ids below 98 304 and the tokenizer's added tokens: 98 580 rows,
+  504 729 600 bytes), where any other id embeds as zeros; a new draw outside
+  them has its row in the head's cache rewritten from the file by the next
+  draft pass, when it is the pending token (to within one row's rounding).
+  Output is identical paged and mapped; draft acceptance can be lower on text
+  with many tokens outside the resident rows: Italian 61/134 -> 57/142 drafts
   accepted on the bench text, English unchanged.
 - Net, with the draft head: 766 668 800 bytes less on the GPU; without it the
   narrow rows are not kept and the whole table stays off the GPU.
