@@ -615,3 +615,87 @@ fn moe_grouped_matches_a_bf16_reference() {
         );
     }
 }
+
+/// The decode step's dense GEMVs at Gemma's shapes, one row, as the model
+/// groups them (q/k/v one dispatch, gate/up one), Q5_K (UD-IQ2_M) and Q8_0
+/// (UD-Q5_K_M); best of five passes of 256 dispatches over four weight
+/// copies (the head: one copy, 16 dispatches): passes as long as a decode
+/// step's, shorter ones measured 30% apart run to run.
+#[test]
+#[ignore = "timing only"]
+fn gemv_timing() {
+    use crate::kernels::glm53::gemv_sets;
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(71);
+    let h = 2816;
+    for ty in [GgmlType::Q5K, GgmlType::Q8_0] {
+        let shapes: [(&str, usize, &[usize]); 5] = [
+            ("q/k/v", h, &[4096, 2048, 2048]),
+            ("o", 4096, &[h]),
+            ("gate/up", h, &[2112, 2112]),
+            ("down", 2112, &[h]),
+            ("head", h, &[262144]),
+        ];
+        for (label, cols, rows) in shapes {
+            let ty = if label == "down" { GgmlType::Q8_0 } else { ty };
+            if label == "down" && ty == GgmlType::Q8_0 && cols != 2112 {
+                continue;
+            }
+            let copies = if label == "head" { 1 } else { 4 };
+            let repeat = if label == "head" { 16 } else { 256 };
+            let ws: Vec<Vec<QWeight>> = (0..copies)
+                .map(|_| {
+                    rows.iter()
+                        .map(|&r| {
+                            let raw = random_blocks(&mut rng, ty, r * cols);
+                            QWeight::from_bytes(&ctx, &raw, ty, cols, r).unwrap()
+                        })
+                        .collect()
+                })
+                .collect();
+            let x = tensor(&ctx, &f32s(&mut rng, cols, -1.0, 1.0));
+            let ys: Vec<Tensor> = rows.iter().map(|&r| zeros(&ctx, r)).collect();
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let pass = ctx.begin().unwrap();
+                for r in 0..repeat {
+                    let sets: Vec<(&QWeight, &Tensor)> =
+                        ws[r % copies].iter().zip(ys.iter()).collect();
+                    gemv_sets(&ctx, &pass, &sets, &x, 1).unwrap();
+                }
+                let t = std::time::Instant::now();
+                pass.commit_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            let bytes: usize = ws[0].iter().map(|w| w.row_bytes * w.rows).sum();
+            let per = best / repeat as f64;
+            eprintln!(
+                "gemv {ty:?} {label:8} {:8.1} us {:6.1} GB/s",
+                per * 1e6,
+                bytes as f64 / per / 1e9
+            );
+        }
+    }
+}
+
+/// The two-rows-a-subgroup Q5_K GEMV (weights past GEMV_R2_MIN_ROWS rows,
+/// the LM head) against the CPU, an odd row count, rows of fewer and of
+/// more than 32 tasks.
+#[test]
+fn gemv_wide_q5_k_matches_cpu() {
+    use crate::kernels::glm53::gemv;
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(72);
+    for (cols, rows) in [(512, 32771), (2816, 32769)] {
+        let raw = random_blocks(&mut rng, GgmlType::Q5K, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q5K, cols, rows).unwrap();
+        let xv = f32s(&mut rng, cols, -1.0, 1.0);
+        let x = tensor(&ctx, &xv);
+        let y = zeros(&ctx, rows);
+        run(&ctx, |pass| gemv(&ctx, pass, &w, &x, &y, 1).unwrap());
+        let wf = decode(GgmlType::Q5K, &raw);
+        let expected: Vec<f32> =
+            (0..rows).map(|r| dot(&wf[r * cols..(r + 1) * cols], &xv)).collect();
+        assert_close(&y.to_f32().unwrap(), &expected, 1e-4, 1e-4);
+    }
+}
