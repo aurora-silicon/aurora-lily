@@ -405,6 +405,13 @@ impl Scratch {
             chunks,
         );
         let logits = f(MAX_ROWS * cfg.vocab)?;
+        // One pool for the attention's q, qo and heads and the grouped
+        // experts' f32 outputs: the experts run after the attention output
+        // projection has read heads, and the next layer's q waits for the
+        // experts (each ~0.1 MB a run row).
+        let qw = cfg.max_q_width();
+        let moe = g4::MoeGroupScratch::pool_len(m, cfg.n_expert_used, cfg.ff_expert, h);
+        let pool = f((3 * m * qw).max(moe))?;
         Ok(Self {
             rows: m,
             logits_last: logits.view(0, &[cfg.vocab])?,
@@ -416,11 +423,11 @@ impl Scratch {
                 &[m * cfg.max_q_width().max(cfg.ff).max(h)],
                 DType::BF16,
             )?,
-            q: f(m * cfg.max_q_width())?,
+            q: pool.view(0, &[m * qw])?,
             kv: f(m * cfg.max_kv_width())?,
             vraw: f(m * cfg.max_kv_width())?,
-            qo: f(m * cfg.max_q_width())?,
-            heads: f(m * cfg.max_q_width())?,
+            qo: pool.view(m * qw, &[m * qw])?,
+            heads: pool.view(2 * m * qw, &[m * qw])?,
             attn: f(m * h)?,
             r: f(m * h)?,
             n1: f(m * h)?,
@@ -435,13 +442,14 @@ impl Scratch {
             sel: Tensor::zeros(ctx, &[m * cfg.n_expert_used], DType::U32)?,
             rw: f(m * cfg.n_expert_used)?,
             emid: f(MAX_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
-            moe_group: g4::MoeGroupScratch::new(
+            moe_group: g4::MoeGroupScratch::in_pool(
                 ctx,
                 m,
                 cfg.n_expert_used,
                 cfg.n_expert,
                 cfg.ff_expert,
                 h,
+                &pool,
             )?,
             partial: f(partial)?,
             chunks,
