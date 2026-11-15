@@ -784,15 +784,16 @@ void main() {
 }
 #endif
 // ---------------------------------------------------------------------------
-// Routed experts' gate and up at decode (glm53_moe_gate_up_q4_k / _q8_0, the
-// same arithmetic bit for bit) for the model's rows of K = 2048 in less
-// code: no division or clamp by parameters, the task loop rolled (unrolled
-// it was slower: every level fetches its kernel's code cold), a Q4_K
-// block's header (d, dmin, 12 scale bytes) one 16-byte load. mid[slot][r] =
-// glm53_moe_act(gate_r . x, up_r . x, 0, w). One subgroup a row r. Grid
-// (F / 8, m * used), 256 threads. Buffers and params as glm53's: 0 gate,
-// 1 up, 2 x [m][K], 3 sel [m][used], 4 w [m][used], 5 mid; 6 K, 7 F,
-// 8 row_bytes, 9 used.
+// Routed experts' gate and up at decode (glm53_moe_gate_up_q4_k / _q8_0's
+// arithmetic, each sum regrouped) for the model's rows of K = 2048 in less
+// code: no division or clamp by parameters, a Q4_K block's header (d, dmin,
+// 12 scale bytes) one 16-byte load. mid[slot][r] = glm53_moe_act(gate_r .
+// x, up_r . x, 0, w). Each row over two subgroups, one task a lane: twice
+// the threadgroups of a subgroup a row (7.47 -> 7.29 ms a decode step,
+// 2026-11-15); the halves' sums are added in order, so a row's bits do not
+// depend on m. Grid (F / 4, m * used), 256 threads. Buffers and params as
+// glm53's: 0 gate, 1 up, 2 x [m][K], 3 sel [m][used], 4 w [m][used], 5 mid;
+// 6 K, 7 F, 8 row_bytes, 9 used.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_qwen36_moe_gate_up_q4_k_k2048) || defined(KERNEL_qwen36_moe_gate_up_q8_0_k2048)
 // glm53_moe_act (glm53.comp) without the clamp (limit 0): w ((g u) / (1 +
@@ -835,6 +836,8 @@ void qwen36_decode_q4_k(uint64_t row, uint t, out float w[32]) {
         }
     }
 }
+shared float gu_gate[8];
+shared float gu_up[8];
 void main() {
     const uint K = 2048u;
     const uint F = arg_u32(7);
@@ -842,35 +845,35 @@ void main() {
     const uint used = arg_u32(9);
     const uint slot = gl_WorkGroupID.y;
     const uint i = slot / used;
-    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
-    if (r >= F) return;
+    const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint r = gl_WorkGroupID.x * 4u + sg / 2u;
     const uint e = U32(arg(3)).v[slot];
     const float we = F32(arg(4)).v[slot];
-    const uint64_t off = (uint64_t(e) * F + r) * row_bytes;
-    const uint64_t gate = arg(0) + off;
-    const uint64_t up = arg(1) + off;
+    const uint64_t off = (uint64_t(e) * F + min(r, F - 1u)) * row_bytes;
     const uint64_t X = arg(2) + 4u * uint64_t(i) * K;
-    const uint tasks = K / GLM53_TASK;
-    float ag = 0.0, au = 0.0;
-    [[dont_unroll]] for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
-        float w[32];
+    // The row's half (sg & 1): one task a lane.
+    const uint t = (sg & 1u) * 32u + lane;
+    float w[32];
 #ifdef KERNEL_qwen36_moe_gate_up_q4_k_k2048
-        qwen36_decode_q4_k(gate, t, w);
+    qwen36_decode_q4_k(arg(0) + off, t, w);
 #else
-        glm53_decode_q8_0(gate, t, w);
+    glm53_decode_q8_0(arg(0) + off, t, w);
 #endif
-        ag += glm53_task_dot(w, X + 128u * t);
+    const float ag = subgroupAdd(glm53_task_dot(w, X + 128u * t));
 #ifdef KERNEL_qwen36_moe_gate_up_q4_k_k2048
-        qwen36_decode_q4_k(up, t, w);
+    qwen36_decode_q4_k(arg(1) + off, t, w);
 #else
-        glm53_decode_q8_0(up, t, w);
+    glm53_decode_q8_0(arg(1) + off, t, w);
 #endif
-        au += glm53_task_dot(w, X + 128u * t);
+    const float au = subgroupAdd(glm53_task_dot(w, X + 128u * t));
+    if (lane == 0u) {
+        gu_gate[sg] = ag;
+        gu_up[sg] = au;
     }
-    ag = subgroupAdd(ag);
-    au = subgroupAdd(au);
-    if (gl_SubgroupInvocationID == 0u) {
-        F32(arg(5)).v[slot * F + r] = qwen36_moe_act(ag, au, we);
+    barrier();
+    if ((sg & 1u) == 0u && lane == 0u && r < F) {
+        F32(arg(5)).v[slot * F + r] =
+            qwen36_moe_act(gu_gate[sg] + gu_gate[sg + 1u], gu_up[sg] + gu_up[sg + 1u], we);
     }
 }
 #endif
@@ -939,22 +942,23 @@ void main() {
 #endif
 // ---------------------------------------------------------------------------
 // glm53_gemv_q8_0_m1 for rows of K = 4096 (the GDN and attention output
-// projections, 2048 rows: 256 threadgroups) with each row split over KS = 2
-// subgroups of a threadgroup, each taking half its values: twice the
-// threadgroups and half the dependent task rounds a lane. The sum
-// regrouped: each half's lanes summed, then the halves.
+// projections, 2048 rows: 256 threadgroups) with each row split over KS = 4
+// subgroups of a threadgroup, each taking a quarter of its values: four
+// times the threadgroups and one task a lane (two parts: 7.5 -> 7.4 ms a
+// decode step, 2026-11-15). The sum regrouped: each part's lanes summed,
+// then the parts in order.
 // Threadgroups of 256 (8 / KS rows). Buffers: 0 x [K], 1 W, 2 y. Param: 3 N.
 // ---------------------------------------------------------------------------
-#if defined(KERNEL_qwen36_gemv_q8_0_k4096_s2) || defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m2) || \
-    defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m3) || defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m4)
-#define KS 2u
+#if defined(KERNEL_qwen36_gemv_q8_0_k4096_s4) || defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m2) || \
+    defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m3) || defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m4)
+#define KS 4u
 // Activation rows: _m2 .. _m4 (verify passes) take each row's sums in the
 // one-row kernel's order, so a verify row is the same bits as a decode step.
-#if defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m2)
+#if defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m2)
 #define KM 2u
-#elif defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m3)
+#elif defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m3)
 #define KM 3u
-#elif defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m4)
+#elif defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m4)
 #define KM 4u
 #else
 #define KM 1u
@@ -997,6 +1001,82 @@ void main() {
             float total = ks_part[i][sg];
             [[unroll]] for (uint p = 1u; p < KS; p++) total += ks_part[i][sg + p];
             F32(arg(2)).v[i * N + n] = total;
+        }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Up to four GEMVs over one x at decode and verify rows (1-4: the kernel's
+// _m<rows>), rows of K = 2048, each set F32 or Q8_0 (the GDN input
+// projections, the attention's q, k and v, the shared expert's gate and
+// up): glm53_gemv's per-task arithmetic for the set's type, each row over
+// two subgroups of a threadgroup, one task a lane (glm53_gemv: a subgroup a
+// row, two tasks a lane; 7.34-7.43 -> 7.26-7.30 ms a decode step,
+// 2026-11-15). The halves' sums are added in order, so a row's bits do not
+// depend on m. A threadgroup's set, and so its type, is uniform.
+// Threadgroups of 256 (4 rows). Buffers: 0 x [m][K], 1-4 W, 5-8 y
+// [m][rows_s]. Params: 9-12 rows of each set (0: unused), 13 the F32 sets
+// (bit s).
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qwen36_gemv_k2048_m1) || defined(KERNEL_qwen36_gemv_k2048_m2) || \
+    defined(KERNEL_qwen36_gemv_k2048_m3) || defined(KERNEL_qwen36_gemv_k2048_m4)
+#if defined(KERNEL_qwen36_gemv_k2048_m2)
+#define KM 2u
+#elif defined(KERNEL_qwen36_gemv_k2048_m3)
+#define KM 3u
+#elif defined(KERNEL_qwen36_gemv_k2048_m4)
+#define KM 4u
+#else
+#define KM 1u
+#endif
+shared float k2_part[KM][8];
+void main() {
+    const uint64_t X = arg(0);
+    const uint K = 2048u;
+    const uint tasks = K / GLM53_TASK;
+    // The threadgroup's set.
+    uint tg = gl_WorkGroupID.x;
+    uint set = 0u;
+    uint N = arg_u32(9);
+    [[unroll]] for (uint s = 0u; s < 3u; s++) {
+        const uint tgs = (N + 3u) / 4u;
+        if (set == s && tg >= tgs) {
+            tg -= tgs;
+            set = s + 1u;
+            N = arg_u32(10u + s);
+        }
+    }
+    const bool f32w = ((arg_u32(13) >> set) & 1u) != 0u;
+    const uint row_bytes = f32w ? K * 4u : tasks * 34u;
+    const uint64_t Y = arg(5u + set);
+    const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint n = tg * 4u + sg / 2u;
+    const uint t = (sg & 1u) * 32u + lane;
+    const uint64_t row = arg(1u + set) + uint64_t(min(n, N - 1u)) * row_bytes;
+    const uint64_t xt = X + 4u * uint64_t(t * GLM53_TASK);
+    float w[32];
+    float d = 1.0;
+    if (f32w) {
+        glm53_decode_f32(row, t, w);
+    } else {
+        const uint64_t b = row + uint64_t(t) * 34u;
+        d = glm53_h2f(uint(U16(b).v[0]));
+        [[unroll]] for (uint i = 0u; i < 16u; i++) {
+            const uint pair = uint(U16(b + 2u).v[i]);
+            w[2u * i] = float(int(pair << 24) >> 24);
+            w[2u * i + 1u] = float(int(pair << 16) >> 24);
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < KM; i++) {
+        const float dot = glm53_task_dot(w, xt + 4u * uint64_t(i) * K);
+        const float sum = subgroupAdd(f32w ? dot : d * dot);
+        if (lane == 0u) k2_part[i][sg] = sum;
+    }
+    barrier();
+    if ((sg & 1u) == 0u && lane == 0u && n < N) {
+        [[unroll]] for (uint i = 0u; i < KM; i++) {
+            F32(Y).v[i * N + n] = k2_part[i][sg] + k2_part[i][sg + 1u];
         }
     }
 }

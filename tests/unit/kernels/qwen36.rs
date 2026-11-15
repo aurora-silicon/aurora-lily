@@ -23,6 +23,24 @@ fn tensor(ctx: &MetalContext, v: &[f32]) -> Tensor {
     Tensor::from_f32(ctx, v, &[v.len()]).expect("tensor")
 }
 
+/// Fill past a kernel's logical output: it must survive the dispatch.
+const SENTINEL: f32 = -7.25;
+
+/// An F32 tensor of `n` outputs and 8 sentinels after them.
+fn guarded(ctx: &MetalContext, n: usize) -> Tensor {
+    tensor(ctx, &vec![SENTINEL; n + 8])
+}
+
+/// The `n` logical outputs of a [`guarded`] tensor, its sentinels checked.
+fn unguard(t: &Tensor, n: usize, what: &str) -> Vec<f32> {
+    let mut v = t.to_f32().unwrap();
+    for (k, x) in v[n..].iter().enumerate() {
+        assert_eq!(x.to_bits(), SENTINEL.to_bits(), "{what}: sentinel {k} written");
+    }
+    v.truncate(n);
+    v
+}
+
 fn zeros(ctx: &MetalContext, n: usize, d: DType) -> Tensor {
     Tensor::zeros(ctx, &[n], d).expect("zeros")
 }
@@ -684,25 +702,42 @@ fn gdn_step_matches_gdn_bitwise() {
     }
 }
 
-/// The K = 2048 gate/up kernels against GLM's: the same bits.
+/// Routed gate/up at rows of 2048 against GLM's kernel: each row over two
+/// subgroups regroups its sums, so both are compared with an f64 reference
+/// (an empirical comparison on these seeded inputs: the new kernel's
+/// largest absolute error at most twice GLM's, plus 1e-6; every output and
+/// reference finite). ff of 512 and 510 (a partial last threadgroup), with
+/// sentinels after the outputs. Each activation row of a multi-row run is
+/// the same bits as that row alone (a verify row is a decode step's).
 #[test]
-fn moe_gate_up_matches_glm53_bitwise() {
+fn moe_gate_up_matches_glm53() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(80);
-    let (experts, hidden, ff, used) = (12, 2048, 512, 8);
-    for (ty, m) in [(GgmlType::Q4K, 1), (GgmlType::Q4K, 3), (GgmlType::Q8_0, 2)] {
-        let q = |rng: &mut StdRng| {
+    let (experts, hidden, used) = (12, 2048, 8);
+    for (ty, m, ff) in [
+        (GgmlType::Q4K, 1, 512),
+        (GgmlType::Q4K, 3, 510),
+        (GgmlType::Q8_0, 2, 510),
+        (GgmlType::Q8_0, 4, 512),
+    ] {
+        let mut deq = Vec::new();
+        let mut q = |rng: &mut StdRng| {
             let raw = random_blocks(rng, ty, hidden * experts * ff);
+            let mut d = vec![0f32; hidden * experts * ff];
+            dequantize(ty, &raw, &mut d).unwrap();
+            deq.push(d);
             QWeight::from_bytes(&ctx, &raw, ty, hidden, experts * ff).unwrap()
         };
         let (gw, uw) = (q(&mut rng), q(&mut rng));
-        let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+        let xs = f32s(&mut rng, m * hidden, -2.0, 2.0);
+        let x = tensor(&ctx, &xs);
         let sel: Vec<u32> =
             (0..m * used).map(|p| ((p * 5 + 1) % experts) as u32).collect();
         let tsel = u32s(&ctx, &sel);
-        let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
-        let a = zeros(&ctx, m * used * ff, DType::F32);
-        let b = zeros(&ctx, m * used * ff, DType::F32);
+        let ws = f32s(&mut rng, m * used, 0.1, 0.6);
+        let tw = tensor(&ctx, &ws);
+        let n = m * used * ff;
+        let (a, b) = (guarded(&ctx, n), guarded(&ctx, n));
         run(&ctx, |p| {
             moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &a, m, used).unwrap();
             crate::kernels::glm53::moe_gate_up(
@@ -710,13 +745,49 @@ fn moe_gate_up_matches_glm53_bitwise() {
             )
             .unwrap();
         });
-        let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
-        for (k, (u, v)) in a.iter().zip(&b).enumerate() {
-            assert_eq!(
-                u.to_bits(),
-                v.to_bits(),
-                "{ty:?} m {m} element {k}: {u} vs {v}"
-            );
+        let at = format!("{ty:?} m {m} ff {ff}");
+        let (a, b) = (unguard(&a, n, &at), unguard(&b, n, &at));
+        let (mut err_a, mut err_b) = (0f64, 0f64);
+        for slot in 0..m * used {
+            let i = slot / used;
+            let xi = &xs[i * hidden..(i + 1) * hidden];
+            let base = sel[slot] as usize * ff;
+            for r in 0..ff {
+                let dot = |w: &[f32]| -> f64 {
+                    let row = &w[(base + r) * hidden..(base + r + 1) * hidden];
+                    row.iter().zip(xi).map(|(&w, &x)| w as f64 * x as f64).sum()
+                };
+                let (g, u) = (dot(&deq[0]), dot(&deq[1]));
+                let want = ws[slot] as f64 * g * u / (1.0 + (-g).exp());
+                let (ea, eb) = (
+                    (a[slot * ff + r] as f64 - want).abs(),
+                    (b[slot * ff + r] as f64 - want).abs(),
+                );
+                assert!(
+                    want.is_finite() && ea.is_finite() && eb.is_finite(),
+                    "{at} slot {slot} row {r}: {} / {} vs {want}",
+                    a[slot * ff + r],
+                    b[slot * ff + r]
+                );
+                err_a = err_a.max(ea);
+                err_b = err_b.max(eb);
+            }
+        }
+        assert!(err_a <= 2.0 * err_b + 1e-6, "{at}: error {err_a} vs GLM's {err_b}");
+        for i in 0..m {
+            let xi = tensor(&ctx, &xs[i * hidden..(i + 1) * hidden]);
+            let si = u32s(&ctx, &sel[i * used..(i + 1) * used]);
+            let wi = tensor(&ctx, &ws[i * used..(i + 1) * used]);
+            let one = guarded(&ctx, used * ff);
+            run(&ctx, |p| {
+                moe_gate_up(&ctx, p, &gw, &uw, ff, &xi, &si, &wi, &one, 1, used)
+                    .unwrap()
+            });
+            let one = unguard(&one, used * ff, &at);
+            let rows = &a[i * used * ff..(i + 1) * used * ff];
+            for (k, (u, v)) in rows.iter().zip(&one).enumerate() {
+                assert_eq!(u.to_bits(), v.to_bits(), "{at} row {i} element {k}");
+            }
         }
     }
 }
@@ -748,33 +819,35 @@ fn router_sg_matches_router_bitwise() {
 }
 
 /// The K-split Q8_0 GEMV of rows of 4096 against GLM's (sums regrouped) for
-/// 1 to 4 activation rows, and each row of a multi-row dispatch the same
-/// bits as that row alone (a verify row is a decode step's).
+/// 1 to 4 activation rows over 2051 output rows (two a threadgroup: a
+/// partial last one), sentinels after the outputs, and each row of a
+/// multi-row dispatch the same bits as that row alone (a verify row is a
+/// decode step's).
 #[test]
 fn gemv_q8_0_k4096_matches_glm53() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(87);
-    let (cols, rows) = (4096, 2050);
+    let (cols, rows) = (4096, 2051);
     let raw = random_blocks(&mut rng, GgmlType::Q8_0, rows * cols);
     let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap();
     let xs = f32s(&mut rng, 4 * cols, -2.0, 2.0);
     let one: Vec<Vec<f32>> = (0..4)
         .map(|i| {
             let x = tensor(&ctx, &xs[i * cols..(i + 1) * cols]);
-            let y = zeros(&ctx, rows, DType::F32);
+            let y = guarded(&ctx, rows);
             run(&ctx, |p| gemv_q8_0_k4096(&ctx, p, &w, &x, &y, 1).unwrap());
-            y.to_f32().unwrap()
+            unguard(&y, rows, "m 1")
         })
         .collect();
     for m in 1..=4 {
         let x = tensor(&ctx, &xs[..m * cols]);
-        let (a, b) =
-            (zeros(&ctx, m * rows, DType::F32), zeros(&ctx, m * rows, DType::F32));
+        let (a, b) = (guarded(&ctx, m * rows), zeros(&ctx, m * rows, DType::F32));
         run(&ctx, |p| {
             gemv_q8_0_k4096(&ctx, p, &w, &x, &a, m).unwrap();
             crate::kernels::glm53::gemv(&ctx, p, &w, &x, &b, m).unwrap();
         });
-        let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+        let (a, b) = (unguard(&a, m * rows, &format!("m {m}")), b.to_f32().unwrap());
+        assert!(a.iter().chain(&b).all(|v| v.is_finite()), "m {m}: non-finite output");
         assert_close(&a, &b, 1e-5, 1e-5);
         for (i, row) in one.iter().enumerate().take(m) {
             let got = &a[i * rows..(i + 1) * rows];
@@ -904,4 +977,146 @@ fn router_sg_rejects_malformed_tensors() {
         assert!(router_sg(&ctx, &pass, l, s, ww, m).is_err(), "{name} accepted");
     }
     pass.commit_wait().unwrap();
+}
+
+/// The K = 2048 GEMV against `glm53::gemv_sets`: each row over two
+/// subgroups regroups its sums, so both are compared with an f64 reference
+/// (an empirical comparison on these seeded inputs: each set's largest
+/// absolute error at most twice GLM's, plus 1e-6; every output and
+/// reference finite). F32 and Q8_0 sets in one dispatch; two, three and
+/// four sets; partial last threadgroups (509, 1 rows), sentinels after the
+/// outputs. Each activation row of a multi-row run is the same bits as that
+/// row alone.
+#[test]
+fn gemv_k2048_matches_gemv_sets() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(89);
+    let cols = 2048;
+    let (f, q) = (GgmlType::F32, GgmlType::Q8_0);
+    let shapes: [&[(GgmlType, usize)]; 4] = [
+        &[(f, 256), (f, 1), (q, 509), (q, 512)],
+        &[(q, 8192), (q, 4096), (q, 32), (q, 32)],
+        &[(q, 8192), (q, 509)],
+        &[(f, 255), (q, 512), (q, 1)],
+    ];
+    for shape in shapes {
+        let mut deq = Vec::new();
+        let ws: Vec<_> = shape
+            .iter()
+            .map(|&(ty, rows)| {
+                let raw: Vec<u8> = if ty == f {
+                    f32s(&mut rng, rows * cols, -0.1, 0.1)
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect()
+                } else {
+                    random_blocks(&mut rng, ty, rows * cols)
+                };
+                let mut d = vec![0f32; rows * cols];
+                dequantize(ty, &raw, &mut d).unwrap();
+                deq.push(d);
+                QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+            })
+            .collect();
+        let xs = f32s(&mut rng, 4 * cols, -2.0, 2.0);
+        let one: Vec<Vec<Vec<f32>>> = (0..4)
+            .map(|i| {
+                let x = tensor(&ctx, &xs[i * cols..(i + 1) * cols]);
+                let ys: Vec<_> = ws.iter().map(|w| guarded(&ctx, w.rows)).collect();
+                run(&ctx, |p| {
+                    let sets: Vec<_> = ws.iter().zip(&ys).collect();
+                    gemv_k2048(&ctx, p, &sets, &x, 1).unwrap();
+                });
+                ys.iter().zip(&ws).map(|(y, w)| unguard(y, w.rows, "m 1")).collect()
+            })
+            .collect();
+        for m in 1..=4 {
+            let x = tensor(&ctx, &xs[..m * cols]);
+            let ys: Vec<_> = ws.iter().map(|w| guarded(&ctx, m * w.rows)).collect();
+            let refs: Vec<_> =
+                ws.iter().map(|w| zeros(&ctx, m * w.rows, DType::F32)).collect();
+            run(&ctx, |p| {
+                let sets: Vec<_> = ws.iter().zip(&ys).collect();
+                gemv_k2048(&ctx, p, &sets, &x, m).unwrap();
+                for (w, r) in ws.iter().zip(&refs) {
+                    crate::kernels::glm53::gemv_sets(&ctx, p, &[(w, r)], &x, m)
+                        .unwrap();
+                }
+            });
+            for (s, ((y, r), d)) in ys.iter().zip(&refs).zip(&deq).enumerate() {
+                let rows = ws[s].rows;
+                let at = format!("{shape:?} m {m} set {s}");
+                let (y, r) = (unguard(y, m * rows, &at), r.to_f32().unwrap());
+                let (mut err_y, mut err_r) = (0f64, 0f64);
+                for i in 0..m {
+                    let xi = &xs[i * cols..(i + 1) * cols];
+                    for n in 0..rows {
+                        let want: f64 = d[n * cols..(n + 1) * cols]
+                            .iter()
+                            .zip(xi)
+                            .map(|(&w, &x)| w as f64 * x as f64)
+                            .sum();
+                        let (ey, er) = (
+                            (y[i * rows + n] as f64 - want).abs(),
+                            (r[i * rows + n] as f64 - want).abs(),
+                        );
+                        assert!(
+                            want.is_finite() && ey.is_finite() && er.is_finite(),
+                            "{at} row {i} output {n}: {} / {} vs {want}",
+                            y[i * rows + n],
+                            r[i * rows + n]
+                        );
+                        err_y = err_y.max(ey);
+                        err_r = err_r.max(er);
+                    }
+                    let got = &y[i * rows..(i + 1) * rows];
+                    for (k, (u, v)) in got.iter().zip(&one[i][s]).enumerate() {
+                        assert_eq!(u.to_bits(), v.to_bits(), "{at} row {i} output {k}");
+                    }
+                }
+                assert!(
+                    err_y <= 2.0 * err_r + 1e-6,
+                    "{at}: error {err_y} vs GLM's {err_r}"
+                );
+            }
+        }
+    }
+}
+
+/// The K = 2048 GEMV refuses other types and widths, short or non-F32
+/// inputs and outputs, and row or set counts outside 1-4.
+#[test]
+fn gemv_k2048_rejects_malformed() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(90);
+    let cols = 2048;
+    let q = |rng: &mut StdRng, ty: GgmlType, cols: usize| {
+        QWeight::from_bytes(&ctx, &random_blocks(rng, ty, 8 * cols), ty, cols, 8)
+            .unwrap()
+    };
+    let q8 = q(&mut rng, GgmlType::Q8_0, cols);
+    let q4 = q(&mut rng, GgmlType::Q4K, cols);
+    let wide = q(&mut rng, GgmlType::Q8_0, 4096);
+    assert!(
+        gemv_k2048_takes(&q8) && !gemv_k2048_takes(&q4) && !gemv_k2048_takes(&wide)
+    );
+    let x = zeros(&ctx, 4 * 4096, DType::F32);
+    let y = zeros(&ctx, 4 * 8, DType::F32);
+    let short = zeros(&ctx, 2 * 8 - 1, DType::F32);
+    let shortx = zeros(&ctx, 2 * cols - 1, DType::F32);
+    let ux = zeros(&ctx, 4 * 4096, DType::U32);
+    let uy = zeros(&ctx, 4 * 8, DType::U32);
+    run(&ctx, |p| {
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &y)], &x, 2).is_ok());
+        assert!(gemv_k2048(&ctx, p, &[(&q4, &y)], &x, 2).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&wide, &y)], &x, 2).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &short)], &x, 2).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &y)], &shortx, 2).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &y)], &x, 5).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &y)], &x, 0).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &y)], &ux, 2).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &y), (&q8, &uy)], &x, 2).is_err());
+        assert!(gemv_k2048(&ctx, p, &[], &x, 1).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &y); 5], &x, 1).is_err());
+    });
 }

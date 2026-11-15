@@ -766,9 +766,9 @@ pub fn gdn_step(
 }
 
 /// The routed experts' gate and up at decode (`glm53::moe_gate_up` without
-/// the clamp, the same bits) for rows of 2048 values (the model's hidden
-/// width) over Q4_K or Q8_0 experts, in less code; other widths take GLM's
-/// kernel.
+/// the clamp, each row over two subgroups: the sums regrouped, a row's bits
+/// the same at any `m`) for rows of 2048 values (the model's hidden width)
+/// over Q4_K or Q8_0 experts; other widths take GLM's kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gate_up(
     ctx: &MetalContext,
@@ -827,7 +827,7 @@ pub fn moe_gate_up(
             &u32_bytes(used),
         ],
         Grid::Threadgroups {
-            groups: (ff.div_ceil(8), m * used, 1),
+            groups: (ff.div_ceil(4), m * used, 1),
             threadgroup: (256, 1, 1),
         },
     )
@@ -863,7 +863,7 @@ pub fn gemv_q8_0_k4096_takes(w: &QWeight) -> bool {
 }
 
 /// `y[i] = w x[i]` for `m` rows of x (1 to 4) through Q8_0 rows of 4096
-/// values, each row over two subgroups (the sum regrouped against
+/// values, each row over four subgroups (the sum regrouped against
 /// `glm53::gemv`; a row's sums are the same bits at any `m`, so a verify
 /// row is a decode step's).
 pub fn gemv_q8_0_k4096(
@@ -883,12 +883,12 @@ pub fn gemv_q8_0_k4096(
     check(&[(x, DType::F32), (y, DType::F32)])?;
     ensure!((1..=4).contains(&m), "K-split GEMV of {m} rows");
     ensure!(x.numel() >= m * w.cols && y.numel() >= m * w.rows, "K-split GEMV shapes");
-    let ks = 2;
+    let ks = 4;
     let name = [
-        "qwen36_gemv_q8_0_k4096_s2",
-        "qwen36_gemv_q8_0_k4096_s2_m2",
-        "qwen36_gemv_q8_0_k4096_s2_m3",
-        "qwen36_gemv_q8_0_k4096_s2_m4",
+        "qwen36_gemv_q8_0_k4096_s4",
+        "qwen36_gemv_q8_0_k4096_s4_m2",
+        "qwen36_gemv_q8_0_k4096_s4_m3",
+        "qwen36_gemv_q8_0_k4096_s4_m4",
     ][m - 1];
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -899,6 +899,71 @@ pub fn gemv_q8_0_k4096(
             groups: (w.rows.div_ceil(8 / ks), 1, 1),
             threadgroup: (256, 1, 1),
         },
+    )
+}
+
+/// Whether [`gemv_k2048`] takes `w`: F32 or Q8_0 rows of 2048 values.
+pub fn gemv_k2048_takes(w: &QWeight) -> bool {
+    w.cols == 2048
+        && match w.ty {
+            GgmlType::F32 => w.row_bytes == 2048 * 4,
+            GgmlType::Q8_0 => w.row_bytes == 64 * 34,
+            _ => false,
+        }
+}
+
+/// `y_s[i] = w_s x[i]` for one to four weights of rows of 2048 values, each
+/// F32 or Q8_0, over `m` rows of x (1 to 4) in one dispatch
+/// (`qwen36_gemv_k2048_m<m>`): each row over two subgroups (the sum
+/// regrouped against `glm53::gemv_sets`; a row's sums are the same bits at
+/// any `m`, so a verify row is a decode step's).
+pub fn gemv_k2048(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    sets: &[(&QWeight, &Tensor)],
+    x: &Tensor,
+    m: usize,
+) -> Result<()> {
+    ensure!((1..=4).contains(&sets.len()), "K = 2048 GEMV of {} sets", sets.len());
+    ensure!((1..=4).contains(&m), "K = 2048 GEMV of {m} rows");
+    check(&[(x, DType::F32)])?;
+    ensure!(x.numel() >= m * 2048, "K = 2048 GEMV input of {}", x.numel());
+    let mut groups = 0;
+    let mut f32_sets = 0;
+    for (s, &(w, y)) in sets.iter().enumerate() {
+        ensure!(
+            gemv_k2048_takes(w),
+            "no K = 2048 GEMV over {:?} rows of {}",
+            w.ty,
+            w.cols
+        );
+        check(&[(y, DType::F32)])?;
+        ensure!(y.numel() >= m * w.rows, "K = 2048 GEMV output of {}", y.numel());
+        groups += w.rows.div_ceil(4);
+        if w.ty == GgmlType::F32 {
+            f32_sets |= 1 << s;
+        }
+    }
+    let name = [
+        "qwen36_gemv_k2048_m1",
+        "qwen36_gemv_k2048_m2",
+        "qwen36_gemv_k2048_m3",
+        "qwen36_gemv_k2048_m4",
+    ][m - 1];
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    let mut bindings = vec![x.binding()];
+    for s in 0..4 {
+        bindings.push(sets.get(s).map_or(x.binding(), |(w, _)| w.t.binding()));
+    }
+    for s in 0..4 {
+        bindings.push(sets.get(s).map_or(x.binding(), |(_, y)| y.binding()));
+    }
+    let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
+    pass.dispatch_at(
+        &pipeline,
+        &bindings,
+        &[&rows(0), &rows(1), &rows(2), &rows(3), &u32_bytes(f32_sets)],
+        Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
     )
 }
 
