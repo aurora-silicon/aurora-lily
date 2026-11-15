@@ -64,6 +64,10 @@ fn profiling() -> bool {
     std::env::var_os("LILY_PROFILE").is_some()
 }
 
+/// GPU end time of the last draft pass (`LILY_PROFILE` only), for the gap
+/// to the verify pass after it.
+static DRAFT_GPU_END: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
 /// The draft head's narrow LM head: Qwen3.8's ids below this and from
 /// [`DRAFT_SPECIAL_FROM`] on (the tokenizer's added tokens: turn, tool and
 /// thinking markers). On English prose, code and lily's own sources 99.8 to
@@ -259,8 +263,13 @@ impl Qwen4ExpModel {
         let done = committed.wait_retain_polled()?;
         let verify_gpu_end = if profiling() {
             let t = done.timing()?;
+            let gap = DRAFT_GPU_END
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .map_or(f64::NAN, |end| (t.gpu_start_secs - end) * 1e3);
             eprintln!(
-                "profile verify m={m}: gpu {:.2} ms",
+                "profile verify m={m}: gpu {:.2} ms, started {gap:.3} ms after the draft pass ended",
                 (t.gpu_end_secs - t.gpu_start_secs) * 1e3
             );
             Some(t.gpu_end_secs)
@@ -572,6 +581,9 @@ impl Qwen4ExpModel {
         let done = committed.wait_retain_polled()?;
         if profiling() {
             let t = done.timing()?;
+            if let Ok(mut g) = DRAFT_GPU_END.lock() {
+                *g = Some(t.gpu_end_secs);
+            }
             let gap = pending
                 .verify_gpu_end
                 .map_or(f64::NAN, |end| (t.gpu_start_secs - end) * 1e3);
