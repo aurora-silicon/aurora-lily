@@ -73,3 +73,141 @@ fn staged_tokens_are_checked_against_the_vocabulary() {
     assert!(sc.stage_tokens(&[1, 1000]).is_err());
     assert!(sc.stage_tokens(&vec![1; PREFILL_ROWS + 1]).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// The published file: `LILY_GEMMA4_GGUF=<UD-Q5_K_M or UD-IQ2_M path>` (the
+// draft model beside it) `cargo test --release --lib gemma4::engine --
+// --ignored --test-threads=1`.
+// ---------------------------------------------------------------------------
+
+fn argmax(v: &[f32]) -> u32 {
+    v.iter().enumerate().fold(0, |b, (i, &x)| if x > v[b] { i } else { b }) as u32
+}
+
+/// Greedy speculation from a state at rest whose last draw `first` is not
+/// fed, until at least `n` tokens (counting `first`) or the state's cap;
+/// with `rest_every`, every so many steps it finishes without proposing (as
+/// at a checkpoint) and restarts with `draft_initial`. Returns the tokens
+/// and the proposals by the position of their verify pass.
+fn speculate(
+    model: &Gemma4Model,
+    ctx: &MetalContext,
+    st: &mut Gemma4State,
+    sc: &mut Scratch,
+    first: u32,
+    n: usize,
+    rest_every: Option<usize>,
+) -> (Vec<u32>, Vec<(usize, Vec<u32>)>) {
+    use crate::engine::LanguageModel;
+    use crate::kernels::sample::SamplingParams;
+    let greedy = SamplingParams::greedy();
+    let drafts = model.drafts;
+    let mut out = vec![first];
+    let mut log = Vec::new();
+    let mut proposals =
+        model.draft_initial(ctx, st, sc, first, drafts, &greedy, 1).unwrap();
+    let mut step = 0;
+    while out.len() < n && st.pos < st.max_capacity {
+        let pending = *out.last().unwrap();
+        log.push((st.pos, proposals.clone()));
+        let (draws, pass) = model
+            .verify(ctx, st, sc, pending, &proposals, &greedy, out.len(), drafts)
+            .unwrap();
+        let kept = proposals.iter().zip(&draws).take_while(|(p, d)| p == d).count();
+        out.extend_from_slice(&draws[..=kept]);
+        step += 1;
+        let rest = rest_every.is_some_and(|e| step % e == 0);
+        proposals = model.finish_speculation(ctx, st, sc, kept, !rest, pass).unwrap();
+        if rest {
+            let last = *out.last().unwrap();
+            proposals = model
+                .draft_initial(ctx, st, sc, last, drafts, &greedy, out.len())
+                .unwrap();
+        }
+    }
+    (out, log)
+}
+
+#[test]
+#[ignore = "requires LILY_GEMMA4_GGUF"]
+fn speculation_at_rest_restores_and_forks_like_plain_decoding() {
+    use crate::engine::{Draw, LanguageModel, LoadOptions, SnapshotApi};
+    use crate::kernels::sample::SamplingParams;
+    let path = std::env::var("LILY_GEMMA4_GGUF").expect("LILY_GEMMA4_GGUF");
+    let ctx = MetalContext::new().unwrap();
+    let options = LoadOptions { mtp_drafts: 3, ..Default::default() };
+    let model = <Gemma4Model as LanguageModel>::load(
+        &ctx,
+        std::path::Path::new(&path),
+        &options,
+    )
+    .unwrap();
+    assert!(model.draft.is_some(), "no draft model beside {path}");
+    let greedy = SamplingParams::greedy();
+    // A prompt past the sliding window, so the rings wrap.
+    let prompt: Vec<u32> = (0..1500u32).map(|i| 1000 + (i * 7919) % 50000).collect();
+    let n = 64;
+    let mut sc = LanguageModel::new_scratch_with_capacity(&model, &ctx, 2048).unwrap();
+    let prefill = |st: &mut Gemma4State, sc: &mut Scratch| -> u32 {
+        st.reset().unwrap();
+        let d = Draw { params: &greedy, step: 0 };
+        LanguageModel::prefill(&model, &ctx, st, sc, &prompt, Some(d)).unwrap();
+        sc.next_token.to_u32().unwrap()[0]
+    };
+
+    // Plain greedy decoding.
+    let mut st = LanguageModel::new_state(&model, &ctx, 2048).unwrap();
+    let first = prefill(&mut st, &mut sc);
+    let mut plain = vec![first];
+    while plain.len() < n {
+        let last = *plain.last().unwrap();
+        model.forward(&ctx, &mut st, &sc, &[last], Logits::Last).unwrap();
+        plain.push(argmax(&sc.logits_last.to_f32().unwrap()));
+    }
+    let agree = |t: &[u32], what: &str| {
+        let k = t.len().min(plain.len());
+        assert_eq!(&t[..k], &plain[..k], "{what}");
+    };
+
+    // Speculation, and speculation that comes to rest every third step.
+    let first = prefill(&mut st, &mut sc);
+    let (a, _) = speculate(&model, &ctx, &mut st, &mut sc, first, n, None);
+    agree(&a, "speculation");
+    let first = prefill(&mut st, &mut sc);
+    let (b, _) = speculate(&model, &ctx, &mut st, &mut sc, first, n, Some(3));
+    agree(&b, "speculation with rests");
+
+    // At rest after 20 tokens: snapshot, go on, restore, go on again; and a
+    // fork (prefix copy + snapshot) into a fresh state.
+    let first = prefill(&mut st, &mut sc);
+    let (head, _) = speculate(&model, &ctx, &mut st, &mut sc, first, 20, Some(1));
+    let at_rest = st.pos;
+    let last = *head.last().unwrap();
+    let snap = st.snapshot(&ctx).unwrap();
+    assert_eq!(snap.pos(), at_rest);
+    let rest = |r: Vec<u32>| [&head[..head.len() - 1], &r].concat();
+    let go = |st: &mut Gemma4State, sc: &mut Scratch| {
+        speculate(&model, &ctx, st, sc, last, n - head.len() + 1, None).0
+    };
+    let c1 = go(&mut st, &mut sc);
+    st.restore(&ctx, &snap).unwrap();
+    let c2 = go(&mut st, &mut sc);
+    let mut fork = LanguageModel::new_state(&model, &ctx, 64).unwrap();
+    fork.copy_prefix_from(&ctx, &st, at_rest).unwrap();
+    fork.restore(&ctx, &snap).unwrap();
+    let c3 = go(&mut fork, &mut sc);
+    agree(&rest(c1), "after the snapshot");
+    agree(&rest(c2), "after the restore");
+    agree(&rest(c3), "in the fork");
+
+    // The context's last rows: a state capped 30 rows past the prompt
+    // speculates to its end, drafts stopping short of it, and agrees.
+    let cap = prompt.len() + 30;
+    let mut st = Gemma4State::new(&ctx, &model.cfg, prompt.len(), cap).unwrap();
+    let first = prefill(&mut st, &mut sc);
+    let (e, log) = speculate(&model, &ctx, &mut st, &mut sc, first, n, None);
+    assert_eq!(st.pos, cap, "fed to the cap");
+    agree(&e, "to the end of the context");
+    assert!(log.iter().all(|(p, d)| p + 1 + d.len() <= cap), "{log:?}");
+    assert!(st.ensure_capacity(&ctx, cap + 1).is_err());
+}
