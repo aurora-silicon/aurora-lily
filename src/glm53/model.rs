@@ -396,31 +396,30 @@ impl Glm53State {
     pub fn new(ctx: &MetalContext, cfg: &Config, capacity: usize) -> Result<Self> {
         let capacity = capacity.next_multiple_of(4);
         let p = cfg.kda_projection();
+        // Every KDA layer's conv windows and states, and their alternates,
+        // views of one allocation (about 140 allocations of their own cost
+        // ~10 ms a session), zeroed on the GPU below: the recurrent state
+        // starts at zero (the alternates are written before they are read).
+        let conv_len = 3 * (cfg.kda_conv - 1) * p;
+        let s_len = cfg.kda_heads * cfg.kda_dim * cfg.kda_dim;
+        let n_kda = cfg.kinds.iter().filter(|k| **k == LayerKind::Kda).count();
+        let kda_all =
+            Tensor::uninit(ctx, &[n_kda * 2 * (conv_len + s_len)], DType::F32)?;
+        let kda_at = std::cell::Cell::new(0usize);
+        let take = |n: usize| -> Result<Tensor> {
+            let at = kda_at.get();
+            kda_at.set(at + n);
+            kda_all.view(at, &[n])
+        };
         let layers = (0..cfg.n_layer)
             .map(|il| -> Result<LayerState> {
                 Ok(match cfg.kinds[il] {
-                    LayerKind::Kda => {
-                        let conv = || {
-                            Tensor::zeros(
-                                ctx,
-                                &[3 * (cfg.kda_conv - 1) * p],
-                                DType::F32,
-                            )
-                        };
-                        let s = || {
-                            Tensor::zeros(
-                                ctx,
-                                &[cfg.kda_heads * cfg.kda_dim * cfg.kda_dim],
-                                DType::F32,
-                            )
-                        };
-                        LayerState::Kda {
-                            conv: conv()?,
-                            s: s()?,
-                            conv_alt: conv()?,
-                            s_alt: s()?,
-                        }
-                    }
+                    LayerKind::Kda => LayerState::Kda {
+                        conv: take(conv_len)?,
+                        s: take(s_len)?,
+                        conv_alt: take(conv_len)?,
+                        s_alt: take(s_len)?,
+                    },
                     LayerKind::Dsa => LayerState::Dsa {
                         latent: Tensor::zeros(
                             ctx,
@@ -437,7 +436,12 @@ impl Glm53State {
                     },
                 })
             })
-            .collect::<Result<_>>()?;
+            .collect::<Result<Vec<_>>>()?;
+        // 305 MB zeroed on the GPU in well under a millisecond, where the
+        // host's memset of fresh buffers took ~20 ms (2026-11-15).
+        let pass = ctx.begin()?;
+        k::zero(ctx, &pass, &kda_all)?;
+        pass.commit_wait()?;
         let pool_cap = capacity / 4 + 1;
         let pool_scores = Tensor::zeros(ctx, &[PREFILL_ROWS * pool_cap], DType::F32)?;
         Ok(Self {

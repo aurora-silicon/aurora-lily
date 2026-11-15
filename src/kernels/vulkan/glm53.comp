@@ -1034,6 +1034,14 @@ void main() {
 // ---------------------------------------------------------------------------
 // out[j] = a[j] + b[j]. Grid::Threads (n). Buffers: 0 a, 1 b, 2 out.
 // ---------------------------------------------------------------------------
+// Zeroes buffer 0's first 16 * n bytes. Grid::Threads (n). Params: 1 n.
+#ifdef KERNEL_glm53_zero
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    U32x4(arg(0)).v[gl_GlobalInvocationID.x] = uvec4(0u);
+}
+#endif
+
 #ifdef KERNEL_glm53_add
 void main() {
     if (!LILY_THREAD_IN_GRID) return;

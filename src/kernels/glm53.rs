@@ -1327,6 +1327,19 @@ pub fn add(
     )
 }
 
+/// Zeroes `t` on the GPU (its bytes a multiple of 16).
+pub fn zero(ctx: &MetalContext, pass: &ComputePass<'_>, t: &Tensor) -> Result<()> {
+    let n = t.byte_len();
+    ensure!(n.is_multiple_of(16), "GPU zero fill of {n} bytes");
+    let pipeline = ctx.pipeline("glm53_zero", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[t.binding()],
+        &[&u32_bytes(n / 16)],
+        Grid::Threads { grid: (n / 16, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 /// One layer's KDA parameters on the GPU (f32).
 pub struct KdaParams<'a> {
     pub q_conv: &'a Tensor,

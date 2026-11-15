@@ -50,6 +50,15 @@ impl Tensor {
         Ok(Self { buf, shape: shape.to_vec(), dtype, offset: 0 })
     }
 
+    /// A tensor whose contents are unspecified
+    /// ([`MetalContext::new_buffer_uninit`]): for one written before it is
+    /// read.
+    pub fn uninit(ctx: &MetalContext, shape: &[usize], dtype: DType) -> Result<Self> {
+        let numel: usize = shape.iter().product();
+        let buf = ctx.new_buffer_uninit(numel * dtype.size())?;
+        Ok(Self { buf, shape: shape.to_vec(), dtype, offset: 0 })
+    }
+
     /// Wraps an existing buffer (e.g. one filled directly from a checkpoint
     /// read) as a tensor.
     pub fn from_buffer(buf: Buffer, shape: &[usize], dtype: DType) -> Result<Self> {
