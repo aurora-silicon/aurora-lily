@@ -75,15 +75,20 @@ the weights are mapped read-only from the page cache.
   come back as OpenAI tool calls, and tool results go back through the
   template.
 
-Memory (lily's allocation counter, `lily-gemma4 mem`): UD-IQ2_M at the
-16 GB tier's full context with its checkpoint 10.95 GB (weights 10.00,
-scratch 0.12, session 0.62, checkpoint 0.21); the server held 10.8 GB after
-7.5K- and 5.8K-token requests. UD-Q5_K_M at 49K with three checkpoints
-23.17 GB plus the 0.45 GB draft model; the server held 22.2 GB after a
-31K-token request, its cached repeat and four short ones. A session holds
-the 5 global layers' K/V for its whole context (20 KB a token) and a ring of
-the last 1024 + 256 positions for the 25 sliding-window layers (0.26 GB); a
-checkpoint keeps the rings' last 1024 positions (0.21 GB).
+Memory with the two configurations above (lily's allocation counter; the
+load's fit, printed at start): on 16 GB, 10.1 GB of weights and scratch and
+at most 0.83 GB for the request's session (its caches at the full 14.6K
+context, its checkpoint, the layer its growth holds twice), which is the
+10.95 GB limit; after 7.5K- and 5.8K-token requests and a tool call 10.9 GB
+was resident. On 32 GB, 21.7 GB of weights, the draft model and scratch
+and at most 1.90 GB for the session (41K tokens, three checkpoints), the
+23.6 GB limit; after a 31K-token request and its cached repeat 23.0 GB was
+resident. A request drops the checkpoints its release would drop before it
+takes a new one, so a session never holds more than the store keeps. A
+session holds the 5 global layers' K/V for its whole context (20 KB a
+token) and a ring of the last 1024 + 256 positions for the 25
+sliding-window layers (0.26 GB); a checkpoint keeps the rings' last 1024
+positions (0.21 GB).
 
 ## What runs
 
@@ -110,9 +115,11 @@ file), `chat`, `bench`, `spec`, `state-check`, `mem`.
 Against llama.cpp on the same file and tokens, per-token mean NLL:
 UD-Q5_K_M 0.164 (llama.cpp 0.164) on model-written chat answers, 2.955
 (2.956) on human text continued in a chat turn; UD-IQ2_M 0.330 (0.334) and
-2.923 (2.927). The KL divergence between lily and llama.cpp on the same
-weights is about half of what Q8_0 to Q5_K costs (llama.cpp's CPU path
-quantizes the activations to 8 bits; lily keeps them f32).
+2.923 (2.927). The KL divergence from llama.cpp to lily on the same weights
+is 0.0018 / 0.011 on UD-Q5_K_M, about half of what Q8_0 to UD-Q5_K_M costs
+(0.0036 / 0.017), and 0.0077 / 0.026 on UD-IQ2_M, 5% and 9% of what Q8_0 to
+UD-IQ2_M costs (0.158 / 0.298). llama.cpp's CPU path quantizes the
+activations to 8 bits; lily keeps them f32.
 
 | | UD-IQ2_M | UD-Q5_K_M |
 |---|---|---|
