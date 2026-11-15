@@ -2473,11 +2473,12 @@ fn moe_grouped_timing() {
     let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
     // Rows such that pairs per expert = n * 8 / 288 for prompts of 256, 1K
-    // and 4K tokens.
+    // and 4K tokens; DeepSeek V4's 2K (6 of 256: 48 a expert).
     for (label, m) in [
         ("256-token density", 57),
         ("1K-token density", 228),
         ("4K-token density", 910),
+        ("DS4 2K density", 384),
     ] {
         let sel: Vec<u32> = (0..m)
             .flat_map(|i| {
@@ -2496,7 +2497,7 @@ fn moe_grouped_timing() {
         let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
         let out = zeros(&ctx, m * hidden);
         let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
-        for tile_rows in [64, 128] {
+        for tile_rows in [MoeTiles::R64, MoeTiles::R128] {
             let mut best = f64::MAX;
             for _ in 0..3 {
                 let pass = ctx.begin().unwrap();
@@ -2510,7 +2511,7 @@ fn moe_grouped_timing() {
                 best = best.min(t.elapsed().as_secs_f64());
             }
             println!(
-                "moe grouped {label:20} m {m:4} tiles {tile_rows:3}: {:8.1} us",
+                "moe grouped {label:20} m {m:4} tiles {tile_rows:?}: {:8.1} us",
                 best * 1e6
             );
         }
@@ -2599,7 +2600,12 @@ fn moe_grouped_fused_matches_separate() {
     let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
     for limit in [0.0f32, 1e-3, 10.0] {
         let mut got = Vec::new();
-        for (fused, tile_rows) in [(true, 64), (false, 64), (true, 128), (false, 128)] {
+        for (fused, tile_rows) in [
+            (true, MoeTiles::R64),
+            (false, MoeTiles::R64),
+            (true, MoeTiles::R128),
+            (false, MoeTiles::R128),
+        ] {
             let out = zeros(&ctx, m * hidden);
             run(&ctx, |p| {
                 moe_grouped_with(

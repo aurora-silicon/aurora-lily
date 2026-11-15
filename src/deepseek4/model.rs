@@ -1337,7 +1337,7 @@ impl Ds4Model {
             let fb = self.bf16_copy(ctx, pass, &sc.fmid, &sc.fmidb, m, cfg.ff_expert)?;
             self.proj_b(ctx, pass, &[(&l.sh_down, &sc.ffn_out)], &sc.fmid, fb, m)?;
             pass.memory_barrier()?;
-            k::moe_grouped(
+            k::moe_grouped_tiles(
                 ctx,
                 pass,
                 &l.gate,
@@ -1354,6 +1354,11 @@ impl Ds4Model {
                 used,
                 cfg.n_expert,
                 lim,
+                // Tiles of 64 rows: a run averages 48 pairs an expert at
+                // most (2 048 rows x 6 of 256), where 128-row tiles leave
+                // half their subgroups idle (2048-token prefill 898-915
+                // -> 924-952 tok/s, 2026-11-15).
+                k::MoeTiles::R64,
             )?;
             return pass.memory_barrier();
         }

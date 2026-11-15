@@ -560,17 +560,53 @@ pub fn moe_grouped(
     limit: f32,
 ) -> Result<()> {
     // Tiles of up to 128 rows once an expert averages 48 pairs or more.
-    let tile_rows = if m * used >= 48 * experts { 128 } else { 64 };
+    let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
     moe_grouped_with(
         ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true, tile_rows,
+        experts, limit, true, tiles,
+    )
+}
+
+/// How [`moe_grouped`]'s expert GEMMs tile an expert's rows (the results
+/// are the same bit for bit).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoeTiles {
+    /// Up to 64 rows, four subgroups of 16.
+    R64,
+    /// Up to 128 rows, four subgroups of 32.
+    R128,
+}
+
+/// [`moe_grouped`] with the tiling chosen by the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_tiles(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    hidden: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+    limit: f32,
+    tiles: MoeTiles,
+) -> Result<()> {
+    moe_grouped_with(
+        ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
+        experts, limit, true, tiles,
     )
 }
 
 /// [`moe_grouped`]; `fuse_gate_up` false takes IQ2_XXS experts through the
 /// separate gate and up GEMMs and SwiGLU too (the tests' reference);
-/// `tile_rows` (64 or 128) caps a tile's pairs (the results are the same
-/// either way).
+/// `tiles` caps a tile's pairs (the results are the same either way).
 #[allow(clippy::too_many_arguments)]
 fn moe_grouped_with(
     ctx: &MetalContext,
@@ -590,10 +626,10 @@ fn moe_grouped_with(
     experts: usize,
     limit: f32,
     fuse_gate_up: bool,
-    tile_rows: usize,
+    tiles: MoeTiles,
 ) -> Result<()> {
-    ensure!(tile_rows == 64 || tile_rows == 128, "expert tiles of {tile_rows} rows");
-    let r128 = tile_rows == 128;
+    let tile_rows = if tiles == MoeTiles::R64 { 64 } else { 128 };
+    let r128 = tiles == MoeTiles::R128;
     let pairs = m * used;
     ensure!(
         sc.pairs.numel() >= pairs,
