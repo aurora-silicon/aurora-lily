@@ -263,6 +263,39 @@ fn router_matches_cpu() {
     }
 }
 
+/// Rows with NaN or infinite logits still pick `k` distinct experts below
+/// E (the lowest-numbered remaining ones where the probabilities are NaN),
+/// with finite weights; E is not a multiple of the subgroup.
+#[test]
+fn router_non_finite_rows_pick_experts_below_e() {
+    let ctx = ctx();
+    let (e, kk) = (100, 8);
+    let mut rows = vec![vec![f32::NAN; e], vec![0.5; e], vec![0.0; e]];
+    rows[1][7] = f32::INFINITY;
+    rows[1][40] = f32::INFINITY;
+    rows[2][3] = f32::NAN;
+    let m = rows.len();
+    let logits: Vec<f32> = rows.concat();
+    let scale = vec![1.0; e];
+    let (tl, ts) = (tensor(&ctx, &logits), tensor(&ctx, &scale));
+    let sel = Tensor::zeros(&ctx, &[m * kk], DType::U32).unwrap();
+    let w = zeros(&ctx, m * kk);
+    run(&ctx, |p| router(&ctx, p, &tl, &ts, &sel, &w, m, e, kk).unwrap());
+    let (gs, gw) = (sel.to_u32().unwrap(), w.to_f32().unwrap());
+    for i in 0..m {
+        let picks = &gs[i * kk..(i + 1) * kk];
+        let mut sorted = picks.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), kk, "row {i}: {picks:?}");
+        assert!(picks.iter().all(|&x| (x as usize) < e), "row {i}: {picks:?}");
+        assert!(gw[i * kk..(i + 1) * kk].iter().all(|w| w.is_finite()), "row {i}");
+    }
+    // An all-NaN row takes experts 0..k at weight 0.
+    assert_eq!(&gs[..kk], &(0..kk as u32).collect::<Vec<_>>()[..]);
+    assert!(gw[..kk].iter().all(|&w| w == 0.0));
+}
+
 #[test]
 fn moe_matches_cpu() {
     let ctx = ctx();

@@ -30,6 +30,28 @@ pub const MAX_ROWS: usize = k::GEMV_MAX_ROWS;
 /// budget (512 rows: 10.84 GB with one checkpoint, 256: 10.71).
 pub const PREFILL_ROWS: usize = 256;
 
+/// The longest context lily serves Gemma at: the server's limit (positions
+/// and cache offsets fit the kernels' u32 arithmetic well past it).
+pub const MAX_SEQ: usize = crate::kernels::attention::MAX_SEQ;
+
+/// Rows a state holds past its context: a verify pass at the context's last
+/// position feeds the pending token and up to three drafts.
+pub const LOOKAHEAD: usize = MAX_ROWS;
+
+/// The rows a state of `context` tokens may grow to.
+pub fn capacity_cap(context: usize) -> usize {
+    (context + LOOKAHEAD).min(MAX_SEQ)
+}
+
+/// Fails on a token id outside the vocabulary (the embedding would read
+/// past its rows).
+pub fn check_tokens(tokens: &[u32], vocab: usize) -> Result<()> {
+    if let Some(&t) = tokens.iter().find(|&&t| t as usize >= vocab) {
+        anyhow::bail!("token id {t} is outside the vocabulary of {vocab}");
+    }
+    Ok(())
+}
+
 struct LayerW {
     attn_norm: Tensor,
     q: QWeight,
@@ -74,14 +96,53 @@ pub struct Gemma4Model {
     /// A draft is proposed only when the draft model's softmax probability
     /// of it is at least this (the chain stops at the first that is not).
     pub draft_min_prob: f32,
+    /// `--memory-limit-gb` in bytes: the footprint the server keeps to.
+    pub memory_limit: Option<u64>,
+    /// The longest context served: the file's, the server's limit, or what
+    /// fits the memory limit ([`Gemma4Model::fit_context`]).
+    pub context_cap: usize,
 }
 
-fn check_w(name: &str, w: &QWeight, cols: usize, rows: usize) -> Result<()> {
+/// Block types of the dense projections: those with both a GEMV (decode,
+/// verify) and a matrix-unit GEMM (prompt runs).
+pub(crate) const DENSE_TYPES: [GgmlType; 10] = [
+    GgmlType::Q8_0,
+    GgmlType::Q4K,
+    GgmlType::Bf16,
+    GgmlType::F32,
+    GgmlType::F16,
+    GgmlType::Q4_0,
+    GgmlType::Q5K,
+    GgmlType::Q6K,
+    GgmlType::Iq4Nl,
+    GgmlType::Iq2S,
+];
+/// The embedding (also the head, through the GEMVs).
+const EMBED_TYPES: [GgmlType; 4] =
+    [GgmlType::Q8_0, GgmlType::Q5K, GgmlType::Q6K, GgmlType::Q4K];
+/// The routed experts' gate/up: the decode kernel's types that the grouped
+/// prompt GEMM also takes.
+const GATE_UP_TYPES: [GgmlType; 4] =
+    [GgmlType::Q8_0, GgmlType::Q5K, GgmlType::Iq2Xxs, GgmlType::Iq2S];
+/// The routed experts' down projection, likewise.
+const DOWN_TYPES: [GgmlType; 2] = [GgmlType::Q8_0, GgmlType::Iq4Nl];
+
+pub(crate) fn check_w(name: &str, w: &QWeight, cols: usize, rows: usize) -> Result<()> {
     ensure!(
         w.cols == cols && w.rows == rows,
         "{name} is {} x {}, Gemma needs {cols} x {rows}",
         w.cols,
         w.rows
+    );
+    Ok(())
+}
+
+/// Fails unless `w` is of one of the block types its kernels take.
+pub(crate) fn check_type(name: &str, w: &QWeight, types: &[GgmlType]) -> Result<()> {
+    ensure!(
+        types.contains(&w.ty),
+        "{name} is {:?}; lily's Gemma kernels take {types:?} there",
+        w.ty
     );
     Ok(())
 }
@@ -152,6 +213,21 @@ impl Gemma4Model {
                 post_ffw_norm: f("post_ffw_norm.weight", h)?,
                 out_scale: f("layer_output_scale.weight", 1)?,
             };
+            for (name, w) in [
+                ("attn_q", &l.q),
+                ("attn_k", &l.k),
+                ("attn_output", &l.o),
+                ("ffn_gate", &l.gate),
+                ("ffn_up", &l.up),
+                ("ffn_down", &l.down),
+            ]
+            .into_iter()
+            .chain(l.v.as_ref().map(|v| ("attn_v", v)))
+            {
+                check_type(&n(name), w, &DENSE_TYPES)?;
+            }
+            check_type(&n("ffn_gate_up_exps"), &l.gate_up_exps, &GATE_UP_TYPES)?;
+            check_type(&n("ffn_down_exps"), &l.down_exps, &DOWN_TYPES)?;
             check_w(&n("attn_q"), &l.q, h, qw)?;
             check_w(&n("attn_k"), &l.k, h, kw)?;
             if let Some(v) = &l.v {
@@ -182,12 +258,14 @@ impl Gemma4Model {
             layers.push(l);
         }
         let embed = mapped.q("token_embd.weight")?;
+        check_type("token_embd", &embed, &EMBED_TYPES)?;
         check_w("token_embd", &embed, h, cfg.vocab)?;
         ensure!(
             gguf.tensor("output.weight").is_none(),
             "an untied output.weight (lily ties the head to token_embd as Gemma does)"
         );
         let output_norm = mapped.f32("output_norm.weight")?;
+        ensure!(output_norm.numel() == h, "output_norm of {}", output_norm.numel());
         let rope_freqs = mapped.f32("rope_freqs.weight")?;
         ensure!(
             rope_freqs.numel() == cfg.head_dim / 2,
@@ -195,16 +273,18 @@ impl Gemma4Model {
             rope_freqs.numel()
         );
         Ok(Self {
-            cfg,
             gguf,
             mapped,
             layers,
             embed,
             output_norm,
             rope_freqs,
+            context_cap: cfg.context_length.min(MAX_SEQ),
+            cfg,
             draft: None,
             drafts: 0,
             draft_min_prob: 0.0,
+            memory_limit: None,
         })
     }
 
@@ -230,7 +310,7 @@ impl Gemma4Model {
         ctx: &MetalContext,
         capacity: usize,
     ) -> Result<Gemma4State> {
-        Gemma4State::new(ctx, &self.cfg, capacity)
+        Gemma4State::new(ctx, &self.cfg, capacity, capacity_cap(self.context_cap))
     }
 
     pub fn new_scratch(&self, ctx: &MetalContext, capacity: usize) -> Result<Scratch> {
@@ -256,6 +336,8 @@ pub struct LayerCache {
 pub struct Gemma4State {
     pub pos: usize,
     pub capacity: usize,
+    /// The rows the global layers' caches may grow to.
+    pub max_capacity: usize,
     pub layers: Vec<LayerCache>,
     /// The row of the scratch's `h` holding the post-norm hidden of the
     /// last fed position (the draft model's input).
@@ -268,7 +350,16 @@ pub struct Gemma4State {
 }
 
 impl Gemma4State {
-    pub fn new(ctx: &MetalContext, cfg: &Config, capacity: usize) -> Result<Self> {
+    pub fn new(
+        ctx: &MetalContext,
+        cfg: &Config,
+        capacity: usize,
+        max_capacity: usize,
+    ) -> Result<Self> {
+        ensure!(
+            capacity <= max_capacity && max_capacity <= capacity_cap(MAX_SEQ),
+            "a session of {capacity} tokens exceeds the {max_capacity} rows this model serves"
+        );
         let layers = (0..cfg.n_layer)
             .map(|il| -> Result<LayerCache> {
                 let swa = cfg.swa[il];
@@ -282,7 +373,15 @@ impl Gemma4State {
                 })
             })
             .collect::<Result<_>>()?;
-        Ok(Self { pos: 0, capacity, layers, h_row: 0, spec: None, window: cfg.window })
+        Ok(Self {
+            pos: 0,
+            capacity,
+            max_capacity,
+            layers,
+            h_row: 0,
+            spec: None,
+            window: cfg.window,
+        })
     }
 
     /// Bytes of the caches.
@@ -327,6 +426,7 @@ pub struct Scratch {
     pub next_token: Tensor,
     /// U32[MAX_ROWS]: a verify pass's draws, one a row.
     pub draws: Tensor,
+    vocab: usize,
 }
 
 impl Scratch {
@@ -381,11 +481,15 @@ impl Scratch {
             sampler: SamplerScratch::new(ctx, cfg.vocab)?,
             next_token: Tensor::zeros(ctx, &[2], DType::U32)?,
             draws: Tensor::zeros(ctx, &[MAX_ROWS], DType::U32)?,
+            vocab: cfg.vocab,
         })
     }
 
-    /// Stages a run's token ids (at most PREFILL_ROWS).
+    /// Stages a run's token ids (at most PREFILL_ROWS, each in the
+    /// vocabulary).
     pub(crate) fn stage_tokens(&self, tokens: &[u32]) -> Result<()> {
+        ensure!(tokens.len() <= PREFILL_ROWS, "a run of {} tokens", tokens.len());
+        check_tokens(tokens, self.vocab)?;
         crate::glm53::model::write_words(&self.tokens, tokens)
     }
 

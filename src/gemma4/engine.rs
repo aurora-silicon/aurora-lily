@@ -11,7 +11,8 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 
 use super::model::{
-    Gemma4Model, Gemma4State, LayerCache, Logits, MAX_ROWS, PREFILL_ROWS, Scratch,
+    Gemma4Model, Gemma4State, LOOKAHEAD, LayerCache, Logits, MAX_ROWS, MAX_SEQ,
+    PREFILL_ROWS, Scratch, capacity_cap, check_tokens,
 };
 use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
@@ -114,7 +115,13 @@ impl DecodeStateApi for Gemma4State {
         if tokens <= self.capacity {
             return Ok(());
         }
-        let capacity = tokens.max(self.capacity * 2);
+        ensure!(
+            tokens <= self.max_capacity,
+            "a session of {tokens} tokens exceeds the {} rows this model serves",
+            self.max_capacity
+        );
+        let capacity =
+            tokens.max(self.capacity.saturating_mul(2)).min(self.max_capacity);
         for l in &mut self.layers {
             if l.swa {
                 continue;
@@ -266,10 +273,17 @@ impl Gemma4Model {
 /// at least this; the chain stops at the first that is not.
 const DRAFT_MIN_PROB: f32 = 0.3;
 
+/// Drafts a verify pass from position `pos` may carry within
+/// `max_capacity` rows: it feeds the pending token and the drafts.
+pub(crate) fn drafts_fit(pos: usize, max_capacity: usize, n: usize) -> usize {
+    n.min(max_capacity.saturating_sub(pos + 1))
+}
+
 impl Gemma4Model {
     /// Up to `n` greedy drafts following `token` (at the state's position),
     /// from the target hidden in row `row` of the scratch; the proposals
-    /// end before the first draft below the probability gate. Waits.
+    /// end before the first draft below the probability gate, and at the
+    /// state's last rows. Waits.
     fn propose(
         &self,
         ctx: &MetalContext,
@@ -280,6 +294,8 @@ impl Gemma4Model {
         n: usize,
     ) -> Result<Vec<u32>> {
         let Some(draft) = &self.draft else { return Ok(Vec::new()) };
+        check_tokens(&[token], self.cfg.vocab)?;
+        let n = drafts_fit(state.pos, state.max_capacity, n);
         if n == 0 {
             return Ok(Vec::new());
         }
@@ -294,6 +310,48 @@ impl Gemma4Model {
     }
 }
 
+impl Gemma4Model {
+    /// Bytes of the scratch's attention partials per token of context.
+    fn partial_bytes_per_token(&self) -> u64 {
+        let cfg = &self.cfg;
+        let d = cfg.head_dim.max(cfg.head_dim_swa);
+        (4 * crate::kernels::gemma4::attn_partial_len(MAX_ROWS, cfg.n_head, d, 1)
+            / crate::kernels::gemma4::ATTN_CHUNK) as u64
+            + 1
+    }
+
+    /// The longest context (a multiple of 256 tokens) whose session, with
+    /// `checkpoints` snapshots and the scratch's growth, fits `limit` bytes
+    /// next to `allocated` bytes (the weights and the scratch);
+    /// `context_cap` becomes it, so the server caps --max-seq there.
+    pub fn fit_context(
+        &mut self,
+        limit: u64,
+        allocated: u64,
+        checkpoints: usize,
+    ) -> Result<usize> {
+        let room = limit.saturating_sub(allocated);
+        let session =
+            |c: usize, k: usize| LanguageModel::session_bytes(self, c, k).unwrap_or(0);
+        let per_token =
+            (session(256, 0) - session(0, 0)) / 256 + self.partial_bytes_per_token();
+        let fixed = session(0, checkpoints);
+        let rows = room.saturating_sub(fixed) / per_token.max(1);
+        let context = (rows as usize).saturating_sub(LOOKAHEAD) / 256 * 256;
+        let context = context.min(self.cfg.context_length).min(MAX_SEQ);
+        ensure!(
+            context >= 4096,
+            "--memory-limit-gb {:.1} leaves {:.2} GB after {:.1} GB of weights and scratch: a context \
+             of {context} tokens (lily wants at least 4096)",
+            limit as f64 / (1u64 << 30) as f64,
+            room as f64 / 1e9,
+            allocated as f64 / 1e9
+        );
+        self.context_cap = context;
+        Ok(context)
+    }
+}
+
 impl LanguageModel for Gemma4Model {
     type State = Gemma4State;
     type Scratch = Scratch;
@@ -302,6 +360,7 @@ impl LanguageModel for Gemma4Model {
 
     fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
         let mut model = Gemma4Model::load(ctx, path)?;
+        model.memory_limit = options.memory_limit;
         if options.mtp_drafts > 0 {
             match super::draft::find_beside(path, model.cfg.hidden)? {
                 Some(dp) => {
@@ -320,6 +379,35 @@ impl LanguageModel for Gemma4Model {
                     path.display()
                 ),
             }
+        }
+        if let Some(limit) = model.memory_limit {
+            // The weights and a scratch as the server allocates it (made
+            // here once to measure it; its attention partials grow with
+            // the context, which fit_context counts per token), then the
+            // longest context whose session fits the rest: the server caps
+            // --max-seq there.
+            let before = ctx.current_allocated();
+            let probe = model.new_scratch(ctx, 1)?;
+            let scratch = ctx.current_allocated().saturating_sub(before);
+            drop(probe);
+            let allocated = before + scratch;
+            let checkpoints = options.session_checkpoints.unwrap_or(
+                crate::serve::CHECKPOINTS_PER_SESSION
+                    + crate::serve::DECODE_CHECKPOINTS_PER_SESSION,
+            );
+            let context = model.fit_context(limit, allocated as u64, checkpoints)?;
+            eprintln!(
+                "gemma4: --memory-limit-gb {:.1} ({:.1} GB) leaves {:.2} GB after {:.1} GB of weights and \
+                 scratch: contexts of up to {context} tokens (one session of {:.2} GB with \
+                 {checkpoints} snapshots); --max-seq is capped there",
+                limit as f64 / (1u64 << 30) as f64,
+                limit as f64 / 1e9,
+                limit.saturating_sub(allocated as u64) as f64 / 1e9,
+                allocated as f64 / 1e9,
+                model.session_bytes(capacity_cap(context), checkpoints).unwrap_or(0)
+                    as f64
+                    / 1e9,
+            );
         }
         Ok(model)
     }
@@ -357,6 +445,8 @@ impl LanguageModel for Gemma4Model {
         ensure!(rows <= MAX_ROWS, "verify of {rows} rows");
         ensure!(state.spec.is_none(), "a verify pass is already pending");
         state.ensure_capacity(ctx, state.pos + rows)?;
+        check_tokens(&[pending], self.cfg.vocab)?;
+        check_tokens(drafts, self.cfg.vocab)?;
         let tokens: Vec<u32> =
             std::iter::once(pending).chain(drafts.iter().copied()).collect();
         scratch.stage_tokens(&tokens)?;
@@ -408,7 +498,11 @@ impl LanguageModel for Gemma4Model {
     }
 
     fn max_position_embeddings(&self) -> usize {
-        self.cfg.context_length
+        self.context_cap
+    }
+
+    fn memory_limit(&self) -> Option<u64> {
+        self.memory_limit
     }
 
     fn eos_token_ids(&self) -> Vec<u32> {
@@ -469,7 +563,8 @@ impl LanguageModel for Gemma4Model {
         ctx: &MetalContext,
         capacity_tokens: usize,
     ) -> Result<Scratch> {
-        self.new_scratch(ctx, capacity_tokens.max(1))
+        // States of a `capacity_tokens` context grow LOOKAHEAD rows past it.
+        self.new_scratch(ctx, capacity_cap(capacity_tokens.max(1)))
     }
 
     fn prefill(
@@ -504,8 +599,9 @@ impl LanguageModel for Gemma4Model {
         &self,
         state: &mut Gemma4State,
         _scratch: &Scratch,
-        _token: u32,
+        token: u32,
     ) -> Result<()> {
+        check_tokens(&[token], self.cfg.vocab)?;
         // A one-row step leaves its hidden in row 0.
         state.h_row = 0;
         Ok(())
@@ -546,3 +642,7 @@ impl LanguageModel for Gemma4Model {
         pass.end()
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/gemma4/engine.rs"]
+mod tests;

@@ -214,7 +214,10 @@ fn gemma_value(s: &str) -> Result<(Value, &str)> {
     let s = s.trim_start();
     if let Some(rest) = s.strip_prefix(GEMMA_QUOTE) {
         let end = rest.find(GEMMA_QUOTE).context("unterminated Gemma string")?;
-        return Ok((Value::String(rest[..end].to_string()), &rest[end + GEMMA_QUOTE.len()..]));
+        return Ok((
+            Value::String(rest[..end].to_string()),
+            &rest[end + GEMMA_QUOTE.len()..],
+        ));
     }
     if let Some(rest) = s.strip_prefix('{') {
         let (map, rest) = gemma_object(rest)?;
@@ -276,7 +279,9 @@ pub fn parse_gemma_tool_call(
     tools: &[ToolSchema],
 ) -> Result<ParsedToolCall> {
     let block = block.trim();
-    let rest = block.strip_prefix("call:").context("Gemma tool call does not start with call:")?;
+    let rest = block
+        .strip_prefix("call:")
+        .context("Gemma tool call does not start with call:")?;
     let brace = rest.find('{').context("Gemma tool call without arguments")?;
     let name = rest[..brace].trim();
     let is_name_char =

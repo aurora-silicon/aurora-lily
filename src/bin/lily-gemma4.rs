@@ -13,7 +13,7 @@ use std::time::Instant;
 use anyhow::{Context as _, Result, ensure};
 use clap::{Parser, Subcommand};
 use half::f16;
-use lily::gemma4::model::{MAX_ROWS, PREFILL_ROWS};
+use lily::gemma4::model::{MAX_ROWS, PREFILL_ROWS, check_tokens};
 use lily::gemma4::{Gemma4Model, Logits};
 use lily::metal::MetalContext;
 
@@ -198,6 +198,14 @@ fn score(
     let maxlen = list.iter().map(|c| c.2.len()).max().unwrap_or(1);
     let ctx = MetalContext::new()?;
     let model = Gemma4Model::load(&ctx, path)?;
+    for (id, first, toks) in &list {
+        check_tokens(toks, model.cfg.vocab)?;
+        ensure!(
+            (1..toks.len()).contains(first),
+            "case {id}: first scored token {first} of {}",
+            toks.len()
+        );
+    }
     let vocab = model.cfg.vocab;
     let sc = model.new_scratch(&ctx, maxlen + 8)?;
     let mut base =
@@ -287,6 +295,7 @@ fn generate(path: &std::path::Path, tokens: &[u32], n: usize) -> Result<()> {
     let ctx = MetalContext::new()?;
     let model = Gemma4Model::load(&ctx, path)?;
     let vocab = model.cfg.vocab;
+    check_tokens(tokens, vocab)?;
     let cap = tokens.len() + n + 8;
     let sc = model.new_scratch(&ctx, cap)?;
     let mut st = model.new_state(&ctx, cap)?;
@@ -537,6 +546,7 @@ fn spec(
     let greedy = SamplingParams::greedy();
     let cap = ids.len() + n + 8;
     let mut sc = LanguageModel::new_scratch_with_capacity(&model, &ctx, cap)?;
+    let mut mismatches = 0;
     for run in 0..runs {
         let mut st = LanguageModel::new_state(&model, &ctx, cap)?;
         LanguageModel::prefill(
@@ -626,6 +636,11 @@ fn spec(
         if run == 0 {
             println!("speculative text: {:?}", tok.decode(&out, false)?);
         }
+        mismatches += usize::from(same < n);
     }
+    ensure!(
+        mismatches == 0,
+        "speculative decoding parted from plain greedy decoding in {mismatches} of {runs} runs"
+    );
     Ok(())
 }

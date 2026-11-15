@@ -7,7 +7,6 @@ use anyhow::Result;
 use super::tools::{ParsedToolCall, ToolGrammar, ToolSchema, parse_tool_calls_as};
 use crate::thinking::ReasoningScan;
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Reasoning(String),
@@ -260,9 +259,11 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                     // the start of its output on its own (Gemma after a
                     // tool response, where the template opens none): that
                     // block is reasoning.
-                    if let (false, Some(open), false) =
-                        (self.think_open_settled, self.tool_grammar.think_open(), self.raw)
-                    {
+                    if let (false, Some(open), false) = (
+                        self.think_open_settled,
+                        self.tool_grammar.think_open(),
+                        self.raw,
+                    ) {
                         let lead = self.buf.trim_start();
                         if let Some(rest) = lead.strip_prefix(open) {
                             self.buf = rest.to_string();

@@ -16,8 +16,10 @@ use std::path::Path;
 use anyhow::{Context as _, Result, ensure};
 
 use super::config::Config as TargetConfig;
-use super::model::{Gemma4Model, Gemma4State, MAX_ROWS, Scratch};
-use crate::gguf::{Gguf, Value};
+use super::model::{
+    DENSE_TYPES, Gemma4Model, Gemma4State, MAX_ROWS, Scratch, check_type, check_w,
+};
+use crate::gguf::Gguf;
 use crate::glm53::model::Mapped;
 use crate::kernels::gemma4::{self as g4, AttnShape};
 use crate::kernels::glm53::{self as k, QWeight};
@@ -90,19 +92,6 @@ struct DraftScratch {
     pub probs: Tensor,
 }
 
-fn arr_bools(g: &Gguf, key: &str) -> Result<Vec<bool>> {
-    match g.get(key) {
-        Some(Value::Array(v)) => v
-            .iter()
-            .map(|b| match b {
-                Value::Bool(b) => Ok(*b),
-                _ => anyhow::bail!("{key} holds a non-boolean"),
-            })
-            .collect(),
-        _ => anyhow::bail!("GGUF metadata {key} missing"),
-    }
-}
-
 /// The draft model beside `target_path`: a `gemma4-assistant` GGUF in the
 /// same directory whose output width is the target's hidden size.
 pub fn find_beside(
@@ -145,20 +134,23 @@ impl Gemma4Draft {
             "{} is not a {ARCH} GGUF",
             path.display()
         );
-        let u = |k: &str| -> Result<usize> {
-            Ok(gguf.u64(&format!("{ARCH}.{k}"))? as usize)
-        };
-        let f = |k: &str| gguf.f32(&format!("{ARCH}.{k}"));
-        let n_layer = u("block_count")?;
-        let hidden = u("embedding_length")?;
-        let ff = u("feed_forward_length")?;
-        let heads = u("attention.head_count")?;
+        let m = super::config::Meta { meta: &gguf.metadata, arch: ARCH };
+        let n_layer = m.u("block_count", 64)?;
+        let hidden = m.u("embedding_length", super::config::MAX_HIDDEN)?;
+        let ff = m.u("feed_forward_length", 1 << 16)?;
+        let heads = m.u("attention.head_count", 1024)?;
+        ensure!(n_layer > 0, "a draft model of no layers");
         ensure!(
-            u("embedding_length_out")? == target.hidden,
+            hidden >= 256 && hidden.is_multiple_of(256),
+            "draft embedding_length {hidden} (lily takes multiples of 256)"
+        );
+        ensure!(ff > 0 && ff.is_multiple_of(32), "draft feed_forward_length {ff}");
+        ensure!(
+            m.u("embedding_length_out", super::config::MAX_HIDDEN)? == target.hidden,
             "draft model for another target"
         );
         ensure!(
-            u("attention.shared_kv_layers")? == n_layer,
+            m.u("attention.shared_kv_layers", 64)? == n_layer,
             "the draft model keeps K/V of its own (lily reads the target's)"
         );
         ensure!(
@@ -166,61 +158,66 @@ impl Gemma4Draft {
             "draft heads {heads}, target {}",
             target.n_head
         );
-        let swa =
-            arr_bools(&gguf, &format!("{ARCH}.attention.sliding_window_pattern"))?;
-        ensure!(swa.len() == n_layer, "sliding pattern of {} layers", swa.len());
-        let (dh, dh_swa) = (u("attention.key_length")?, u("attention.key_length_swa")?);
+        let swa = m.bools("attention.sliding_window_pattern", n_layer)?;
+        let (dh, dh_swa) = (
+            m.u("attention.key_length", 1 << 12)?,
+            m.u("attention.key_length_swa", 1 << 12)?,
+        );
         ensure!(
             dh == target.head_dim && dh_swa == target.head_dim_swa,
             "draft head widths {dh}/{dh_swa} differ from the target's"
         );
-        ensure!(u("attention.sliding_window")? == target.window, "draft window");
+        ensure!(
+            m.u("attention.sliding_window", 1 << 20)? == target.window,
+            "draft window"
+        );
+        if let Some(v) = m.get("rope.scaling.type") {
+            ensure!(v.as_str() == Some("none"), "{ARCH}.rope.scaling.type {v:?}");
+        }
+        m.refuse_float("rope.scaling.factor", &[0.0, 1.0])?;
+        m.refuse_float("attention.scale", &[0.0, 1.0])?;
+        let eps = m.f("attention.layer_norm_rms_epsilon")?;
+        let (rope_base, rope_base_swa) =
+            (m.f("rope.freq_base")?, m.f("rope.freq_base_swa")?);
+        ensure!(eps > 0.0 && eps < 1.0, "draft rms epsilon {eps}");
+        ensure!(rope_base > 1.0 && rope_base_swa > 1.0, "draft RoPE bases");
         let mapped = Mapped::map(ctx, &gguf)?;
+        let f32_of = |name: &str, len: usize| -> Result<Tensor> {
+            let t = mapped.f32(name)?;
+            ensure!(t.numel() == len, "{name} has {} values, not {len}", t.numel());
+            Ok(t)
+        };
+        let q_of = |name: &str, cols: usize, rows: usize| -> Result<QWeight> {
+            let w = mapped.q(name)?;
+            check_type(name, &w, &DENSE_TYPES)?;
+            check_w(name, &w, cols, rows)?;
+            Ok(w)
+        };
         let mut layers = Vec::with_capacity(n_layer);
         for il in 0..n_layer {
             let n = |s: &str| format!("blk.{il}.{s}");
             let d = if swa[il] { dh_swa } else { dh };
             layers.push(LayerW {
-                attn_norm: mapped.f32(&n("attn_norm.weight"))?,
-                q: mapped.q(&n("attn_q.weight"))?,
-                q_norm: mapped.f32(&n("attn_q_norm.weight"))?,
-                o: mapped.q(&n("attn_output.weight"))?,
-                post_attn_norm: mapped.f32(&n("post_attention_norm.weight"))?,
-                ffn_norm: mapped.f32(&n("ffn_norm.weight"))?,
-                gate: mapped.q(&n("ffn_gate.weight"))?,
-                up: mapped.q(&n("ffn_up.weight"))?,
-                down: mapped.q(&n("ffn_down.weight"))?,
-                post_ffw_norm: mapped.f32(&n("post_ffw_norm.weight"))?,
-                out_scale: mapped.f32(&n("layer_output_scale.weight"))?,
+                attn_norm: f32_of(&n("attn_norm.weight"), hidden)?,
+                q: q_of(&n("attn_q.weight"), hidden, heads * d)?,
+                q_norm: f32_of(&n("attn_q_norm.weight"), d)?,
+                o: q_of(&n("attn_output.weight"), heads * d, hidden)?,
+                post_attn_norm: f32_of(&n("post_attention_norm.weight"), hidden)?,
+                ffn_norm: f32_of(&n("ffn_norm.weight"), hidden)?,
+                gate: q_of(&n("ffn_gate.weight"), hidden, ff)?,
+                up: q_of(&n("ffn_up.weight"), hidden, ff)?,
+                down: q_of(&n("ffn_down.weight"), ff, hidden)?,
+                post_ffw_norm: f32_of(&n("post_ffw_norm.weight"), hidden)?,
+                out_scale: f32_of(&n("layer_output_scale.weight"), 1)?,
                 swa: swa[il],
                 head_dim: d,
             });
-            let l = &layers[il];
-            ensure!(
-                l.q.cols == hidden && l.q.rows == heads * d && l.o.rows == hidden,
-                "draft layer {il} attention shapes"
-            );
-            ensure!(
-                l.gate.rows == ff && l.down.cols == ff,
-                "draft layer {il} FFN shapes"
-            );
         }
-        let pre_proj = mapped.q("nextn.pre_projection.weight")?;
-        let post_proj = mapped.q("nextn.post_projection.weight")?;
-        ensure!(
-            pre_proj.cols == 2 * target.hidden && pre_proj.rows == hidden,
-            "pre_projection {} x {}",
-            pre_proj.cols,
-            pre_proj.rows
-        );
-        ensure!(
-            post_proj.cols == hidden && post_proj.rows == target.hidden,
-            "post_projection"
-        );
-        let embed = mapped.q("token_embd.weight")?;
-        ensure!(embed.cols == hidden && embed.rows == target.vocab, "draft embedding");
-        let output_norm = mapped.f32("output_norm.weight")?;
-        let rope_freqs = mapped.f32("rope_freqs.weight")?;
+        let pre_proj = q_of("nextn.pre_projection.weight", 2 * target.hidden, hidden)?;
+        let post_proj = q_of("nextn.post_projection.weight", hidden, target.hidden)?;
+        let embed = q_of("token_embd.weight", hidden, target.vocab)?;
+        let output_norm = f32_of("output_norm.weight", hidden)?;
+        let rope_freqs = f32_of("rope_freqs.weight", dh / 2)?;
         let z = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let qw = heads * dh.max(dh_swa);
         let sc = DraftScratch {
@@ -243,9 +240,9 @@ impl Gemma4Draft {
             probs: z(MAX_DRAFTS)?,
         };
         Ok(Self {
-            eps: f("attention.layer_norm_rms_epsilon")?,
-            rope_base: f("rope.freq_base")?,
-            rope_base_swa: f("rope.freq_base_swa")?,
+            eps,
+            rope_base,
+            rope_base_swa,
             gguf,
             mapped,
             hidden,

@@ -391,13 +391,19 @@ void main() {
         s += v[j];
     }
     s = subgroupAdd(s);
-    [[unroll]] for (uint j = 0u; j < 8u; j++) v[j] = v[j] / s;
-    // Selection by k rounds of an argmax; taken entries become -1.
+    // Probabilities are in [0, 1]; a non-finite row's (NaN) are -1, entries
+    // past E -2 and taken experts -3, so every pick is an expert below E
+    // (K <= E), the lowest-numbered remaining one on a non-finite row.
+    [[unroll]] for (uint j = 0u; j < 8u; j++) {
+        const float p = v[j] / s;
+        v[j] = lane + 32u * j < E ? (isnan(p) ? -1.0 : p) : -2.0;
+    }
+    // Selection by k rounds of an argmax, ties to the lower id.
     float wsel = 0.0, chosen_sum = 0.0;
     uint my_e = 0u;
     for (uint r = 0u; r < K; r++) {
-        float best = -1.0;
-        uint best_e = 0xffffffffu;
+        float best = -4.0;
+        uint best_e = lane;
         [[unroll]] for (uint j = 0u; j < 8u; j++) {
             if (v[j] > best) {
                 best = v[j];
@@ -406,12 +412,13 @@ void main() {
         }
         const float top = subgroupMax(best);
         const uint e = subgroupMin(best == top ? best_e : 0xffffffffu);
-        chosen_sum += top;
+        // A non-finite row's experts get weight 0.
+        chosen_sum += max(top, 0.0);
         if (lane == r) {
             my_e = e;
-            wsel = top;
+            wsel = max(top, 0.0);
         }
-        [[unroll]] for (uint j = 0u; j < 8u; j++) if (lane + 32u * j == e) v[j] = -1.0;
+        [[unroll]] for (uint j = 0u; j < 8u; j++) if (lane + 32u * j == e) v[j] = -3.0;
     }
     if (lane < K) {
         const float w = wsel / max(chosen_sum, 6.103515625e-5);
