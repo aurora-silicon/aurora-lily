@@ -747,21 +747,42 @@ fn router_sg_matches_router_bitwise() {
     }
 }
 
-/// The K-split Q8_0 GEMV of rows of 4096 against GLM's (sums regrouped).
+/// The K-split Q8_0 GEMV of rows of 4096 against GLM's (sums regrouped) for
+/// 1 to 4 activation rows, and each row of a multi-row dispatch the same
+/// bits as that row alone (a verify row is a decode step's).
 #[test]
 fn gemv_q8_0_k4096_matches_glm53() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(87);
-    let (cols, rows) = (4096, 2048);
+    let (cols, rows) = (4096, 2050);
     let raw = random_blocks(&mut rng, GgmlType::Q8_0, rows * cols);
     let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap();
-    let x = tensor(&ctx, &f32s(&mut rng, cols, -2.0, 2.0));
-    let (a, b) = (zeros(&ctx, rows, DType::F32), zeros(&ctx, rows, DType::F32));
-    run(&ctx, |p| {
-        gemv_q8_0_k4096(&ctx, p, &w, &x, &a).unwrap();
-        crate::kernels::glm53::gemv(&ctx, p, &w, &x, &b, 1).unwrap();
-    });
-    assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-5, 1e-5);
+    let xs = f32s(&mut rng, 4 * cols, -2.0, 2.0);
+    let one: Vec<Vec<f32>> = (0..4)
+        .map(|i| {
+            let x = tensor(&ctx, &xs[i * cols..(i + 1) * cols]);
+            let y = zeros(&ctx, rows, DType::F32);
+            run(&ctx, |p| gemv_q8_0_k4096(&ctx, p, &w, &x, &y, 1).unwrap());
+            y.to_f32().unwrap()
+        })
+        .collect();
+    for m in 1..=4 {
+        let x = tensor(&ctx, &xs[..m * cols]);
+        let (a, b) =
+            (zeros(&ctx, m * rows, DType::F32), zeros(&ctx, m * rows, DType::F32));
+        run(&ctx, |p| {
+            gemv_q8_0_k4096(&ctx, p, &w, &x, &a, m).unwrap();
+            crate::kernels::glm53::gemv(&ctx, p, &w, &x, &b, m).unwrap();
+        });
+        let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+        assert_close(&a, &b, 1e-5, 1e-5);
+        for (i, row) in one.iter().enumerate().take(m) {
+            let got = &a[i * rows..(i + 1) * rows];
+            for (k, (u, v)) in got.iter().zip(row).enumerate() {
+                assert_eq!(u.to_bits(), v.to_bits(), "m {m} row {i} output {k}");
+            }
+        }
+    }
 }
 
 /// Attention decode in splits of 64 keys against the default route: at the

@@ -1047,8 +1047,8 @@ impl Qwen36Model {
         xb: Option<&Tensor>,
         m: usize,
     ) -> Result<()> {
-        if m == 1 && sets.len() == 1 && k::gemv_q8_0_k4096_takes(sets[0].0) {
-            return k::gemv_q8_0_k4096(ctx, pass, sets[0].0, x, sets[0].1);
+        if m <= MAX_ROWS && sets.len() == 1 && k::gemv_q8_0_k4096_takes(sets[0].0) {
+            return k::gemv_q8_0_k4096(ctx, pass, sets[0].0, x, sets[0].1, m);
         }
         if m <= MAX_ROWS {
             return g::gemv_sets(ctx, pass, sets, x, m);

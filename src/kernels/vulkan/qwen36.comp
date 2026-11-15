@@ -945,9 +945,21 @@ void main() {
 // regrouped: each half's lanes summed, then the halves.
 // Threadgroups of 256 (8 / KS rows). Buffers: 0 x [K], 1 W, 2 y. Param: 3 N.
 // ---------------------------------------------------------------------------
-#ifdef KERNEL_qwen36_gemv_q8_0_k4096_s2
+#if defined(KERNEL_qwen36_gemv_q8_0_k4096_s2) || defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m2) || \
+    defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m3) || defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m4)
 #define KS 2u
-shared float ks_part[8];
+// Activation rows: _m2 .. _m4 (verify passes) take each row's sums in the
+// one-row kernel's order, so a verify row is the same bits as a decode step.
+#if defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m2)
+#define KM 2u
+#elif defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m3)
+#define KM 3u
+#elif defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m4)
+#define KM 4u
+#else
+#define KM 1u
+#endif
+shared float ks_part[KM][8];
 void main() {
     const uint K = 4096u;
     const uint tasks = K / GLM53_TASK;
@@ -958,7 +970,8 @@ void main() {
     const uint part = sg % KS;
     const uint64_t X = arg(0);
     const uint64_t row = arg(1) + uint64_t(min(n, N - 1u)) * row_bytes;
-    float acc = 0.0;
+    float acc[KM];
+    [[unroll]] for (uint i = 0u; i < KM; i++) acc[i] = 0.0;
     const uint t0 = part * (tasks / KS);
     [[unroll]] for (uint it = 0u; it < tasks / KS / 32u; it++) {
         const uint t = t0 + lane + 32u * it;
@@ -970,15 +983,21 @@ void main() {
             w[2u * i] = float(int(pair << 24) >> 24);
             w[2u * i + 1u] = float(int(pair << 16) >> 24);
         }
-        acc += d * glm53_task_dot(w, X + 4u * uint64_t(t * GLM53_TASK));
+        [[unroll]] for (uint i = 0u; i < KM; i++) {
+            acc[i] += d * glm53_task_dot(w, X + 4u * (uint64_t(i) * K + uint64_t(t * GLM53_TASK)));
+        }
     }
-    acc = subgroupAdd(acc);
-    if (lane == 0u) ks_part[sg] = acc;
+    [[unroll]] for (uint i = 0u; i < KM; i++) {
+        const float sum = subgroupAdd(acc[i]);
+        if (lane == 0u) ks_part[i][sg] = sum;
+    }
     barrier();
     if (part == 0u && lane == 0u && n < N) {
-        float total = ks_part[sg];
-        [[unroll]] for (uint p = 1u; p < KS; p++) total += ks_part[sg + p];
-        F32(arg(2)).v[n] = total;
+        [[unroll]] for (uint i = 0u; i < KM; i++) {
+            float total = ks_part[i][sg];
+            [[unroll]] for (uint p = 1u; p < KS; p++) total += ks_part[i][sg + p];
+            F32(arg(2)).v[i * N + n] = total;
+        }
     }
 }
 #endif

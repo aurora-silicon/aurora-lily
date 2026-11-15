@@ -862,14 +862,17 @@ pub fn gemv_q8_0_k4096_takes(w: &QWeight) -> bool {
     w.ty == GgmlType::Q8_0 && w.cols == 4096
 }
 
-/// `y = w x` for one row of x through Q8_0 rows of 4096 values, each row
-/// over two subgroups (the sum regrouped against `glm53::gemv`).
+/// `y[i] = w x[i]` for `m` rows of x (1 to 4) through Q8_0 rows of 4096
+/// values, each row over two subgroups (the sum regrouped against
+/// `glm53::gemv`; a row's sums are the same bits at any `m`, so a verify
+/// row is a decode step's).
 pub fn gemv_q8_0_k4096(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     w: &QWeight,
     x: &Tensor,
     y: &Tensor,
+    m: usize,
 ) -> Result<()> {
     ensure!(
         gemv_q8_0_k4096_takes(w),
@@ -878,10 +881,16 @@ pub fn gemv_q8_0_k4096(
         w.cols
     );
     check(&[(x, DType::F32), (y, DType::F32)])?;
-    ensure!(x.numel() >= w.cols && y.numel() >= w.rows, "K-split GEMV shapes");
+    ensure!((1..=4).contains(&m), "K-split GEMV of {m} rows");
+    ensure!(x.numel() >= m * w.cols && y.numel() >= m * w.rows, "K-split GEMV shapes");
     let ks = 2;
-    let pipeline =
-        ctx.pipeline("qwen36_gemv_q8_0_k4096_s2", SOURCE, MslVersion::V3_1)?;
+    let name = [
+        "qwen36_gemv_q8_0_k4096_s2",
+        "qwen36_gemv_q8_0_k4096_s2_m2",
+        "qwen36_gemv_q8_0_k4096_s2_m3",
+        "qwen36_gemv_q8_0_k4096_s2_m4",
+    ][m - 1];
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[x.binding(), w.t.binding(), y.binding()],
