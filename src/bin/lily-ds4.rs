@@ -467,14 +467,18 @@ fn bench(
         let mut next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
         let mut out = Vec::with_capacity(n);
         let mut steps = Vec::with_capacity(n);
+        let mut busy = Vec::with_capacity(n);
         let t = Instant::now();
         for _ in 0..n {
             out.push(next);
             let s = Instant::now();
+            let b0 = lily::metal::gpu_busy_ns();
             model.forward(&ctx, &mut st, &sc, &[next], Logits::Last)?;
+            busy.push((lily::metal::gpu_busy_ns() - b0) as f64 * 1e-6);
             next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
             steps.push(s.elapsed().as_secs_f64() * 1e3);
         }
+        busy.sort_by(f64::total_cmp);
         let dt = t.elapsed().as_secs_f64();
         if ctx.profiling() {
             eprintln!("decode at prompt {}, per step:", prompt.len());
@@ -485,13 +489,15 @@ fn bench(
             (h ^ u64::from(t)).wrapping_mul(0x100000001b3)
         });
         println!(
-            "run {run}: prompt {} prefill {pf:.2} s ({:.1} tok/s), decode {n} in {dt:.2} s ({:.2} tok/s, median {:.2} ms/step, p10 {:.2}, min {:.2}), digest {digest:016x}",
+            "run {run}: prompt {} prefill {pf:.2} s ({:.1} tok/s), decode {n} in {dt:.2} s ({:.2} tok/s, median {:.2} ms/step, p10 {:.2}, min {:.2}; GPU busy median {:.2} ms, p10 {:.2}), digest {digest:016x}",
             prompt.len(),
             prompt.len() as f64 / pf,
             n as f64 / dt,
             steps[steps.len() / 2],
             steps[steps.len() / 10],
-            steps[0]
+            steps[0],
+            busy[busy.len() / 2],
+            busy[busy.len() / 10],
         );
     }
     Ok(())
