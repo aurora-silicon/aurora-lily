@@ -1712,7 +1712,9 @@ impl Glm53Model {
                 pass.memory_barrier()?;
                 if m > MAX_ROWS {
                     // A prompt run: shared expert first, then the routed
-                    // experts grouped by expert on the matrix units.
+                    // experts grouped by expert: an expert of at most four
+                    // rows (one tile) by register dot products, the others
+                    // on the matrix units (`moe_grouped_dot`).
                     let xb =
                         self.bf16_input(ctx, pass, sc, &sc.fmid, cfg.ff_expert, m)?;
                     self.proj(ctx, pass, &[(sh_down, &sc.ffn_out)], &sc.fmid, xb, m)?;
