@@ -25,6 +25,7 @@ use crate::tensor::{DType, Tensor};
 /// per tensor as the checkpoint stores it (the routers, gates and mixers are
 /// always 8-bit; a `--q8-dense` conversion makes the dense projections 8-bit
 /// too).
+#[derive(Clone)]
 pub struct QuantWeights {
     /// U32 `[out, in * bits / 32]`.
     pub codes: Tensor,
@@ -58,6 +59,88 @@ impl QuantWeights {
             bits: self.bits,
         })
     }
+}
+
+/// One linear layer as a GGUF file stores it (`crate::kernels::qwen_gguf`):
+/// blocks read in place, one or more weights whose outputs concatenate (a
+/// fused stack such as the GDN `qkv | z | a | b`, whose parts the file holds
+/// as separate tensors, not all of one type).
+#[derive(Clone)]
+pub struct GgufLinear {
+    pub parts: Vec<crate::kernels::qwen_gguf::QWeight>,
+}
+
+impl GgufLinear {
+    pub fn out_features(&self) -> usize {
+        self.parts.iter().map(|p| p.rows).sum()
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.parts.first().map_or(0, |p| p.cols)
+    }
+}
+
+/// A linear layer in either storage: lily's MLX affine checkpoints, or the
+/// GGUF blocks of a llama.cpp/ds4 file. The kernels of each are separate;
+/// the graph dispatches on the variant (`crate::qwen4exp::proj`).
+pub enum LinearWeights {
+    Affine(QuantWeights),
+    Gguf(GgufLinear),
+}
+
+impl LinearWeights {
+    /// The affine weights, for the paths only lily's checkpoints take.
+    pub fn affine(&self) -> Result<&QuantWeights> {
+        match self {
+            Self::Affine(w) => Ok(w),
+            Self::Gguf(_) => anyhow::bail!("this path takes affine weights only"),
+        }
+    }
+
+    pub fn gguf(&self) -> Option<&GgufLinear> {
+        match self {
+            Self::Affine(_) => None,
+            Self::Gguf(g) => Some(g),
+        }
+    }
+
+    pub fn out_features(&self) -> usize {
+        match self {
+            Self::Affine(w) => w.out_features(),
+            Self::Gguf(g) => g.out_features(),
+        }
+    }
+
+    pub fn in_features(&self) -> usize {
+        match self {
+            Self::Affine(w) => w.in_features(),
+            Self::Gguf(g) => g.in_features(),
+        }
+    }
+
+    /// A row-range view: [`QuantWeights::view_rows`], or for GGUF the parts
+    /// the range covers exactly (a fused stack's segments are its parts).
+    pub fn view_rows(&self, start_row: usize, rows: usize) -> Result<Self> {
+        match self {
+            Self::Affine(w) => Ok(Self::Affine(w.view_rows(start_row, rows)?)),
+            Self::Gguf(g) => {
+                let mut at = 0;
+                let mut parts = Vec::new();
+                for p in &g.parts {
+                    if at >= start_row && at + p.rows <= start_row + rows {
+                        parts.push(p.clone());
+                    }
+                    at += p.rows;
+                }
+                ensure!(
+                    parts.iter().map(|p| p.rows).sum::<usize>() == rows,
+                    "rows {start_row}..{} are not whole parts of the GGUF stack",
+                    start_row + rows
+                );
+                Ok(Self::Gguf(GgufLinear { parts }))
+            }
+        }
+    }
 
     pub(crate) fn expect_features(
         &self,
@@ -74,8 +157,6 @@ impl QuantWeights {
         Ok(())
     }
 }
-
-pub type LinearWeights = QuantWeights;
 
 pub struct MlpWeights {
     /// `[2*inter, h]` — gate rows then up rows; `gate_proj`/`up_proj` are
@@ -311,7 +392,13 @@ impl Loader<'_> {
             scales.dtype() == DType::BF16 && biases.dtype() == DType::BF16,
             "quantized scales/biases must be BF16"
         );
-        Ok(QuantWeights { codes, scales, biases, group_size: q.group_size, bits })
+        Ok(LinearWeights::Affine(QuantWeights {
+            codes,
+            scales,
+            biases,
+            group_size: q.group_size,
+            bits,
+        }))
     }
 
     /// Loads the conv1d weight, accepting the HF `[C, 1, KD]` or mlx

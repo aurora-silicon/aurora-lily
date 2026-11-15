@@ -2325,14 +2325,15 @@ fn stack_slices_match_the_fused_stack_bits() {
             timing_quant_bits(&ctx, n, k, 8, 11)
         };
         let mut start = 0;
-        let slices: Vec<QuantWeights> = widths
+        let slices: Vec<crate::weights::LinearWeights> = widths
             .iter()
             .map(|&rows| {
                 let v = quant_view_rows(&stack, start, rows);
                 start += rows;
-                v
+                crate::weights::LinearWeights::Affine(v)
             })
             .collect();
+        let stack = crate::weights::LinearWeights::Affine(stack);
         for m in [1usize, 3, 8] {
             let a = bits_activations(&mut rng, m * k, k, true, false);
             let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, k]).expect("a");

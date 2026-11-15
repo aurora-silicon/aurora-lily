@@ -378,6 +378,10 @@ pub struct LoadOptions {
     pub session_context: Option<crate::qwen4exp::weights::SessionContext>,
     /// The attention K/V caches' element format (`--kv-cache`).
     pub kv_format: crate::kernels::attention::KvFormat,
+    /// For a Qwen3.8-Flash-Next GGUF: a lily checkpoint of the model whose
+    /// 4-bit n-gram table is paged in place of the file's BF16 one
+    /// (`--ngram-checkpoint`; `LILY_NGRAM_TABLE` when `None`).
+    pub ngram_checkpoint: Option<std::path::PathBuf>,
 }
 
 /// Which draw a decode pass ends with.
@@ -711,6 +715,15 @@ pub trait LanguageModel: Sized {
     /// full session, `LoadOptions::session_context`); `None` when no plan
     /// reserved anything.
     fn session_reserve(&self) -> Option<u64> {
+        None
+    }
+
+    /// What the session store keeps free for the session a request holds
+    /// ([`crate::serve::session::SessionStore::with_acquire_reserve`]): the
+    /// most that session takes on its way to the fitted context under
+    /// `--memory-limit-gb`, for a load that fits one session and serves one
+    /// request at a time (`max_batch_rows` 0); `None` otherwise.
+    fn acquire_reserve(&self) -> Option<u64> {
         None
     }
 

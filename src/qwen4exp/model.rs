@@ -49,16 +49,16 @@ use crate::kernels::qsa::{self, INDEXER_D, SparseAttnRoute, SparseSplitScratch};
 use crate::kernels::sample::{
     DraftDists, SamplerScratch, SamplingParams, sample_f32, sample_spec_f32,
 };
+use crate::kernels::skinny;
 use crate::kernels::spec::ctrl_words;
 use crate::kernels::{Arg, Pos, Rope};
-use crate::kernels::{quant, skinny};
 use crate::metal::{
     BlitCopy, ComputePass, EncodedPass, MetalContext, PendingPass, SharedEvent,
 };
 use crate::moe_ffn::{
     DecodeMoeIo, MoeDims, MoeScratch, PrefillMoeIo, PrefillMoeScratch, decode_moe,
-    prefill_moe, prefix_rows, project_mat, project_stack_or_slices, route_decode,
-    route_rows,
+    embed_rows, linear_gemv, linear_gemv_sets, prefill_moe, prefix_rows, project_mat,
+    project_stack_or_slices, route_decode, route_rows,
 };
 use crate::tensor::{DType, Tensor};
 
@@ -87,7 +87,7 @@ const QSA_QUERY_BATCH: usize = 256;
 /// Per-token caches grow in steps of this many tokens (the trunk's K/V take
 /// 192 MiB a step in bf16, 102 MiB in q8, plus the indexer keys), so a
 /// session's footprint follows its length.
-const CAPACITY_STEP: usize = 8192;
+pub(crate) const CAPACITY_STEP: usize = 8192;
 
 /// Most draft tokens a speculative step may verify at once (the spec scratch
 /// is sized for it).
@@ -316,6 +316,7 @@ fn moe_dims(cfg: &Qwen4ExpConfig) -> MoeDims {
         moe_intermediate: cfg.moe_intermediate_size,
         hidden: cfg.hidden_size,
         norm_topk_prob: cfg.norm_topk_prob,
+        gguf_down_cols: cfg.gguf_down_cols,
     }
 }
 
@@ -340,10 +341,26 @@ pub struct Qwen4ExpModel {
     /// The attention K/V caches' element format (`--kv-cache`); states and
     /// scratch made after [`Self::set_kv_format`] follow it.
     kv_format: KvFormat,
-    /// Which checkpoint this is ([`super::config::checkpoint_identity`]),
-    /// part of the disk tier's key.
+    /// Which checkpoint this is ([`super::config::checkpoint_identity`],
+    /// [`super::gguf::gguf_identity`]), part of the disk tier's key.
     checkpoint_id: String,
+    /// The longest request context served: the checkpoint's, less the
+    /// speculative lookahead under the attention kernel's limit, or what
+    /// `--memory-limit-gb` fits ([`Self::fit_context`]).
+    context_cap: usize,
+    /// Scratch with its full prefill chunk from the start (a fitted
+    /// `--memory-limit-gb`, [`Self::fit_context`]).
+    prefill_upfront: bool,
+    /// What the session store keeps free for the session a request holds
+    /// under a fitted `--memory-limit-gb`: [`session_peak`] at the fitted
+    /// context ([`LanguageModel::acquire_reserve`]).
+    acquire_reserve: Option<u64>,
 }
+
+/// Cache rows a session needs past its request's tokens: a verify pass of
+/// `MAX_DRAFTS + 1` rows and the `MAX_DRAFTS` the speculative step reserves
+/// beyond them (`spec.rs`).
+pub const LOOKAHEAD: usize = 2 * MAX_DRAFTS + 2;
 
 pub(super) enum LayerState {
     Gdn {
@@ -1613,6 +1630,7 @@ impl Qwen4ExpModel {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1632,9 +1650,24 @@ impl Qwen4ExpModel {
         memory_limit: Option<u64>,
         expert_usage_out: Option<std::path::PathBuf>,
         session_context: Option<weights::SessionContext>,
+        ngram_checkpoint: Option<&Path>,
     ) -> Result<Self> {
-        let config = Qwen4ExpConfig::from_model_dir(&dir)?;
-        let checkpoint_id = super::config::checkpoint_identity(dir.as_ref())?;
+        let gguf_file = super::gguf::is_qwen_gguf(dir.as_ref());
+        // A GGUF's n-gram table comes from a lily checkpoint, resolved
+        // before anything is mapped; its identity is part of the load's.
+        let (config, checkpoint_id, ngram_dir) = if gguf_file {
+            let g = crate::gguf::Gguf::open(dir.as_ref())?;
+            let config = super::gguf::config_from_gguf(&g)?;
+            let ngram_dir = match config.ple {
+                Some(_) => Some(super::gguf::ngram_table_dir(ngram_checkpoint)?),
+                None => None,
+            };
+            let id = super::gguf::gguf_identity(&g, ngram_dir.as_deref())?;
+            (config, format!("gguf-{id}"), ngram_dir)
+        } else {
+            let config = Qwen4ExpConfig::from_model_dir(&dir)?;
+            (config, super::config::checkpoint_identity(dir.as_ref())?, None)
+        };
         ensure!(
             config.linear_key_head_dim == GDN_HEAD_DIM
                 && config.linear_value_head_dim == GDN_HEAD_DIM,
@@ -1646,20 +1679,31 @@ impl Qwen4ExpModel {
             "indexer head dim {} unsupported (kernels are compiled for {INDEXER_D})",
             config.indexer.head_dim
         );
-        let weights = weights::load(
-            ctx,
-            &dir,
-            &config,
-            storage,
-            with_mtp,
-            vision == VisionMode::Auto,
-            expert_slots,
-            expert_usage,
-            machine_memory,
-            memory_limit,
-            expert_usage_out,
-            session_context,
-        )?;
+        let weights = if gguf_file {
+            super::gguf::load(
+                ctx,
+                dir.as_ref(),
+                &config,
+                with_mtp,
+                ngram_dir.as_deref(),
+                memory_limit,
+            )?
+        } else {
+            weights::load(
+                ctx,
+                &dir,
+                &config,
+                storage,
+                with_mtp,
+                vision == VisionMode::Auto,
+                expert_slots,
+                expert_usage,
+                machine_memory,
+                memory_limit,
+                expert_usage_out,
+                session_context,
+            )?
+        };
         let hasher = match &config.ple {
             Some(p) => Some(NgramHasher::new(
                 &p.layer_multipliers,
@@ -1676,6 +1720,9 @@ impl Qwen4ExpModel {
         };
         let attn_scale = 1.0 / (config.head_dim as f32).sqrt();
         let gdn_scale = 1.0 / (config.linear_key_head_dim as f32).sqrt();
+        // The served context: the checkpoint's, with the speculative
+        // lookahead's rows under the attention kernel's limit.
+        let context_cap = config.max_position_embeddings.min(MAX_SEQ - LOOKAHEAD);
         let prefill_chunk = std::env::var("LILY_PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -1692,7 +1739,78 @@ impl Qwen4ExpModel {
             ngram_ahead: true,
             kv_format: kv_format_from_env()?.unwrap_or_default(),
             checkpoint_id,
+            context_cap,
+            prefill_upfront: false,
+            acquire_reserve: None,
         })
+    }
+
+    /// Under `--memory-limit-gb` (a GGUF load: there is no expert cache to
+    /// plan): the longest context whose session, with the server's
+    /// checkpoints, growth to its full capacity and the speculative
+    /// lookahead, fits what `limit` leaves after the weights and a scratch
+    /// as the server allocates it (made here to measure it, with a full
+    /// prefill chunk's); [`LanguageModel::max_position_embeddings`] becomes
+    /// it, so the server caps `--max-seq` there and refuses longer requests.
+    pub fn fit_context(&mut self, ctx: &MetalContext, limit: u64) -> Result<usize> {
+        let mtp = self.weights.mtp.is_some();
+        let checkpoints = crate::serve::CHECKPOINTS_PER_SESSION
+            + crate::serve::DECODE_CHECKPOINTS_PER_SESSION;
+        let peak = |model: &Self, context: usize| -> Result<u64> {
+            let capacity = (context + LOOKAHEAD).min(MAX_SEQ);
+            session_peak(&model.config, mtp, model.kv_format, capacity, checkpoints)
+        };
+        let fits = |model: &Self, context: usize, allocated: u64| -> Result<bool> {
+            Ok(allocated + peak(model, context)? <= limit)
+        };
+        self.prefill_upfront = true;
+        let measure = |model: &Self, capacity: usize| -> Result<u64> {
+            let before = ctx.current_allocated();
+            let s = model.new_scratch_with_capacity(ctx, capacity)?;
+            let scratch = ctx.current_allocated().saturating_sub(before);
+            drop(s);
+            Ok((before + scratch) as u64)
+        };
+        let longest = |model: &Self, allocated: u64| -> Result<usize> {
+            longest_context(
+                &model.config,
+                mtp,
+                model.kv_format,
+                model.context_cap,
+                limit.saturating_sub(allocated),
+                checkpoints,
+            )
+        };
+        // The prefill chunk's scratch (about 0.55 GB per 1024 rows) against
+        // the context: a smaller chunk where the full one leaves less than
+        // 32K tokens (of capacity: the context and its lookahead).
+        let (mut allocated, mut context);
+        loop {
+            allocated = measure(self, self.context_cap.min(32768))?;
+            context = longest(self, allocated)?;
+            if context + LOOKAHEAD >= 32768 || self.prefill_chunk <= 1024 {
+                break;
+            }
+            let smaller = self.prefill_chunk / 2;
+            self.set_prefill_chunk(smaller)?;
+        }
+        // The scratch grows a little with the capacity: measured again at
+        // the context found.
+        if context > 32768 {
+            allocated = measure(self, context)?;
+            context = longest(self, allocated)?;
+        }
+        ensure!(
+            context > 4096 || fits(self, context, allocated)?,
+            "--memory-limit-gb {:.1} leaves {:.2} GB after {:.1} GB of weights and scratch: not \
+             even a 4096-token session fits",
+            limit as f64 / (1u64 << 30) as f64,
+            limit.saturating_sub(allocated) as f64 / 1e9,
+            allocated as f64 / 1e9
+        );
+        self.context_cap = context;
+        self.acquire_reserve = Some(peak(self, context)?);
+        Ok(context)
     }
 
     /// Runs the vision tower over one preprocessed image and returns its
@@ -2446,7 +2564,7 @@ impl Qwen4ExpModel {
         .into_iter()
         .max()
         .unwrap_or(0);
-        Ok(Scratch {
+        let mut scratch = Scratch {
             sync: StepSync::new(ctx)?,
             x: Tensor::zeros(ctx, &[h], bf)?,
             hyper: Tensor::zeros(ctx, &[wide], bf)?,
@@ -2498,7 +2616,14 @@ impl Qwen4ExpModel {
                 .as_ref()
                 .map(|_| SpecScratch::new(ctx, cfg))
                 .transpose()?,
-        })
+        };
+        // Under a memory limit the prefill scratch is there from the start,
+        // at its full chunk, so what the server sees allocated after its
+        // warm-up is the footprint a long prompt reaches.
+        if self.prefill_upfront {
+            self.ensure_prefill_scratch(ctx, &mut scratch, self.prefill_chunk)?;
+        }
+        Ok(scratch)
     }
 
     /// Makes sure `s.prefill` can hold chunks of `needed` rows.
@@ -2558,6 +2683,11 @@ impl Qwen4ExpModel {
         s: &Scratch,
         token: u32,
     ) -> Result<()> {
+        ensure!(
+            (token as usize) < self.config.vocab_size,
+            "token id {token} is outside the vocabulary of {}",
+            self.config.vocab_size
+        );
         if let (Some(pst), Some(p)) = (&mut state.ple, &s.ple) {
             let w = self
                 .weights
@@ -2636,6 +2766,11 @@ impl Qwen4ExpModel {
     ) -> Result<usize> {
         ensure!(!tokens.is_empty(), "empty prompt");
         ensure!(state.spec.is_none(), "prefill during a pending speculative step");
+        // The embedding gathers index the table by id: none past it.
+        let vocab = self.config.vocab_size;
+        if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= vocab) {
+            anyhow::bail!("token id {bad} is outside the vocabulary of {vocab}");
+        }
         let h = self.config.hidden_size;
         if let Some(v) = vision {
             let n = v.positions.len();
@@ -2877,13 +3012,7 @@ impl Qwen4ExpModel {
             None => Rope::Delta(state.rope_delta),
         };
 
-        quant::gather_rows_quant(
-            ctx,
-            &pass,
-            &self.weights.embed_tokens,
-            &ps.ids,
-            &ps.x,
-        )?;
+        embed_rows(ctx, &pass, &self.weights.embed_tokens, &ps.ids, &ps.x)?;
         if let Some(v) = vision {
             // The images' merged rows replace the placeholders' embeddings
             // before the streams are initialised from them (the reference's
@@ -2987,7 +3116,7 @@ impl Qwen4ExpModel {
                     gather_row_bf16(ctx, &pass, &ps.hyper, &s.hyper, m - 1)?;
                     pass.level_barrier(&[&s.hyper])?;
                     self.hc_read_decode(ctx, &pass, &self.weights.final_mixer, s)?;
-                    quant::gemv_quant(
+                    linear_gemv(
                         ctx,
                         &pass,
                         &self.weights.lm_head,
@@ -3199,16 +3328,42 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
-        if m <= HC_FUSED_MAX_ROWS
-            && fused_read_supported(&hc.down, &hc.up, hc.inject.as_ref(), h, g)
+        // GGUF F16 mixers: the fused read up to four rows (verify passes).
+        if let Some((down, up, inject)) = hc.gguf_parts()
+            && m <= crate::kernels::qwen_gguf::GEMV_MAX_ROWS
+            && std::env::var_os("LILY_QWEN_HC_UNFUSED").is_none()
+        {
+            crate::kernels::qwen_gguf::hc_read_f16(
+                ctx,
+                pass,
+                hyper,
+                &hc.norm,
+                down,
+                inject,
+                up,
+                &out.down,
+                &out.inj,
+                &out.inv_rms,
+                &out.mixed,
+                h,
+                g,
+                cfg.rms_norm_eps,
+                NORM_WEIGHT_BIAS,
+                m,
+            )?;
+            return pass.level_barrier(&[&out.mixed]);
+        }
+        if let Some((down, up, inject)) = hc.affine()
+            && m <= HC_FUSED_MAX_ROWS
+            && fused_read_supported(down, up, inject, h, g)
         {
             hc_read_down_q8_rows(
                 ctx,
                 pass,
                 hyper,
                 &hc.norm,
-                &hc.down,
-                hc.inject.as_ref(),
+                down,
+                inject,
                 &out.down,
                 &out.inj,
                 &out.inv_rms,
@@ -3222,7 +3377,7 @@ impl Qwen4ExpModel {
             hc_read_up_mix_q8_rows(
                 ctx,
                 pass,
-                &hc.up,
+                up,
                 &out.act,
                 hyper,
                 &hc.norm,
@@ -3910,7 +4065,7 @@ impl Qwen4ExpModel {
             eps,
             NORM_WEIGHT_BIAS,
         )?;
-        quant::gather_rows_quant(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
+        embed_rows(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
         if !overrides.is_empty() {
             pass.level_barrier(&[&ps.x])?;
             override_rows(ctx, pass, &ps.x, overrides, h)?;
@@ -4089,7 +4244,7 @@ impl Qwen4ExpModel {
         self.set_cache_position(Some(state.pos));
 
         let ids = s.next_token.view(slot_in, &[1])?;
-        quant::gather_rows_quant(ctx, pass, &self.weights.embed_tokens, &ids, &s.x)?;
+        embed_rows(ctx, pass, &self.weights.embed_tokens, &ids, &s.x)?;
         pass.level_barrier(&[&s.x])?;
         hc_broadcast_bf16(ctx, pass, &s.x, &s.hyper, h, g)?;
         pass.level_barrier(&[&s.hyper])?;
@@ -4195,13 +4350,7 @@ impl Qwen4ExpModel {
 
         self.hc_read_decode(ctx, pass, &self.weights.final_mixer, s)?;
         if !crate::ablate::on(crate::ablate::Group::Head) {
-            quant::gemv_quant(
-                ctx,
-                pass,
-                &self.weights.lm_head,
-                &s.hc.mixed,
-                &s.logits,
-            )?;
+            linear_gemv(ctx, pass, &self.weights.lm_head, &s.hc.mixed, &s.logits)?;
             pass.level_barrier(&[&s.logits])?;
         }
         let out = s.next_token.view(slot_out, &[1])?;
@@ -4241,13 +4390,41 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
+        let Some((down, up, inject)) = hc.affine() else {
+            // GGUF F16 mixers: the fused F16 read (LILY_QWEN_HC_UNFUSED=1: the
+            // unfused one, by the GEMVs, which stage nothing).
+            if let Some((down, up, inject)) = hc.gguf_parts()
+                && std::env::var_os("LILY_QWEN_HC_UNFUSED").is_none()
+            {
+                crate::kernels::qwen_gguf::hc_read_f16(
+                    ctx,
+                    pass,
+                    hyper,
+                    &hc.norm,
+                    down,
+                    inject,
+                    up,
+                    &out.down,
+                    &out.inj,
+                    &out.inv_rms,
+                    &out.mixed,
+                    h,
+                    g,
+                    cfg.rms_norm_eps,
+                    NORM_WEIGHT_BIAS,
+                    1,
+                )?;
+                return pass.level_barrier(&[&out.mixed]);
+            }
+            return self.hc_read_rows(ctx, pass, hc, hyper, out, 1, hyper);
+        };
         hc_read_down_q8(
             ctx,
             pass,
             hyper,
             &hc.norm,
-            &hc.down,
-            hc.inject.as_ref(),
+            down,
+            inject,
             &out.down,
             &out.inj,
             &out.inv_rms,
@@ -4260,7 +4437,7 @@ impl Qwen4ExpModel {
         hc_read_up_mix_q8(
             ctx,
             pass,
-            &hc.up,
+            up,
             &out.down,
             hyper,
             &hc.norm,
@@ -4300,7 +4477,7 @@ impl Qwen4ExpModel {
             NORM_WEIGHT_BIAS,
         )?;
         pass.level_barrier(&[&p.emb, &p.query_n])?;
-        quant::gemv_quant_sets(
+        linear_gemv_sets(
             ctx,
             pass,
             &p.emb,
@@ -4358,7 +4535,7 @@ impl Qwen4ExpModel {
         conv_window: &Tensor,
     ) -> Result<()> {
         if !crate::ablate::on(crate::ablate::Group::GdnProj) {
-            quant::gemv_quant(ctx, pass, &w.in_proj, &s.hc.mixed, &s.gdn_in)?;
+            linear_gemv(ctx, pass, &w.in_proj, &s.hc.mixed, &s.gdn_in)?;
             pass.level_barrier(&[&s.gdn_in])?;
         }
         if crate::ablate::on(crate::ablate::Group::GdnStep) {
@@ -4387,7 +4564,7 @@ impl Qwen4ExpModel {
         if crate::ablate::on(crate::ablate::Group::GdnProj) {
             return Ok(());
         }
-        quant::gemv_quant(ctx, pass, &w.out_proj, &s.gdn_gated, &s.branch_out)
+        linear_gemv(ctx, pass, &w.out_proj, &s.gdn_gated, &s.branch_out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4421,7 +4598,7 @@ impl Qwen4ExpModel {
         if crate::ablate::on(crate::ablate::Group::Attn) {
             return Ok(());
         }
-        quant::gemv_quant_sets(
+        linear_gemv_sets(
             ctx,
             pass,
             &s.hc.mixed,
@@ -4538,7 +4715,7 @@ impl Qwen4ExpModel {
         pass.level_barrier(&[&s.attn_o])?;
         sigmoid_mul_bf16(ctx, pass, &s.gate, &s.attn_o, &s.attn_gated)?;
         pass.level_barrier(&[&s.attn_gated])?;
-        quant::gemv_quant(ctx, pass, &w.o_proj, &s.attn_gated, &s.branch_out)
+        linear_gemv(ctx, pass, &w.o_proj, &s.attn_gated, &s.branch_out)
     }
 }
 
@@ -4561,10 +4738,7 @@ pub(crate) fn session_bytes(
         |kind: LayerType| cfg.layer_types.iter().filter(|t| **t == kind).count();
     // `DecodeState::cache_bytes`: every attention layer, the draft head's too.
     let attn_layers = count(LayerType::FullAttention) + usize::from(mtp);
-    let per_token =
-        2 * cfg.num_key_value_heads * kv_format.row_bytes(cfg.head_dim) + INDEXER_D * 2;
-    let blocks = block_key_rows(capacity, cfg.indexer.compress_ratio) * INDEXER_D * 2;
-    let caches = attn_layers * (capacity * per_token + blocks);
+    let caches = attn_layers * attn_layer_bytes(cfg, kv_format, capacity);
     // `Qwen4ExpModel::new_state`: per GDN layer the state and two conv
     // windows (a snapshot keeps one), the PLE's two windows (one), the draft
     // head's hidden.
@@ -4583,6 +4757,64 @@ pub(crate) fn session_bytes(
     let live = caches + gdn_layers * (state + 2 * conv) + 2 * ple + hidden;
     let snapshot = gdn_layers * (state + conv) + ple + hidden;
     Ok((live + checkpoints * snapshot) as u64)
+}
+
+/// The most GPU memory one session holds on its way to `capacity` tokens
+/// with `checkpoints` snapshots: [`session_bytes`] at that capacity plus the
+/// one attention layer's caches that `ensure_capacity` holds twice while it
+/// replaces them (the old ones are freed layer by layer, after the copy).
+pub(crate) fn session_peak(
+    cfg: &Qwen4ExpConfig,
+    mtp: bool,
+    kv_format: KvFormat,
+    capacity: usize,
+    checkpoints: usize,
+) -> Result<u64> {
+    Ok(session_bytes(cfg, mtp, kv_format, capacity, checkpoints)?
+        + attn_layer_bytes(cfg, kv_format, round_capacity(capacity)?) as u64)
+}
+
+/// The longest context, from `cap` down by capacity steps to 4096, whose
+/// [`session_peak`] (growth to the context and the speculative lookahead,
+/// `checkpoints` snapshots) fits `room` bytes; 4096 when none longer does
+/// (the caller refuses that unless it fits).
+pub(crate) fn longest_context(
+    cfg: &Qwen4ExpConfig,
+    mtp: bool,
+    kv_format: KvFormat,
+    cap: usize,
+    room: u64,
+    checkpoints: usize,
+) -> Result<usize> {
+    let peak = |context: usize| {
+        session_peak(
+            cfg,
+            mtp,
+            kv_format,
+            (context + LOOKAHEAD).min(MAX_SEQ),
+            checkpoints,
+        )
+    };
+    let mut context = cap;
+    while context > 4096 && peak(context)? > room {
+        // The next smaller capacity step, less the lookahead.
+        let capacity = round_capacity(context + LOOKAHEAD)?;
+        context = capacity.saturating_sub(CAPACITY_STEP + LOOKAHEAD).max(4096);
+    }
+    Ok(context)
+}
+
+/// One attention layer's per-token caches for `capacity` tokens
+/// (`DecodeState::cache_bytes` per layer).
+pub(crate) fn attn_layer_bytes(
+    cfg: &Qwen4ExpConfig,
+    kv_format: KvFormat,
+    capacity: usize,
+) -> usize {
+    let per_token =
+        2 * cfg.num_key_value_heads * kv_format.row_bytes(cfg.head_dim) + INDEXER_D * 2;
+    capacity * per_token
+        + block_key_rows(capacity, cfg.indexer.compress_ratio) * INDEXER_D * 2
 }
 
 /// `LILY_KV_CACHE` (`bf16` or `q8`), which overrides the K/V format of
@@ -4960,10 +5192,37 @@ impl LanguageModel for Qwen4ExpModel {
             options.memory_limit,
             expert_usage_out,
             session_context,
+            options.ngram_checkpoint.as_deref(),
         )
-        .map(|mut model| {
+        .and_then(|mut model| {
             model.set_kv_format(kv_format);
-            model
+            // A GGUF load under --memory-limit-gb fits its context to it.
+            if let (Some(limit), Some(_)) =
+                (options.memory_limit, model.config.gguf_down_cols)
+            {
+                let context = model.fit_context(ctx, limit)?;
+                let mtp = model.weights.mtp.is_some();
+                let checkpoints = crate::serve::CHECKPOINTS_PER_SESSION
+                    + crate::serve::DECODE_CHECKPOINTS_PER_SESSION;
+                eprintln!(
+                    "qwen3.8: --memory-limit-gb {:.1} ({:.1} GB): contexts of up to {context} tokens \
+                     (one session of at most {:.2} GB with {checkpoints} snapshots, kept free \
+                     for each request; one request at a time), prefill chunks of {} rows; \
+                     --max-seq is capped there",
+                    limit as f64 / (1u64 << 30) as f64,
+                    limit as f64 / 1e9,
+                    session_peak(
+                        &model.config,
+                        mtp,
+                        model.kv_format,
+                        (context + LOOKAHEAD).min(MAX_SEQ),
+                        checkpoints
+                    )? as f64
+                        / 1e9,
+                    model.prefill_chunk
+                );
+            }
+            Ok(model)
         })
     }
 
@@ -4981,6 +5240,10 @@ impl LanguageModel for Qwen4ExpModel {
 
     fn session_reserve(&self) -> Option<u64> {
         self.weights.session_reserve
+    }
+
+    fn acquire_reserve(&self) -> Option<u64> {
+        self.acquire_reserve
     }
 
     fn session_bytes(&self, capacity: usize, checkpoints: usize) -> Option<u64> {
@@ -5005,7 +5268,7 @@ impl LanguageModel for Qwen4ExpModel {
     }
 
     fn max_position_embeddings(&self) -> usize {
-        self.config.max_position_embeddings
+        self.context_cap
     }
 
     fn eos_token_ids(&self) -> Vec<u32> {

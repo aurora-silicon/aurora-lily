@@ -11,7 +11,7 @@ use crate::gguf::Gguf;
 
 /// The `qwen35` pre-tokenizer split (the regex of Qwen3.5's
 /// `tokenizer.json`).
-const QWEN35_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+pub(crate) const QWEN35_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// The `tokenizer.json` of the file's vocabulary.
 pub fn tokenizer_json(g: &Gguf) -> Result<String> {

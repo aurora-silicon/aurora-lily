@@ -582,9 +582,19 @@ mod store {
     /// prompt with a checkpoint at `n - 1`, release. Returns the acquire
     /// and what the release evicted.
     fn serve(f: &mut Fixture, prompt: &[u32]) -> (Acquired<Model>, Evictions) {
+        serve_then(f, prompt, |_| {})
+    }
+
+    /// [`serve`] with `check` run on the store right after the acquire.
+    fn serve_then(
+        f: &mut Fixture,
+        prompt: &[u32],
+        check: impl FnOnce(&SessionStore<Model>),
+    ) -> (Acquired<Model>, Evictions) {
         let n = prompt.len();
         let mut acquired =
             f.store.acquire(&f.ctx, &Model, prompt, &[], None).expect("acquire");
+        check(&f.store);
         let reused = acquired.reused;
         let mut session = std::mem::replace(
             &mut acquired.session,
@@ -1168,6 +1178,72 @@ mod store {
         assert_eq!((acquired.forked, acquired.cut_back), (true, None));
         let disk = f.store.disk().expect("disk");
         assert!(disk.entries().iter().any(|e| e.tokens == lineage));
+    }
+
+    // --- the acquire reserve ---------------------------------------------------
+
+    /// The fixture's store with `reserve` bytes kept free for each request.
+    fn reserving(tag: &str, budget: usize, reserve: usize) -> Fixture {
+        let mut f = fixture(tag, budget, None);
+        let store = std::mem::replace(&mut f.store, SessionStore::new(budget, 16, 3));
+        f.store = store.with_acquire_reserve(reserve);
+        f
+    }
+
+    /// What a fitted --memory-limit-gb load relies on: an acquire leaves the
+    /// reserve free of resident sessions before it allocates (a fork's
+    /// source among them), and so does one that takes a session as is.
+    #[test]
+    fn an_acquire_leaves_the_reserve_free_before_it_allocates() {
+        // Three 300-token sessions fit; the reserve is one of 500 tokens.
+        let (budget, reserve) = (1_000_000, 500 * BYTES_PER_TOKEN);
+        let mut f = reserving("reserve", budget, reserve);
+        let fits = |store: &SessionStore<Model>| {
+            assert!(
+                store.used_bytes() + reserve <= budget,
+                "{} resident",
+                store.used_bytes()
+            );
+        };
+        serve_then(&mut f, &prompt(1, 300), fits);
+        serve_then(&mut f, &prompt(2, 300), fits);
+        // A third would fit the budget, not next to the reserve.
+        let (third, _) = serve_then(&mut f, &prompt(3, 300), fits);
+        assert_eq!(third.evictions.evicted, 1);
+        assert_eq!(f.store.len(), 2);
+        // Taken as is: what stays leaves the reserve, nothing goes.
+        let turn = [prompt(3, 300), prompt(9, 100)].concat();
+        let (acquired, _) = serve_then(&mut f, &turn, fits);
+        assert_eq!((acquired.reused, acquired.evictions.evicted), (300, 0));
+        // A fork of the 400-token session: the other one goes first, the
+        // source stays.
+        let regenerate = [&turn[..300], &[4242u32][..]].concat();
+        let (acquired, _) = serve_then(&mut f, &regenerate, |store| {
+            fits(store);
+            assert!(store.entries.iter().any(|s| s.tokens == turn));
+        });
+        assert_eq!((acquired.reused, acquired.forked), (299, true));
+        assert_eq!(acquired.evictions.evicted, 1);
+        assert_eq!(f.store.len(), 2);
+    }
+
+    /// A fork whose source alone leaves less than the reserve rewinds the
+    /// source in place instead of copying it.
+    #[test]
+    fn a_fork_that_does_not_fit_next_to_its_source_cuts_back() {
+        let (budget, reserve) = (1_000_000, 700 * BYTES_PER_TOKEN);
+        let mut f = reserving("reserve-cut", budget, reserve);
+        serve(&mut f, &prompt(1, 300));
+        let turn = [prompt(1, 300), prompt(9, 100)].concat();
+        serve(&mut f, &turn);
+        let regenerate = [&turn[..300], &[4242u32][..]].concat();
+        let (acquired, _) = serve(&mut f, &regenerate);
+        assert_eq!(
+            (acquired.reused, acquired.forked, acquired.cut_back),
+            (299, false, Some(101))
+        );
+        assert_eq!(f.store.len(), 1);
+        assert_holds(&f.store.entries[0].state, &regenerate);
     }
 
     // --- cutting back in place ------------------------------------------------

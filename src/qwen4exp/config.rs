@@ -494,7 +494,7 @@ pub const VISION_PREFIX: &str = "model.visual.";
 pub const FORMAT: &str = "qwen4_exp-affine-v1";
 
 /// Hex digits of [`checkpoint_identity`] kept in the disk tier's key.
-const CHECKPOINT_ID_HEX: usize = 12;
+pub(crate) const CHECKPOINT_ID_HEX: usize = 12;
 
 /// An identity of the checkpoint in `dir`, for the disk tier's key: two
 /// conversions of the same architecture (q4 and q4-xl, a re-conversion, a
@@ -581,6 +581,9 @@ pub struct Qwen4ExpConfig {
     pub mtp: Option<MtpConfig>,
     /// The vision tower, when the checkpoint includes it.
     pub vision: Option<VisionConfig>,
+    /// A GGUF checkpoint's routed down rows' stored width (ds4 pads 640 to
+    /// 768 values); `None` for lily's checkpoints.
+    pub gguf_down_cols: Option<usize>,
 }
 
 impl Qwen4ExpConfig {
@@ -787,6 +790,7 @@ impl Qwen4ExpConfig {
             storage,
             mtp,
             vision,
+            gguf_down_cols: None,
         };
         config.validate_flash_next()?;
         config.validate_vision()?;
@@ -876,7 +880,7 @@ impl Qwen4ExpConfig {
 
     /// The kernels are written for Qwen3.8-Flash-Next's exact shape; refuse
     /// anything else loudly rather than run subtly wrong.
-    fn validate_flash_next(&self) -> Result<()> {
+    pub(super) fn validate_flash_next(&self) -> Result<()> {
         let layer_pattern = self.layer_types.iter().enumerate().all(|(i, ty)| {
             *ty == if i % 4 == 3 {
                 LayerType::FullAttention

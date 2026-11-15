@@ -143,6 +143,16 @@ impl Tokenizer {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn from_gguf(path: &Path) -> Result<Self> {
         let g = crate::gguf::Gguf::open(path)?;
+        if g.architecture()? == crate::qwen4exp::gguf::ARCH {
+            let json = crate::qwen4exp::tokenizer::tokenizer_json(&g)?;
+            let inner = tokenizers::Tokenizer::from_bytes(json.as_bytes())
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .context("building the GGUF's tokenizer")?;
+            let template = crate::qwen4exp::tokenizer::chat_template(&g)?;
+            let mut t = Self::new(inner, &serde_json::Value::Null, template)?;
+            t.add_stop_tokens(&crate::qwen4exp::tokenizer::stop_ids(&g)?);
+            return Ok(t);
+        }
         if g.architecture()? == crate::qwen36::config::ARCH {
             return Self::from_gguf_qwen36(&g);
         }

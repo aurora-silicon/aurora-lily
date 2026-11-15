@@ -268,6 +268,8 @@ pub struct ServeOptions {
     pub kv_format: Option<KvFormat>,
     pub max_sessions: usize,
     pub ngram_storage: NgramStorage,
+    /// A Qwen GGUF's n-gram table checkpoint (`--ngram-checkpoint`).
+    pub ngram_checkpoint: Option<std::path::PathBuf>,
     pub ngram_preload: bool,
     /// Pin the preloaded table in memory (`mlock`).
     pub ngram_lock: bool,
@@ -950,6 +952,7 @@ impl<M: LanguageModel> Engine<M> {
             model_dir,
             &LoadOptions {
                 ngram_storage: options.ngram_storage,
+                ngram_checkpoint: options.ngram_checkpoint.clone(),
                 mtp_drafts: options.mtp_drafts,
                 vision: options.vision,
                 expert_slots: None,
@@ -981,7 +984,8 @@ impl<M: LanguageModel> Engine<M> {
         let max_batch = requested_batch.clamp(1, model.max_batch_rows().max(1));
         if requested_batch > 1 && max_batch == 1 {
             eprintln!(
-                "batching: off, {} cannot batch decode steps in this configuration (the expert cache)",
+                "batching: off, {} cannot batch decode steps in this configuration (the expert cache, \
+                 or a --memory-limit-gb fit of one session)",
                 M::MODEL_ID
             );
         } else if requested_batch > 1 {
@@ -1169,6 +1173,22 @@ impl<M: LanguageModel> Engine<M> {
         let mut sessions =
             SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION)
                 .with_lineages(board.lineages());
+        // A fitted --memory-limit-gb: the request's session at its largest
+        // is kept free of resident ones.
+        if let Some(reserve) = model.acquire_reserve() {
+            eprintln!(
+                "session cache: {:.2} GB of the budget kept free for the request's session (the whole \
+                 fitted context with its checkpoints); one request at a time",
+                gb(reserve as usize)
+            );
+            if reserve as usize > budget {
+                eprintln!(
+                    "warning: the session cache budget is below one fitted session; requests evict \
+                     every resident session"
+                );
+            }
+            sessions = sessions.with_acquire_reserve(reserve as usize);
+        }
         // The expert cache's plan reserved one session with exactly
         // `CHECKPOINTS_PER_SESSION` snapshots; more would outgrow it.
         if model.session_reserve().is_some() {
@@ -1266,7 +1286,32 @@ impl<M: LanguageModel> Engine<M> {
         // warm-up is done, and runs while the engine serves: the first
         // requests do not wait for 32 GB of reads, and a row they need before
         // the preload reaches it is read on demand.
+        // The default preload only where the page cache can hold the table
+        // beside what the GPU allocated and a 12 GB reserve for the system:
+        // on a 64 GB machine serving the 45 GB Q2 GGUF it cannot, and reading
+        // 27 GB through a full page cache would only evict what it read.
+        // `--ngram-lock` asks for it regardless.
+        let preload_fits = |table_bytes: u64| {
+            const RESERVE: u64 = 12 << 30;
+            crate::qwen4exp::weights::physical_memory().is_none_or(|ram| {
+                ram.saturating_sub(ctx.current_allocated() as u64)
+                    >= table_bytes + RESERVE
+            })
+        };
         let preload = match model.paged_table() {
+            Some(table)
+                if options.ngram_preload
+                    && !options.ngram_lock
+                    && !preload_fits(table.bytes()) =>
+            {
+                eprintln!(
+                    "paged weights: {:.1} GB do not fit the page cache beside {:.1} GB allocated; not \
+                     preloading them (rows are read on demand; --ngram-lock preloads anyway)",
+                    table.bytes() as f64 / 1e9,
+                    ctx.current_allocated() as f64 / 1e9
+                );
+                None
+            }
             Some(table) if options.ngram_preload || options.ngram_lock => {
                 let lock = options.ngram_lock;
                 eprintln!(
@@ -1706,6 +1751,15 @@ fn read_config(model_dir: &Path) -> Result<Value> {
 fn gguf_config(path: &Path) -> Result<Value> {
     let g = crate::gguf::Gguf::open(path)?;
     let arch = g.architecture()?.to_string();
+    if arch == crate::qwen4exp::gguf::ARCH {
+        // Qwen3.8-Flash-Next in llama.cpp's schema: lily's model type.
+        let cfg = crate::qwen4exp::gguf::config_from_gguf(&g)?;
+        return Ok(serde_json::json!({
+            "model_type": "qwen4_exp",
+            "eos_token_id": cfg.eos_token_id.as_vec(),
+            "max_position_embeddings": cfg.max_position_embeddings,
+        }));
+    }
     let mut config = serde_json::json!({ "model_type": arch });
     if arch == crate::deepseek4::config::ARCH {
         let stops = crate::deepseek4::tokenizer::stop_ids(&g)?;

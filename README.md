@@ -7,6 +7,7 @@ Apple M5 Max**, through Vulkan, and serves more than one model family:
 | model | weights | status |
 |---|---|---|
 | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | lily's own 4-bit conversions (q4-xl, q4) | runs |
+| Qwen3.8-Flash-Next (64 GB tier) | antirez's Q2 GGUF, loaded as it is | runs |
 | GLM 5.3 Flash | antirez's Q2 GGUF, loaded as it is | runs |
 | DeepSeek V4 Flash | antirez's Q2 GGUF and DSpark file, loaded as they are | runs |
 
@@ -122,6 +123,14 @@ cargo build --release --locked
 ./target/release/lily --model ~/models/Qwen3.8-Flash-Next-lily-q4-xl \
   --bind 127.0.0.1:8000 --max-seq 131072
 
+# Qwen3.8-Flash-Next from ds4's Q2 GGUF for a 64 GB machine: 44.8 GB of
+# weights, and everything lily allocates (weights, scratch, one 32K session)
+# within 48.0 GB (44.7 GiB); one request at a time. The n-gram table is paged
+# from a lily checkpoint of the model (docs/qwen38-q2.md)
+./target/release/lily --model ~/models/Qwen3.8-Flash-Next-Q2/Qwen3.8-Flash-Next-Q2.gguf \
+  --ngram-checkpoint ~/models/Qwen3.8-Flash-Next-lily-q4-xl \
+  --bind 127.0.0.1:8000 --memory-limit-gb 44.7
+
 # GLM 5.3 Flash (a .gguf path selects the model from its metadata)
 ./target/release/lily --model ~/models/GLM-5.3-Flash-Q2/GLM-5.3-Flash-Q2.gguf \
   --bind 127.0.0.1:8001 --max-seq 65536 --cache-bytes 9G --pin-weights off \
@@ -134,7 +143,8 @@ cargo build --release --locked
 ```
 
 Only one model fits in 128 GB at a time; every loader takes a machine-wide
-instance lock before mapping weights. [docs/glm53.md](docs/glm53.md) has
+instance lock before mapping weights. [docs/qwen38-q2.md](docs/qwen38-q2.md)
+covers the Q2 GGUF of Qwen. [docs/glm53.md](docs/glm53.md) has
 GLM's checkpoint, memory, differences from ds4 and what is not implemented
 yet; [docs/deepseek4.md](docs/deepseek4.md) the same for DeepSeek V4 Flash. [src/kernels/vulkan/PORTING.md](src/kernels/vulkan/PORTING.md) describes
 the Vulkan port.

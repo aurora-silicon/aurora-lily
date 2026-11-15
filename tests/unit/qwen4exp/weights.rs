@@ -328,29 +328,49 @@ fn the_draft_head_reads_the_widths_the_config_records() {
     let storage = model.config.storage;
     let w = &model.weights;
     let mtp = w.mtp.as_ref().expect("the checkpoint has a draft head");
-    assert_eq!(w.lm_head.bits, storage.bits(Head), "trunk lm_head");
-    assert_eq!(w.embed_tokens.bits, storage.bits(Embed), "embed_tokens");
+    assert_eq!(w.lm_head.affine().unwrap().bits, storage.bits(Head), "trunk lm_head");
+    assert_eq!(
+        w.embed_tokens.affine().unwrap().bits,
+        storage.bits(Embed),
+        "embed_tokens"
+    );
     let Mixer::Attn(attn) = &mtp.layer.mixer else { panic!("the head is attention") };
-    assert_eq!(attn.qkv_proj.bits, storage.draft_bits(Attn), "head q|k|v");
-    assert_eq!(attn.o_proj.bits, storage.draft_bits(Attn), "head o_proj");
+    assert_eq!(
+        attn.qkv_proj.affine().unwrap().bits,
+        storage.draft_bits(Attn),
+        "head q|k|v"
+    );
+    assert_eq!(
+        attn.o_proj.affine().unwrap().bits,
+        storage.draft_bits(Attn),
+        "head o_proj"
+    );
     let shared = &mtp.layer.ffn.shared;
     assert_eq!(
-        shared.gate_up_proj.bits,
+        shared.gate_up_proj.affine().unwrap().bits,
         storage.draft_bits(Shared),
         "head shared gate|up"
     );
-    assert_eq!(shared.down_proj.bits, storage.draft_bits(Shared), "head shared down");
+    assert_eq!(
+        shared.down_proj.affine().unwrap().bits,
+        storage.draft_bits(Shared),
+        "head shared down"
+    );
     assert_eq!(mtp.lm_head.is_some(), storage.draft_head_copy());
     let head = mtp.head(&w.lm_head);
-    assert_eq!(head.bits, storage.draft_bits(Head), "the head's LM head");
+    assert_eq!(
+        head.affine().unwrap().bits,
+        storage.draft_bits(Head),
+        "the head's LM head"
+    );
     head.expect_features(model.config.vocab_size, model.config.hidden_size, "head")
         .expect("the head's LM head shape");
     eprintln!(
         "{dir}: trunk head {}-bit, draft head attn {} / shared {} / logits {}-bit ({})",
-        w.lm_head.bits,
-        attn.qkv_proj.bits,
-        shared.down_proj.bits,
-        head.bits,
+        w.lm_head.affine().unwrap().bits,
+        attn.qkv_proj.affine().unwrap().bits,
+        shared.down_proj.affine().unwrap().bits,
+        head.affine().unwrap().bits,
         if mtp.lm_head.is_some() {
             "its own mtp.lm_head"
         } else {
