@@ -521,3 +521,49 @@ fn moe_down_matches_glm53() {
         assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-5, 1e-4);
     }
 }
+
+/// The fused residual + RMSNorm kernels against glm53::add / ffn_residual
+/// then glm53::rmsnorm: the same bits in x and the normed rows.
+#[test]
+fn residual_norm_matches_add_then_rmsnorm() {
+    use crate::kernels::glm53::{add, rmsnorm};
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(79);
+    for (m, h) in [(1, 2048), (3, 2048), (2, 2048)] {
+        let x = f32s(&mut rng, m * h, -3.0, 3.0);
+        let a = f32s(&mut rng, m * h, -1.0, 1.0);
+        let sh = f32s(&mut rng, m * h, -1.0, 1.0);
+        let g = f32s(&mut rng, m, -2.0, 2.0);
+        let w = tensor(&ctx, &f32s(&mut rng, h, 0.5, 1.5));
+        for fused_shared in [false, true] {
+            let (xa, xb) = (tensor(&ctx, &x), tensor(&ctx, &x));
+            let (at, st, gt) = (tensor(&ctx, &a), tensor(&ctx, &sh), tensor(&ctx, &g));
+            let (oa, ob) =
+                (zeros(&ctx, m * h, DType::F32), zeros(&ctx, m * h, DType::F32));
+            run(&ctx, |p| {
+                if fused_shared {
+                    ffn_residual(&ctx, p, &xa, &at, &st, &gt, m, h).unwrap();
+                } else {
+                    add(&ctx, p, &xa, &at, &xa, m * h).unwrap();
+                }
+                p.memory_barrier().unwrap();
+                rmsnorm(&ctx, p, &xa, Some(&w), &oa, m, h, 1e-6).unwrap();
+                let shared = fused_shared.then_some((&st, &gt));
+                residual_norm(&ctx, p, &xb, &at, shared, &w, &ob, m, h, 1e-6).unwrap();
+            });
+            // And the norm alone, over the new rows.
+            let oc = zeros(&ctx, m * h, DType::F32);
+            run(&ctx, |p| super::rmsnorm(&ctx, p, &xa, &w, &oc, m, h, 1e-6).unwrap());
+            // The residual bit for bit; the normed rows within 1e-6 (the
+            // sum of squares of glm53_rmsnorm's runtime loop and of these
+            // unrolled ones round differently: a row's scale moves by ulps).
+            let (u, v) = (xa.to_f32().unwrap(), xb.to_f32().unwrap());
+            for (k, (p, q)) in u.iter().zip(&v).enumerate() {
+                assert_eq!(p.to_bits(), q.to_bits(), "x m {m} {fused_shared} at {k}");
+            }
+            let want = oa.to_f32().unwrap();
+            assert_close(&ob.to_f32().unwrap(), &want, 1e-6, 1e-6);
+            assert_close(&oc.to_f32().unwrap(), &want, 1e-6, 1e-6);
+        }
+    }
+}

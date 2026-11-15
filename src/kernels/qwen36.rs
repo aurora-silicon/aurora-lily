@@ -484,6 +484,105 @@ pub fn mtp_cat(
     )
 }
 
+/// `x += a`, then `out = rmsnorm(x) * w` (`glm53::add` then
+/// `glm53::rmsnorm`; the residual the same bits, the normed rows within
+/// 1e-6, as [`rmsnorm`]) over `m` rows of `hidden` (2048);
+/// with `shared`, `x += a + shared * sigmoid(g)` (`ffn_residual`).
+#[allow(clippy::too_many_arguments)]
+pub fn residual_norm(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    a: &Tensor,
+    shared: Option<(&Tensor, &Tensor)>,
+    w: &Tensor,
+    out: &Tensor,
+    m: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<()> {
+    for t in [x, a, w, out] {
+        check(&[(t, DType::F32)])?;
+    }
+    ensure!(hidden == 2048 && w.numel() >= hidden, "residual norm of rows of {hidden}");
+    ensure!(
+        x.numel() >= m * hidden && a.numel() >= m * hidden && out.numel() >= m * hidden,
+        "residual norm of {m} rows"
+    );
+    let (s, g) = shared.unwrap_or((a, a));
+    check(&[(s, DType::F32), (g, DType::F32)])?;
+    let name = if shared.is_some() {
+        ensure!(s.numel() >= m * hidden && g.numel() >= m, "residual norm shared rows");
+        "qwen36_ffn_residual_norm"
+    } else {
+        "qwen36_add_norm"
+    };
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            x.binding(),
+            a.binding(),
+            s.binding(),
+            g.binding(),
+            w.binding(),
+            out.binding(),
+        ],
+        &[&u32_bytes(hidden), &f32_bytes(eps)],
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
+/// `glm53::rmsnorm` with its weight for rows of 2048 (the model's hidden
+/// width; other widths take GLM's): a thread's 8 loads in flight at once
+/// where GLM's loop waits for each. The sum of squares rounds as the
+/// compiler fuses it here (normed values within 1e-6 of GLM's).
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    w: &Tensor,
+    out: &Tensor,
+    m: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<()> {
+    if hidden != 2048 {
+        return crate::kernels::glm53::rmsnorm(
+            ctx,
+            pass,
+            x,
+            Some(w),
+            out,
+            m,
+            hidden,
+            eps,
+        );
+    }
+    for t in [x, w, out] {
+        check(&[(t, DType::F32)])?;
+    }
+    ensure!(
+        x.numel() >= m * hidden && out.numel() >= m * hidden,
+        "rmsnorm of {m} rows"
+    );
+    let pipeline = ctx.pipeline("qwen36_rmsnorm_h2048", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            x.binding(),
+            x.binding(),
+            x.binding(),
+            x.binding(),
+            w.binding(),
+            out.binding(),
+        ],
+        &[&u32_bytes(hidden), &f32_bytes(eps)],
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/qwen36.rs"]
 mod tests;

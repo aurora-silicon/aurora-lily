@@ -776,6 +776,10 @@ impl Qwen36Model {
             pass.memory_barrier()?;
         }
         for il in layers.clone() {
+            // A block's FFN residual also norms the next block's input.
+            let fuse = self.fuse_norm();
+            let next =
+                (fuse && il + 1 < layers.end).then(|| &self.layers[il + 1].attn_norm);
             self.encode_block(
                 ctx,
                 pass,
@@ -785,6 +789,8 @@ impl Qwen36Model {
                 st.pos,
                 snap,
                 m,
+                fuse && il > layers.start,
+                next,
             )?;
         }
         if layers.end < cfg.n_layer {
@@ -793,8 +799,10 @@ impl Qwen36Model {
         self.encode_head(ctx, pass, sc, m, logits)
     }
 
-    /// One block on `sc.x`'s `m` rows at positions `pos0..`: norm, mixer,
-    /// residual, norm, FFN (with its residual).
+    /// One block on `sc.x`'s `m` rows at positions `pos0..`: norm (unless
+    /// `normed`: `sc.xn` holds it), mixer, residual, norm, FFN with its
+    /// residual, which with `next_norm` also writes `sc.xn` = the new rows
+    /// normed by it (the next block's input norm).
     #[allow(clippy::too_many_arguments)]
     fn encode_block(
         &self,
@@ -806,19 +814,14 @@ impl Qwen36Model {
         pos0: usize,
         snap: Option<usize>,
         m: usize,
+        normed: bool,
+        next_norm: Option<&Tensor>,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        g::rmsnorm(
-            ctx,
-            pass,
-            &sc.x,
-            Some(&l.attn_norm),
-            &sc.xn,
-            m,
-            cfg.hidden,
-            cfg.rms_eps,
-        )?;
-        pass.memory_barrier()?;
+        if !normed {
+            self.rmsnorm(ctx, pass, &sc.x, &l.attn_norm, &sc.xn, m)?;
+            pass.memory_barrier()?;
+        }
         match (&l.mixer, ls) {
             (Mixer::Gdn(w), LayerState::Gdn { conv, s, conv_alt, s_alt }) => {
                 let snap =
@@ -830,20 +833,45 @@ impl Qwen36Model {
             }
             _ => anyhow::bail!("a block's state does not match its kind"),
         }
-        g::add(ctx, pass, &sc.x, &sc.mix, &sc.x, m * cfg.hidden)?;
+        if self.fuse_norm() {
+            k::residual_norm(
+                ctx,
+                pass,
+                &sc.x,
+                &sc.mix,
+                None,
+                &l.post_norm,
+                &sc.xn,
+                m,
+                cfg.hidden,
+                cfg.rms_eps,
+            )?;
+        } else {
+            g::add(ctx, pass, &sc.x, &sc.mix, &sc.x, m * cfg.hidden)?;
+            pass.memory_barrier()?;
+            self.rmsnorm(ctx, pass, &sc.x, &l.post_norm, &sc.xn, m)?;
+        }
         pass.memory_barrier()?;
-        g::rmsnorm(
-            ctx,
-            pass,
-            &sc.x,
-            Some(&l.post_norm),
-            &sc.xn,
-            m,
-            cfg.hidden,
-            cfg.rms_eps,
-        )?;
-        pass.memory_barrier()?;
-        self.ffn(ctx, pass, sc, &l.ffn, m)
+        self.ffn(ctx, pass, sc, &l.ffn, m, next_norm)
+    }
+
+    /// Whether residual adds and the RMSNorm after them are one kernel
+    /// (`k::residual_norm`, rows of 2048).
+    fn fuse_norm(&self) -> bool {
+        self.cfg.hidden == 2048
+    }
+
+    /// `out = rmsnorm(x) * w` over `m` rows of the hidden width.
+    fn rmsnorm(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        x: &Tensor,
+        w: &Tensor,
+        out: &Tensor,
+        m: usize,
+    ) -> Result<()> {
+        k::rmsnorm(ctx, pass, x, w, out, m, self.cfg.hidden, self.cfg.rms_eps)
     }
 
     /// The MTP head over `m` pairs (llama.cpp's `graph_mtp`): pair `r` is
@@ -890,21 +918,12 @@ impl Qwen36Model {
         self.proj(ctx, pass, &[(&w.eh_proj, &sc.x)], &sc.cat, xb, m)?;
         pass.memory_barrier()?;
         let ls = LayerState::Attn { k: ms.k.clone(), v: ms.v.clone() };
-        self.encode_block(ctx, pass, sc, &w.layer, &ls, pos0, None, m)?;
+        self.encode_block(ctx, pass, sc, &w.layer, &ls, pos0, None, m, false, None)?;
         if !draft {
             return Ok(());
         }
         let x = sc.x.view((m - 1) * cfg.hidden, &[cfg.hidden])?;
-        g::rmsnorm(
-            ctx,
-            pass,
-            &x,
-            Some(&w.head_norm),
-            &sc.mtp_hn,
-            1,
-            cfg.hidden,
-            cfg.rms_eps,
-        )?;
+        self.rmsnorm(ctx, pass, &x, &w.head_norm, &sc.mtp_hn, 1)?;
         pass.memory_barrier()?;
         self.proj(ctx, pass, &[(&self.output, &sc.logits)], &sc.mtp_hn, None, 1)?;
         pass.memory_barrier()?;
@@ -935,16 +954,7 @@ impl Qwen36Model {
     ) -> Result<()> {
         let h = self.cfg.hidden;
         let rows = sc.hbuf.view(h, &[m * h])?;
-        g::rmsnorm(
-            ctx,
-            pass,
-            &sc.x,
-            Some(&self.output_norm),
-            &rows,
-            m,
-            h,
-            self.cfg.rms_eps,
-        )?;
+        self.rmsnorm(ctx, pass, &sc.x, &self.output_norm, &rows, m)?;
         pass.memory_barrier()?;
         let hin = sc.hbuf.view(0, &[m * h])?;
         self.encode_mtp(ctx, pass, st, sc, &sc.tokens, &hin, pos0, m, false)
@@ -981,16 +991,7 @@ impl Qwen36Model {
         }
         let (first, rows) = if logits == Logits::All { (0, m) } else { (m - 1, 1) };
         let x = sc.x.view(first * cfg.hidden, &[rows * cfg.hidden])?;
-        g::rmsnorm(
-            ctx,
-            pass,
-            &x,
-            Some(&self.output_norm),
-            &sc.hidden_norm,
-            rows,
-            cfg.hidden,
-            cfg.rms_eps,
-        )?;
+        self.rmsnorm(ctx, pass, &x, &self.output_norm, &sc.hidden_norm, rows)?;
         pass.memory_barrier()?;
         self.proj(
             ctx,
@@ -1195,6 +1196,7 @@ impl Qwen36Model {
         sc: &Scratch,
         f: &FfnW,
         m: usize,
+        next_norm: Option<&Tensor>,
     ) -> Result<()> {
         let cfg = &self.cfg;
         let used = cfg.n_expert_used;
@@ -1253,7 +1255,21 @@ impl Qwen36Model {
                 0.0,
             )?;
             pass.memory_barrier()?;
-            g::add(ctx, pass, &sc.x, &sc.moe_out, &sc.x, m * cfg.hidden)?;
+            match next_norm {
+                Some(w) => k::residual_norm(
+                    ctx,
+                    pass,
+                    &sc.x,
+                    &sc.moe_out,
+                    None,
+                    w,
+                    &sc.xn,
+                    m,
+                    cfg.hidden,
+                    cfg.rms_eps,
+                )?,
+                None => g::add(ctx, pass, &sc.x, &sc.moe_out, &sc.x, m * cfg.hidden)?,
+            }
             return pass.memory_barrier();
         }
         g::moe_gate_up(
@@ -1285,16 +1301,30 @@ impl Qwen36Model {
             used,
         )?;
         pass.memory_barrier()?;
-        k::ffn_residual(
-            ctx,
-            pass,
-            &sc.x,
-            &sc.moe_out,
-            &sc.sout,
-            &sc.shg,
-            m,
-            cfg.hidden,
-        )?;
+        match next_norm {
+            Some(w) => k::residual_norm(
+                ctx,
+                pass,
+                &sc.x,
+                &sc.moe_out,
+                Some((&sc.sout, &sc.shg)),
+                w,
+                &sc.xn,
+                m,
+                cfg.hidden,
+                cfg.rms_eps,
+            )?,
+            None => k::ffn_residual(
+                ctx,
+                pass,
+                &sc.x,
+                &sc.moe_out,
+                &sc.sout,
+                &sc.shg,
+                m,
+                cfg.hidden,
+            )?,
+        }
         pass.memory_barrier()
     }
 }
