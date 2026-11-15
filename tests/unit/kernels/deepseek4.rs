@@ -336,7 +336,10 @@ fn compressor_matches_cpu_across_steps() {
 fn indexer_matches_cpu() {
     // A decode-sized run, and a prompt run (the matrix-unit scores).
     indexer_case(407, 2400, 3);
-    indexer_case(411, 2100, 40);
+    // A prompt run's scores use matrix units.
+    if ctx().matrix_units() {
+        indexer_case(411, 2100, 40);
+    }
 }
 
 fn indexer_case(seed: u64, pos0: usize, m: usize) {
@@ -434,6 +437,10 @@ fn attention_matches_cpu() {
 /// steps.
 #[test]
 fn attention_mu_matches_cpu() {
+    // The prompt-run attention uses matrix units.
+    if !ctx().matrix_units() {
+        return;
+    }
     attention_case(
         409,
         true,
@@ -454,7 +461,12 @@ fn attention_mu_matches_cpu() {
 /// decode-sized one (f32).
 #[test]
 fn attend_fused_matches_separate_steps() {
+    // The prompt run's attention uses matrix units.
+    let mu = ctx().matrix_units();
     for (m, prompt) in [(60usize, true), (3, false)] {
+        if prompt && !mu {
+            continue;
+        }
         attend_fused_case(m, prompt);
     }
 }
@@ -518,6 +530,10 @@ fn attend_fused_case(m: usize, prompt: bool) {
 #[test]
 fn attention_mu_sharp_scores() {
     let ctx = ctx();
+    // The prompt-run attention uses matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(412);
     let (heads, pos0, m, ratio) = (64usize, 200usize, 10usize, 4usize);
     let total = pos0 + m;

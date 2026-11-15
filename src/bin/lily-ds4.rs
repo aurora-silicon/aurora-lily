@@ -73,6 +73,10 @@ enum Cmd {
         n: usize,
         #[arg(long, default_value_t = 3)]
         runs: usize,
+        /// Rows a decode step feeds (the token repeated): a verify pass's
+        /// size for timing; 1 is plain decoding.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=8))]
+        rows: u64,
     },
     /// Speculative decoding with the DSpark drafter (support file beside the
     /// model or LILY_DS4_DSPARK) against plain greedy decoding: the same
@@ -148,8 +152,8 @@ fn run() -> Result<()> {
         Cmd::Spec { model, text, prompt_len, chat, n, runs } => {
             spec(&model, text.as_ref(), prompt_len, chat.as_deref(), n, runs)
         }
-        Cmd::Bench { model, text, prompt_len, n, runs } => {
-            bench(&model, &text, prompt_len, n, runs)
+        Cmd::Bench { model, text, prompt_len, n, runs, rows } => {
+            bench(&model, &text, prompt_len, n, runs, rows as usize)
         }
         Cmd::Ppl { model, text, prompt_len, n, per_token } => {
             ppl(&model, &text, prompt_len, n, per_token)
@@ -447,13 +451,14 @@ fn bench(
     prompt_len: usize,
     n: usize,
     runs: usize,
+    rows: usize,
 ) -> Result<()> {
     let prompt = text_tokens(path, text, prompt_len)?;
     let ctx = MetalContext::new()?;
     let model = Ds4Model::load(&ctx, path)?;
     let vocab = model.cfg.vocab;
     let sc = model.new_scratch(&ctx)?;
-    let mut st = model.new_state(&ctx, prompt.len() + n + 8)?;
+    let mut st = model.new_state(&ctx, prompt.len() + n * rows + 8)?;
     for run in 0..runs {
         st.reset();
         let _ = lily::metal::profile::take();
@@ -473,7 +478,7 @@ fn bench(
             out.push(next);
             let s = Instant::now();
             let b0 = lily::metal::gpu_busy_ns();
-            model.forward(&ctx, &mut st, &sc, &[next], Logits::Last)?;
+            model.forward(&ctx, &mut st, &sc, &vec![next; rows], Logits::Last)?;
             busy.push((lily::metal::gpu_busy_ns() - b0) as f64 * 1e-6);
             next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
             steps.push(s.elapsed().as_secs_f64() * 1e3);

@@ -903,7 +903,9 @@ impl Ds4Model {
                 .collect::<Result<_>>()?;
             let refs: Vec<(&QWeight, &Tensor)> =
                 ys.iter().map(|(w, y)| (*w, y)).collect();
-            k::gemv_sets(ctx, pass, &refs, &xv, rows)?;
+            // Two weight rows a subgroup where it pays (Q8_0 rows of 1 024 values:
+            // q_b in verify and draft passes), else the GEMV.
+            k::gemv_sets_r2(ctx, pass, &refs, &xv, rows)?;
         }
         Ok(())
     }
