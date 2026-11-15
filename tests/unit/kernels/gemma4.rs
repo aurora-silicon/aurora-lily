@@ -722,7 +722,9 @@ fn moe_grouped_matches_a_bf16_reference() {
             mean / (m * hid) as f64
         );
     }
-}/// Each kernel's least GPU time in one pass among the profiled passes
+}
+
+/// Each kernel's least GPU time in one pass among the profiled passes
 /// since the last call.
 fn best_kernel_secs() -> std::collections::BTreeMap<&'static str, f64> {
     let mut best = std::collections::BTreeMap::new();
@@ -747,30 +749,31 @@ fn best_kernel_secs() -> std::collections::BTreeMap<&'static str, f64> {
 #[ignore = "timing probe; run with --ignored --nocapture"]
 fn prefill_gemm_probe() {
     let ctx = MetalContext::new_with_profile(true).expect("metal context");
-    // The GPU's clock varies from run to run (a fanless Mac's heat): the
-    // FMA peak kernel's rate at the start and end is the yardstick.
+    // The GPU's clock varies (a fanless Mac's heat, and it rises only under
+    // steady load): before each case one pass of 24 FMA peak kernels (~0.3
+    // s) brings it up, and the kernel's rate after it is the yardstick.
     #[cfg(target_os = "linux")]
     let clock = |when: &str| {
         let fma = ctx.pipeline("pk_fma_f32", "", MslVersion::V3_1).expect("fma");
         let out = zeros(&ctx, 1024);
-        for _ in 0..8 {
+        let grid =
+            Grid::Threadgroups { groups: (1024, 1, 1), threadgroup: (256, 1, 1) };
+        let rounds = u32_bytes(2048);
+        run(&ctx, |p| {
+            for _ in 0..24 {
+                p.dispatch_at(&fma, &[out.binding()], &[&rounds], grid).unwrap();
+            }
+        });
+        crate::metal::profile::take();
+        for _ in 0..4 {
             run(&ctx, |p| {
-                let grid = Grid::Threadgroups {
-                    groups: (1024, 1, 1),
-                    threadgroup: (256, 1, 1),
-                };
-                p.dispatch_at(&fma, &[out.binding()], &[&u32_bytes(2048)], grid)
-                    .unwrap()
+                p.dispatch_at(&fma, &[out.binding()], &[&rounds], grid).unwrap()
             });
         }
         let s = best_kernel_secs()["pk_fma_f32"];
-        eprintln!(
-            "clock {when}: f32 FMA {:.3} TFLOPS",
-            2.0 * (1024.0 * 256.0 * 2048.0 * 32.0) / s / 1e12
-        );
+        let flops = 2.0 * (1024.0 * 256.0 * 2048.0 * 32.0);
+        eprintln!("clock {when}: f32 FMA {:.3} TFLOPS", flops / s / 1e12);
     };
-    #[cfg(target_os = "linux")]
-    clock("before");
     let mut rng = StdRng::seed_from_u64(5);
     let m =
         std::env::var("LILY_PROBE_M").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
@@ -783,6 +786,8 @@ fn prefill_gemm_probe() {
         let w = QWeight::from_bytes(&ctx, &raw, ty, k, n).unwrap();
         let x = tensor(&ctx, &f32s(&mut rng, m * k, -1.0, 1.0));
         let y = zeros(&ctx, m * n);
+        #[cfg(target_os = "linux")]
+        clock("before");
         for _ in 0..8 {
             run(&ctx, |p| crate::kernels::glm53::gemm(&ctx, p, &w, &x, &y, m).unwrap());
         }
@@ -828,6 +833,8 @@ fn prefill_gemm_probe() {
     let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.05, 0.2));
     let out = zeros(&ctx, m * hid);
     let sc = MoeGroupScratch::new(&ctx, m, used, ne, ff, hid).unwrap();
+    #[cfg(target_os = "linux")]
+    clock("before");
     for _ in 0..8 {
         run(&ctx, |p| {
             moe_grouped(&ctx, p, &gu, &dn, ff, &x, &ts, &tw, &out, &sc, m, used, ne)
