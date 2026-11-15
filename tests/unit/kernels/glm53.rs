@@ -88,7 +88,9 @@ fn gemv_and_gemm_match_cpu_for_gemma4_types() {
                     (0..m).flat_map(|i| cpu.mv(&x[i * cols..(i + 1) * cols])).collect();
                 assert_close(&y.to_f32().unwrap(), &expected, 1e-4, 1e-4);
             }
-            if cols.is_multiple_of(64) {
+            // Without matrix units the GEMM is sgemm.comp's, f32 throughout
+            // (kernels::gemma4 gemms_without_matrix_units_match_cpu).
+            if cols.is_multiple_of(64) && ctx.matrix_units() {
                 // The GEMM rounds both operands to bfloat: so does the
                 // reference.
                 let m = 37;
