@@ -2190,7 +2190,7 @@ void main() {
 // [24][4 * hidden] bf16 over the streams' flat order. Every load is issued
 // before the first use: the scheduler leaves a row's loads next to their
 // use, so a row at a time waited for memory 24 times (29 us a call; 2026-11-14).
-// Grid (hidden / 64, m), 32 threads. Buffers: 0 H [m][4][hidden], 1 block
+// Grid (hidden / 64, m), 128 threads. Buffers: 0 H [m][4][hidden], 1 block
 // [m][hidden], 2 split [m][24], 3 fn bf16, 4 partial [m][groups][25].
 // Params: 5 hidden, 6 has_post. glm53_hc_post_mix_f16 reads fn as f16
 // (DeepSeek V4's HC controls).
@@ -2203,15 +2203,21 @@ void main() {
     const uint g = gl_WorkGroupID.x;
     const uint groups = gl_NumWorkGroups.x;
     const uint lane = gl_SubgroupInvocationID;
+    // Four subgroups share the threadgroup's 64 positions, each the fn rows
+    // 6 sg .. 6 sg + 6: a quarter of the weight loads a lane, four times
+    // the threads (one subgroup of 24 rows, 64 threadgroups of 32 threads,
+    // left the GPU waiting on each lane's 96 loads). Each row's sum is the
+    // same lanes' same products in the same order.
+    const uint r0 = 6u * gl_SubgroupID;
     const uint d = g * 64u + 2u * lane;
     const uint64_t Hs = arg(0) + 16u * uint64_t(i) * hidden;
     vec2 h[4];
     [[unroll]] for (uint s = 0u; s < 4u; s++) h[s] = uintBitsToFloat(U32x2(Hs + 4u * (s * hidden + d)).v[0]);
     const uint64_t W = arg(3);
     const uint row_words = 2u * hidden; // 4 * hidden bf16 = 2 * hidden words
-    uint w[24][4];
-    [[unroll]] for (uint r = 0u; r < 24u; r++)
-        [[unroll]] for (uint s = 0u; s < 4u; s++) w[r][s] = U32(W).v[r * row_words + (s * hidden + d) / 2u];
+    uint w[6][4];
+    [[unroll]] for (uint r = 0u; r < 6u; r++)
+        [[unroll]] for (uint s = 0u; s < 4u; s++) w[r][s] = U32(W).v[(r0 + r) * row_words + (s * hidden + d) / 2u];
     if (has_post) {
         const uint64_t S = arg(2) + 96u * uint64_t(i);
         const vec2 b = uintBitsToFloat(U32x2(arg(1) + 4u * (i * hidden + d)).v[0]);
@@ -2224,15 +2230,18 @@ void main() {
             acc += F32(S).v[8u + dst + 12u] * h[3];
             o[dst] = acc;
         }
-        [[unroll]] for (uint s = 0u; s < 4u; s++) {
-            h[s] = o[s];
-            U32x2(Hs + 4u * (s * hidden + d)).v[0] = floatBitsToUint(o[s]);
-        }
+        [[unroll]] for (uint s = 0u; s < 4u; s++) h[s] = o[s];
+    }
+    // Every subgroup has read the old streams (its post mix used them)
+    // before the first writes them back.
+    barrier();
+    if (has_post && gl_SubgroupID == 0u) {
+        [[unroll]] for (uint s = 0u; s < 4u; s++) U32x2(Hs + 4u * (s * hidden + d)).v[0] = floatBitsToUint(h[s]);
     }
     float ss = 0.0;
     [[unroll]] for (uint s = 0u; s < 4u; s++) ss += dot(h[s], h[s]);
     float mine = subgroupAdd(ss);
-    [[unroll]] for (uint r = 0u; r < 24u; r++) {
+    [[unroll]] for (uint r = 0u; r < 6u; r++) {
         float acc = 0.0;
         [[unroll]] for (uint s = 0u; s < 4u; s++) {
 #ifdef KERNEL_glm53_hc_post_mix_f16
@@ -2243,9 +2252,10 @@ void main() {
 #endif
         }
         acc = subgroupAdd(acc);
-        mine = lane == r ? acc : mine;
+        mine = lane == r0 + r ? acc : mine;
     }
-    if (lane < 25u) F32(arg(4)).v[(i * groups + g) * 25u + lane] = mine;
+    const bool writes = (lane >= r0 && lane < r0 + 6u) || (gl_SubgroupID == 0u && lane == 24u);
+    if (writes) F32(arg(4)).v[(i * groups + g) * 25u + lane] = mine;
 }
 #endif
 
