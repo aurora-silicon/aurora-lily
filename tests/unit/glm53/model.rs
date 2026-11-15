@@ -180,7 +180,8 @@ fn sessions_share_the_scratch_alternates_safely() {
     };
     let fill = |ts: &[&Tensor], k: u32| {
         for (t, x) in ts.iter().enumerate() {
-            let v: Vec<f32> = (0..x.numel()).map(|i| f32::from_bits(word(k, t, i))).collect();
+            let v: Vec<f32> =
+                (0..x.numel()).map(|i| f32::from_bits(word(k, t, i))).collect();
             x.write_bytes(bytemuck::cast_slice(&v)).unwrap();
         }
     };
@@ -226,7 +227,9 @@ fn sessions_share_the_scratch_alternates_safely() {
     check(&kda(&c), 5, "forked after swaps");
     // B reset and dropped; A and the scratch carry on.
     b.reset();
-    assert!(kda(&b).iter().all(|t| t.to_f32().unwrap().iter().all(|v| v.to_bits() == 0)));
+    assert!(
+        kda(&b).iter().all(|t| t.to_f32().unwrap().iter().all(|v| v.to_bits() == 0))
+    );
     check(&kda(&a), 5, "A through B's reset");
     drop(b);
     fill(&alternates(&sc), 7);
@@ -332,14 +335,26 @@ fn q8_0_to_q4_0_known_blocks() {
     #[allow(clippy::type_complexity)]
     let cases: &[(u16, &[(usize, i8)], u16, &[(usize, u8)])] = &[
         // x = 0.5 q: -8 first, then 8; d = 1.
-        (0x3800, &[(0, -16), (1, 1), (2, -1), (3, 3), (4, 16)], 0x3c00,
-            &[(0, 0), (1, 9), (2, 8), (3, 10), (4, 15)]),
+        (
+            0x3800,
+            &[(0, -16), (1, 1), (2, -1), (3, 3), (4, 16)],
+            0x3c00,
+            &[(0, 0), (1, 9), (2, 8), (3, 10), (4, 15)],
+        ),
         // 8 first, then -8; d = -1.
-        (0x3800, &[(0, 16), (1, 1), (2, -1), (3, 3), (4, -16)], 0xbc00,
-            &[(0, 0), (1, 8), (2, 9), (3, 7), (4, 15)]),
+        (
+            0x3800,
+            &[(0, 16), (1, 1), (2, -1), (3, 3), (4, -16)],
+            0xbc00,
+            &[(0, 0), (1, 8), (2, 9), (3, 7), (4, 15)],
+        ),
         // x = q / 128: -128 sets d = 0.125; 127 clamps; 64 -> 12.
-        (0x2000, &[(0, -128), (1, 127), (17, 64)], 0x3000,
-            &[(0, 0), (1, 15), (17, 12)]),
+        (
+            0x2000,
+            &[(0, -128), (1, 127), (17, 64)],
+            0x3000,
+            &[(0, 0), (1, 15), (17, 12)],
+        ),
         // A zero scale: every value 0.
         (0x0000, &[(0, 100), (5, -7)], 0x8000, &[]),
         // A negative Q8_0 scale: x = -0.5 q.
