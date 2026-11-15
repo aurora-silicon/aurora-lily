@@ -5,11 +5,10 @@
 // expert (src/kernels/gemma4.rs `moe_grouped`). f32 operands and sums: the
 // weights as glm53_decode gives them, the activations as stored.
 //
-// A threadgroup of 256 computes a tile of 64 activation rows x 128 weight
-// rows of Y, a thread 4 x 8; a 32-deep K step decodes 32 weights of each of
-// the tile's 128 weight rows (a thread 16 of a row) into threadgroup memory
-// beside the 64 activation rows' 32 values, both transposed so a thread
-// reads vectors of each.
+// A threadgroup of 256 computes a tile of Y (sgemm_tile.glsl), a thread 4
+// activation rows x 8 weight rows: 64 x 128, or 32 x 256 for an expert's
+// pairs that fit 32 rows. Every output is one f32 FMA chain over k in
+// order, whatever the tile.
 #if defined(KERNEL_sgemm_q4_0) || defined(KERNEL_sgemm_q5_k) || defined(KERNEL_sgemm_q6_k) || \
     defined(KERNEL_sgemm_iq4_nl) || defined(KERNEL_sgemm_iq2_s) || \
     defined(KERNEL_sgemm_moe_iq2_s) || defined(KERNEL_sgemm_moe_q5_k) || \
@@ -123,12 +122,11 @@ void sg_decode8(uint64_t row, uint k, out float w[8]) {
 #endif
 }
 
-#define SG_T 64u
-#define SG_TN 128u
-#define SG_K 32u
-// [k][n / 4] and [k][m / 4].
-shared vec4 sg_w[SG_K * SG_TN / 4u];
-shared vec4 sg_x[SG_K * SG_T / 4u];
+// The tile kernel (sgemm_tile.glsl), instantiated per tile shape below.
+// Threadgroup memory: the decoded weights of a K step (4096) and its
+// activations (up to 64 rows x 32).
+shared vec4 sg_w[1024];
+shared vec4 sg_x[512];
 
 // Y's tile: rows i < rows of the activations at x_row(i) (f32 elements
 // from X), of Y at y_row(i), weight rows n0 + j from W + j row_bytes.
@@ -162,10 +160,25 @@ uint64_t sg_y_row(uint i) {
 }
 #endif
 
+// 64 activation rows x 128 weight rows, K steps of 32.
+#define SGT_NAME sg_tile_64
+#define SGT_TR 64u
+#define SGT_TW 128u
+#define SGT_KS 32u
+#include "sgemm_tile.glsl"
+#ifdef SG_MOE
+// An expert tile of at most 32 pairs: 32 rows x 256 weight rows, K steps of
+// 16, so that every subgroup computes (on 64-row tiles half would idle).
+#define SGT_NAME sg_tile_32
+#define SGT_TR 32u
+#define SGT_TW 256u
+#define SGT_KS 16u
+#include "sgemm_tile.glsl"
+#endif
+
 void main() {
     const uint N = SG_N, K = SG_KK, row_bytes = SG_ROW_BYTES;
-    const uint tid = gl_LocalInvocationIndex;
-    const uint n0 = gl_WorkGroupID.x * SG_TN;
+    const uint n0 = gl_WorkGroupID.x * 128u;
 #ifdef SG_MOE
     if (gl_WorkGroupID.y >= U32(arg(5)).v[0]) return;
     const uint expert = U32(arg(4)).v[3u * gl_WorkGroupID.y];
@@ -173,63 +186,17 @@ void main() {
     const uint rows = U32(arg(4)).v[3u * gl_WorkGroupID.y + 2u];
     sg_shift = arg_u32(9);
     const uint64_t W = arg(1) + (uint64_t(expert) * N + n0) * row_bytes;
+    if (rows > 32u) {
+        sg_tile_64(n0, rows, W, N, K, row_bytes);
+    } else if ((gl_WorkGroupID.x & 1u) == 0u) {
+        // Weight rows n0 .. n0 + 256: the odd column of the grid idles.
+        sg_tile_32(n0, rows, W, N, K, row_bytes);
+    }
 #else
-    sg_m0 = gl_WorkGroupID.y * SG_T;
-    const uint rows = min(arg_u32(3) - sg_m0, SG_T);
+    sg_m0 = gl_WorkGroupID.y * 64u;
+    const uint rows = min(arg_u32(3) - sg_m0, 64u);
     const uint64_t W = arg(1) + (uint64_t(gl_WorkGroupID.z) * arg_u32(10) + n0) * row_bytes;
+    sg_tile_64(n0, rows, W, N, K, row_bytes);
 #endif
-    // Weight decode: values dk .. dk + 16 of a step's 32 of row dr.
-    const uint dr = tid >> 1u, dk = 16u * (tid & 1u);
-    const uint64_t w_row = W + uint64_t(min(dr, N - 1u - n0)) * row_bytes;
-    // X loads: two vec4 a thread, (row, 4 values) = (q >> 3, q & 7).
-    uint64_t x_at[2];
-    [[unroll]] for (uint h = 0u; h < 2u; h++) {
-        const uint q = tid + 256u * h;
-        x_at[h] = arg(0) + 4u * (sg_x_row(min(q >> 3u, rows - 1u)) + 4u * (q & 7u));
-    }
-    const uint tn = tid & 15u, tm = tid >> 4u;
-    vec4 acc[4][2];
-    [[unroll]] for (uint i = 0u; i < 4u; i++) acc[i][0] = acc[i][1] = vec4(0.0);
-    for (uint k0 = 0u; k0 < K; k0 += SG_K) {
-        [[unroll]] for (uint h = 0u; h < 2u; h++) {
-            float w[8];
-            sg_decode8(w_row, k0 + dk + 8u * h, w);
-            [[unroll]] for (uint k = 0u; k < 8u; k++) sg_w[(dk + 8u * h + k) * 32u + (dr >> 2u)][dr & 3u] = w[k];
-        }
-        [[unroll]] for (uint h = 0u; h < 2u; h++) {
-            const uint q = tid + 256u * h, r = q >> 3u, kq = q & 7u;
-            const vec4 v = F32x4(x_at[h] + 4u * k0).v[0];
-            [[unroll]] for (uint i = 0u; i < 4u; i++) sg_x[(4u * kq + i) * 16u + (r >> 2u)][r & 3u] = v[i];
-        }
-        barrier();
-        // Threads past the tile's rows (whole subgroups: a subgroup holds
-        // 8 rows) skip the products: expert tiles are often part full.
-        if (4u * tm < rows) {
-            [[unroll]] for (uint k = 0u; k < SG_K; k++) {
-                const vec4 xv = sg_x[k * 16u + tm];
-                const vec4 w0 = sg_w[k * 32u + 2u * tn], w1 = sg_w[k * 32u + 2u * tn + 1u];
-                [[unroll]] for (uint i = 0u; i < 4u; i++) {
-                    acc[i][0] = fma(vec4(xv[i]), w0, acc[i][0]);
-                    acc[i][1] = fma(vec4(xv[i]), w1, acc[i][1]);
-                }
-            }
-        }
-        barrier();
-    }
-    [[unroll]] for (uint c = 0u; c < 2u; c++) {
-        const uint n = n0 + 8u * tn + 4u * c;
-        if (n >= N) return;
-        [[unroll]] for (uint i = 0u; i < 4u; i++) {
-            const uint r = 4u * tm + i;
-            if (r < rows) {
-                const uint64_t y = arg(2) + 4u * (sg_y_row(r) + n);
-                if (n + 4u <= N) {
-                    F32x4(y).v[0] = acc[i][c];
-                } else {
-                    for (uint j = 0u; j < N - n; j++) F32(y).v[j] = acc[i][c][j];
-                }
-            }
-        }
-    }
 }
 #endif
