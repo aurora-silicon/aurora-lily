@@ -76,8 +76,10 @@ shared expert. Four hyper-connection streams with the Sinkhorn split, and a
 sigmoid-weighted collapse before the output head.
 
 Decode and verify rows use the GEMV kernels on f32 activations (up to 8 rows
-a pass); prompts run in runs of 4 096 rows on the matrix units, one pass a
-layer, with routed experts grouped by expert.
+a pass; the routed gate/up reads its activations as f16); prompts run in
+runs of 4 096 rows on the matrix units, one pass a layer, with routed
+experts grouped by expert, and attention and the indexer's scores on the
+matrix units too.
 
 DSpark: three stages over the mean hyper-connection state after the trunk's
 last three layers, drafting a block of five positions at once (non-causal
@@ -95,7 +97,11 @@ guaranteed.
 
 - Prompt-run GEMMs round both operands to bfloat16 (f32 accumulators); the
   hyper-connection control projection stays in f32 (in bfloat16 it cost 6 of
-  100 first tokens on ds4's fixture). Decode works on f32 activations.
+  100 first tokens on ds4's fixture). Prompt-run attention takes queries,
+  keys and softmax weights in f16 (as ds4's prefill attention does), the
+  indexer's scores f16 operands (exact: FP4 values times powers of two).
+  Decode works on f32 activations, except the routed gate/up's, rounded
+  to f16.
 - E4M3 and E2M1 rounding is computed in closed form instead of ds4's table
   search; the unit tests check the two agree on every input class.
 - RoPE tables are computed on the host with the CPU reference's arithmetic
@@ -114,16 +120,20 @@ The CPU reference's QAT, RoPE and compressor ops are checked against goldens
 computed by ds4's own C functions (`tools/reference/deepseek4/ops_golden.c`).
 `lily-ds4` (`src/bin/lily-ds4.rs`) compares the GPU with the CPU reference
 layer by layer (`compare`), scores ds4's official DeepSeek V4 Flash
-continuations from its `gguf-tools/quality-testing` (`score`), generates
-greedy text (`generate`) and measures prefill, decode and DSpark (`bench`,
-`spec`).
+continuations from its `gguf-tools/quality-testing` (`score`), measures the
+NLL of long texts past a long prompt (`ppl`: the official cases' prompts
+are short), generates greedy text (`generate`) and measures prefill, decode
+and DSpark (`bench`, with `LILY_KERNEL_PROFILE=1` for a per-kernel
+profile; `spec`).
 
-Measured on the M5 Max, 2026-11-14: ds4's 100 official cases NLL 0.395 per
-token and 57/100 first tokens (ds4's own reference for this file 0.398 and
-56/100). Prefill about 560 tok/s at 1K tokens and 470 to 505 at 4K; decode
-36 tok/s at 1K, 34 at 4K. Greedy DSpark, 256 tokens: code 57 to 58 tok/s
-(76% of drafts kept, 2.9 tokens a step) against 38 plain; English prose 41
-against 38; raw Italian text 37, the same as plain.
+Measured on the M5 Max, 2026-11-15 (Mesa with the night round's compiler
+changes): ds4's 100 official cases NLL 0.399 per token and 55/100 first
+tokens (ds4's own reference for this file 0.398 and 56/100). Prefill 920 to
+1 020 tok/s at a 2K prompt and 910 to 980 at 4.5K; plain decode about 24.5
+ms a token at 2K (41 tok/s). Served (`--mtp-drafts 5`): a 4.4K-token prompt
+prefills at 900 to 950 tok/s, decode 49 to 57 tok/s. Greedy DSpark, 256
+tokens: raw C 79 tok/s (96% of drafts kept, 4.8 tokens a step), a code
+prompt 73, English prose 45, raw Italian 53, against 41 to 44 plain.
 
 ## Not implemented
 
