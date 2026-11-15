@@ -834,8 +834,12 @@ impl<M: LanguageModel> Engine<M> {
         drop(embeds);
         drop(encoded);
         let checkpoint_started = Instant::now();
-        let snapshot = session.state.snapshot(&self.ctx)?;
-        session.add_checkpoint(snapshot);
+        // What the release would prune goes first: the request never holds
+        // more snapshots than the store keeps.
+        if session.prepare_prompt_checkpoint(self.sessions.max_checkpoints()) {
+            let snapshot = session.state.snapshot(&self.ctx)?;
+            session.add_checkpoint(snapshot);
+        }
         let checkpoint_secs = checkpoint_started.elapsed().as_secs_f64();
         let prefix_secs = started.elapsed().as_secs_f64();
         let counters_prefill = crate::stats::counters();

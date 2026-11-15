@@ -656,6 +656,27 @@ impl<M: LanguageModel> Session<M> {
         Ok(())
     }
 
+    /// Before a request takes its prompt-end checkpoint at the state's
+    /// position: drops now what the request's release would drop, so that
+    /// the new snapshot never sits beside one more than the store keeps.
+    /// That is every decode checkpoint at or before where the request began
+    /// (all the earlier turns' ones; the release keeps only the request's
+    /// own), and the oldest prompt-end checkpoints beyond `max - 1` (`max`
+    /// when one is held at the position already). Returns whether the
+    /// checkpoint is still to be taken.
+    pub fn prepare_prompt_checkpoint(&mut self, max: usize) -> bool {
+        let start = self.request_start;
+        self.checkpoints.retain(|c| !c.decode || c.pos() > start);
+        let pos = self.state.pos();
+        let held = self.checkpoints.iter().any(|c| c.pos() == pos);
+        keep_newest(
+            &mut self.checkpoints,
+            false,
+            max.saturating_sub(usize::from(!held)),
+        );
+        !held
+    }
+
     fn insert_checkpoint(&mut self, checkpoint: Checkpoint<SnapshotOf<M>>) {
         let pos = checkpoint.pos();
         if self.checkpoints.iter().any(|c| c.pos() == pos) {
@@ -1018,6 +1039,11 @@ impl<M: LanguageModel> SessionStore<M> {
     pub fn with_durable_min_tokens(mut self, min_tokens: Arc<AtomicUsize>) -> Self {
         self.durable_min_tokens = min_tokens;
         self
+    }
+
+    /// Prompt-end checkpoints a session keeps.
+    pub fn max_checkpoints(&self) -> usize {
+        self.max_checkpoints
     }
 
     /// Keeps `bytes` of the budget free for the session each request holds
