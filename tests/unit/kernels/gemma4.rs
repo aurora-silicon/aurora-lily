@@ -44,7 +44,7 @@ fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
     };
     for blk in b.chunks_exact_mut(bb) {
         match ty {
-            GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Iq2Xxs => {
+            GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Iq2Xxs | GgmlType::Iq2S => {
                 put(blk, 0, rng.gen_range(0.001..0.01))
             }
             GgmlType::Q5K => {
@@ -476,7 +476,11 @@ fn moe_timing() {
     let repeat = 32;
     let (experts, hidden, ff, used) = (24, 2816, 704, 8);
     for (gt, dt) in
-        [(GgmlType::Iq2Xxs, GgmlType::Iq4Nl), (GgmlType::Q5K, GgmlType::Q8_0)]
+        [
+            (GgmlType::Iq2Xxs, GgmlType::Iq4Nl),
+            (GgmlType::Iq2S, GgmlType::Iq4Nl),
+            (GgmlType::Q5K, GgmlType::Q8_0),
+        ]
     {
         let layers: Vec<(QWeight, QWeight)> = (0..4)
             .map(|_| {
@@ -541,7 +545,11 @@ fn moe_grouped_matches_a_bf16_reference() {
     let bfw = |v: f32| f32::from_bits((v.to_bits() + 0x8000) & 0xffff_0000);
     let bf = |v: f32| half::bf16::from_f32(v).to_f32();
     for (gt, dt) in
-        [(GgmlType::Iq2Xxs, GgmlType::Iq4Nl), (GgmlType::Q5K, GgmlType::Q8_0)]
+        [
+            (GgmlType::Iq2Xxs, GgmlType::Iq4Nl),
+            (GgmlType::Iq2S, GgmlType::Iq4Nl),
+            (GgmlType::Q5K, GgmlType::Q8_0),
+        ]
     {
         let gu_raw = random_blocks(&mut rng, gt, ne * 2 * ff * hid);
         let dn_raw = random_blocks(&mut rng, dt, ne * hid * ff);

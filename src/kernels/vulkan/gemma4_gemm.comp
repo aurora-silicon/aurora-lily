@@ -104,13 +104,24 @@ void gm_decode8(uint64_t row, uint k, out float w[8]) {
         w[i] = scale * float(c) - minv;
     }
 #else
-    // IQ2_S: eight values of glm53_decode's 32.
-    float t[32];
-    glm53_decode(GLM53_IQ2_S, row, k >> 5u, t);
-    [[unroll]] for (uint q = 0u; q < 4u; q++) {
-        if ((k & 24u) == 8u * q) {
-            [[unroll]] for (uint i = 0u; i < 8u; i++) w[i] = t[8u * q + i];
-        }
+    // IQ2_S: values 8 l .. 8 l + 8 of group ib, as glm53_decode_iq2_s
+    // computes them: grid vector qs[4 ib + l] | the high bits, times the
+    // scale of its half, signs from byte 4 ib + l.
+    const uint t = k >> 5u, l = (k >> 3u) & 3u;
+    const uint64_t b = row + uint64_t(t >> 3u) * 82u;
+    const uint ib = t & 7u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint qs = uint(U16(b + 2u + 4u * ib).v[l >> 1u]) >> (8u * (l & 1u));
+    const uint sg = uint(U16(b + 34u + 4u * ib).v[l >> 1u]) >> (8u * (l & 1u));
+    const uint hs = uint(U16(b + 66u).v[ib >> 1u]) >> (8u * (ib & 1u));
+    const uint scb = uint(U16(b + 74u).v[ib >> 1u]) >> (8u * (ib & 1u));
+    const float dl = d * (0.5 + float((scb >> (l < 2u ? 0u : 4u)) & 0xfu)) * 0.25;
+    const uint g = (qs & 0xffu) | (((hs & 0xffu) << (8u - 2u * l)) & 0x300u);
+    const uint lo = glm53_iq2s_grid[2u * g];
+    const uint hi = glm53_iq2s_grid[2u * g + 1u];
+    [[unroll]] for (uint c = 0u; c < 8u; c++) {
+        const float v = dl * float(((c < 4u ? lo : hi) >> (8u * (c & 3u))) & 0xffu);
+        w[c] = ((sg >> c) & 1u) != 0u ? -v : v;
     }
 #endif
 }
