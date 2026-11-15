@@ -75,7 +75,7 @@ The same M5 Max under macOS, as published by the projects lily on Linux follows:
     (2026-10-12): fresh prompts over HTTP, 4K–64K tokens, 2 drafts.
 [^2]: [antirez's ds4](https://github.com/antirez/ds4), `speed-bench/m5_max.csv`.
 
-Decode on Linux matches or beats macOS; Qwen3.8's prefill is still about 25% behind lily on Metal.
+Decode on Linux matches or beats macOS; Qwen3.8-Flash-Next's prefill is still about 25% behind lily on Metal.
 Neither project publishes M5 Max numbers for the other models.
 
 ### Linux, M4 (16 GB)
@@ -243,7 +243,7 @@ engine and its dispatch code are shared, and every kernel is GLSL in
 - **Session cache.** Each conversation's state stays resident within a GPU
   memory budget; evicted sessions move to disk and survive restarts; shared
   agent preambles are stored once ([docs/architecture.md](docs/architecture.md)).
-- **Batching.** Up to `--max-batch` requests decode together on Qwen3.8
+- **Batching.** Up to `--max-batch` requests decode together on Qwen3.8-Flash-Next
   q4-xl; the GGUF models serve one request at a time.
 - **Thinking controls.** A thinking budget with nudges; a tool call drawn
   inside the reasoning ends it ([docs/server.md](docs/server.md)).
@@ -259,7 +259,7 @@ cargo test --locked
 
 runs the kernel tests against CPU references, the shader compilation test
 and the API tests on the local GPU; they need no checkpoint. Tests that need
-weights are ignored by default and take `LILY_MODEL_DIR_FLASH` (Qwen3.8),
+weights are ignored by default and take `LILY_MODEL_DIR_FLASH` (Qwen3.8-Flash-Next),
 `LILY_QWEN36_GGUF`, `LILY_GLM53_GGUF`, `LILY_DS4_GGUF` or `LILY_GEMMA4_GGUF`.
 [CONTRIBUTING.md](CONTRIBUTING.md) has the gates.
 
@@ -273,7 +273,7 @@ weights are ignored by default and take `LILY_MODEL_DIR_FLASH` (Qwen3.8),
 - **[fabiogreter/lily-qwen3.8-flash-next](https://github.com/fabiogreter/lily-qwen3.8-flash-next)**:
   the Qwen3.8-Flash-Next graph and converter, speculative decoding with the
   model's draft head, the session cache, and the kernel tuning the Vulkan
-  kernels follow. The Qwen3.8 checkpoints are this work.
+  kernels follow. The Qwen3.8-Flash-Next checkpoints are this work.
 - **[antirez/ds4](https://github.com/antirez/ds4)** (MIT): the reference
   implementation GLM 5.3 Flash and DeepSeek V4 Flash follow, the quantized
   GGUFs lily loads, and the official continuation fixtures lily is scored on.

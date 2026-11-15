@@ -46,7 +46,7 @@ chat template are read from it.
   other models ([server.md](server.md)).
 - One model on the machine at a time: the loader takes the instance lock
   before mapping anything. The page cache has to hold the 92.7 GB of both
-  files, so neither GLM 5.3 nor Qwen3.8 fits beside it.
+  files, so neither GLM 5.3 nor Qwen3.8-Flash-Next fits beside it.
 
 As with GLM, run it on a Mesa with the compute kick
 (aurora-silicon/mesa #260): a prompt pass (a layer of up to 4 096 rows) is
