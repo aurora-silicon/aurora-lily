@@ -833,3 +833,33 @@ fn sdpa_decode_split64_matches_sdpa_decode() {
         assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-2, 1e-2);
     }
 }
+
+/// The one-subgroup router refuses tensors of the wrong type or too short
+/// for its rows (it reads 256 logits and writes 8 picks a row).
+#[test]
+fn router_sg_rejects_malformed_tensors() {
+    let ctx = ctx();
+    let m = 3;
+    let logits = zeros(&ctx, m * 256, DType::F32);
+    let sel = zeros(&ctx, m * 8, DType::U32);
+    let w = zeros(&ctx, m * 8, DType::F32);
+    let pass = ctx.begin().unwrap();
+    assert!(router_sg(&ctx, &pass, &logits, &sel, &w, m).is_ok());
+    let short_logits = zeros(&ctx, m * 256 - 1, DType::F32);
+    let short_sel = zeros(&ctx, m * 8 - 1, DType::U32);
+    let short_w = zeros(&ctx, m * 8 - 1, DType::F32);
+    let bf_logits = zeros(&ctx, m * 256, DType::BF16);
+    let f_sel = zeros(&ctx, m * 8, DType::F32);
+    let u_w = zeros(&ctx, m * 8, DType::U32);
+    for (name, l, s, ww) in [
+        ("short logits", &short_logits, &sel, &w),
+        ("short selection", &logits, &short_sel, &w),
+        ("short weights", &logits, &sel, &short_w),
+        ("bf16 logits", &bf_logits, &sel, &w),
+        ("f32 selection", &logits, &f_sel, &w),
+        ("u32 weights", &logits, &sel, &u_w),
+    ] {
+        assert!(router_sg(&ctx, &pass, l, s, ww, m).is_err(), "{name} accepted");
+    }
+    pass.commit_wait().unwrap();
+}

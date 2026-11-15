@@ -843,6 +843,11 @@ pub fn router_sg(
     weights: &Tensor,
     m: usize,
 ) -> Result<()> {
+    check(&[(logits, DType::F32), (sel, DType::U32), (weights, DType::F32)])?;
+    ensure!(
+        logits.numel() >= m * 256 && sel.numel() >= m * 8 && weights.numel() >= m * 8,
+        "router of {m} rows of 256 logits, top 8"
+    );
     let pipeline = ctx.pipeline("qwen36_router_sg", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
