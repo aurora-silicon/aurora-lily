@@ -69,12 +69,21 @@ enum Cmd {
     },
     /// The prompt's last logits by prefill against the same prompt fed one
     /// token at a time after a one-token prefill (the GEMM against the GEMV
-    /// path): max difference and both argmaxes.
+    /// path): max difference, the KL divergence of their distributions and
+    /// both argmaxes. Fails (exit status 1) on a non-finite logit,
+    /// different argmaxes, a max difference above `--tolerance` times the
+    /// largest |logit| or a KL above `--max-kl`. The defaults are above
+    /// what lily's q4-xl checkpoint of the model gives on a 52-token prompt
+    /// (0.10 and 0.062; the Q2 GGUF 0.11 and 0.056).
     Selfcheck {
         #[arg(long)]
         model: PathBuf,
         #[arg(long)]
         prompt: String,
+        #[arg(long, default_value_t = 0.15)]
+        tolerance: f32,
+        #[arg(long, default_value_t = 0.1)]
+        max_kl: f64,
     },
     /// The chat prompt ids of a conversation (a JSON file: `messages`,
     /// optional `tools`), with thinking off and on, one line each.
@@ -373,7 +382,7 @@ fn run() -> Result<()> {
                 100.0 * agree as f64 / n_tok as f64
             );
         }
-        Cmd::Selfcheck { model, prompt } => {
+        Cmd::Selfcheck { model, prompt, tolerance, max_kl } => {
             let tok = Tokenizer::from_model_dir(&model)?;
             let ids = tok.encode(&prompt)?;
             let r = Runner::load(&model)?;
@@ -392,13 +401,28 @@ fn run() -> Result<()> {
             let diff =
                 a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
             let scale = a.iter().map(|x| x.abs()).fold(0f32, f32::max);
+            let finite = a.iter().chain(&b).all(|x| x.is_finite());
+            let (pa, pb) = (top2(&a).0, top2(&b).0);
+            // KL(prefill || decode) of the softmaxes, in nats.
+            let log_softmax = |l: &[f32]| -> Vec<f64> {
+                let max = l.iter().copied().fold(f32::MIN, f32::max) as f64;
+                let lse =
+                    l.iter().map(|&x| (x as f64 - max).exp()).sum::<f64>().ln() + max;
+                l.iter().map(|&x| x as f64 - lse).collect()
+            };
+            let (la, lb) = (log_softmax(&a), log_softmax(&b));
+            let kl: f64 = la.iter().zip(&lb).map(|(p, q)| p.exp() * (p - q)).sum();
             println!(
-                "{} tokens: prefill argmax {} decode argmax {}, max |diff| {diff:.4} of max |logit| {scale:.2}, finite {}",
+                "{} tokens: prefill argmax {pa} decode argmax {pb}, max |diff| {diff:.4} of max |logit| {scale:.2}, KL {kl:.2e}, finite {finite}",
                 ids.len(),
-                top2(&a).0,
-                top2(&b).0,
-                a.iter().chain(&b).all(|x| x.is_finite())
             );
+            ensure!(finite && !a.is_empty() && a.len() == b.len(), "non-finite logits");
+            ensure!(pa == pb, "prefill and decode pick different tokens");
+            ensure!(
+                diff <= tolerance * scale,
+                "max |diff| {diff} above {tolerance} of max |logit| {scale}"
+            );
+            ensure!(kl <= max_kl, "KL {kl} above {max_kl}");
         }
         Cmd::ChatIds { model, conversation } => {
             use lily::tokenizer::ChatRender;

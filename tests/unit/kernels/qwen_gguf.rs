@@ -398,8 +398,19 @@ fn grouped_experts_match_the_gathers() {
             (w.iter().zip(&g).map(|(a, b)| f64::from(a - b).powi(2)).sum::<f64>()
                 / w.len() as f64)
                 .sqrt();
-        eprintln!("m {m}: max |diff| {err} of max |value| {scale}, rms {rms:.3e}");
-        assert!(err <= 0.02 * scale, "m {m}: {err} of {scale}");
+        let out_rms = (w.iter().map(|a| f64::from(*a).powi(2)).sum::<f64>()
+            / w.len() as f64)
+            .sqrt();
+        eprintln!(
+            "m {m}: max |diff| {err} of max |value| {scale}, rms diff {rms:.3e} of rms {out_rms:.3e}"
+        );
+        // The paths round the gate/up product to bfloat16 after sums in
+        // other orders, so the outputs differ by the rounding of the down
+        // projection's terms, not only of its result: per element one
+        // bfloat16 ulp of the value plus 6% of the output's RMS (measured
+        // worst 4%), 1% of it over all elements (measured 0.55%).
+        assert_close(&g, &w, 0.06 * out_rms as f32, 1.0 / 128.0);
+        assert!(rms <= 0.01 * out_rms, "m {m}: rms diff {rms} of {out_rms}");
     }
 }
 
@@ -576,4 +587,82 @@ fn out_of_range_ids_stay_inside_their_tables() {
     let (ca, cb) = outputs(&clamped);
     assert_eq!(a, ca, "gathers");
     assert_eq!(b, cb, "grouped");
+}
+
+/// MXFP4 against ggml's values: `kvalues_mxfp4` (twice the E2M1 values)
+/// times `ggml_e8m0_to_fp32_half(e)` = 2^(e - 128), every code in both
+/// nibbles at exponents from subnormal scales to 2^124. The CPU decoder
+/// exactly, and the expert down kernel column by column (bfloat16 output,
+/// subnormal results flushed).
+#[test]
+fn mxfp4_matches_ggml_values() {
+    // ggml-common.h's kvalues_mxfp4.
+    const KVALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    // (e, ggml_e8m0_to_fp32_half(e)).
+    let scales: [(u8, f32); 8] = [
+        (128, 1.0),
+        (125, 0.125),
+        (129, 2.0),
+        (140, 4096.0),
+        (2, 1.17549435e-38),
+        (1, 5.87747175e-39),
+        (0, 2.93873588e-39),
+        (252, 2.12676479e37),
+    ];
+    // Byte j holds code j (low nibble, value j) and code 15 - j (high
+    // nibble, value j + 16).
+    let block = |e: u8| -> Vec<u8> {
+        let mut b = vec![e];
+        b.extend((0..16u8).map(|j| j | ((15 - j) << 4)));
+        b
+    };
+    let golden = |d: f32| -> Vec<f32> {
+        (0..32)
+            .map(|i| f32::from(KVALUES[if i < 16 { i } else { 31 - i }]) * d)
+            .collect()
+    };
+    for &(e, d) in &scales {
+        assert_eq!(decode(GgmlType::Mxfp4, &block(e)), golden(d), "e {e}");
+    }
+    // 64 rows of two blocks: row r's first is golden block r % 8, its
+    // second zeros; one expert, one slot, a one-hot activation per column.
+    let ctx = ctx();
+    let (h, ff) = (64usize, 64usize);
+    let mut raw = Vec::new();
+    for r in 0..h {
+        raw.extend(block(scales[r % 8].0));
+        raw.extend(vec![128u8].into_iter().chain([0u8; 16]));
+    }
+    let wd = QWeight::from_bytes(&ctx, &raw, GgmlType::Mxfp4, ff, h).unwrap();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&[0u32]), &[1], DType::U32)
+            .unwrap();
+    let tsc = Tensor::from_f32(&ctx, &[1.0], &[1]).unwrap();
+    let acts: Vec<Tensor> = (0..32)
+        .map(|c| {
+            let v: Vec<f32> = (0..ff).map(|i| if i == c { 1.0 } else { 0.0 }).collect();
+            Tensor::from_f32_as_bf16(&ctx, &v, &[ff]).unwrap()
+        })
+        .collect();
+    let outs: Vec<Tensor> =
+        (0..32).map(|_| Tensor::zeros(&ctx, &[h], DType::BF16).unwrap()).collect();
+    run(&ctx, |p| {
+        for (act, out) in acts.iter().zip(&outs) {
+            moe_down(&ctx, p, &wd, ff, h, act, &tsel, &tsc, None, out, 1, 1).unwrap();
+        }
+    });
+    for (c, out) in outs.iter().enumerate() {
+        let got = out.to_f32().unwrap();
+        for r in 0..h {
+            let (e, d) = scales[r % 8];
+            let want = bf16::from_f32(golden(d)[c]).to_f32();
+            // The GPU's float arithmetic flushes subnormal results to zero.
+            let flushed = want.abs() < f32::MIN_POSITIVE && got[r] == 0.0;
+            assert!(
+                got[r] == want || flushed,
+                "e {e}, column {c}: {} for {want}",
+                got[r]
+            );
+        }
+    }
 }

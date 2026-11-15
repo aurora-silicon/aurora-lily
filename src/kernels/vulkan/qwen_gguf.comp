@@ -43,11 +43,21 @@ const float qg_mxfp4_values[16] = float[16](
 void qg_decode_mxfp4(uint64_t row, uint t, out float w[32]) {
     const uint64_t b = row + uint64_t(t) * 17u;
     const uint e = uint(U8(b).v[0]);
-    const float d = e < 2u ? uintBitsToFloat(0x00200000u << e) : uintBitsToFloat((e - 1u) << 23u);
+    // 2^(e - 128) is subnormal for e < 2, which the GPU flushes: there it is
+    // applied as 2^(e - 64) * 2^-64, two normal factors (the results the
+    // code values make normal are ggml's; subnormal ones flush).
+    const bool tiny = e < 2u;
+    const float d = uintBitsToFloat((tiny ? e + 63u : e - 1u) << 23u);
+    const float d2 = tiny ? uintBitsToFloat(63u << 23u) : 1.0;
     [[unroll]] for (uint j = 0u; j < 16u; j++) {
         const uint q = uint(U8(b + 1u).v[j]);
-        w[j] = qg_mxfp4_values[q & 15u] * d;
-        w[j + 16u] = qg_mxfp4_values[q >> 4u] * d;
+        // precise: d * d2 folded first would be the subnormal again.
+        precise float lo = qg_mxfp4_values[q & 15u] * d;
+        precise float hi = qg_mxfp4_values[q >> 4u] * d;
+        lo = lo * d2;
+        hi = hi * d2;
+        w[j] = lo;
+        w[j + 16u] = hi;
     }
 }
 
