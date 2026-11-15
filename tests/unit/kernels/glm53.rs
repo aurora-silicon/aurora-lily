@@ -246,6 +246,88 @@ fn moe_xh_matches_f32_kernel() {
     }
 }
 
+/// GLM's decode and verify steps run the IQ2_XXS gate/up over f16
+/// activations for one to four rows. At GLM's widths (4 096 in, 2 048 out,
+/// eight slots), each row of an m-row call, the f16 conversion and the
+/// gate/up, has the same bits as a one-row call on that row alone, for rows
+/// sharing experts in other orders; and neither writes past its rows.
+#[test]
+fn moe_xh_rows_match_one_row_exactly() {
+    use crate::kernels::deepseek4::x_f16_iq2;
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(82);
+    let (experts, hidden, ff, used, limit) = (10, 4096, 2048, 8, 10.0);
+    let mk = |rng: &mut StdRng| {
+        let raw = random_blocks(rng, GgmlType::Iq2Xxs, experts * ff * hidden);
+        QWeight::from_bytes(&ctx, &raw, GgmlType::Iq2Xxs, hidden, experts * ff).unwrap()
+    };
+    let (gw, uw) = (mk(&mut rng), mk(&mut rng));
+    const GUARD: f32 = -7.25;
+    let guarded_h = |n: usize| {
+        let bits = vec![f16::from_f32(GUARD).to_bits(); n];
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&bits), &[n], DType::F16).unwrap()
+    };
+    let guarded = |n: usize| tensor(&ctx, &vec![GUARD; n]);
+    let tail_is_guard = |t: &Tensor, from: usize, what: &str| {
+        let v = t.to_f32().unwrap();
+        assert!(v[from..].iter().all(|&x| x == GUARD), "{what}: written past its rows");
+    };
+    for m in 1..=4 {
+        let x = f32s(&mut rng, m * hidden, -4.0, 4.0);
+        let tx = tensor(&ctx, &x);
+        // Each row's eight experts are distinct; rows share them in other
+        // orders.
+        let sel: Vec<u32> = (0..m * used)
+            .map(|s| ((3 * (s % used) + 7 * (s / used)) % experts) as u32)
+            .collect();
+        let tsel = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&sel),
+            &[sel.len()],
+            DType::U32,
+        )
+        .unwrap();
+        let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+        let (xh, mid) = (guarded_h((m + 1) * hidden), guarded((m * used + 1) * ff));
+        run(&ctx, |p| {
+            x_f16_iq2(&ctx, p, &tx, &xh, m, hidden).unwrap();
+            p.memory_barrier().unwrap();
+            moe_gate_up_xh(
+                &ctx, p, &gw, &uw, ff, &xh, &tsel, &tw, &mid, m, used, limit,
+            )
+            .unwrap();
+        });
+        tail_is_guard(&xh, m * hidden, "f16 activations");
+        tail_is_guard(&mid, m * used * ff, "gate/up");
+        assert!(mid.to_f32().unwrap()[..m * used * ff].iter().all(|v| v.is_finite()));
+        for i in 0..m {
+            let xi = tensor(&ctx, &x[i * hidden..(i + 1) * hidden]);
+            let si = tsel.view(i * used, &[used]).unwrap();
+            let wi = tw.view(i * used, &[used]).unwrap();
+            let (xh1, mid1) = (guarded_h(2 * hidden), guarded((used + 1) * ff));
+            run(&ctx, |p| {
+                x_f16_iq2(&ctx, p, &xi, &xh1, 1, hidden).unwrap();
+                p.memory_barrier().unwrap();
+                moe_gate_up_xh(
+                    &ctx, p, &gw, &uw, ff, &xh1, &si, &wi, &mid1, 1, used, limit,
+                )
+                .unwrap();
+            });
+            tail_is_guard(&xh1, hidden, "one-row f16 activations");
+            tail_is_guard(&mid1, used * ff, "one-row gate/up");
+            let (h, h1) = (2 * hidden, 4 * used * ff);
+            assert!(
+                xh.contents()[i * h..(i + 1) * h] == xh1.contents()[..h],
+                "m={m} row {i}: f16 activations"
+            );
+            assert!(
+                mid.contents()[i * h1..(i + 1) * h1] == mid1.contents()[..h1],
+                "m={m} row {i}: gate/up"
+            );
+        }
+    }
+}
+
 #[test]
 fn moe_gate_up_and_down_match_cpu() {
     let ctx = ctx();
