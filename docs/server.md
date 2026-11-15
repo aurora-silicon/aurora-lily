@@ -295,6 +295,14 @@ refuses to start there. Its default budget is the one full `--max-seq`
 session the plan reserved (2.7 GB at 131 072 tokens), not the floor
 above.
 
+A Qwen3.8-Flash-Next GGUF (ds4's Q2, [qwen38-q2.md](qwen38-q2.md)) pages its
+n-gram table from a lily checkpoint of the model, `--ngram-checkpoint <dir>`
+(`LILY_NGRAM_TABLE` when not given). Its `--memory-limit-gb` caps the session cache
+beside what the load allocated. The n-gram table's background preload
+(`--ngram-preload`, on by default) is skipped where the machine's memory, less what
+the GPU allocated, cannot hold the table and a 12 GB reserve; `--ngram-lock`
+preloads regardless.
+
 ## Thinking
 
 Thinking is on by default. `reasoning_effort` (`none`, `low`, `medium`,
