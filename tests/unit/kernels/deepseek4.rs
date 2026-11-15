@@ -334,11 +334,16 @@ fn compressor_matches_cpu_across_steps() {
 /// selection.
 #[test]
 fn indexer_matches_cpu() {
+    // A decode-sized run, and a prompt run (the matrix-unit scores).
+    indexer_case(407, 2400, 3);
+    indexer_case(411, 2100, 40);
+}
+
+fn indexer_case(seed: u64, pos0: usize, m: usize) {
     let ctx = ctx();
     let c = Config::deepseek4_flash();
-    let mut rng = StdRng::seed_from_u64(407);
+    let mut rng = StdRng::seed_from_u64(seed);
     let heads = 64;
-    let (pos0, m) = (2400usize, 3usize);
     let rope = c.rope(2);
     let table = tensor(&ctx, &rope_table(&rope, pos0, m));
     let q = f32s(&mut rng, m * heads * 128, -1.0, 1.0);
@@ -410,18 +415,223 @@ fn indexer_matches_cpu() {
 /// compressed rows, all or selected, against the reference.
 #[test]
 fn attention_matches_cpu() {
+    attention_case(
+        408,
+        false,
+        &[
+            (0, 1, 0, false),
+            (5, 3, 4, false),
+            (300, 4, 128, false),
+            (130, 70, 4, false),
+            (2100, 2, 4, true),
+        ],
+        (2e-5, 1e-4),
+    );
+}
+
+/// The matrix-unit attention of prompt runs (f16 operands): runs within
+/// the first window, across it, ratio 128, selected rows, and partial key
+/// steps.
+#[test]
+fn attention_mu_matches_cpu() {
+    attention_case(
+        409,
+        true,
+        &[
+            (0, 40, 0, false),
+            (130, 70, 4, false),
+            (300, 33, 128, false),
+            (2100, 20, 4, true),
+            (7, 200, 4, false),
+        ],
+        (3e-4, 1e-3),
+    );
+}
+
+/// The attention with the query norm + RoPE folded into its loads and the
+/// inverse RoPE into its output, against the three separate steps: a
+/// prompt run (matrix units, bfloat output: against a bfloat copy) and a
+/// decode-sized one (f32).
+#[test]
+fn attend_fused_matches_separate_steps() {
+    for (m, prompt) in [(60usize, true), (3, false)] {
+        attend_fused_case(m, prompt);
+    }
+}
+
+fn attend_fused_case(m: usize, prompt: bool) {
     let ctx = ctx();
-    let mut rng = StdRng::seed_from_u64(408);
+    let c = Config::deepseek4_flash();
+    let mut rng = StdRng::seed_from_u64(410 + m as u64);
+    let heads = 64;
+    let pos0 = 100usize;
+    let sinks = tensor(&ctx, &f32s(&mut rng, heads, -1.0, 2.0));
+    let (_, yarn) = tables(&c, 0, pos0 + m);
+    let tt = tensor(&ctx, &yarn);
+    let f16_rows = |rng: &mut StdRng, n: usize| -> Vec<f32> {
+        f32s(rng, n * 512, -1.0, 1.0).iter().map(|&v| round_f16(v)).collect()
+    };
+    let ring = f16_tensor(&ctx, &f16_rows(&mut rng, 128));
+    let run_rows = f16_tensor(&ctx, &f16_rows(&mut rng, m));
+    let comp = f16_tensor(&ctx, &f16_rows(&mut rng, (pos0 + m) / 4));
+    let rows = CompRows::All { cache: &comp, ratio: 4 };
+    let q = f32s(&mut rng, m * heads * 512, -2.0, 2.0);
+    let (qa, qb) = (tensor(&ctx, &q), tensor(&ctx, &q));
+    let n = m * heads * 512;
+    let out = zeros(&ctx, n, DType::F32);
+    let out_dt = if prompt { DType::BF16 } else { DType::F32 };
+    let want = zeros(&ctx, n, DType::BF16);
+    let got = zeros(&ctx, n, out_dt);
+    run(&ctx, |p| {
+        head_norm_rope(&ctx, p, &qa, &tt, pos0, m, heads, 512, 64, 1e-6, HeadOp::NormRope)
+            .unwrap();
+        p.memory_barrier().unwrap();
+        let raw = RawWindow::MODEL;
+        attend_with(&ctx, p, &qa, &run_rows, &ring, rows, &sinks, &out, m, heads, pos0, raw, prompt)
+            .unwrap();
+        p.memory_barrier().unwrap();
+        head_norm_rope(&ctx, p, &out, &tt, pos0, m, heads, 512, 64, 0.0, HeadOp::InverseRope)
+            .unwrap();
+        p.memory_barrier().unwrap();
+        crate::kernels::glm53::to_bf16(&ctx, p, &out, &want, n).unwrap();
+        let fuse = PromptFuse { table: &tt, t0: pos0, eps: 1e-6 };
+        attend_fused(&ctx, p, &qb, &run_rows, &ring, rows, &sinks, &got, m, heads, pos0, fuse)
+            .unwrap();
+    });
+    if prompt {
+        // A bfloat step, or an f16 step of a query moving a score (the
+        // norm's sum is in another order).
+        assert_close(&got.to_f32().unwrap(), &want.to_f32().unwrap(), 1e-4, 8e-3);
+    } else {
+        assert_close(&got.to_f32().unwrap(), &out.to_f32().unwrap(), 2e-6, 1e-4);
+    }
+}
+
+/// The matrix-unit attention with sharp scores: each head's query lies
+/// along a +-1 direction and a few keys are copies of some heads'
+/// directions (scores about 11 against noise of about 0.3), in the first
+/// 128-key block and in the second, so the online maximum jumps between
+/// blocks and the other weights fall to ~1e-5 (f16's subnormal range).
+/// Against an oracle of the kernel's arithmetic (f16 queries, blocks of 128
+/// keys, each weight rounded to f16 for P V only, f32 elsewhere) and against
+/// the f32 reference.
+#[test]
+fn attention_mu_sharp_scores() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(412);
+    let (heads, pos0, m, ratio) = (64usize, 200usize, 10usize, 4usize);
+    let total = pos0 + m;
+    let sign = |rng: &mut StdRng| -> Vec<f32> {
+        (0..512).map(|_| if rng.gen_bool(0.5) { 1.0 } else { -1.0 }).collect()
+    };
+    let dirs: Vec<Vec<f32>> = (0..heads).map(|_| sign(&mut rng)).collect();
+    let noise = |rng: &mut StdRng| -> Vec<f32> {
+        f32s(rng, 512, -1.0, 1.0).iter().map(|&v| round_f16(v)).collect()
+    };
+    let mut rows: Vec<Vec<f32>> = (0..total).map(|_| noise(&mut rng)).collect();
+    let n_comp = total / ratio;
+    let mut comp: Vec<Vec<f32>> = (0..n_comp).map(|_| noise(&mut rng)).collect();
+    // Second block (compressed rows come after the 128 raw ones): head 0 at
+    // full strength, head 1 weaker; first block (raw rows): head 2.
+    comp[5] = dirs[0].clone();
+    comp[7] = dirs[1].iter().map(|&v| round_f16(0.6 * v)).collect();
+    rows[pos0 - 20] = dirs[2].iter().map(|&v| round_f16(0.8 * v)).collect();
+    let ring: Vec<f32> = (0..128)
+        .flat_map(|slot| {
+            (0..pos0).rev().find(|p| p % 128 == slot).map_or(vec![0.0; 512], |p| rows[p].clone())
+        })
+        .collect();
+    let mut q = vec![0f32; m * heads * 512];
+    for i in 0..m {
+        for h in 0..heads {
+            for (d, v) in dirs[h].iter().enumerate() {
+                q[(i * heads + h) * 512 + d] = 0.5 * v + rng.gen_range(-0.05..0.05);
+            }
+        }
+    }
+    let sinks = f32s(&mut rng, heads, -1.0, 2.0);
+    let (tq, ts) = (tensor(&ctx, &q), tensor(&ctx, &sinks));
+    let (tring, trun) = (f16_tensor(&ctx, &ring), f16_tensor(&ctx, &rows[pos0..].concat()));
+    let tcomp = f16_tensor(&ctx, &comp.concat());
+    let out = zeros(&ctx, m * heads * 512, DType::F32);
+    let rows_arg = CompRows::All { cache: &tcomp, ratio };
+    run(&ctx, |p| {
+        let raw = RawWindow::MODEL;
+        attend_with(&ctx, p, &tq, &trun, &tring, rows_arg, &ts, &out, m, heads, pos0, raw, true)
+            .unwrap()
+    });
+    let got = out.to_f32().unwrap();
+    let scale = 1.0 / (512f64).sqrt();
+    let (mut err_half, mut err_f32) = (0f32, 0f32);
+    for i in 0..m {
+        let p = pos0 + i;
+        // The kernel's key order: the raw window by position, then the
+        // compressed rows.
+        let mut keys: Vec<&[f32]> = (p + 1 - 128..=p).map(|x| rows[x].as_slice()).collect();
+        keys.extend(comp.iter().take((p + 1) / ratio).map(|c| c.as_slice()));
+        for h in 0..heads {
+            let qh = &q[(i * heads + h) * 512..(i * heads + h + 1) * 512];
+            let q16: Vec<f32> = qh.iter().map(|&v| round_f16(v)).collect();
+            let sc: Vec<f32> = keys
+                .iter()
+                .map(|k| (q16.iter().zip(*k).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum::<f64>() * scale) as f32)
+                .collect();
+            let (mut mx, mut l) = (-1e30f32, 0f32);
+            let mut o = vec![0f64; 512];
+            for b0 in (0..keys.len()).step_by(128) {
+                let blk = b0..(b0 + 128).min(keys.len());
+                let n = sc[blk.clone()].iter().copied().fold(mx, f32::max);
+                let f = (mx - n).exp();
+                l *= f;
+                for v in &mut o {
+                    *v *= f64::from(f);
+                }
+                for r in blk {
+                    let w = (sc[r] - n).exp();
+                    l += w;
+                    let wh = f64::from(round_f16(w));
+                    for (d, v) in o.iter_mut().enumerate() {
+                        *v += wh * f64::from(keys[r][d]);
+                    }
+                }
+                mx = n;
+            }
+            let sink = sinks[h];
+            let big = mx.max(sink);
+            let g = (mx - big).exp() / (l * (mx - big).exp() + (sink - big).exp());
+            let want_half: Vec<f32> = o.iter().map(|&v| (v * f64::from(g)) as f32).collect();
+            let want_f32 = r::sink_attention(qh, &keys, &sinks[h..=h], 512);
+            let row = &got[(i * heads + h) * 512..(i * heads + h + 1) * 512];
+            for d in 0..512 {
+                err_half = err_half.max((row[d] - want_half[d]).abs());
+                err_f32 = err_f32.max((row[d] - want_f32[d]).abs());
+            }
+        }
+    }
+    // The scores are sharp: the spiked heads' outputs are their spike keys.
+    for (h, key) in [(0usize, &comp[5]), (2, &rows[pos0 - 20])] {
+        let row = &got[h * 512..(h + 1) * 512];
+        let off = row.iter().zip(key.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(off < 0.05, "head {h} is not dominated by its spike ({off})");
+    }
+    // Measured 2026-11-15: 6.3e-6 and 4.6e-5.
+    eprintln!("sharp attention: max |error| against the half-P oracle {err_half:e}, against f32 {err_f32:e}");
+    assert!(err_half <= 2e-5, "against the half-P oracle: {err_half}");
+    assert!(err_f32 <= 2e-4, "against the f32 reference: {err_f32}");
+}
+
+fn attention_case(
+    seed: u64,
+    matrix: bool,
+    cases: &[(usize, usize, usize, bool)],
+    tol: (f32, f32),
+) {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(seed);
     let heads = 64;
     let sinks = f32s(&mut rng, heads, -1.0, 2.0);
     let tsinks = tensor(&ctx, &sinks);
-    for (pos0, m, ratio, select) in [
-        (0usize, 1usize, 0usize, false),
-        (5, 3, 4, false),
-        (300, 4, 128, false),
-        (130, 70, 4, false),
-        (2100, 2, 4, true),
-    ] {
+    for &(pos0, m, ratio, select) in cases {
         let total = pos0 + m;
         // Every position's KV row (f16 values).
         let rows: Vec<Vec<f32>> = (0..total)
@@ -472,7 +682,7 @@ fn attention_matches_cpu() {
             }
         };
         run(&ctx, |p| {
-            attend(
+            attend_with(
                 &ctx,
                 p,
                 &tq,
@@ -485,6 +695,7 @@ fn attention_matches_cpu() {
                 heads,
                 pos0,
                 RawWindow::MODEL,
+                matrix,
             )
             .unwrap()
         });
@@ -510,12 +721,8 @@ fn attention_matches_cpu() {
                 &sinks,
                 512,
             );
-            assert_close(
-                &got[i * heads * 512..(i + 1) * heads * 512],
-                &want,
-                2e-5,
-                1e-4,
-            );
+            let got = &got[i * heads * 512..(i + 1) * heads * 512];
+            assert_close(got, &want, tol.0, tol.1);
         }
         // The ring after the step holds the newest position of each slot.
         let tring2 = f16_tensor(&ctx, &ring);
@@ -771,6 +978,35 @@ fn noncausal_block_attention_matches_cpu() {
                 1e-4,
             );
         }
+        // DSpark's call: the query norm and RoPE at each row's own position
+        // and the inverse RoPE folded in (attend_fused_raw), against the
+        // three steps; the block's common endpoint and the truncated ring
+        // (lo) as above.
+        let c = Config::deepseek4_flash();
+        let (plain, _) = tables(&c, 0, pos0 + m);
+        let tt = tensor(&ctx, &plain);
+        let (qa, qb) = (tensor(&ctx, &q), tensor(&ctx, &q));
+        let (sep, fused) = (
+            zeros(&ctx, m * heads * 512, DType::F32),
+            zeros(&ctx, m * heads * 512, DType::F32),
+        );
+        run(&ctx, |p| {
+            head_norm_rope(&ctx, p, &qa, &tt, pos0, m, heads, 512, 64, 1e-6, HeadOp::NormRope)
+                .unwrap();
+            p.memory_barrier().unwrap();
+            attend(&ctx, p, &qa, &trun, &tring, CompRows::None, &tsinks, &sep, m, heads, pos0, raw)
+                .unwrap();
+            p.memory_barrier().unwrap();
+            head_norm_rope(&ctx, p, &sep, &tt, pos0, m, heads, 512, 64, 0.0, HeadOp::InverseRope)
+                .unwrap();
+            let fuse = PromptFuse { table: &tt, t0: pos0, eps: 1e-6 };
+            attend_fused_raw(
+                &ctx, p, &qb, &trun, &tring, CompRows::None, &tsinks, &fused, m, heads, pos0,
+                raw, fuse,
+            )
+            .unwrap();
+        });
+        assert_close(&fused.to_f32().unwrap(), &sep.to_f32().unwrap(), 2e-6, 1e-4);
     }
 }
 

@@ -258,3 +258,296 @@ fn speculation_at_rest_restores_and_forks_like_plain_decoding() {
     agree(&e.tokens, "to the end of the context");
     assert!(e.proposals.iter().all(|(p, d)| d.is_empty() || draft_fits(*p, cap)));
 }
+
+/// What a forced speculative step does with the head's draft.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Force {
+    /// Verify the head's proposal as it is.
+    Keep,
+    /// Verify a wrong draft in its place (the next token id): rejected.
+    Reject,
+    /// Verify no draft (as the gate does).
+    Suppress,
+}
+
+#[derive(Default, Debug)]
+struct Forced {
+    tokens: Vec<u32>,
+    proposals: Vec<(usize, Vec<u32>)>,
+    accepted: usize,
+    rejected: usize,
+    suppressed: usize,
+    /// The last step's outcome.
+    last: Option<Force>,
+}
+
+/// The head's state after a finished step: one row past the trunk while it
+/// drafts, at the trunk at rest with the kept row's hidden state pending.
+fn check_head(st: &Qwen36State, sc: &Scratch, kept: usize, rest: bool, hidden: usize) {
+    let m = st.mtp.as_ref().expect("MTP state");
+    if rest {
+        assert_eq!(m.pos, st.pos, "the head at rest stands at the trunk");
+        let row = sc.hidden_norm.view(kept * hidden, &[hidden]).unwrap();
+        assert_eq!(
+            m.pending_h.to_f32().unwrap(),
+            row.to_f32().unwrap(),
+            "the pending row at rest is the kept row's hidden state"
+        );
+    } else {
+        assert_eq!(m.pos, st.pos + 1, "the drafting head is a row past the trunk");
+    }
+}
+
+/// [`speculate`] with each step's draft forced by `plan(step)` and sampling
+/// `params`; it comes to rest after the steps in `rests` and restarts with
+/// `draft_initial` (or, with `stop_after_rest`, returns at the first rest).
+/// Checks the head's state after every step.
+#[allow(clippy::too_many_arguments)]
+fn speculate_forced(
+    model: &Qwen36Model,
+    ctx: &MetalContext,
+    st: &mut Qwen36State,
+    sc: &mut Scratch,
+    first: u32,
+    n: usize,
+    params: &SamplingParams,
+    plan: &dyn Fn(usize) -> Force,
+    rests: &[usize],
+    stop_after_rest: bool,
+) -> Forced {
+    let vocab = model.cfg.vocab as u32;
+    let mut r = Forced { tokens: vec![first], ..Default::default() };
+    let mut proposals = model.draft_initial(ctx, st, sc, first, 1, params, 1).unwrap();
+    let mut step = 0;
+    while r.tokens.len() < n && st.pos < st.max_capacity {
+        let pending = *r.tokens.last().unwrap();
+        let force = plan(step);
+        let drafts: Vec<u32> = match force {
+            Force::Keep => proposals.clone(),
+            Force::Reject => proposals.iter().map(|&d| (d + 1) % vocab).collect(),
+            Force::Suppress => Vec::new(),
+        };
+        r.proposals.push((st.pos, proposals.clone()));
+        let (draws, pass) = model
+            .verify(ctx, st, sc, pending, &drafts, params, r.tokens.len(), 1)
+            .unwrap();
+        let mut kept = 0;
+        for (j, &t) in draws.iter().enumerate() {
+            r.tokens.push(t);
+            kept = j;
+            if j >= drafts.len() || drafts[j] != t {
+                break;
+            }
+        }
+        match (drafts.is_empty(), kept) {
+            (true, _) => r.suppressed += 1,
+            (false, 1) => r.accepted += 1,
+            (false, _) => r.rejected += 1,
+        }
+        let rest = rests.contains(&step);
+        proposals = model.finish_speculation(ctx, st, sc, kept, !rest, pass).unwrap();
+        check_head(st, sc, kept, rest, model.cfg.hidden);
+        r.last = Some(match (drafts.is_empty(), kept) {
+            (true, _) => Force::Suppress,
+            (false, 1) => Force::Keep,
+            (false, _) => Force::Reject,
+        });
+        if rest {
+            assert!(proposals.is_empty(), "no proposal at rest");
+            if stop_after_rest {
+                break;
+            }
+            let last = *r.tokens.last().unwrap();
+            proposals = model
+                .draft_initial(ctx, st, sc, last, 1, params, r.tokens.len())
+                .unwrap();
+        }
+        step += 1;
+    }
+    r
+}
+
+/// Plain decoding through the engine's decode step (the in-graph sampler,
+/// its emission counts and penalties), `n` tokens after the prefill's.
+fn plain_sampled(
+    model: &Qwen36Model,
+    ctx: &MetalContext,
+    st: &mut Qwen36State,
+    sc: &mut Scratch,
+    first: u32,
+    n: usize,
+    params: &SamplingParams,
+) -> Vec<u32> {
+    use crate::engine::ScratchApi;
+    let mut out = vec![first];
+    let mut slot = 0;
+    while out.len() < n {
+        let pass = LanguageModel::encode_decode_step(
+            model,
+            ctx,
+            st,
+            sc,
+            slot,
+            1 - slot,
+            Draw { params, step: out.len() },
+        )
+        .unwrap();
+        pass.commit().unwrap().wait().unwrap();
+        st.advance(1);
+        slot = 1 - slot;
+        out.push(sc.next_token().to_u32().unwrap()[slot]);
+    }
+    out
+}
+
+#[test]
+#[ignore = "requires LILY_QWEN36_GGUF"]
+fn forced_draft_outcomes_follow_plain_decoding() {
+    use crate::engine::ScratchApi;
+    let path = std::env::var("LILY_QWEN36_GGUF").expect("LILY_QWEN36_GGUF");
+    let ctx = MetalContext::new().unwrap();
+    let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
+    let mut model = <Qwen36Model as LanguageModel>::load(
+        &ctx,
+        std::path::Path::new(&path),
+        &options,
+    )
+    .unwrap();
+    assert!(model.mtp.is_some(), "no MTP file beside {path}");
+    // Every draft proposed; the plans force the outcomes.
+    model.draft_min_prob = 0.0;
+    let greedy = SamplingParams::greedy();
+    let prompt: Vec<u32> = (0..300u32).map(|i| 1000 + (i * 7919) % 50000).collect();
+    let n = 40;
+    let mut sc = LanguageModel::new_scratch_with_capacity(&model, &ctx, 0).unwrap();
+    let prefill = |model: &Qwen36Model,
+                   st: &mut Qwen36State,
+                   sc: &mut Scratch,
+                   p: &SamplingParams|
+     -> u32 {
+        st.reset();
+        sc.begin_request();
+        let d = Draw { params: p, step: 0 };
+        LanguageModel::prefill(model, &ctx, st, sc, &prompt, Some(d)).unwrap();
+        sc.next_token.to_u32().unwrap()[0]
+    };
+    // Keep, reject, suppress, keep, ...; a rejection at step 5, then rest.
+    let plan =
+        |s: usize| [Force::Keep, Force::Reject, Force::Suppress, Force::Keep][s % 4];
+
+    // Greedy: plain, then the forced cycle with rests after a rejection
+    // (step 5) and after a suppression (step 10).
+    let mut st = LanguageModel::new_state(&model, &ctx, 512).unwrap();
+    let first = prefill(&model, &mut st, &mut sc, &greedy);
+    let plain = plain_sampled(&model, &ctx, &mut st, &mut sc, first, n, &greedy);
+    let first = prefill(&model, &mut st, &mut sc, &greedy);
+    let f = speculate_forced(
+        &model,
+        &ctx,
+        &mut st,
+        &mut sc,
+        first,
+        n,
+        &greedy,
+        &plan,
+        &[5, 10],
+        false,
+    );
+    let k = f.tokens.len().min(plain.len());
+    assert_eq!(&f.tokens[..k], &plain[..k], "forced greedy speculation");
+    assert!(
+        f.accepted >= 2 && f.rejected >= 2 && f.suppressed >= 2,
+        "every outcome forced: {} accepted, {} rejected, {} suppressed",
+        f.accepted,
+        f.rejected,
+        f.suppressed
+    );
+
+    // A rejection, then rest: snapshot, go on, restore, go on; a fork. The
+    // proposals after the restore and in the fork are the first run's.
+    let first = prefill(&model, &mut st, &mut sc, &greedy);
+    let head = speculate_forced(
+        &model,
+        &ctx,
+        &mut st,
+        &mut sc,
+        first,
+        n,
+        &greedy,
+        &|s| if s == 2 { Force::Reject } else { Force::Keep },
+        &[2],
+        true,
+    );
+    assert_eq!(head.last, Some(Force::Reject), "{head:?}");
+    let snap = st.snapshot(&ctx).unwrap();
+    let at_rest = st.pos;
+    let last = *head.tokens.last().unwrap();
+    let go = |st: &mut Qwen36State, sc: &mut Scratch| {
+        let keep = |_: usize| Force::Keep;
+        speculate_forced(&model, &ctx, st, sc, last, 16, &greedy, &keep, &[], false)
+    };
+    let c1 = go(&mut st, &mut sc);
+    st.restore(&ctx, &snap).unwrap();
+    let c2 = go(&mut st, &mut sc);
+    assert_eq!(c1.proposals, c2.proposals, "proposals after the restore");
+    assert_eq!(c1.tokens, c2.tokens, "tokens after the restore");
+    let mut fork = LanguageModel::new_state(&model, &ctx, 128).unwrap();
+    fork.copy_prefix_from(&ctx, &st, at_rest).unwrap();
+    fork.restore(&ctx, &snap).unwrap();
+    let c3 = go(&mut fork, &mut sc);
+    assert_eq!(c1.proposals, c3.proposals, "proposals in the fork");
+    assert_eq!(c1.tokens, c3.tokens, "tokens in the fork");
+
+    // The gate at its threshold: the head's probability p of a draft
+    // proposes it at a threshold of p and below, not just above.
+    let first = prefill(&model, &mut st, &mut sc, &greedy);
+    let snap = st.snapshot(&ctx).unwrap();
+    let d0 = model.draft_initial(&ctx, &mut st, &mut sc, first, 1, &greedy, 1).unwrap();
+    assert_eq!(d0.len(), 1);
+    let p = sc.mtp_prob.to_f32().unwrap()[0];
+    for (threshold, proposed) in
+        [(p * 0.5, true), (p, true), (f32::from_bits(p.to_bits() + 1), false)]
+    {
+        st.restore(&ctx, &snap).unwrap();
+        model.draft_min_prob = threshold;
+        let d =
+            model.draft_initial(&ctx, &mut st, &mut sc, first, 1, &greedy, 1).unwrap();
+        assert_eq!(d.is_empty(), !proposed, "threshold {threshold} against p {p}");
+        if proposed {
+            assert_eq!(d, d0, "the same draft at threshold {threshold}");
+        }
+    }
+    model.draft_min_prob = 0.0;
+
+    // Sampled with penalties: the forced cycle draws what plain sampling
+    // with the same seed draws (discarded draws leave no counts behind).
+    let sampled = SamplingParams {
+        temperature: 0.8,
+        top_k: 40,
+        top_p: 0.95,
+        min_p: 0.0,
+        presence_penalty: 0.3,
+        frequency_penalty: 0.2,
+        repetition_penalty: 1.1,
+        seed: 7,
+    };
+    let first = prefill(&model, &mut st, &mut sc, &sampled);
+    let plain = plain_sampled(&model, &ctx, &mut st, &mut sc, first, n, &sampled);
+    let first2 = prefill(&model, &mut st, &mut sc, &sampled);
+    assert_eq!(first, first2, "the prefill's sampled draw repeats");
+    let f = speculate_forced(
+        &model,
+        &ctx,
+        &mut st,
+        &mut sc,
+        first,
+        n,
+        &sampled,
+        &plan,
+        &[6],
+        false,
+    );
+    let k = f.tokens.len().min(plain.len());
+    assert_eq!(&f.tokens[..k], &plain[..k], "forced sampled speculation");
+    assert!(f.rejected >= 1 && f.suppressed >= 1);
+}

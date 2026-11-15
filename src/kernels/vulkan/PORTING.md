@@ -31,9 +31,9 @@ one beside its `.metal` before starting.
 - **Arguments.** `arg(i)` (common.glsl) is the 64-bit GPU address of what
   Metal binds at `[[buffer(i)]]`: a `device T*` pointer (already at its
   offset), or the value of a `constant T&` param. A four-byte param (`uint`,
-  `int`, `float`) is read with `arg_u32(i)`, `arg_i32(i)` or `arg_f32(i)`
-  and in no other way: the backend may pass it by value in place of its
-  address. A larger one (a `uint4`, a struct) is read through a buffer
+  `int`, `float`) is read with `arg_u32(i)`, `arg_i32(i)` or `arg_f32(i)`:
+  params always bind by address, and those helpers load through it. A
+  larger one (a `uint4`, a struct) is read through a buffer
   reference at `arg(i)`. Read and write memory
   through the buffer references of common.glsl: `BF16(arg(0)).v[i]`,
   `U32(address).v[i]`, `F32x4(...)`, ...; declare more where a kernel has a
@@ -107,8 +107,7 @@ one beside its `.metal` before starting.
   back, round in integer math (attention_common.glsl).
   `precise` does not reach `exp` and the other extended instructions.
 - **Params are loads.** `arg(i)` is a push constant, read once per
-  dispatch; `arg_u32(i)` loads through it unless the param came by value:
-  take each once, outside loops (the compiler does not hoist the load).
+  dispatch; `arg_u32(i)` loads through it: take each once, outside loops (the compiler does not hoist the load).
 - **Templates and macros.** MSL is C++: templates, lambdas, references,
   `static inline` helpers. GLSL has none of that: functions take
   `in`/`out`/`inout` parameters, families become `#define`d constants per

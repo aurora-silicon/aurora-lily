@@ -1,6 +1,6 @@
 //! Gemma 4 on the GPU: weights mapped read-only from the GGUF, the
 //! per-session K/V caches, and the forward pass over up to
-//! [`prefill_rows`] consecutive tokens (decode is one row; verify passes
+//! [`PREFILL_ROWS`] consecutive tokens (decode is one row; verify passes
 //! up to [`MAX_ROWS`]).
 //!
 //! The graph is llama.cpp's (`src/models/gemma4.cpp`): per layer
@@ -24,22 +24,17 @@ use crate::tensor::{DType, Tensor};
 /// Rows one step takes on the GEMV path (decode, verify, scoring).
 pub const MAX_ROWS: usize = k::GEMV_MAX_ROWS;
 
-/// Rows a prompt run takes. The sliding-window layers' rings hold the
-/// window plus one run, and the scratch is sized by it: 256 rows keep the
-/// 16 GB tier's configuration (UD-IQ2_M, 8K context) under its 11 GB
-/// budget (512 rows: 10.84 GB with one checkpoint, 256: 10.71).
-pub const PREFILL_ROWS: usize = 256;
+/// The most rows a prompt run takes ([`Gemma4Model::prefill_rows`]: fewer
+/// under a memory limit, the scratch growing ~0.3 MB a row). Each routed
+/// expert's weights are decoded once a run, so longer runs pay: 4K-token
+/// prompts 2366 -> 3462 tok/s (UD-IQ2_M) and 2111 -> 3184 (UD-Q5_K_M) at
+/// 1024 rows against 256 (2026-11-15).
+pub const PREFILL_ROWS: usize = 1024;
 
-/// Rows a prompt run takes on a GPU without matrix units (an M4), where
-/// the f32 GEMMs decode each routed expert's weights once a run: twice the
-/// rows amortize that (prefill 13% faster on the J713). The 16 GB tier at
-/// 8K context then takes 10.91 GB with one checkpoint, within its budget.
-pub const PREFILL_ROWS_NO_MATRIX_UNITS: usize = 512;
-
-/// Rows a prompt run takes on `ctx`'s device.
-pub fn prefill_rows(ctx: &MetalContext) -> usize {
-    if ctx.matrix_units() { PREFILL_ROWS } else { PREFILL_ROWS_NO_MATRIX_UNITS }
-}
+/// The rows a prompt run's K/V store and attention take at a time (in
+/// turn within each layer): the sliding-window layers' rings hold the
+/// window plus this many, whatever the run.
+pub const ATTN_ROWS: usize = 256;
 
 /// The longest context lily serves Gemma at: the server's limit (positions
 /// and cache offsets fit the kernels' u32 arithmetic well past it).
@@ -109,6 +104,9 @@ pub struct Gemma4Model {
     pub draft_min_prob: f32,
     /// `--memory-limit-gb` in bytes: the footprint the server keeps to.
     pub memory_limit: Option<u64>,
+    /// Rows a prompt run takes (at most [`PREFILL_ROWS`]; scratches are
+    /// sized by it).
+    pub prefill_rows: usize,
     /// The longest context served: the file's, the server's limit, or what
     /// fits the memory limit ([`Gemma4Model::fit_context`]).
     pub context_cap: usize,
@@ -131,8 +129,7 @@ impl Gemma4Model {
     ) -> Result<Self> {
         lock()?;
         let gguf = Gguf::open(path)?;
-        let mut cfg = Config::from_gguf(&gguf)?;
-        cfg.prefill_rows = prefill_rows(ctx);
+        let cfg = Config::from_gguf(&gguf)?;
         ensure!(
             gguf.tensor("output.weight").is_none(),
             "an untied output.weight (lily ties the head to token_embd as Gemma does)"
@@ -203,6 +200,7 @@ impl Gemma4Model {
             draft_min_prob: 0.0,
             memory_limit: None,
             acquire_reserve: None,
+            prefill_rows: PREFILL_ROWS,
         })
     }
 
@@ -214,6 +212,12 @@ impl Gemma4Model {
     /// The token embedding (also the head).
     pub(crate) fn embed(&self) -> &QWeight {
         &self.embed
+    }
+
+    /// Layer `il`'s K norm weight (attention reads the keys its K cache
+    /// leaves out as V times it).
+    pub(crate) fn k_norm(&self, il: usize) -> &Tensor {
+        &self.layers[il].k_norm
     }
 
     /// The layer whose caches the draft model's sliding-window (or global)
@@ -235,13 +239,13 @@ impl Gemma4Model {
     }
 
     pub fn new_scratch(&self, ctx: &MetalContext, capacity: usize) -> Result<Scratch> {
-        Scratch::new(ctx, &self.cfg, capacity)
+        Scratch::new(ctx, &self.cfg, capacity, self.prefill_rows)
     }
 }
 
 /// Slots of a sliding-window layer's ring.
 pub fn ring_slots(cfg: &Config) -> usize {
-    cfg.window + cfg.prefill_rows
+    cfg.window + ATTN_ROWS
 }
 
 /// GPU bytes of one session's caches for `capacity` tokens (the global
@@ -251,7 +255,7 @@ pub fn session_bytes(cfg: &Config, capacity: usize, checkpoints: usize) -> u64 {
     let per_row = |swa: bool| -> usize {
         (0..cfg.n_layer)
             .filter(|&il| cfg.swa[il] == swa)
-            .map(|il| 4 * cfg.kv_width(il))
+            .map(|il| 2 * (cfg.k_cache_width(il) + cfg.kv_width(il)))
             .sum()
     };
     // Each snapshot also keeps the draft model's input (4 B a hidden value).
@@ -267,13 +271,14 @@ pub fn session_bytes(cfg: &Config, capacity: usize, checkpoints: usize) -> u64 {
 pub fn session_peak(cfg: &Config, capacity: usize, checkpoints: usize) -> u64 {
     let widest = (0..cfg.n_layer)
         .filter(|&il| !cfg.swa[il])
-        .map(|il| cfg.kv_width(il))
+        .map(|il| cfg.k_cache_width(il) + cfg.kv_width(il))
         .max()
         .unwrap_or(0);
-    session_bytes(cfg, capacity, checkpoints) + (4 * widest * capacity) as u64
+    session_bytes(cfg, capacity, checkpoints) + (2 * widest * capacity) as u64
 }
 
-/// One layer's K and V caches, f16 `[slots][kv heads][head dim]`.
+/// One layer's K and V caches, f16 `[slots][kv heads][head dim]` (K: the
+/// layer's `Config::k_rot` pairs a head).
 pub struct LayerCache {
     pub k: Tensor,
     pub v: Tensor,
@@ -315,10 +320,9 @@ impl Gemma4State {
             .map(|il| -> Result<LayerCache> {
                 let swa = cfg.swa[il];
                 let slots = if swa { ring_slots(cfg) } else { capacity };
-                let n = slots * cfg.kv_width(il);
                 Ok(LayerCache {
-                    k: Tensor::zeros(ctx, &[n], DType::F16)?,
-                    v: Tensor::zeros(ctx, &[n], DType::F16)?,
+                    k: Tensor::zeros(ctx, &[slots * cfg.k_cache_width(il)], DType::F16)?,
+                    v: Tensor::zeros(ctx, &[slots * cfg.kv_width(il)], DType::F16)?,
                     slots,
                     swa,
                 })
@@ -342,11 +346,15 @@ impl Gemma4State {
     }
 }
 
-/// Per-step intermediates for up to `cfg.prefill_rows` rows.
+/// Per-step intermediates for up to `rows` rows.
 pub struct Scratch {
+    /// The rows a run may take.
+    rows: usize,
     pub tokens: Tensor,
     pub x: Tensor,
     h: Tensor,
+    /// BF16: a prompt run's projection input (the bfloat-input GEMMs').
+    xb: Tensor,
     q: Tensor,
     kv: Tensor,
     vraw: Tensor,
@@ -382,9 +390,11 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    /// Scratch for states of up to `capacity` tokens.
-    pub fn new(ctx: &MetalContext, cfg: &Config, capacity: usize) -> Result<Self> {
-        let m = cfg.prefill_rows;
+    /// Scratch for states of up to `capacity` tokens and runs of up to
+    /// `rows` rows.
+    pub fn new(ctx: &MetalContext, cfg: &Config, capacity: usize, rows: usize) -> Result<Self> {
+        ensure!((MAX_ROWS..=PREFILL_ROWS).contains(&rows), "runs of {rows} rows");
+        let m = rows;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let h = cfg.hidden;
         let chunks = capacity.max(1).div_ceil(g4::ATTN_CHUNK);
@@ -395,37 +405,57 @@ impl Scratch {
             chunks,
         );
         let logits = f(MAX_ROWS * cfg.vocab)?;
+        // One pool for the attention's q, qo, heads and raw K/V and the
+        // grouped experts' f32 outputs: the experts run after the attention
+        // output projection has read heads, and the next layer's q waits
+        // for the experts (each ~0.1 MB a run row).
+        let (qw, kvw) = (cfg.max_q_width(), cfg.max_kv_width());
+        let moe = g4::MoeGroupScratch::pool_len(m, cfg.n_expert_used, cfg.ff_expert, h);
+        let pool = f((3 * m * qw + 2 * m * kvw).max(moe))?;
+        // Within a layer: h (its input) is dead from the projections to
+        // the FFN's end, so it holds the attention output; n1 and t are
+        // dead after the dense gate/up and the router read them, so they
+        // hold the dense MLP's and the experts' outputs; GeGLU writes its
+        // gate in place.
+        let (hb, n1, t, g) = (f(m * h)?, f(m * h)?, f(m * h)?, f(m * cfg.ff)?);
         Ok(Self {
+            rows: m,
             logits_last: logits.view(0, &[cfg.vocab])?,
             tokens: Tensor::zeros(ctx, &[m], DType::U32)?,
             x: f(m * h)?,
-            h: f(m * h)?,
-            q: f(m * cfg.max_q_width())?,
-            kv: f(m * cfg.max_kv_width())?,
-            vraw: f(m * cfg.max_kv_width())?,
-            qo: f(m * cfg.max_q_width())?,
-            heads: f(m * cfg.max_q_width())?,
-            attn: f(m * h)?,
+            h: hb.clone(),
+            xb: Tensor::zeros(
+                ctx,
+                &[m * cfg.max_q_width().max(cfg.ff).max(h)],
+                DType::BF16,
+            )?,
+            q: pool.view(0, &[m * qw])?,
+            kv: pool.view(3 * m * qw, &[m * kvw])?,
+            vraw: pool.view(3 * m * qw + m * kvw, &[m * kvw])?,
+            qo: pool.view(m * qw, &[m * qw])?,
+            heads: pool.view(2 * m * qw, &[m * qw])?,
+            attn: hb,
             r: f(m * h)?,
-            n1: f(m * h)?,
             n2: f(m * h)?,
-            t: f(m * h)?,
-            g: f(m * cfg.ff)?,
             u: f(m * cfg.ff)?,
-            mid: f(m * cfg.ff)?,
-            m1: f(m * h)?,
-            m2: f(m * h)?,
+            mid: g.clone(),
+            g,
+            m1: t.clone(),
+            m2: n1.clone(),
+            n1,
+            t,
             rlogits: f(m * cfg.n_expert)?,
             sel: Tensor::zeros(ctx, &[m * cfg.n_expert_used], DType::U32)?,
             rw: f(m * cfg.n_expert_used)?,
             emid: f(MAX_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
-            moe_group: g4::MoeGroupScratch::new(
+            moe_group: g4::MoeGroupScratch::in_pool(
                 ctx,
                 m,
                 cfg.n_expert_used,
                 cfg.n_expert,
                 cfg.ff_expert,
                 h,
+                &pool,
             )?,
             partial: f(partial)?,
             chunks,
@@ -437,14 +467,10 @@ impl Scratch {
         })
     }
 
-    /// Stages a run's token ids (at most the configuration's
-    /// `prefill_rows`, each in the vocabulary).
+    /// Stages a run's token ids (at most the scratch's rows, each in the
+    /// vocabulary).
     pub(crate) fn stage_tokens(&self, tokens: &[u32]) -> Result<()> {
-        ensure!(
-            tokens.len() <= self.tokens.numel(),
-            "a run of {} tokens",
-            tokens.len()
-        );
+        ensure!(tokens.len() <= self.rows, "a run of {} tokens", tokens.len());
         check_tokens(tokens, self.vocab)?;
         crate::glm53::model::write_words(&self.tokens, tokens)
     }
@@ -496,13 +522,28 @@ impl Gemma4Model {
         &self,
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
+        sc: &Scratch,
         sets: &[(&QWeight, &Tensor)],
         x: &Tensor,
         m: usize,
     ) -> Result<()> {
         if m > MAX_ROWS {
+            // The input once as bfloat for the weights the bfloat-input
+            // GEMM takes (the same products as the f32-input one, which
+            // rounds X in every column tile): UD-IQ2_M's 4K prompt
+            // 2115 -> 2378 tok/s, 2026-11-15.
+            let cols = sets[0].0.cols;
+            let bx = sets.iter().all(|(w, _)| w.cols == cols && k::gemm_bx_takes(w));
+            if bx {
+                k::to_bf16(ctx, pass, x, &sc.xb, m * cols)?;
+                pass.memory_barrier()?;
+            }
             for &(w, y) in sets {
-                k::gemm(ctx, pass, w, x, y, m)?;
+                if bx {
+                    k::gemm_bx(ctx, pass, w, &sc.xb, y, m)?;
+                } else {
+                    k::gemm(ctx, pass, w, x, y, m)?;
+                }
             }
             return Ok(());
         }
@@ -519,7 +560,7 @@ impl Gemma4Model {
         Ok(())
     }
 
-    /// Feeds `tokens` (at most `cfg.prefill_rows`) at the state's position,
+    /// Feeds `tokens` (at most the scratch's rows) at the state's position,
     /// computes the logits `logits` asks for, and advances the state.
     pub fn forward(
         &self,
@@ -595,7 +636,7 @@ impl Gemma4Model {
     ) -> Result<()> {
         let cfg = &self.cfg;
         let pos0 = st.pos;
-        ensure!((1..=cfg.prefill_rows).contains(&m), "step of {m} rows");
+        ensure!((1..=sc.rows).contains(&m), "step of {m} rows");
         ensure!(logits != Logits::All || m <= MAX_ROWS, "logits of {m} rows");
         ensure!(
             pos0 + m <= st.capacity,
@@ -656,11 +697,12 @@ impl Gemma4Model {
             Some(v) => self.proj(
                 ctx,
                 pass,
+                sc,
                 &[(&l.q, &sc.q), (&l.k, &sc.kv), (v, &sc.vraw)],
                 &sc.h,
                 m,
             )?,
-            None => self.proj(ctx, pass, &[(&l.q, &sc.q), (&l.k, &sc.kv)], &sc.h, m)?,
+            None => self.proj(ctx, pass, sc, &[(&l.q, &sc.q), (&l.k, &sc.kv)], &sc.h, m)?,
         }
         pass.memory_barrier()?;
         let a = AttnShape {
@@ -671,44 +713,48 @@ impl Gemma4Model {
             window: if c.swa { cfg.window } else { 0 },
             k_cache: &c.k,
             v_cache: &c.v,
+            k_rot: cfg.k_rot[il],
+            k_norm: &l.k_norm,
         };
-        g4::qkv(
-            ctx,
-            pass,
-            &a,
-            &sc.q,
-            &sc.kv,
-            if l.v.is_some() { &sc.vraw } else { &sc.kv },
-            kw,
-            0,
-            &l.q_norm,
-            &l.k_norm,
-            (!c.swa).then_some(&self.rope_freqs),
-            &sc.qo,
-            pos0,
-            m,
-            cfg.rope_base_of(il),
-            eps,
-        )?;
-        pass.memory_barrier()?;
-        ensure!(
-            m > MAX_ROWS || g4::attn_chunks(&a, pos0, m) <= sc.chunks,
-            "attention past the scratch's {} chunks",
-            sc.chunks
-        );
-        g4::attention(
-            ctx,
-            pass,
-            &a,
-            &sc.qo,
-            &sc.partial,
-            &sc.heads,
-            pos0,
-            m,
-            MAX_ROWS,
-        )?;
-        pass.memory_barrier()?;
-        self.proj(ctx, pass, &[(&l.o, &sc.attn)], &sc.heads, m)?;
+        // A prompt run's K/V store and attention in turns of ATTN_ROWS rows
+        // (a ring holds the window and one turn); its projections whole.
+        let (qw, d) = (cfg.q_width(il), cfg.head_dim_of(il));
+        let turn = if m > MAX_ROWS { ATTN_ROWS } else { m };
+        for off in (0..m).step_by(turn) {
+            let n = turn.min(m - off);
+            let rows = |t: &Tensor, w: usize| t.view(off * w, &[n * w]);
+            let (q, qo, heads) = (rows(&sc.q, qw)?, rows(&sc.qo, qw)?, rows(&sc.heads, qw)?);
+            let k_raw = rows(&sc.kv, kw)?;
+            let v_raw = if l.v.is_some() { rows(&sc.vraw, kw)? } else { k_raw.clone() };
+            g4::qkv(
+                ctx,
+                pass,
+                &a,
+                &q,
+                &k_raw,
+                &v_raw,
+                kw,
+                0,
+                &l.q_norm,
+                &l.k_norm,
+                (!c.swa).then_some(&self.rope_freqs),
+                &qo,
+                pos0 + off,
+                n,
+                cfg.rope_base_of(il),
+                eps,
+            )?;
+            pass.memory_barrier()?;
+            ensure!(
+                n > MAX_ROWS || g4::attn_chunks(&a, pos0 + off, n) <= sc.chunks,
+                "attention past the scratch's {} chunks",
+                sc.chunks
+            );
+            debug_assert_eq!(qw, cfg.n_head * d);
+            g4::attention(ctx, pass, &a, &qo, &sc.partial, &heads, pos0 + off, n, MAX_ROWS)?;
+            pass.memory_barrier()?;
+        }
+        self.proj(ctx, pass, sc, &[(&l.o, &sc.attn)], &sc.heads, m)?;
         pass.memory_barrier()?;
         // The residual, and the inputs of the dense MLP, the routed
         // experts and the router.
@@ -726,8 +772,8 @@ impl Gemma4Model {
             eps,
         )?;
         pass.memory_barrier()?;
-        self.proj(ctx, pass, &[(&l.gate, &sc.g), (&l.up, &sc.u)], &sc.n1, m)?;
-        self.proj(ctx, pass, &[(&l.router, &sc.rlogits)], &sc.t, m)?;
+        self.proj(ctx, pass, sc, &[(&l.gate, &sc.g), (&l.up, &sc.u)], &sc.n1, m)?;
+        self.proj(ctx, pass, sc, &[(&l.router, &sc.rlogits)], &sc.t, m)?;
         pass.memory_barrier()?;
         g4::geglu(ctx, pass, &sc.g, &sc.u, &sc.mid, m * cfg.ff)?;
         g4::router(
@@ -742,7 +788,7 @@ impl Gemma4Model {
             cfg.n_expert_used,
         )?;
         pass.memory_barrier()?;
-        self.proj(ctx, pass, &[(&l.down, &sc.m1)], &sc.mid, m)?;
+        self.proj(ctx, pass, sc, &[(&l.down, &sc.m1)], &sc.mid, m)?;
         if m > MAX_ROWS {
             // A prompt run: grouped by expert on the matrix units.
             g4::moe_grouped(
@@ -830,7 +876,7 @@ impl Gemma4Model {
         Ok(())
     }
 
-    /// Feeds a whole prompt in runs of `cfg.prefill_rows`, leaving the last
+    /// Feeds a whole prompt in runs of `prefill_rows`, leaving the last
     /// row's logits.
     pub fn prefill(
         &self,
@@ -840,9 +886,8 @@ impl Gemma4Model {
         tokens: &[u32],
     ) -> Result<()> {
         ensure!(!tokens.is_empty(), "empty prefill");
-        let rows = self.cfg.prefill_rows;
-        let n = tokens.len().div_ceil(rows);
-        for (i, chunk) in tokens.chunks(rows).enumerate() {
+        let n = tokens.len().div_ceil(self.prefill_rows);
+        for (i, chunk) in tokens.chunks(self.prefill_rows).enumerate() {
             let l = if i + 1 == n { Logits::Last } else { Logits::None };
             self.forward(ctx, st, sc, chunk, l)
                 .with_context(|| format!("prefill run {i} at {}", st.pos))?;

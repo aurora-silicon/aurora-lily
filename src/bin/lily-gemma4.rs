@@ -70,6 +70,18 @@ enum Cmd {
         #[arg(long, default_value_t = 24)]
         steps: usize,
     },
+    /// The context `--memory-limit-gb` fits, loading as the server does
+    /// (prints the load's fit line): `checkpoints` snapshots a session.
+    Fit {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        memory_limit_gb: f64,
+        #[arg(long, default_value_t = 0)]
+        drafts: usize,
+        #[arg(long, default_value_t = 1)]
+        checkpoints: usize,
+    },
     /// GPU memory of a configuration: the loaded weights, the scratch and
     /// one session for `ctx` tokens with `checkpoints` snapshots, exactly
     /// (the backend's allocation counter).
@@ -96,6 +108,9 @@ enum Cmd {
         n: usize,
         #[arg(long, default_value_t = 2)]
         runs: usize,
+        /// Rows a prompt run takes (default: the model's, 1024).
+        #[arg(long)]
+        prefill_rows: Option<usize>,
     },
     /// Greedy speculative decoding with the draft model (a gemma4-assistant
     /// GGUF beside the model) through the engine interface, against plain
@@ -150,8 +165,25 @@ fn run() -> Result<()> {
             state_check(&model, &cases, n, steps)
         }
         Cmd::Mem { model, ctx, checkpoints } => mem(&model, ctx, checkpoints),
-        Cmd::Bench { model, text, prompt_len, n, runs } => {
-            bench(&model, &text, prompt_len, n, runs)
+        Cmd::Fit { model, memory_limit_gb, drafts, checkpoints } => {
+            use lily::engine::{LanguageModel, LoadOptions};
+            let ctx = MetalContext::new()?;
+            let options = LoadOptions {
+                mtp_drafts: drafts,
+                memory_limit: Some((memory_limit_gb * (1u64 << 30) as f64) as u64),
+                session_checkpoints: Some(checkpoints),
+                ..Default::default()
+            };
+            let m = <Gemma4Model as LanguageModel>::load(&ctx, &model, &options)?;
+            println!(
+                "fit: context {} tokens, drafts {}",
+                m.context_cap,
+                m.max_drafts()
+            );
+            Ok(())
+        }
+        Cmd::Bench { model, text, prompt_len, n, runs, prefill_rows } => {
+            bench(&model, &text, prompt_len, n, runs, prefill_rows)
         }
     }
 }
@@ -469,6 +501,7 @@ fn bench(
     prompt_len: usize,
     n: usize,
     runs: usize,
+    prefill_rows: Option<usize>,
 ) -> Result<()> {
     let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
     let text = std::fs::read_to_string(text)?;
@@ -478,7 +511,10 @@ fn bench(
     ensure!(body.len() + ids.len() >= prompt_len, "text has {} tokens", body.len());
     ids.extend_from_slice(&body[..prompt_len - ids.len()]);
     let ctx = MetalContext::new()?;
-    let model = Gemma4Model::load(&ctx, path)?;
+    let mut model = Gemma4Model::load(&ctx, path)?;
+    if let Some(r) = prefill_rows {
+        model.prefill_rows = r;
+    }
     let vocab = model.cfg.vocab;
     let sc = model.new_scratch(&ctx, prompt_len + n + 8)?;
     for run in 0..runs {

@@ -519,5 +519,389 @@ fn moe_down_matches_glm53() {
             .unwrap();
         });
         assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-5, 1e-4);
+        // The wide kernel (8 slots of 512) against the lane-walk one: the
+        // same sums regrouped.
+        if ff == 512 {
+            let c = zeros(&ctx, m * hidden, DType::F32);
+            run(&ctx, |p| {
+                moe_down_with(&ctx, p, &dw, hidden, &mid, &tsel, &c, m, used, false)
+                    .unwrap()
+            });
+            assert_close(&a.to_f32().unwrap(), &c.to_f32().unwrap(), 1e-5, 1e-5);
+        }
     }
+}
+
+/// The fused residual + RMSNorm kernels against glm53::add / ffn_residual
+/// then glm53::rmsnorm: the same bits in x and the normed rows.
+#[test]
+fn residual_norm_matches_add_then_rmsnorm() {
+    use crate::kernels::glm53::{add, rmsnorm};
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(79);
+    for (m, h) in [(1, 2048), (3, 2048), (2, 2048)] {
+        let x = f32s(&mut rng, m * h, -3.0, 3.0);
+        let a = f32s(&mut rng, m * h, -1.0, 1.0);
+        let sh = f32s(&mut rng, m * h, -1.0, 1.0);
+        let g = f32s(&mut rng, m, -2.0, 2.0);
+        let w = tensor(&ctx, &f32s(&mut rng, h, 0.5, 1.5));
+        for fused_shared in [false, true] {
+            let (xa, xb) = (tensor(&ctx, &x), tensor(&ctx, &x));
+            let (at, st, gt) = (tensor(&ctx, &a), tensor(&ctx, &sh), tensor(&ctx, &g));
+            let (oa, ob) =
+                (zeros(&ctx, m * h, DType::F32), zeros(&ctx, m * h, DType::F32));
+            run(&ctx, |p| {
+                if fused_shared {
+                    ffn_residual(&ctx, p, &xa, &at, &st, &gt, m, h).unwrap();
+                } else {
+                    add(&ctx, p, &xa, &at, &xa, m * h).unwrap();
+                }
+                p.memory_barrier().unwrap();
+                rmsnorm(&ctx, p, &xa, Some(&w), &oa, m, h, 1e-6).unwrap();
+                let shared = fused_shared.then_some((&st, &gt));
+                residual_norm(&ctx, p, &xb, &at, shared, &w, &ob, m, h, 1e-6).unwrap();
+            });
+            // And the norm alone, over the new rows.
+            let oc = zeros(&ctx, m * h, DType::F32);
+            run(&ctx, |p| super::rmsnorm(&ctx, p, &xa, &w, &oc, m, h, 1e-6).unwrap());
+            // The residual bit for bit; the normed rows within 1e-6 (the
+            // sum of squares of glm53_rmsnorm's runtime loop and of these
+            // unrolled ones round differently: a row's scale moves by ulps).
+            let (u, v) = (xa.to_f32().unwrap(), xb.to_f32().unwrap());
+            for (k, (p, q)) in u.iter().zip(&v).enumerate() {
+                assert_eq!(p.to_bits(), q.to_bits(), "x m {m} {fused_shared} at {k}");
+            }
+            let want = oa.to_f32().unwrap();
+            assert_close(&ob.to_f32().unwrap(), &want, 1e-6, 1e-6);
+            assert_close(&oc.to_f32().unwrap(), &want, 1e-6, 1e-6);
+        }
+    }
+}
+
+/// The one-level GDN step (then its conv window moved in a later level)
+/// against the conv, scan and out kernels, with value heads sharing key
+/// heads (h and h + HK read the same q and k conv channels): chains
+/// of steps of 1 to 4 rows carrying the window and state from step to step,
+/// with snapshots at row 0 and later rows, the whole chain repeated. Every
+/// step's y, window, state and snapshots the same bits. A step that moved
+/// the shared window while a sharing head still read it would part here.
+#[test]
+fn gdn_step_matches_gdn_bitwise() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(83);
+    // The model's 16 key and 32 value heads, and 160 value heads over 16 key
+    // heads: more threadgroups of 1024 than the GPU holds at once, so later
+    // ones start after earlier ones finished (a step that moved the shared
+    // window would then feed later heads a moved window).
+    for (hk, h) in [(16, 32), (16, 160)] {
+        let eps = 1e-6f32;
+        let ch = (2 * hk + h) * GDN_DIM;
+        let inner = h * GDN_DIM;
+        let t = |v: &[f32]| tensor(&ctx, v);
+        let w = t(&f32s(&mut rng, 4 * ch, -0.5, 0.5));
+        let ssm_a = t(&f32s(&mut rng, h, -2.0, -0.1));
+        let dt = t(&f32s(&mut rng, h, -1.0, 1.0));
+        let norm = t(&f32s(&mut rng, GDN_DIM, 0.5, 1.5));
+        let p = GdnParams { conv_w: &w, ssm_a: &ssm_a, dt_bias: &dt, norm: &norm };
+        let conv0 = f32s(&mut rng, 3 * ch, -1.0, 1.0);
+        let s0 = f32s(&mut rng, h * GDN_DIM * GDN_DIM, -0.1, 0.1);
+        let bits = |a: &Tensor, b: &Tensor, what: &str| {
+            let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+            for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "{what} at {k}: {x} vs {y}");
+            }
+        };
+        // (rows, snapshot row) of each step of a chain.
+        let chain = [(1, 0), (2, 0), (1, 0), (4, 0), (3, 1), (2, 1), (1, 0), (4, 2)];
+        for round in 0..3 {
+            let (c1, s1, c2, s2) = (t(&conv0), t(&s0), t(&conv0), t(&s0));
+            for (step, &(m, row)) in chain.iter().enumerate() {
+                let qkv = t(&f32s(&mut rng, m * ch, -1.0, 1.0));
+                let a = t(&f32s(&mut rng, m * h, -2.0, 2.0));
+                let b = t(&f32s(&mut rng, m * h, -2.0, 2.0));
+                let z = t(&f32s(&mut rng, m * inner, -2.0, 2.0));
+                let snaps = || {
+                    (zeros(&ctx, 3 * ch, DType::F32), zeros(&ctx, s0.len(), DType::F32))
+                };
+                let ((sc1, ss1), (sc2, ss2)) = (snaps(), snaps());
+                let (y1, y2) = (
+                    zeros(&ctx, m * inner, DType::F32),
+                    zeros(&ctx, m * inner, DType::F32),
+                );
+                let c = zeros(&ctx, m * ch, DType::F32);
+                let o = zeros(&ctx, m * inner, DType::F32);
+                run(&ctx, |pass| {
+                    let st = GdnState { conv: &c1, s: &s1 };
+                    let snap = GdnSnapshot { row, conv: &sc1, s: &ss1 };
+                    gdn(
+                        &ctx,
+                        pass,
+                        &p,
+                        &st,
+                        Some(&snap),
+                        &qkv,
+                        &a,
+                        &b,
+                        &z,
+                        &c,
+                        &o,
+                        &y1,
+                        m,
+                        hk,
+                        eps,
+                    )
+                    .unwrap();
+                    let st = GdnState { conv: &c2, s: &s2 };
+                    let snap = GdnSnapshot { row, conv: &sc2, s: &ss2 };
+                    gdn_step(
+                        &ctx,
+                        pass,
+                        &p,
+                        &st,
+                        Some(&snap),
+                        &qkv,
+                        &a,
+                        &b,
+                        &z,
+                        &y2,
+                        m,
+                        hk,
+                        eps,
+                    )
+                    .unwrap();
+                    pass.memory_barrier().unwrap();
+                    gdn_conv_window(&ctx, pass, &p, &st, Some(&snap), &qkv, m).unwrap();
+                });
+                let at =
+                    format!("round {round} step {step} (m {m}, snapshot row {row})");
+                bits(&y1, &y2, &format!("{at} y"));
+                bits(&c1, &c2, &format!("{at} window"));
+                bits(&s1, &s2, &format!("{at} state"));
+                bits(&sc1, &sc2, &format!("{at} snapshot window"));
+                bits(&ss1, &ss2, &format!("{at} snapshot state"));
+            }
+        }
+    }
+}
+
+/// The K = 2048 gate/up kernels against GLM's: the same bits.
+#[test]
+fn moe_gate_up_matches_glm53_bitwise() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(80);
+    let (experts, hidden, ff, used) = (12, 2048, 512, 8);
+    for (ty, m) in [(GgmlType::Q4K, 1), (GgmlType::Q4K, 3), (GgmlType::Q8_0, 2)] {
+        let q = |rng: &mut StdRng| {
+            let raw = random_blocks(rng, ty, hidden * experts * ff);
+            QWeight::from_bytes(&ctx, &raw, ty, hidden, experts * ff).unwrap()
+        };
+        let (gw, uw) = (q(&mut rng), q(&mut rng));
+        let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+        let sel: Vec<u32> =
+            (0..m * used).map(|p| ((p * 5 + 1) % experts) as u32).collect();
+        let tsel = u32s(&ctx, &sel);
+        let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+        let a = zeros(&ctx, m * used * ff, DType::F32);
+        let b = zeros(&ctx, m * used * ff, DType::F32);
+        run(&ctx, |p| {
+            moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &a, m, used).unwrap();
+            crate::kernels::glm53::moe_gate_up(
+                &ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &b, m, used, 0.0,
+            )
+            .unwrap();
+        });
+        let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+        for (k, (u, v)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(
+                u.to_bits(),
+                v.to_bits(),
+                "{ty:?} m {m} element {k}: {u} vs {v}"
+            );
+        }
+    }
+}
+
+/// The one-subgroup router against the 256-thread one: the same picks and
+/// weights, bit for bit, ties and a non-finite row included.
+#[test]
+fn router_sg_matches_router_bitwise() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(84);
+    let (m, e, k) = (5, 256, 8);
+    let mut l = f32s(&mut rng, m * e, -6.0, 6.0);
+    l[10] = l[20];
+    l[256 + 5] = 30.0;
+    l[256 + 6] = 30.0;
+    l[2 * 256 + 7] = f32::NAN;
+    let lt = tensor(&ctx, &l);
+    let (sa, sb) = (zeros(&ctx, m * k, DType::U32), zeros(&ctx, m * k, DType::U32));
+    let (wa, wb) = (zeros(&ctx, m * k, DType::F32), zeros(&ctx, m * k, DType::F32));
+    run(&ctx, |p| {
+        router(&ctx, p, &lt, &sa, &wa, m, e, k).unwrap();
+        router_sg(&ctx, p, &lt, &sb, &wb, m).unwrap();
+    });
+    assert_eq!(sa.to_u32().unwrap(), sb.to_u32().unwrap());
+    let (wa, wb) = (wa.to_f32().unwrap(), wb.to_f32().unwrap());
+    for (i, (a, b)) in wa.iter().zip(&wb).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "weight {i}: {a} vs {b}");
+    }
+}
+
+/// The K-split Q8_0 GEMV of rows of 4096 against GLM's (sums regrouped) for
+/// 1 to 4 activation rows, and each row of a multi-row dispatch the same
+/// bits as that row alone (a verify row is a decode step's).
+#[test]
+fn gemv_q8_0_k4096_matches_glm53() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(87);
+    let (cols, rows) = (4096, 2050);
+    let raw = random_blocks(&mut rng, GgmlType::Q8_0, rows * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap();
+    let xs = f32s(&mut rng, 4 * cols, -2.0, 2.0);
+    let one: Vec<Vec<f32>> = (0..4)
+        .map(|i| {
+            let x = tensor(&ctx, &xs[i * cols..(i + 1) * cols]);
+            let y = zeros(&ctx, rows, DType::F32);
+            run(&ctx, |p| gemv_q8_0_k4096(&ctx, p, &w, &x, &y, 1).unwrap());
+            y.to_f32().unwrap()
+        })
+        .collect();
+    for m in 1..=4 {
+        let x = tensor(&ctx, &xs[..m * cols]);
+        let (a, b) =
+            (zeros(&ctx, m * rows, DType::F32), zeros(&ctx, m * rows, DType::F32));
+        run(&ctx, |p| {
+            gemv_q8_0_k4096(&ctx, p, &w, &x, &a, m).unwrap();
+            crate::kernels::glm53::gemv(&ctx, p, &w, &x, &b, m).unwrap();
+        });
+        let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+        assert_close(&a, &b, 1e-5, 1e-5);
+        for (i, row) in one.iter().enumerate().take(m) {
+            let got = &a[i * rows..(i + 1) * rows];
+            for (k, (u, v)) in got.iter().zip(row).enumerate() {
+                assert_eq!(u.to_bits(), v.to_bits(), "m {m} row {i} output {k}");
+            }
+        }
+    }
+}
+
+/// Attention decode in splits of 64 keys against the default route: at the
+/// split boundaries (64, 65, 128, 129 keys), longer contexts, and with the
+/// production scratch (128 splits) at 8192 keys (the last it takes) and
+/// 8193 (where it falls back), cache rows past the context poisoned with
+/// NaN (a read past the context would show).
+#[test]
+fn sdpa_decode_split64_matches_sdpa_decode() {
+    use crate::kernels::attention::{
+        KvCache, KvFormat, MAX_SEQ, scatter_kv, sdpa_decode, sdpa_decode_split64,
+        sdpa_split_scratch_splits,
+    };
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(88);
+    let (nq, kvh, d) = (16, 2, 256);
+    // The model's scratch: splits for MAX_SEQ.
+    let splits = sdpa_split_scratch_splits(MAX_SEQ);
+    let partials = zeros(&ctx, nq * splits * d, DType::F32);
+    let stats = zeros(&ctx, nq * splits * 2, DType::F32);
+    for (cap, lens) in
+        [(2048, vec![64, 65, 128, 129, 300, 1100, 2000]), (8196, vec![8192, 8193])]
+    {
+        let kc = KvCache::zeros(&ctx, KvFormat::Bf16, kvh, cap, d).unwrap();
+        let vc = KvCache::zeros(&ctx, KvFormat::Bf16, kvh, cap, d).unwrap();
+        let nan = Tensor::from_f32_as_bf16(
+            &ctx,
+            &vec![f32::NAN; cap * kvh * d],
+            &[cap, kvh, d],
+        )
+        .unwrap();
+        for len in lens {
+            let kr = Tensor::from_f32_as_bf16(
+                &ctx,
+                &f32s(&mut rng, len * kvh * d, -1.0, 1.0),
+                &[len, kvh, d],
+            )
+            .unwrap();
+            let vr = Tensor::from_f32_as_bf16(
+                &ctx,
+                &f32s(&mut rng, len * kvh * d, -1.0, 1.0),
+                &[len, kvh, d],
+            )
+            .unwrap();
+            let q = Tensor::from_f32_as_bf16(
+                &ctx,
+                &f32s(&mut rng, nq * d, -1.0, 1.0),
+                &[nq, d],
+            )
+            .unwrap();
+            let a = zeros(&ctx, nq * d, DType::BF16);
+            let b = zeros(&ctx, nq * d, DType::BF16);
+            run(&ctx, |p| {
+                scatter_kv(&ctx, p, &kc, &nan, 0).unwrap();
+                scatter_kv(&ctx, p, &vc, &nan, 0).unwrap();
+                p.memory_barrier().unwrap();
+                scatter_kv(&ctx, p, &kc, &kr, 0).unwrap();
+                scatter_kv(&ctx, p, &vc, &vr, 0).unwrap();
+                p.memory_barrier().unwrap();
+                sdpa_decode_split64(
+                    &ctx,
+                    p,
+                    &q,
+                    &kc,
+                    &vc,
+                    &a,
+                    len,
+                    0.0625,
+                    (&partials, &stats),
+                )
+                .unwrap();
+                p.memory_barrier().unwrap();
+                sdpa_decode(
+                    &ctx,
+                    p,
+                    &q,
+                    &kc,
+                    &vc,
+                    &b,
+                    len,
+                    0.0625,
+                    Some((&partials, &stats)),
+                )
+                .unwrap();
+            });
+            let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+            assert!(a.iter().all(|v| v.is_finite()), "{len} keys: a non-finite output");
+            // bfloat outputs.
+            assert_close(&a, &b, 1e-2, 1e-2);
+        }
+    }
+}
+
+/// The one-subgroup router refuses tensors of the wrong type or too short
+/// for its rows (it reads 256 logits and writes 8 picks a row).
+#[test]
+fn router_sg_rejects_malformed_tensors() {
+    let ctx = ctx();
+    let m = 3;
+    let logits = zeros(&ctx, m * 256, DType::F32);
+    let sel = zeros(&ctx, m * 8, DType::U32);
+    let w = zeros(&ctx, m * 8, DType::F32);
+    let pass = ctx.begin().unwrap();
+    assert!(router_sg(&ctx, &pass, &logits, &sel, &w, m).is_ok());
+    let short_logits = zeros(&ctx, m * 256 - 1, DType::F32);
+    let short_sel = zeros(&ctx, m * 8 - 1, DType::U32);
+    let short_w = zeros(&ctx, m * 8 - 1, DType::F32);
+    let bf_logits = zeros(&ctx, m * 256, DType::BF16);
+    let f_sel = zeros(&ctx, m * 8, DType::F32);
+    let u_w = zeros(&ctx, m * 8, DType::U32);
+    for (name, l, s, ww) in [
+        ("short logits", &short_logits, &sel, &w),
+        ("short selection", &logits, &short_sel, &w),
+        ("short weights", &logits, &sel, &short_w),
+        ("bf16 logits", &bf_logits, &sel, &w),
+        ("f32 selection", &logits, &f_sel, &w),
+        ("u32 weights", &logits, &sel, &u_w),
+    ] {
+        assert!(router_sg(&ctx, &pass, l, s, ww, m).is_err(), "{name} accepted");
+    }
+    pass.commit_wait().unwrap();
 }

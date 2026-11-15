@@ -13,8 +13,8 @@
 //! - **Arguments** bind by GPU address, as on Metal 4: a dispatch's buffer
 //!   and param addresses, with its thread grid, are its push constants
 //!   (`common.glsl`), which the compiler reads once per dispatch, not per
-//!   thread. A four-byte host param can travel as its value in place of an
-//!   address ([`INLINE_PARAMS`]).
+//!   thread. A host param travels by the address of its copy in the pass's
+//!   arena.
 //! - **Ordering.** Dispatches of one command buffer overlap unless a barrier
 //!   separates them (Honeykrisp encodes a barrier in the compute stream), so
 //!   serial passes place one after every dispatch and concurrent passes at
@@ -105,19 +105,10 @@ const PARAM_ALIGN: usize = 16;
 /// First arena chunk; a pass that outgrows it gets a larger one appended.
 const ARENA_CHUNK: usize = 1 << 20;
 
-/// The push constants of every kernel (`common.glsl`): the thread grid, the
-/// mask of the arguments that are values, and the arguments.
+/// The push constants of every kernel (`common.glsl`): the thread grid, a
+/// reserved word (zero), and the arguments.
 const PUSH_HEADER: usize = 16;
 const PUSH_BYTES: u32 = (PUSH_HEADER + 8 * MAX_BUFFER_BINDINGS) as u32;
-
-/// Whether a four-byte host param is passed as its value (`LILY_VK_INLINE_PARAMS=1`):
-/// the shader then reads it from the push constants, once per dispatch,
-/// where through its address every thread loads it. Off until every shader
-/// reads its four-byte params through `arg_u32`/`arg_f32`/`arg_i32`.
-fn inline_params() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LILY_VK_INLINE_PARAMS").is_some_and(|v| v == "1"))
-}
 
 /// Dispatches per command buffer of a serial and of a concurrent pass
 /// (`LILY_VK_BATCH` sets both), and command buffers in flight
@@ -1865,6 +1856,18 @@ impl MetalContext {
         Ok(buf)
     }
 
+    /// [`Self::new_buffer`] without the zero fill: the contents are whatever
+    /// the driver's recycled memory held, for a buffer the GPU writes before
+    /// anything reads it (the zero fill is a host memset: about 10 ms per
+    /// 150 MB).
+    pub fn new_buffer_uninit(&self, len: usize) -> Result<Buffer> {
+        let buf = self.dev.new_buffer(len, false)?;
+        if let Some(recorded) = self.recorded.borrow_mut().as_mut() {
+            recorded.push(Rc::downgrade(&buf));
+        }
+        Ok(buf)
+    }
+
     /// Starts recording the buffers [`Self::new_buffer`] allocates, until
     /// [`BufferRecording::finish`] returns the ones still alive.
     pub fn record_buffers(&self) -> Result<BufferRecording<'_>> {
@@ -2642,32 +2645,19 @@ impl<'a> ComputePass<'a> {
         let dev = &self.ctx.dev;
         self.with_cmd(|device, seg, inner| {
             let mut table = [0u64; MAX_BUFFER_BINDINGS];
-            let mut inline = 0u32;
-            let by_value = inline_params();
             for (slot, (buf, offset)) in table.iter_mut().zip(buffers) {
                 *slot = buf.address() + *offset as u64;
             }
             for (i, param) in params.iter().enumerate() {
                 let at = buffers.len() + i;
-                let word = |bytes: [u8; 4]| u64::from(u32::from_ne_bytes(bytes));
-                let value = match param {
+                table[at] = match param {
                     Param::Bytes(bytes) => {
                         ensure!(!bytes.is_empty(), "empty kernel param");
-                        (*bytes).try_into().ok().map(word)
+                        inner.arena.push(dev, bytes)?
                     }
-                    Param::U32(v) => Some(word(v.to_ne_bytes())),
-                    Param::F32(v) => Some(word(v.to_ne_bytes())),
-                    Param::Gpu(..) => None,
-                };
-                table[at] = match (param, value) {
-                    (_, Some(value)) if by_value => {
-                        inline |= 1 << at;
-                        value
-                    }
-                    (Param::Bytes(bytes), _) => inner.arena.push(dev, bytes)?,
-                    (Param::U32(v), _) => inner.arena.push(dev, &v.to_ne_bytes())?,
-                    (Param::F32(v), _) => inner.arena.push(dev, &v.to_ne_bytes())?,
-                    (Param::Gpu(buf, offset), _) => {
+                    Param::U32(v) => inner.arena.push(dev, &v.to_ne_bytes())?,
+                    Param::F32(v) => inner.arena.push(dev, &v.to_ne_bytes())?,
+                    Param::Gpu(buf, offset) => {
                         ensure!(
                             offset.is_multiple_of(4) && *offset + 4 <= buf.length(),
                             "GPU param at byte {offset} is not a word of its buffer"
@@ -2681,7 +2671,7 @@ impl<'a> ComputePass<'a> {
             push[0..4].copy_from_slice(&(threads.0 as u32).to_ne_bytes());
             push[4..8].copy_from_slice(&(threads.1 as u32).to_ne_bytes());
             push[8..12].copy_from_slice(&(threads.2 as u32).to_ne_bytes());
-            push[12..16].copy_from_slice(&inline.to_ne_bytes());
+            // push[12..16], `by_value` in common.glsl, stays zero.
             push[PUSH_HEADER..PUSH_HEADER + 8 * bound]
                 .copy_from_slice(bytemuck::cast_slice(&table[..bound]));
             let push = &push[..PUSH_HEADER + 8 * bound];

@@ -37,8 +37,14 @@ float qg_dot32(in float w[32], in vec4 xv[8]) {
 // 2^(e - 128) (ggml_e8m0_to_fp32_half: kvalues are twice the E2M1 values).
 #define QG_MXFP4 39u
 
-const float qg_mxfp4_values[16] = float[16](
-    0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0);
+// kvalues_mxfp4 as signed bytes, four to a word (little-endian): a word
+// select and a byte extract, where a constant array became a select tree of
+// 32-bit float constants.
+float qg_mxfp4_value(uint c) {
+    const uint w = c < 8u ? (c < 4u ? 0x03020100u : 0x0C080604u)
+                          : (c < 12u ? 0xFDFEFF00u : 0xF4F8FAFCu);
+    return float(bitfieldExtract(int(w), int(8u * (c & 3u)), 8));
+}
 
 void qg_decode_mxfp4(uint64_t row, uint t, out float w[32]) {
     const uint64_t b = row + uint64_t(t) * 17u;
@@ -52,8 +58,8 @@ void qg_decode_mxfp4(uint64_t row, uint t, out float w[32]) {
     [[unroll]] for (uint j = 0u; j < 16u; j++) {
         const uint q = uint(U8(b + 1u).v[j]);
         // precise: d * d2 folded first would be the subnormal again.
-        precise float lo = qg_mxfp4_values[q & 15u] * d;
-        precise float hi = qg_mxfp4_values[q >> 4u] * d;
+        precise float lo = qg_mxfp4_value(q & 15u) * d;
+        precise float hi = qg_mxfp4_value(q >> 4u) * d;
         lo = lo * d2;
         hi = hi * d2;
         w[j] = lo;
@@ -353,6 +359,176 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
+// qg_moe_gate_up2_*: qg_moe_gate_up_* with two expert rows a subgroup, 16
+// lanes each, for K a multiple of 512 (Qwen3.8: K = 2560, 80 tasks: 5 a lane,
+// where 32 lanes on one row took 3 or 2). The halves' sums are two masked
+// subgroup adds. Grid (ceil(F / 16), m * used), 256 threads; same buffers
+// and parameters.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qg_moe_gate_up2_iq2_xxs) || defined(KERNEL_qg_moe_gate_up2_q4_k)
+void main() {
+    const uint K = arg_u32(5);
+    const uint F = arg_u32(6);
+    const uint row_bytes = arg_u32(7);
+    const uint used = arg_u32(8);
+    const uint slot = gl_WorkGroupID.y;
+    const uint i = slot / used;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint hi = lane >> 4u, sub = lane & 15u;
+    const uint r = gl_WorkGroupID.x * 16u + gl_SubgroupID * 2u + hi;
+    const uint e = min(U32(arg(3)).v[slot], arg_u32(9) - 1u);
+    const uint64_t off = (uint64_t(e) * F + min(r, F - 1u)) * row_bytes;
+    const uint64_t gate = arg(0) + off;
+    const uint64_t up = arg(1) + off;
+    const uint64_t X = arg(2) + 2u * uint64_t(i) * K;
+    const uint tasks = K / GLM53_TASK;
+    float ag = 0.0, au = 0.0;
+    for (uint t = sub; t < tasks; t += 16u) {
+        vec4 xv[8];
+        qg_load_x(X, t, xv);
+#ifdef KERNEL_qg_moe_gate_up2_iq2_xxs
+        ag += glm53_dot_iq2_xxs(gate, t, xv);
+        au += glm53_dot_iq2_xxs(up, t, xv);
+#else
+        float w[32];
+        glm53_decode(GLM53_Q4_K, gate, t, w);
+        ag += qg_dot32(w, xv);
+        glm53_decode(GLM53_Q4_K, up, t, w);
+        au += qg_dot32(w, xv);
+#endif
+    }
+    const float g0 = subgroupAdd(hi == 0u ? ag : 0.0);
+    const float g1 = subgroupAdd(hi != 0u ? ag : 0.0);
+    const float u0 = subgroupAdd(hi == 0u ? au : 0.0);
+    const float u1 = subgroupAdd(hi != 0u ? au : 0.0);
+    if (sub == 0u && r < F) {
+        const float g = float(bfloat16_t(hi == 0u ? g0 : g1));
+        const float u = float(bfloat16_t(hi == 0u ? u0 : u1));
+        precise float sv = g / (1.0 + exp(-g));
+        precise float act = sv * u;
+        BF16(arg(4) + 2u * (uint64_t(slot) * F)).v[r] = bfloat16_t(act);
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// qg_moe_down3_*: qg_moe_down_* for F = 640 (20 tasks a slot), all m rows of
+// one output row in one subgroup: ten lanes a slot, two tasks each, three
+// slots a round (lanes 30 and 31, and the groups past the last slot, repeat
+// a slot's work and add nothing), where one slot a round kept 12 of 32
+// lanes idle. Each slot's sum is a masked subgroup add; a row's slots are
+// combined in slot order as qg_moe_down_* combines them. Grid (ceil(H / 8),
+// 1), 256 threads; same buffers and parameters, plus 13 m (at most 4).
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qg_moe_down3_q2_k) || defined(KERNEL_qg_moe_down3_mxfp4) || \
+    defined(KERNEL_qg_moe_down3_q8_0)
+#if defined(KERNEL_qg_moe_down3_q2_k)
+#define QG_DOWN_TYPE GLM53_Q2_K
+#elif defined(KERNEL_qg_moe_down3_q8_0)
+#define QG_DOWN_TYPE GLM53_Q8_0
+#else
+#define QG_DOWN_TYPE QG_MXFP4
+#endif
+#define QG_D3_LANES 10u
+#define QG_D3_GROUPS 3u
+void main() {
+    const uint F = arg_u32(7);
+    const uint H = arg_u32(8);
+    const uint row_bytes = arg_u32(9);
+    const uint used = arg_u32(10);
+    const uint flags = arg_u32(11);
+    const uint m = arg_u32(13);
+    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    if (r >= H) return;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint grp = lane / QG_D3_LANES, j = lane % QG_D3_LANES;
+    const uint slots = m * used;
+    precise float combined[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    for (uint k0 = 0u; k0 < slots; k0 += QG_D3_GROUPS) {
+        const uint slot = min(k0 + grp, slots - 1u);
+        const uint e = min(U32(arg(2)).v[slot], arg_u32(12) - 1u);
+        const uint64_t row = arg(0) + (uint64_t(e) * H + r) * row_bytes;
+        const uint64_t X = arg(1) + 2u * uint64_t(slot) * F;
+        float acc = 0.0;
+#ifdef KERNEL_qg_moe_down3_q2_k
+        // GLM's Q2_K unit (glm53.comp, glm53_moe_down_q2_k): lane j takes
+        // values 64 j.., block j / 4, half h, code bytes 16 c.. of the half
+        // at their four shifts jj, the 16-value groups 8 h + 2 jj + c (the
+        // contiguous values 256 b + 128 h + 32 jj + 16 c..); the mins
+        // multiply the groups' activation sums. Rows are 4-byte aligned
+        // (84-byte blocks), so codes and scales are word loads.
+        {
+            const uint b = j >> 2u, h = (j >> 1u) & 1u, c = j & 1u;
+            const uint64_t blk = row + 84u * b;
+            const uint qb = 4u + 8u * h + 4u * c;
+            const uvec4 qw = uvec4(U32(blk).v[qb], U32(blk).v[qb + 1u], U32(blk).v[qb + 2u],
+                                   U32(blk).v[qb + 3u]);
+            const uint v0 = 256u * b + 128u * h + 16u * c;
+            float sq[4] = float[4](0.0, 0.0, 0.0, 0.0);
+            vec4 xs = vec4(0.0);
+            [[unroll]] for (uint jj = 0u; jj < 4u; jj++) {
+                const uint64_t xb = X + 2u * uint64_t(v0 + 32u * jj);
+                const uvec4 xa = U32x4(xb).v[0], xc = U32x4(xb + 16u).v[0];
+                const uint xw[8] = uint[8](xa.x, xa.y, xa.z, xa.w, xc.x, xc.y, xc.z, xc.w);
+                [[unroll]] for (uint w = 0u; w < 4u; w++) {
+                    // Values 4 w .. 4 w + 3 of the run: code bytes 4 w + n.
+                    const vec4 x4 = vec4(uintBitsToFloat(xw[2u * w] << 16u),
+                                         uintBitsToFloat(xw[2u * w] & 0xffff0000u),
+                                         uintBitsToFloat(xw[2u * w + 1u] << 16u),
+                                         uintBitsToFloat(xw[2u * w + 1u] & 0xffff0000u));
+                    xs[jj] += (x4.x + x4.y) + (x4.z + x4.w);
+                    [[unroll]] for (uint n = 0u; n < 4u; n++)
+                        sq[jj] += float((qw[w] >> (8u * n + 2u * jj)) & 3u) * x4[n];
+                }
+            }
+            const uint dd = U32(blk).v[20];
+            const float d = glm53_h2f(dd & 0xffffu), dmin = glm53_h2f(dd >> 16u);
+            // Scale bytes 8 h + 2 jj + c: bytes c and c + 2 of words 2 h, 2 h + 1.
+            const uvec2 sw = uvec2(U32(blk).v[2u * h], U32(blk).v[2u * h + 1u]);
+            [[unroll]] for (uint jj = 0u; jj < 4u; jj++) {
+                const uint sc = (sw[jj >> 1u] >> (8u * (c + 2u * (jj & 1u)))) & 0xffu;
+                acc += d * float(sc & 0xfu) * sq[jj] - dmin * float(sc >> 4u) * xs[jj];
+            }
+        }
+#else
+        [[unroll]] for (uint q = 0u; q < 2u; q++) {
+            const uint t = j + q * QG_D3_LANES;
+            float w[32];
+            vec4 xv[8];
+            qg_decode(QG_DOWN_TYPE, row, t, w);
+            qg_load_x(X, t, xv);
+            acc += qg_dot32(w, xv);
+        }
+#endif
+        [[unroll]] for (uint g = 0u; g < QG_D3_GROUPS; g++) {
+            const float sum = subgroupAdd(grp == g ? acc : 0.0);
+            const uint k = k0 + g;
+            if (k < slots) {
+                const float v = F32(arg(3)).v[k] * float(bfloat16_t(sum));
+                const uint ki = k / used;
+                [[unroll]] for (uint ii = 0u; ii < 4u; ii++) {
+                    if (ii == ki) combined[ii] += v;
+                }
+            }
+        }
+    }
+    if (lane == 0u) {
+        [[unroll]] for (uint ii = 0u; ii < 4u; ii++) {
+            if (ii < m) {
+                precise float c = combined[ii];
+                if ((flags & 1u) != 0u) {
+                    const float gl = (flags & 2u) != 0u ? float(BF16(arg(5)).v[ii]) : F32(arg(5)).v[ii];
+                    precise float gate = 1.0 / (1.0 + exp(-gl));
+                    c += gate * float(BF16(arg(4)).v[ii * H + r]);
+                }
+                BF16(arg(6)).v[ii * H + r] = bfloat16_t(c);
+            }
+        }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Routed experts, down and combine, lily's Qwen arithmetic (moe.comp's
 // moe_gather_gemv_q4_down_combine): out[i][r] = bf16(sum over the row's
 // slots, in slot order, of score * bf16(down_e[r] . act[slot]) (+
@@ -425,8 +601,8 @@ void main() {
 // qg_hc_read_down_f16: a threadgroup of G subgroups per weight row (down
 // rows, then inject rows), subgroup g on stream g, 8 values a lane a step.
 // Buffers: 0 hyper bf16 [G*H], 1 norm bf16 [G*H], 2 down F16 [R][G*H], 3
-// inject F16 [NI][G*H], 4 down out bf16 [R], 5 inject out bf16 [NI], 6
-// inv_rms f32 [G]. Params: 7 H, 8 G, 9 R, 10 NI, 11 eps, 12 w_bias, 13 down
+// inject F16 [NI][G*H], 4 the up kernel's input bf16(silu(down / G)) [R],
+// 5 inject out bf16 [NI], 6 inv_rms f32 [G]. Params: 7 H, 8 G, 9 R, 10 NI, 11 eps, 12 w_bias, 13 down
 // row bytes, 14 inject row bytes.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_qg_hc_read_down_f16) || defined(KERNEL_qg_hc_read_down_f16_m2) || \
@@ -492,8 +668,15 @@ void main() {
     if (tid < HC_M) {
         float total = 0.0;
         for (uint s = 0u; s < G; s++) total += qg_part[tid * 8u + s];
-        if (is_inj) BF16(arg(5)).v[tid * NI + r] = bfloat16_t(total);
-        else BF16(arg(4)).v[tid * R + r] = bfloat16_t(total);
+        if (is_inj) {
+            BF16(arg(5)).v[tid * NI + r] = bfloat16_t(total);
+        } else {
+            // The up kernel's input: the scaled SiLU of the bfloat down
+            // value, once here instead of in every up lane that reads it.
+            precise float d = float(bfloat16_t(total)) * (1.0 / float(G));
+            precise float a = d / (1.0 + exp(-d));
+            BF16(arg(4)).v[tid * R + r] = bfloat16_t(a);
+        }
     }
     if (row == 0u && tid < G * HC_M) F32(arg(6)).v[tid] = qg_rms[(tid / G) * 8u + tid % G];
 }
@@ -507,7 +690,6 @@ void main() {
     const uint c = gl_WorkGroupID.x * 8u + gl_SubgroupID;
     const uint lane = gl_SubgroupInvocationID, g = lane >> 3u, sub = lane & 7u;
     if (c >= H) return;
-    const float inv_g = 1.0 / float(G);
     float acc[HC_M];
     [[unroll]] for (uint i = 0u; i < HC_M; i++) acc[i] = 0.0;
     if (g < G) {
@@ -515,11 +697,10 @@ void main() {
         for (uint b = sub; b < R / 8u; b += 8u) {
             const uvec4 wv = ww.v[b];
             [[unroll]] for (uint i = 0u; i < HC_M; i++) {
+                // The down kernel stored the activation bf16(silu(d / G)).
                 const uvec4 dv = U32x4(arg(1) + 2u * uint64_t(i * R)).v[b];
                 [[unroll]] for (uint q = 0u; q < 4u; q++) {
-                    const vec2 d = vec2(uintBitsToFloat(dv[q] << 16u), uintBitsToFloat(dv[q] & 0xffff0000u)) * inv_g;
-                    const vec2 a = vec2(float(bfloat16_t(d.x / (1.0 + exp(-d.x)))),
-                                        float(bfloat16_t(d.y / (1.0 + exp(-d.y)))));
+                    const vec2 a = vec2(uintBitsToFloat(dv[q] << 16u), uintBitsToFloat(dv[q] & 0xffff0000u));
                     const vec2 w = unpackHalf2x16(wv[q]);
                     acc[i] += w.x * a.x + w.y * a.y;
                 }

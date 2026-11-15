@@ -27,8 +27,10 @@ pub const MAX_ROWS: usize = k::GEMV_MAX_ROWS;
 /// [`MAX_ROWS`]; longer runs the matrix units.
 pub const EXACT_ROWS: usize = 8;
 
-/// Rows a forward run takes at most.
-pub const PREFILL_ROWS: usize = 2048;
+/// Rows a forward run takes at most: 4 096 against 2 048 gives the routed
+/// experts twice the rows a decoded weight serves (4500-token prefill
+/// 901-920 -> 933-954 tok/s, 2026-11-15) for about 1.5 GB more scratch.
+pub const PREFILL_ROWS: usize = 4096;
 
 /// The indexer's selection width (`indexer_top_k`).
 const TOP_K: usize = 512;
@@ -235,7 +237,8 @@ impl Ds4Model {
     }
 
     pub fn new_scratch(&self, ctx: &MetalContext) -> Result<Scratch> {
-        let mut sc = Scratch::new(ctx, &self.cfg)?;
+        let separate = separate_gate_up(self.layers.iter().map(|l| l.gate.ty));
+        let mut sc = Scratch::new(ctx, &self.cfg, separate)?;
         if let Some(ds) = &self.dspark {
             sc.ds = Some(ds.new_scratch(ctx, &self.cfg)?);
         }
@@ -414,6 +417,16 @@ pub struct Scratch {
     pub(crate) draws: Tensor,
     /// The DSpark drafter's buffers, when the model has one.
     pub(crate) ds: Option<dspark::DsScratch>,
+    /// Prompt runs: bfloat copies of the projections' inputs (`xn`, `qr`,
+    /// `heads`, `low`, `fmid`), the bfloat-input GEMMs' operands.
+    xb: Tensor,
+    qrb: Tensor,
+    headsb: Tensor,
+    lowb: Tensor,
+    fmidb: Tensor,
+    /// Decode, verify and draft rows: the routed experts' input as f16
+    /// (`x_f16_iq2`, `moe_gate_up_xh`).
+    xh: Tensor,
 }
 
 /// A verify pass's per-layer rows (see [`Scratch::verify`]).
@@ -459,17 +472,44 @@ impl VerifyBufs {
     }
 }
 
+/// Whether layers whose routed gate/up are of these types (gate and up
+/// share one) need the grouped MoE's separate gate and up route: anything
+/// but IQ2_XXS (the schema also accepts Q2_K), which has the fused GEMM.
+pub(crate) fn separate_gate_up(gate_types: impl IntoIterator<Item = GgmlType>) -> bool {
+    gate_types.into_iter().any(|t| t != GgmlType::Iq2Xxs)
+}
+
+/// The grouped routed experts' scratch for prompt runs of up to `rows`
+/// rows of `used` pairs: with the separate gate and up outputs when
+/// `separate` ([`separate_gate_up`]), else the fused route's compact one.
+pub(crate) fn moe_group_scratch(
+    ctx: &MetalContext,
+    rows: usize,
+    (used, e, ff, h): (usize, usize, usize, usize),
+    separate: bool,
+) -> Result<k::MoeGroupScratch> {
+    if separate {
+        k::MoeGroupScratch::new(ctx, rows * used, e, ff, h)
+    } else {
+        k::MoeGroupScratch::fused(ctx, rows, used, e, ff, h)
+    }
+}
+
 impl Scratch {
-    fn new(ctx: &MetalContext, cfg: &Config) -> Result<Self> {
+    /// `separate`: some layer's routed gate/up take the separate grouped
+    /// route (see [`moe_group_scratch`]).
+    fn new(ctx: &MetalContext, cfg: &Config, separate: bool) -> Result<Self> {
         let m = PREFILL_ROWS;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let u = |n: usize| Tensor::zeros(ctx, &[n], DType::U32);
+        let b = |n: usize| Tensor::zeros(ctx, &[n], DType::BF16);
         let hd = cfg.head_dim;
         let logits = f(EXACT_ROWS * cfg.vocab)?;
         Ok(Self {
             tokens: u(m)?,
             h: f(m * cfg.hc_dim())?,
-            flat: f(m * cfg.hc_dim())?,
+            // The head's and DSpark's collapse input: at most EXACT_ROWS rows.
+            flat: f(EXACT_ROWS * cfg.hc_dim())?,
             hc_partial: f(m * k::hc_mix_groups(cfg.hidden) * 25)?,
             split: f(m * cfg.hc_mix())?,
             xn: f(m * cfg.hidden)?,
@@ -496,12 +536,11 @@ impl Scratch {
             rsel: u(m * cfg.n_expert_used)?,
             rw: f(m * cfg.n_expert_used)?,
             moe_mid: f(EXACT_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
-            moe_group: k::MoeGroupScratch::new(
+            moe_group: moe_group_scratch(
                 ctx,
-                m * cfg.n_expert_used,
-                cfg.n_expert,
-                cfg.ff_expert,
-                cfg.hidden,
+                m,
+                (cfg.n_expert_used, cfg.n_expert, cfg.ff_expert, cfg.hidden),
+                separate,
             )?,
             opre: f(m * cfg.n_hc)?,
             hidden: f(m * cfg.hidden)?,
@@ -516,6 +555,12 @@ impl Scratch {
             spec_tokens: u(EXACT_ROWS)?,
             draws: u(EXACT_ROWS)?,
             ds: None,
+            xb: b(m * cfg.hidden)?,
+            qrb: b(m * cfg.q_lora)?,
+            headsb: b(m * cfg.q_dim())?,
+            lowb: b(m * cfg.o_groups * cfg.o_lora)?,
+            fmidb: b(m * cfg.ff_expert)?,
+            xh: Tensor::zeros(ctx, &[EXACT_ROWS * cfg.hidden], DType::F16)?,
         })
     }
 
@@ -580,6 +625,8 @@ struct Run<'t> {
     tokens: &'t Tensor,
     /// A verify pass: no ring writes (see `Scratch::verify`).
     defer: bool,
+    /// A traced run: every intermediate in its f32 tensor.
+    traced: bool,
 }
 
 fn read(t: &Tensor, n: usize) -> Result<Vec<f32>> {
@@ -702,7 +749,7 @@ impl Ds4Model {
         ensure!(st.pos + m <= st.capacity, "state capacity {}", st.capacity);
         ensure!(layers.end <= cfg.n_layer, "layers {layers:?}");
         ensure!(!enc.defer || m <= EXACT_ROWS, "a verify pass of {m} rows");
-        let r = Run { pos0: st.pos, m, tokens, defer: enc.defer };
+        let r = Run { pos0: st.pos, m, tokens, defer: enc.defer, traced: false };
         // DSpark's target features: the rows whose support rows the drafter
         // can use (the last 128 of a run), captured after its target layers.
         let capture = enc.capture && self.dspark.is_some();
@@ -751,7 +798,7 @@ impl Ds4Model {
         trace: &mut Vec<LayerTrace>,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        let r = Run { pos0: st.pos, m, tokens: &sc.tokens, defer: false };
+        let r = Run { pos0: st.pos, m, tokens: &sc.tokens, defer: false, traced: true };
         let mut pass = ctx.begin_concurrent()?;
         d::embed(ctx, &pass, &self.embed, &sc.tokens, &sc.h, m)?;
         pass.memory_barrier()?;
@@ -817,11 +864,29 @@ impl Ds4Model {
         x: &Tensor,
         m: usize,
     ) -> Result<()> {
+        self.proj_b(ctx, pass, sets, x, None, m)
+    }
+
+    /// [`Self::proj`]; a prompt run takes `xb`, `x` as bfloat
+    /// (`to_bf16`), when given: the bfloat-input GEMMs give the f32-input
+    /// ones' results bit for bit, faster.
+    fn proj_b(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        sets: &[(&QWeight, &Tensor)],
+        x: &Tensor,
+        xb: Option<&Tensor>,
+        m: usize,
+    ) -> Result<()> {
         if m > EXACT_ROWS {
             // A prompt run: the matrix units (operands rounded to bfloat,
             // f32 accumulation).
             for &(w, y) in sets {
-                k::gemm(ctx, pass, w, x, y, m)?;
+                match xb {
+                    Some(xb) if k::gemm_bx_with_takes(w) => k::gemm_bx(ctx, pass, w, xb, y, m)?,
+                    _ => k::gemm(ctx, pass, w, x, y, m)?,
+                }
             }
             return Ok(());
         }
@@ -938,9 +1003,10 @@ impl Ds4Model {
         let (table, t0) =
             if yarn { (&st.rope_yarn, pos0) } else { (&st.rope_plain, pos0) };
         // Level 1: the projections of xn.
-        self.proj(ctx, pass, &[(&l.q_a, &sc.qr), (&l.kv, &sc.kv)], &sc.xn, m)?;
+        let xb = self.bf16_copy(ctx, pass, &sc.xn, &sc.xb, m, cfg.hidden)?;
+        self.proj_b(ctx, pass, &[(&l.q_a, &sc.qr), (&l.kv, &sc.kv)], &sc.xn, xb, m)?;
         match (&l.comp, &l.indexer) {
-            (Some(c), Some(ix)) => self.proj(
+            (Some(c), Some(ix)) => self.proj_b(
                 ctx,
                 pass,
                 &[
@@ -950,15 +1016,21 @@ impl Ds4Model {
                     (&ix.comp.gate, b.isc),
                 ],
                 &sc.xn,
+                xb,
                 m,
             )?,
-            (Some(c), None) => {
-                self.proj(ctx, pass, &[(&c.kv, b.ckv), (&c.gate, b.csc)], &sc.xn, m)?
-            }
+            (Some(c), None) => self.proj_b(
+                ctx,
+                pass,
+                &[(&c.kv, b.ckv), (&c.gate, b.csc)],
+                &sc.xn,
+                xb,
+                m,
+            )?,
             _ => {}
         }
         if let Some(ix) = &l.indexer {
-            self.proj(ctx, pass, &[(&ix.proj, &sc.iw)], &sc.xn, m)?;
+            self.proj_b(ctx, pass, &[(&ix.proj, &sc.iw)], &sc.xn, xb, m)?;
         }
         pass.memory_barrier()?;
         // Level 2: norms, compressor pools.
@@ -1038,10 +1110,11 @@ impl Ds4Model {
         }
         pass.memory_barrier()?;
         // Level 3: queries, the KV store, compressor rings.
-        self.proj(ctx, pass, &[(&l.q_b, &sc.q)], &sc.qr, m)?;
+        let qrb = self.bf16_copy(ctx, pass, &sc.qr, &sc.qrb, m, cfg.q_lora)?;
+        self.proj_b(ctx, pass, &[(&l.q_b, &sc.q)], &sc.qr, qrb, m)?;
         let sparse = l.indexer.is_some() && (pos0 + m) / 4 > TOP_K;
         if let (true, Some(ix)) = (sparse, &l.indexer) {
-            self.proj(ctx, pass, &[(&ix.q_b, &sc.iq)], &sc.qr, m)?;
+            self.proj_b(ctx, pass, &[(&ix.q_b, &sc.iq)], &sc.qr, qrb, m)?;
         }
         d::kv_store(ctx, pass, &sc.kv, b.kv_run, table, t0, m)?;
         if !r.defer {
@@ -1053,24 +1126,32 @@ impl Ds4Model {
             }
         }
         pass.memory_barrier()?;
+        // The attention normalizes and rotates its queries as it loads them
+        // and rotates its output back (a prompt run's into the grouped
+        // output's bfloat operand); a traced run keeps every step.
+        let fused = !r.traced;
         // Level 4: query norm and rotation; indexer queries.
-        d::head_norm_rope(
-            ctx,
-            pass,
-            &sc.q,
-            table,
-            t0,
-            m,
-            cfg.n_head,
-            cfg.head_dim,
-            cfg.n_rot,
-            cfg.rms_eps,
-            HeadOp::NormRope,
-        )?;
+        if !fused {
+            d::head_norm_rope(
+                ctx,
+                pass,
+                &sc.q,
+                table,
+                t0,
+                m,
+                cfg.n_head,
+                cfg.head_dim,
+                cfg.n_rot,
+                cfg.rms_eps,
+                HeadOp::NormRope,
+            )?;
+        }
         if sparse {
             d::indexer_q(ctx, pass, &sc.iq, &st.rope_yarn, t0, m, cfg.indexer_heads)?;
         }
-        pass.memory_barrier()?;
+        if !fused || sparse {
+            pass.memory_barrier()?;
+        }
         let rows = if sparse {
             let index = ls.index.as_ref().expect("indexer state");
             let scale = 1.0 / ((cfg.indexer_dim * cfg.indexer_heads) as f32).sqrt();
@@ -1112,43 +1193,69 @@ impl Ds4Model {
         } else {
             CompRows::None
         };
-        d::attend(
-            ctx,
-            pass,
-            &sc.q,
-            b.kv_run,
-            &ls.ring,
-            rows,
-            &l.sinks,
-            &sc.heads,
-            m,
-            cfg.n_head,
-            pos0,
-            d::RawWindow::MODEL,
-        )?;
+        if fused {
+            let fuse = d::PromptFuse { table, t0, eps: cfg.rms_eps };
+            let out = if m > EXACT_ROWS { &sc.headsb } else { &sc.heads };
+            d::attend_fused(
+                ctx,
+                pass,
+                &sc.q,
+                b.kv_run,
+                &ls.ring,
+                rows,
+                &l.sinks,
+                out,
+                m,
+                cfg.n_head,
+                pos0,
+                fuse,
+            )?;
+        } else {
+            d::attend(
+                ctx,
+                pass,
+                &sc.q,
+                b.kv_run,
+                &ls.ring,
+                rows,
+                &l.sinks,
+                &sc.heads,
+                m,
+                cfg.n_head,
+                pos0,
+                d::RawWindow::MODEL,
+            )?;
+        }
         pass.memory_barrier()?;
-        // Rotate back; the ring takes the run's rows.
-        d::head_norm_rope(
-            ctx,
-            pass,
-            &sc.heads,
-            table,
-            t0,
-            m,
-            cfg.n_head,
-            cfg.head_dim,
-            cfg.n_rot,
-            0.0,
-            HeadOp::InverseRope,
-        )?;
+        // Rotate back.
+        if !fused {
+            d::head_norm_rope(
+                ctx,
+                pass,
+                &sc.heads,
+                table,
+                t0,
+                m,
+                cfg.n_head,
+                cfg.head_dim,
+                cfg.n_rot,
+                0.0,
+                HeadOp::InverseRope,
+            )?;
+        }
+        // The ring takes the run's rows beside the grouped output (which
+        // reads only the heads).
         if !r.defer {
             d::ring_store(ctx, pass, b.kv_run, &ls.ring, pos0, m)?;
         }
-        pass.memory_barrier()?;
-        self.grouped_out(ctx, pass, sc, l, m)
+        if !fused {
+            pass.memory_barrier()?;
+        }
+        self.grouped_out(ctx, pass, sc, l, m, fused && m > EXACT_ROWS)
     }
 
-    /// The grouped output projection from `sc.heads` to `sc.attn_out`.
+    /// The grouped output projection from `sc.heads` (`sc.headsb` when
+    /// `bf16_heads`, a prompt run's fused attention output) to `sc.attn_out`.
     fn grouped_out(
         &self,
         ctx: &MetalContext,
@@ -1156,22 +1263,37 @@ impl Ds4Model {
         sc: &Scratch,
         l: &LayerW,
         m: usize,
+        bf16_heads: bool,
     ) -> Result<()> {
         let cfg = &self.cfg;
         // The grouped output projection.
         let group_in = cfg.o_group_heads() * cfg.head_dim;
         debug_assert_eq!(l.out_a.cols, group_in);
         if m > EXACT_ROWS {
-            // Per group: low[i][g] (1024) = out_a[g] (1024 x 4096) . heads[i][g].
+            // Per group: low[i][g] (1024) = out_a[g] (1024 x 4096) . heads[i][g],
+            // a dispatch a group: the eight as one batched grid ran at 25
+            // TFLOP/s, apart at 36 (gemm_bx_timing_ds4: 5.3 -> 3.8 ms a
+            // 2048-row layer, 2026-11-15).
             let gl = k::GemmLayout {
                 ldx: cfg.q_dim(),
                 ldy: l.out_a.rows,
-                batches: cfg.o_groups,
-                x_batch: group_in,
-                w_batch: cfg.o_lora,
-                y_batch: cfg.o_lora,
+                batches: 1,
+                x_batch: 0,
+                w_batch: 0,
+                y_batch: 0,
             };
-            k::gemm_with(ctx, pass, &l.out_a, &sc.heads, &sc.low, m, cfg.o_lora, gl)?;
+            if !bf16_heads {
+                k::to_bf16(ctx, pass, &sc.heads, &sc.headsb, m * cfg.q_dim())?;
+                pass.memory_barrier()?;
+            }
+            let (n, rb) = (cfg.o_lora, l.out_a.row_bytes);
+            for g in 0..cfg.o_groups {
+                let wt = l.out_a.t.view(g * n * rb, &[n * rb])?;
+                let w = QWeight::new(wt, l.out_a.ty, group_in, n)?;
+                let x = sc.headsb.view(g * group_in, &[sc.headsb.numel() - g * group_in])?;
+                let y = sc.low.view(g * n, &[sc.low.numel() - g * n])?;
+                k::gemm_bx_with(ctx, pass, &w, &x, &y, m, n, gl)?;
+            }
         }
         let chunk = k::gemv_max_rows(l.out_a.ty);
         for c0 in (0..m).step_by(chunk).take_while(|_| m <= EXACT_ROWS) {
@@ -1193,8 +1315,29 @@ impl Ds4Model {
             )?;
         }
         pass.memory_barrier()?;
-        self.proj(ctx, pass, &[(&l.out_b, &sc.attn_out)], &sc.low, m)?;
+        let lb = self.bf16_copy(ctx, pass, &sc.low, &sc.lowb, m, cfg.o_groups * cfg.o_lora)?;
+        self.proj_b(ctx, pass, &[(&l.out_b, &sc.attn_out)], &sc.low, lb, m)?;
         pass.memory_barrier()
+    }
+
+    /// For a prompt run (more than [`EXACT_ROWS`] rows): `xb` = the `m`
+    /// rows of `width` values of `x` as bfloat, and a barrier; `None`
+    /// otherwise.
+    fn bf16_copy<'a>(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        x: &Tensor,
+        xb: &'a Tensor,
+        m: usize,
+        width: usize,
+    ) -> Result<Option<&'a Tensor>> {
+        if m <= EXACT_ROWS {
+            return Ok(None);
+        }
+        k::to_bf16(ctx, pass, x, xb, m * width)?;
+        pass.memory_barrier()?;
+        Ok(Some(xb))
     }
 
     /// The FFN sublayer from `sc.xn` to `sc.ffn_out`.
@@ -1210,8 +1353,22 @@ impl Ds4Model {
         let m = r.m;
         let lim = cfg.swiglu_limit;
         let used = cfg.n_expert_used;
-        self.proj(ctx, pass, &[(&l.router, &sc.rlogits)], &sc.xn, m)?;
-        self.proj(ctx, pass, &[(&l.sh_gate, &sc.fg), (&l.sh_up, &sc.fu)], &sc.xn, m)?;
+        let xb = self.bf16_copy(ctx, pass, &sc.xn, &sc.xb, m, cfg.hidden)?;
+        // Decode-sized runs: the routed gate/up read their input as f16 (half
+        // the activation bytes; the kernel is bound by those loads).
+        let xh = m <= EXACT_ROWS && l.gate.ty == crate::gguf::GgmlType::Iq2Xxs;
+        if xh {
+            d::x_f16_iq2(ctx, pass, &sc.xn, &sc.xh, m, cfg.hidden)?;
+        }
+        self.proj_b(ctx, pass, &[(&l.router, &sc.rlogits)], &sc.xn, xb, m)?;
+        self.proj_b(
+            ctx,
+            pass,
+            &[(&l.sh_gate, &sc.fg), (&l.sh_up, &sc.fu)],
+            &sc.xn,
+            xb,
+            m,
+        )?;
         pass.memory_barrier()?;
         d::router(
             ctx,
@@ -1232,9 +1389,10 @@ impl Ds4Model {
         if m > EXACT_ROWS {
             // A prompt run: the shared expert, then the routed experts
             // grouped by expert on the matrix units (adding to it).
-            self.proj(ctx, pass, &[(&l.sh_down, &sc.ffn_out)], &sc.fmid, m)?;
+            let fb = self.bf16_copy(ctx, pass, &sc.fmid, &sc.fmidb, m, cfg.ff_expert)?;
+            self.proj_b(ctx, pass, &[(&l.sh_down, &sc.ffn_out)], &sc.fmid, fb, m)?;
             pass.memory_barrier()?;
-            k::moe_grouped(
+            k::moe_grouped_tiles(
                 ctx,
                 pass,
                 &l.gate,
@@ -1251,23 +1409,44 @@ impl Ds4Model {
                 used,
                 cfg.n_expert,
                 lim,
+                // Tiles of 64 rows, also at a 4 096-row run's 96 pairs an
+                // expert (2048-token prefill 898-915 -> 924-952 tok/s,
+                // 4500-token 892-922 -> 945-962, 2026-11-15).
+                k::MoeTiles::R64,
             )?;
             return pass.memory_barrier();
         }
-        k::moe_gate_up(
-            ctx,
-            pass,
-            &l.gate,
-            &l.up,
-            cfg.ff_expert,
-            &sc.xn,
-            &sc.rsel,
-            &sc.rw,
-            &sc.moe_mid,
-            m,
-            used,
-            lim,
-        )?;
+        if xh {
+            k::moe_gate_up_xh(
+                ctx,
+                pass,
+                &l.gate,
+                &l.up,
+                cfg.ff_expert,
+                &sc.xh,
+                &sc.rsel,
+                &sc.rw,
+                &sc.moe_mid,
+                m,
+                used,
+                lim,
+            )?;
+        } else {
+            k::moe_gate_up(
+                ctx,
+                pass,
+                &l.gate,
+                &l.up,
+                cfg.ff_expert,
+                &sc.xn,
+                &sc.rsel,
+                &sc.rw,
+                &sc.moe_mid,
+                m,
+                used,
+                lim,
+            )?;
+        }
         self.proj(ctx, pass, &[(&l.sh_down, &sc.ffn_out)], &sc.fmid, m)?;
         pass.memory_barrier()?;
         k::moe_down(

@@ -268,12 +268,20 @@ fn gemv_dispatch(
         "GEMV row of {} values",
         w0.cols
     );
+    let max_rows = sets.iter().map(|(w, _)| w.rows).max().unwrap_or(0);
     let g16 = g16_gemv_name(ctx, w0.ty, w0.cols, m, l.x_group, l.x_row_stride);
+    // Two rows a subgroup share one input row, so grouped inputs (GLM's
+    // per-head attn_k_b) take one; the G16 kernels set their own rows.
+    let r = if g16.is_none() && l.x_group >= max_rows {
+        gemv_rows_per_subgroup(w0.ty, m, max_rows)
+    } else {
+        1
+    };
     let per_sg = match g16 {
         Some((_, rows)) => rows,
         None => 32 / tasks.min(32),
     };
-    let rows_per_tg = 8 * per_sg;
+    let rows_per_tg = 8 * per_sg * r;
     let mut groups = 0;
     for &(w, y) in sets {
         ensure!(
@@ -301,6 +309,7 @@ fn gemv_dispatch(
     let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
     let name = match g16 {
         Some((name, _)) => name,
+        None if r == 2 => "glm53_gemv_q5_k_m1_r2",
         None => gemv_name(w0.ty, m)?,
     };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
@@ -321,6 +330,17 @@ fn gemv_dispatch(
         ],
         Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
     )
+}
+
+/// Weights of more rows than this take two rows a subgroup where a kernel
+/// for it exists (Q5_K at one row: Gemma's LM head).
+const GEMV_R2_MIN_ROWS: usize = 32768;
+
+/// Weight rows a subgroup of the GEMV of `ty` takes for each of its lane
+/// groups at `m` rows over weights of up to `rows` rows: two for a wide
+/// Q5_K at one row (they share the x loads), else one.
+fn gemv_rows_per_subgroup(ty: GgmlType, m: usize, rows: usize) -> usize {
+    if ty == GgmlType::Q5K && m == 1 && rows >= GEMV_R2_MIN_ROWS { 2 } else { 1 }
 }
 
 /// Rows (of activations) at which [`gemm`] takes over from the GEMV.
@@ -396,7 +416,8 @@ fn sgemm_name(ty: GgmlType) -> Result<&'static str> {
 }
 
 /// [`gemm`] over `xb`, the input's rows as bfloat ([`to_bf16`]'s rounding:
-/// the results are [`gemm`]'s bit for bit) for Q8_0 and Q4_K weights: the
+/// the results are [`gemm`]'s bit for bit) for Q8_0, Q4_K, Q5_K and Q6_K
+/// weights: the
 /// f32 kernel rounds every element in every column tile (about a third of
 /// a 1 024-row call; 2026-11-14).
 pub fn gemm_bx(
@@ -407,13 +428,6 @@ pub fn gemm_bx(
     y: &Tensor,
     m: usize,
 ) -> Result<()> {
-    ensure!(xb.dtype() == DType::BF16, "bfloat GEMM input is {:?}", xb.dtype());
-    ensure!(w.cols.is_multiple_of(8), "bfloat GEMM rows of {} values", w.cols);
-    let name = match w.ty {
-        GgmlType::Q8_0 => "glm53_gemm_q8_0_bx",
-        GgmlType::Q4K => "glm53_gemm_q4_k_bx",
-        other => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
-    };
     let l = GemmLayout {
         ldx: w.cols,
         ldy: w.rows,
@@ -422,7 +436,46 @@ pub fn gemm_bx(
         w_batch: 0,
         y_batch: 0,
     };
-    gemm_any(ctx, pass, w, xb, y, m, w.rows, l, name, (GEMM_BX_ROWS, 64), GEMM_BX_THREADS)
+    gemm_bx_with(ctx, pass, w, xb, y, m, w.rows, l)
+}
+
+/// [`gemm_bx`] with [`gemm_with`]'s layout (`ldx` and `x_batch` multiples
+/// of 8); F16 weights too.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_bx_with(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w: &QWeight,
+    xb: &Tensor,
+    y: &Tensor,
+    m: usize,
+    n: usize,
+    l: GemmLayout,
+) -> Result<()> {
+    ensure!(xb.dtype() == DType::BF16, "bfloat GEMM input is {:?}", xb.dtype());
+    ensure!(w.cols.is_multiple_of(8), "bfloat GEMM rows of {} values", w.cols);
+    ensure!(
+        l.ldx.is_multiple_of(8) && l.x_batch.is_multiple_of(8),
+        "bfloat GEMM input layout"
+    );
+    // Four subgroups a threadgroup for an unbatched short run over at least
+    // 8 192 Q8_0 or Q4_K weight rows: gemm_small_timing (eight calls
+    // overlapping, as a level's do; 2026-11-15), kda_v Q8_0 8192 x 4096 at
+    // 8 / 24 / 64 rows 270 / 276 / 307 -> 186 / 195 / 206 us, kda_q Q4_K
+    // 205 / 193 / 279 -> 182 / 185 / 200; narrower weights (4096 x 8192,
+    // 2048 x 4096) were 10-20% slower. The same products in the same order.
+    let sg4 = m <= 128 && n >= 8192 && l.batches == 1;
+    let (name, rows, threads) = match (w.ty, sg4) {
+        (GgmlType::Q8_0, false) => ("glm53_gemm_q8_0_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q4K, false) => ("glm53_gemm_q4_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q8_0, true) => ("glm53_gemm_q8_0_bx4", 128, 128),
+        (GgmlType::Q4K, true) => ("glm53_gemm_q4_k_bx4", 128, 128),
+        (GgmlType::F16, _) => ("glm53_gemm_f16_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q5K, _) => ("glm53_gemm_q5_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q6K, _) => ("glm53_gemm_q6_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (other, _) => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
+    };
+    gemm_any(ctx, pass, w, xb, y, m, n, l, name, (rows, 64), threads)
 }
 
 /// Rows of X a threadgroup of the bfloat-input GEMM takes (the kernel's
@@ -433,7 +486,14 @@ const GEMM_BX_THREADS: usize = 256;
 
 /// Whether [`gemm_bx`] takes weights of this type.
 pub fn gemm_bx_takes(w: &QWeight) -> bool {
-    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K) && w.cols.is_multiple_of(8)
+    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
+        && w.cols.is_multiple_of(8)
+}
+
+/// Whether [`gemm_bx_with`] takes weights of this type (F16 too).
+pub fn gemm_bx_with_takes(w: &QWeight) -> bool {
+    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::F16)
+        && w.cols.is_multiple_of(8)
 }
 
 /// `out` = the first `n` values of `x` as bfloat (rounded to nearest even),
@@ -571,6 +631,31 @@ impl MoeGroupScratch {
             down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
         })
     }
+
+    /// For runs of up to `rows` rows of `used` pairs whose IQ2_XXS gate and
+    /// up take the fused GEMM (DeepSeek V4's): no separate gate and up
+    /// outputs, the bfloat input `rows` rows long.
+    pub fn fused(
+        ctx: &MetalContext,
+        rows: usize,
+        used: usize,
+        experts: usize,
+        ff: usize,
+        hidden: usize,
+    ) -> Result<Self> {
+        let pairs = rows * used;
+        let max_tiles = pairs.div_ceil(64) + experts;
+        Ok(Self {
+            pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
+            tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
+            tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
+            xb: Tensor::zeros(ctx, &[rows * hidden], DType::BF16)?,
+            g: Tensor::zeros(ctx, &[1], DType::F32)?,
+            u: Tensor::zeros(ctx, &[1], DType::F32)?,
+            mid: Tensor::zeros(ctx, &[pairs * ff], DType::BF16)?,
+            down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
+        })
+    }
 }
 
 /// Routed experts over a run of `m` rows grouped by expert (prefill): each
@@ -597,17 +682,92 @@ pub fn moe_grouped(
     limit: f32,
 ) -> Result<()> {
     // Tiles of up to 128 rows once an expert averages 48 pairs or more.
-    let tile_rows = if m * used >= 48 * experts { 128 } else { 64 };
+    let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
     moe_grouped_with(
         ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true, tile_rows,
+        experts, limit, true, tiles, 0,
+    )
+}
+
+/// How [`moe_grouped`]'s expert GEMMs tile an expert's rows (the results
+/// are the same bit for bit).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoeTiles {
+    /// Up to 64 rows, four subgroups of 16.
+    R64,
+    /// Up to 128 rows, four subgroups of 32.
+    R128,
+}
+
+/// [`moe_grouped`] with the tiling chosen by the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_tiles(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    hidden: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+    limit: f32,
+    tiles: MoeTiles,
+) -> Result<()> {
+    moe_grouped_with(
+        ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
+        experts, limit, true, tiles, 0,
+    )
+}
+
+/// Most rows an expert's tile computes off the matrix units in
+/// [`moe_grouped_dot`] (the kernels' GM_DOT_ROWS).
+pub const MOE_DOT_ROWS: usize = 4;
+
+/// [`moe_grouped`] where an expert with at most [`MOE_DOT_ROWS`] rows is
+/// computed by register dot products of its decoded f32 weights and the
+/// rows' bfloat values instead of a tile on the matrix units: a short
+/// prompt's experts have one or two rows each, and their tiles cost almost
+/// as much as full ones. moe_grouped_timing (2026-11-15), a layer: 24-token
+/// density 2.46 -> 1.56 ms, 64-token 2.77 -> 1.93, from 256 unchanged; a
+/// cap of 8 rows lost at 256 (3.43 -> 4.68). The values are the same
+/// products up to the weights' bfloat rounding, summed in another order.
+/// GLM 5.3's prefill.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_dot(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    hidden: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+    limit: f32,
+) -> Result<()> {
+    let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
+    moe_grouped_with(
+        ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
+        experts, limit, true, tiles, MOE_DOT_ROWS,
     )
 }
 
 /// [`moe_grouped`]; `fuse_gate_up` false takes IQ2_XXS experts through the
 /// separate gate and up GEMMs and SwiGLU too (the tests' reference);
-/// `tile_rows` (64 or 128) caps a tile's pairs (the results are the same
-/// either way).
+/// `tiles` caps a tile's pairs (the results are the same either way).
 #[allow(clippy::too_many_arguments)]
 fn moe_grouped_with(
     ctx: &MetalContext,
@@ -627,10 +787,12 @@ fn moe_grouped_with(
     experts: usize,
     limit: f32,
     fuse_gate_up: bool,
-    tile_rows: usize,
+    tiles: MoeTiles,
+    dot_rows: usize,
 ) -> Result<()> {
-    ensure!(tile_rows == 64 || tile_rows == 128, "expert tiles of {tile_rows} rows");
-    let r128 = tile_rows == 128;
+    ensure!(dot_rows <= MOE_DOT_ROWS, "register path for {dot_rows} rows");
+    let tile_rows = if tiles == MoeTiles::R64 { 64 } else { 128 };
+    let r128 = tiles == MoeTiles::R128;
     let pairs = m * used;
     ensure!(
         sc.pairs.numel() >= pairs,
@@ -690,6 +852,7 @@ fn moe_grouped_with(
                     &u32_bytes(w.cols),
                     &u32_bytes(w.row_bytes),
                     &u32_bytes(x_shift),
+                    &u32_bytes(dot_rows),
                 ],
                 Grid::Threadgroups {
                     groups: (n.div_ceil(64), max_tiles, 1),
@@ -737,6 +900,7 @@ fn moe_grouped_with(
                 &u32_bytes(gate.row_bytes),
                 &u32_bytes(shift),
                 &f32_bytes(limit),
+                &u32_bytes(dot_rows),
             ],
             Grid::Threadgroups {
                 groups: (ff / 32, max_tiles, 1),
@@ -744,6 +908,10 @@ fn moe_grouped_with(
             },
         )?;
     } else {
+        ensure!(
+            sc.g.numel() >= pairs * ff && sc.u.numel() >= pairs * ff,
+            "grouped MoE scratch without separate gate and up outputs"
+        );
         gemm_moe(gate, &sc.xb, &sc.g, ff, shift)?;
         gemm_moe(up, &sc.xb, &sc.u, ff, shift)?;
         pass.memory_barrier()?;
@@ -828,6 +996,59 @@ pub fn moe_gate_up(
 /// `add` when given: `out[i] = sum_s down_{sel[i][s]} mid[i * used + s]
 /// (+ add[i])`; `out` may be `add`.
 #[allow(clippy::too_many_arguments)]
+/// [`moe_gate_up`] for IQ2_XXS experts over `xh`, the activations as f16
+/// in the dot's pairing (DeepSeek V4's `x_f16_iq2`): half the activation
+/// bytes a task.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gate_up_xh(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    ff: usize,
+    xh: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    mid: &Tensor,
+    m: usize,
+    used: usize,
+    limit: f32,
+) -> Result<()> {
+    check_f32(&[weights, mid])?;
+    ensure!(xh.dtype() == DType::F16, "f16 expert activations");
+    ensure!(
+        gate.ty == GgmlType::Iq2Xxs && up.ty == gate.ty && gate.cols == up.cols && gate.rows == up.rows,
+        "f16-activation gate/up of {:?} experts",
+        gate.ty
+    );
+    ensure!(gate.rows.is_multiple_of(ff) && gate.cols.is_multiple_of(32), "expert shape");
+    ensure!(sel.dtype() == DType::U32 && sel.numel() >= m * used, "selection");
+    ensure!(xh.numel() >= m * gate.cols && mid.numel() >= m * used * ff, "expert buffers");
+    let pipeline = ctx.pipeline("glm53_moe_gate_up_iq2_xxs_xh", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            gate.t.binding(),
+            up.t.binding(),
+            xh.binding(),
+            sel.binding(),
+            weights.binding(),
+            mid.binding(),
+        ],
+        &[
+            &u32_bytes(gate.cols),
+            &u32_bytes(ff),
+            &u32_bytes(gate.row_bytes),
+            &u32_bytes(used),
+            &f32_bytes(limit),
+        ],
+        Grid::Threadgroups {
+            groups: (ff.div_ceil(8), m * used, 1),
+            threadgroup: (256, 1, 1),
+        },
+    )
+}
+
 pub fn moe_down(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
@@ -1179,6 +1400,19 @@ pub fn add(
         &[a.binding(), b.binding(), out.binding()],
         &[],
         Grid::Threads { grid: (n, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
+/// Zeroes `t` on the GPU (its bytes a multiple of 16).
+pub fn zero(ctx: &MetalContext, pass: &ComputePass<'_>, t: &Tensor) -> Result<()> {
+    let n = t.byte_len();
+    ensure!(n.is_multiple_of(16), "GPU zero fill of {n} bytes");
+    let pipeline = ctx.pipeline("glm53_zero", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[t.binding()],
+        &[&u32_bytes(n / 16)],
+        Grid::Threads { grid: (n / 16, 1, 1), threadgroup: (256, 1, 1) },
     )
 }
 

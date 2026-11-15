@@ -33,6 +33,129 @@ fn a_held_instance_lock_refuses_the_load_before_mapping() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A session's recurrent state without the model: a fresh state's KDA
+/// tensors read zero although they come from memory a dropped state filled;
+/// a snapshot of the recurrent tensors (packed into one allocation) restores
+/// every byte of each to its own tensor, stays independent of the live state,
+/// forks into another state, and follows a swapped KDA pair (the alternate
+/// views current after a rejected draft).
+#[test]
+fn recurrent_state_zeroes_and_round_trips_without_the_model() {
+    use crate::engine::{DecodeStateApi, SnapshotApi};
+    let ctx = MetalContext::new().expect("context");
+    let cfg = Config::glm53_flash();
+    // Every recurrent tensor (KDA conv and state, DSA incomplete-pool
+    // tails), in the snapshot's order, and the KDA alternates.
+    fn current(st: &Glm53State) -> Vec<&Tensor> {
+        st.layers
+            .iter()
+            .flat_map(|l| match l {
+                LayerState::Kda { conv, s, .. } => vec![conv, s],
+                LayerState::Dsa { tail_k, tail_g, .. } => vec![tail_k, tail_g],
+            })
+            .collect()
+    }
+    fn alternates(st: &Glm53State) -> Vec<&Tensor> {
+        st.layers
+            .iter()
+            .flat_map(|l| match l {
+                LayerState::Kda { conv_alt, s_alt, .. } => vec![conv_alt, s_alt],
+                LayerState::Dsa { .. } => vec![],
+            })
+            .collect()
+    }
+    // Tensor t's pattern under seed k: distinct for every tensor and value.
+    let fill = |ts: &[&Tensor], k: u32| {
+        for (t, x) in ts.iter().enumerate() {
+            let v: Vec<f32> = (0..x.numel())
+                .map(|i| {
+                    f32::from_bits(
+                        0x3f80_0000
+                            ^ ((k << 26) | ((t as u32) << 18) | (i as u32 & 0x3ffff)),
+                    )
+                })
+                .collect();
+            x.write_bytes(bytemuck::cast_slice(&v)).unwrap();
+        }
+    };
+    let check = |ts: &[&Tensor], k: u32, what: &str| {
+        for (t, x) in ts.iter().enumerate() {
+            let got = x.to_f32().unwrap();
+            for (i, g) in got.iter().enumerate() {
+                let want = 0x3f80_0000
+                    ^ ((k << 26) | ((t as u32) << 18) | (i as u32 & 0x3ffff));
+                assert_eq!(g.to_bits(), want, "{what}: tensor {t} value {i}");
+            }
+        }
+    };
+    {
+        let st = Glm53State::new(&ctx, &cfg, 64).unwrap();
+        let mut all = current(&st);
+        all.extend(alternates(&st));
+        fill(&all, 1);
+    }
+    let mut st = Glm53State::new(&ctx, &cfg, 64).unwrap();
+    for (il, l) in st.layers.iter().enumerate() {
+        if let LayerState::Kda { conv, s, .. } = l {
+            assert!(
+                conv.to_f32().unwrap().iter().all(|&v| v.to_bits() == 0),
+                "layer {il} conv"
+            );
+            assert!(
+                s.to_f32().unwrap().iter().all(|&v| v.to_bits() == 0),
+                "layer {il} state"
+            );
+        }
+    }
+    fill(&current(&st), 2);
+    fill(&alternates(&st), 3);
+    st.pos = 17;
+    let snap = st.snapshot(&ctx).unwrap();
+    assert_eq!(snap.pos(), 17);
+    assert_eq!(snap.bytes(), current(&st).iter().map(|t| t.byte_len()).sum::<usize>());
+    // Mutated live state: the restore brings back every byte; twice, so
+    // the snapshot does not share the live tensors.
+    for _ in 0..2 {
+        fill(&current(&st), 4);
+        st.pos = 30;
+        st.restore(&ctx, &snap).unwrap();
+        assert_eq!(st.pos, 17);
+        check(&current(&st), 2, "restored");
+        check(&alternates(&st), 3, "alternates untouched");
+    }
+    // A fork: another state restored from it.
+    let mut other = Glm53State::new(&ctx, &cfg, 64).unwrap();
+    other.restore(&ctx, &snap).unwrap();
+    check(&current(&other), 2, "forked");
+    // A swapped pair: the alternates become current, and a snapshot then
+    // holds (and restores into) them.
+    st.take_kda_snapshots();
+    let swapped = st.snapshot(&ctx).unwrap();
+    let before: Vec<Vec<f32>> =
+        alternates(&st).iter().map(|t| t.to_f32().unwrap()).collect();
+    fill(&current(&st), 5);
+    st.restore(&ctx, &swapped).unwrap();
+    // The KDA tensors current now are the former alternates, back to their
+    // pattern (seed 3, their order among the alternates); the former
+    // current ones, alternates now, are not touched by the restore.
+    let kda_now: Vec<&Tensor> = st
+        .layers
+        .iter()
+        .flat_map(|l| match l {
+            LayerState::Kda { conv, s, .. } => vec![conv, s],
+            LayerState::Dsa { .. } => vec![],
+        })
+        .collect();
+    check(&kda_now, 3, "swapped pair restored");
+    for (t, (x, b)) in alternates(&st).iter().zip(&before).enumerate() {
+        let got = x.to_f32().unwrap();
+        assert!(
+            got.iter().zip(b).all(|(g, w)| g.to_bits() == w.to_bits()),
+            "alternate {t} changed"
+        );
+    }
+}
+
 /// Every staging path the engine uses fits the scratch it writes, at every
 /// row count it is called with: a verify pass (1 or 2 rows, up to
 /// MAX_ROWS), a decode step, a prefill run up to PREFILL_ROWS, the MTP

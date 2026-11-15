@@ -62,13 +62,17 @@ fn run(
 
 /// Every draft count yields the same tokens (each emitted token is the
 /// trunk's own draw for its prefix; drafts only decide how many rows a pass
-/// confirms), under greedy and under seeded sampling.
+/// confirms), under greedy and under seeded sampling. Seeded sampling runs
+/// without the narrow draft head and the draft gate: they change the
+/// proposals and the rows a step verifies (the narrow head switches to the
+/// whole one at a step boundary, which depends on the draft count), which
+/// keeps the distribution but not a seed's tokens.
 #[test]
 #[ignore = "requires LILY_MODEL_DIR_FLASH"]
 fn speculative_output_is_invariant_to_the_draft_count() -> Result<()> {
     let dir = model_dir()?;
     let ctx = MetalContext::new()?;
-    let model = <Qwen4ExpModel as LanguageModel>::load(
+    let mut model = <Qwen4ExpModel as LanguageModel>::load(
         &ctx,
         Path::new(&dir),
         &LoadOptions { mtp_drafts: 3, ..LoadOptions::default() },
@@ -85,6 +89,7 @@ fn speculative_output_is_invariant_to_the_draft_count() -> Result<()> {
         ..SamplingParams::greedy()
     };
     for params in [SamplingParams::greedy(), sampled] {
+        model.set_draft_policy(params.is_greedy(), params.is_greedy());
         let (one, drafted, _) = run(&ctx, &model, &generator, &prompt, &params, 1, 48)?;
         assert!(drafted > 0, "no drafts were proposed");
         for k in [2usize, 3] {
@@ -94,6 +99,39 @@ fn speculative_output_is_invariant_to_the_draft_count() -> Result<()> {
                 "drafts={k} vs drafts=1 (temperature {})",
                 params.temperature
             );
+        }
+    }
+    Ok(())
+}
+
+/// The draft head's narrow LM head and the draft gate never change greedy
+/// output: with both on and with both off, every draft count gives the
+/// same tokens, on English and on Italian text (where the narrow head
+/// falls back to the whole one).
+#[test]
+#[ignore = "requires LILY_MODEL_DIR_FLASH"]
+fn the_narrow_head_and_the_gate_keep_greedy_output() -> Result<()> {
+    let dir = model_dir()?;
+    let ctx = MetalContext::new()?;
+    let mut model = <Qwen4ExpModel as LanguageModel>::load(
+        &ctx,
+        Path::new(&dir),
+        &LoadOptions { mtp_drafts: 3, ..LoadOptions::default() },
+    )?;
+    let mut generator = Generator::from_model_dir(Path::new(&dir))?;
+    generator.add_stop_tokens(&model.eos_token_ids());
+    let italian = generator.tokenizer().encode(
+        "<|im_start|>user\nRaccontami in poche frasi la storia di Firenze nel Rinascimento.<|im_end|>\n<|im_start|>assistant\n",
+    )?;
+    let greedy = SamplingParams::greedy();
+    for prompt in [prompt(&generator)?, italian] {
+        model.set_draft_policy(false, false);
+        let (want, _, _) = run(&ctx, &model, &generator, &prompt, &greedy, 2, 64)?;
+        model.set_draft_policy(true, true);
+        for k in [1usize, 2, 3] {
+            let (got, drafted, _) = run(&ctx, &model, &generator, &prompt, &greedy, k, 64)?;
+            assert!(drafted > 0, "no drafts were proposed");
+            assert_eq!(got, want, "narrow head and gate, drafts={k}");
         }
     }
     Ok(())

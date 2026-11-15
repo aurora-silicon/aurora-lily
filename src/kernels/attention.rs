@@ -229,6 +229,16 @@ impl<'t> Kv<'t> {
     }
 }
 
+/// Scratch rows [`sdpa_decode_split64`] needs for its splits up to
+/// `capacity_tokens` (at least [`sdpa_split_scratch_splits`]'s, which
+/// covers its fallback).
+pub fn sdpa_split64_scratch_splits(capacity_tokens: usize) -> usize {
+    capacity_tokens
+        .min(GQA_FOLD_MIN_CONTEXT)
+        .div_ceil(SDPA_SPLIT64)
+        .max(sdpa_split_scratch_splits(capacity_tokens))
+}
+
 /// Scratch rows required for a context capacity.
 pub fn sdpa_split_scratch_splits(capacity_tokens: usize) -> usize {
     capacity_tokens
@@ -957,6 +967,98 @@ fn sdpa_decode_inner<'c>(
     )
 }
 
+/// Keys a split of [`sdpa_decode_split64`] takes.
+pub const SDPA_SPLIT64: usize = 64;
+
+/// [`sdpa_decode`] over bf16 caches through the per-head split kernel with
+/// splits of [`SDPA_SPLIT64`] keys (`sdpa_decode_split64_bf16`, then the
+/// combine), for any context past one split whose partials fit the scratch;
+/// other cases take [`sdpa_decode`]. Qwen3.6's decode: a 256-key split's
+/// subgroups walk 32 rounds of dependent loads, ~40 us a level at any
+/// context.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_split64<'c>(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    k_cache: impl Into<Kv<'c>>,
+    v_cache: impl Into<Kv<'c>>,
+    out: &Tensor,
+    len: usize,
+    scale: f32,
+    split_scratch: (&Tensor, &Tensor),
+) -> Result<()> {
+    let (k_kv, v_kv) = (k_cache.into(), v_cache.into());
+    let format = Kv::pair_format(&k_kv, &v_kv)?;
+    let (kvh, max_seq, d) = k_kv.shape();
+    let nq = q.numel() / d;
+    let splits = len.div_ceil(SDPA_SPLIT64);
+    let (partials, stats) = split_scratch;
+    let fits = partials.numel() >= nq * splits * d && stats.numel() >= nq * splits * 2;
+    // Checked for every route before anything is dispatched.
+    ensure!(q.numel() == nq * d && out.numel() == nq * d, "q/out shape mismatch");
+    ensure!(kvh > 0 && nq.is_multiple_of(kvh), "NQ {nq} not a multiple of KVH {kvh}");
+    ensure!(len <= max_seq && max_seq <= MAX_SEQ, "len {len} exceeds kernel MAX_SEQ");
+    // A q8 cache (Qwen3.8's) takes the q8 kernel at 64 keys a split.
+    if format == KvFormat::Q8
+        && len > SDPA_SPLIT64
+        && fits
+        && d == 256
+        && len < GQA_FOLD_MIN_CONTEXT
+    {
+        return sdpa_decode_q8_split(
+            ctx,
+            pass,
+            q,
+            k_kv,
+            v_kv,
+            out,
+            len,
+            scale,
+            split_scratch,
+            SDPA_SPLIT64,
+            "sdpa_decode_split64_q8",
+        );
+    }
+    if format != KvFormat::Bf16 || len <= SDPA_SPLIT64 || !fits || d > 256 {
+        return sdpa_decode(ctx, pass, q, k_kv, v_kv, out, len, scale, Some(split_scratch));
+    }
+    ensure!(
+        partials.dtype() == DType::F32 && stats.dtype() == DType::F32,
+        "split scratch of {:?}",
+        partials.dtype()
+    );
+    let group = nq / kvh;
+    let stage1 = ctx.pipeline("sdpa_decode_split64_bf16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &stage1,
+        &[
+            q.binding(),
+            k_kv.values.binding(),
+            v_kv.values.binding(),
+            partials.binding(),
+            stats.binding(),
+        ],
+        &[
+            &u32_bytes(d),
+            &u32_bytes(max_seq),
+            &u32_bytes(len),
+            &u32_bytes(splits),
+            &u32_bytes(group),
+            &scale.to_ne_bytes(),
+        ],
+        Grid::Threadgroups { groups: (nq, splits, 1), threadgroup: (256, 1, 1) },
+    )?;
+    pass.level_barrier(&[partials, stats])?;
+    let stage2 = ctx.pipeline("sdpa_decode_combine", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &stage2,
+        &[partials.binding(), stats.binding(), out.binding()],
+        &[&u32_bytes(d), &u32_bytes(splits)],
+        Grid::Threadgroups { groups: (nq, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 /// [`sdpa_decode`] over a q8 cache: the per-head split kernel for every
 /// length (one split up to 256 positions), then the combine.
 #[allow(clippy::too_many_arguments)]
@@ -971,8 +1073,7 @@ fn sdpa_decode_q8(
     scale: f32,
     split_scratch: Option<(&Tensor, &Tensor)>,
 ) -> Result<()> {
-    let (kvh, max_seq, d) = k.shape();
-    let nq = q.numel() / d;
+    let (_, _, d) = k.shape();
     ensure!(d == 256, "the q8 decode kernel is written for D=256, not {d}");
     // The folded and fixed-block routes have no q8 kernel: dense decode
     // never reaches their lengths with this model (a checkpoint with a
@@ -983,10 +1084,49 @@ fn sdpa_decode_q8(
         "q8 dense decode covers lengths below {GQA_FOLD_MIN_CONTEXT}, not {len}"
     );
     ensure!(len > 0, "decode over an empty cache");
-    let Some((partials, stats)) = split_scratch else {
+    let Some(split_scratch) = split_scratch else {
         anyhow::bail!("q8 decode needs the split scratch")
     };
-    let splits = len.div_ceil(SDPA_SPLIT);
+    sdpa_decode_q8_split(
+        ctx,
+        pass,
+        q,
+        k,
+        v,
+        out,
+        len,
+        scale,
+        split_scratch,
+        SDPA_SPLIT,
+        "sdpa_decode_split_q8",
+    )
+}
+
+/// [`sdpa_decode_q8`] with splits of `split` keys through the kernel of
+/// that split (`sdpa_decode_split_q8`: 256, `sdpa_decode_split64_q8`: 64).
+#[allow(clippy::too_many_arguments)]
+fn sdpa_decode_q8_split(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    k: Kv<'_>,
+    v: Kv<'_>,
+    out: &Tensor,
+    len: usize,
+    scale: f32,
+    (partials, stats): (&Tensor, &Tensor),
+    split: usize,
+    kernel: &'static str,
+) -> Result<()> {
+    let (kvh, max_seq, d) = k.shape();
+    let nq = q.numel() / d;
+    ensure!(d == 256, "the q8 decode kernel is written for D=256, not {d}");
+    ensure!(len > 0, "decode over an empty cache");
+    ensure!(q.numel() == nq * d && out.numel() == nq * d, "q/out shape mismatch");
+    ensure!(kvh > 0 && nq.is_multiple_of(kvh), "NQ {nq} not a multiple of KVH {kvh}");
+    ensure!(len <= max_seq && max_seq <= MAX_SEQ, "len {len} exceeds kernel MAX_SEQ");
+    ensure!(v.shape() == (kvh, max_seq, d), "k/v cache shapes differ");
+    let splits = len.div_ceil(split);
     ensure!(
         partials.numel() >= nq * splits * d && partials.dtype() == DType::F32,
         "split partials scratch too small"
@@ -995,7 +1135,7 @@ fn sdpa_decode_q8(
         stats.numel() >= nq * splits * 2 && stats.dtype() == DType::F32,
         "split stats scratch too small"
     );
-    let stage1 = ctx.pipeline("sdpa_decode_split_q8", SOURCE, MslVersion::V3_1)?;
+    let stage1 = ctx.pipeline(kernel, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &stage1,
         &[

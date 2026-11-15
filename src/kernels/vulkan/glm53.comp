@@ -11,7 +11,7 @@
     defined(KERNEL_glm53_gemv_q4_0_m2) || \
     defined(KERNEL_glm53_gemv_q4_0_m3) || \
     defined(KERNEL_glm53_gemv_q4_0_m4) || \
-    defined(KERNEL_glm53_gemv_q5_k_m1) || \
+    defined(KERNEL_glm53_gemv_q5_k_m1) || defined(KERNEL_glm53_gemv_q5_k_m1_r2) || \
     defined(KERNEL_glm53_gemv_q5_k_m2) || \
     defined(KERNEL_glm53_gemv_q5_k_m3) || \
     defined(KERNEL_glm53_gemv_q5_k_m4) || \
@@ -101,11 +101,17 @@ float glm53_group_sum(float v, uint width) {
     defined(KERNEL_glm53_gemv_q4_0_m2) || \
     defined(KERNEL_glm53_gemv_q4_0_m3) || defined(KERNEL_glm53_gemv_q4_0_m4)
 #define GEMV_TYPE GLM53_Q4_0
-#elif defined(KERNEL_glm53_gemv_q5_k_m1) || \
+#elif defined(KERNEL_glm53_gemv_q5_k_m1) || defined(KERNEL_glm53_gemv_q5_k_m1_r2) || \
     defined(KERNEL_glm53_gemv_q5_k_m2) || \
     defined(KERNEL_glm53_gemv_q5_k_m3) || defined(KERNEL_glm53_gemv_q5_k_m4)
 #define GEMV_TYPE GLM53_Q5_K
 #define GEMV_Q5_K 1
+#ifdef KERNEL_glm53_gemv_q5_k_m1_r2
+// One row of a wide weight (Gemma's LM head): a subgroup takes two weight
+// rows and loads each x task once for both (gemv_rows_per_subgroup on the
+// host). Narrower weights lose with half the subgroups.
+#define GEMV_R2 1
+#endif
 #elif defined(KERNEL_glm53_gemv_q6_k_m1) || \
     defined(KERNEL_glm53_gemv_q6_k_m2) || \
     defined(KERNEL_glm53_gemv_q6_k_m3) || defined(KERNEL_glm53_gemv_q6_k_m4)
@@ -127,7 +133,7 @@ float glm53_group_sum(float v, uint width) {
     defined(KERNEL_glm53_gemv_bf16_m1) || defined(KERNEL_glm53_gemv_f32_m1) || \
     defined(KERNEL_glm53_gemv_f16_m1) || \
     defined(KERNEL_glm53_gemv_q4_0_m1) || \
-    defined(KERNEL_glm53_gemv_q5_k_m1) || \
+    defined(KERNEL_glm53_gemv_q5_k_m1) || defined(KERNEL_glm53_gemv_q5_k_m1_r2) || \
     defined(KERNEL_glm53_gemv_q6_k_m1) || \
     defined(KERNEL_glm53_gemv_iq4_nl_m1) || \
     defined(KERNEL_glm53_gemv_iq2_s_m1)
@@ -183,6 +189,54 @@ float glm53_group_sum(float v, uint width) {
 #define GEMV_M 8u
 #define GEMV_WIDE 1
 #endif
+#ifdef GEMV_Q5_K
+// Task t of a Q5_K row: its sub-block's scale and min and its 32 codes.
+void glm53_q5_k_codes(uint64_t row, uint t, out float scale, out float minv, out float q[32]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 176u;
+    const uint j = t & 7u;
+    const uvec4 hd = U32x4(b).v[0];
+    const uvec3 sw = hd.yzw;
+    #define K5_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
+    uint sc, mn;
+    if (j < 4u) {
+        sc = K5_BYTE(j) & 63u;
+        mn = K5_BYTE(j + 4u) & 63u;
+    } else {
+        sc = (K5_BYTE(j + 4u) & 0xfu) | ((K5_BYTE(j - 4u) >> 6u) << 4u);
+        mn = (K5_BYTE(j + 4u) >> 4u) | ((K5_BYTE(j) >> 6u) << 4u);
+    }
+    #undef K5_BYTE
+    scale = glm53_h2f(hd.x & 0xffffu) * float(sc);
+    minv = glm53_h2f(hd.x >> 16u) * float(mn);
+    const uint shift = (j & 1u) * 4u;
+    const uvec4 qa = U32x4(b + 48u + (j >> 1u) * 32u).v[0];
+    const uvec4 qb = U32x4(b + 64u + (j >> 1u) * 32u).v[0];
+    const uvec4 ha = U32x4(b + 16u).v[0];
+    const uvec4 hb = U32x4(b + 32u).v[0];
+    // The four codes of a word at once: its bytes' nibbles and high bits
+    // under masks, then a byte extract and a convert each (one row's GEMV
+    // spent a fifth of its time on per-code extracts, 2026-11-15).
+    [[unroll]] for (uint c = 0u; c < 8u; c++) {
+        const uint word = (c < 4u ? qa[c] : qb[c - 4u]) >> shift;
+        const uint hw = (c < 4u ? ha[c] : hb[c - 4u]) >> j;
+        const uint c4 = (word & 0x0f0f0f0fu) | ((hw & 0x01010101u) << 4u);
+        [[unroll]] for (uint k = 0u; k < 4u; k++) q[4u * c + k] = float((c4 >> (8u * k)) & 0xffu);
+    }
+}
+
+// glm53_task_dot_sum of two weight rows over one load of x: (w . x,
+// wb . x, sum x).
+vec3 glm53_task_dot2_sum(in float w[32], in float wb[32], uint64_t x) {
+    float acc = 0.0, acc_b = 0.0, sx = 0.0;
+    [[unroll]] for (uint q = 0u; q < 8u; q++) {
+        const vec4 v = F32x4(x + 16u * q).v[0];
+        acc += w[4u * q] * v.x + w[4u * q + 1u] * v.y + w[4u * q + 2u] * v.z + w[4u * q + 3u] * v.w;
+        acc_b += wb[4u * q] * v.x + wb[4u * q + 1u] * v.y + wb[4u * q + 2u] * v.z + wb[4u * q + 3u] * v.w;
+        sx += (v.x + v.y) + (v.z + v.w);
+    }
+    return vec3(acc, acc_b, sx);
+}
+#endif
 void main() {
     const uint64_t X = arg(0);
     const uint K = arg_u32(9);
@@ -197,7 +251,11 @@ void main() {
     const uint tasks = K / GLM53_TASK;
     const uint width = min(tasks, 32u);
     const uint per_sg = 32u / width;
+#ifdef GEMV_R2
+    const uint rows_per_tg = 16u * per_sg;
+#else
     const uint rows_per_tg = 8u * per_sg;
+#endif
     // The threadgroup's set.
     uint tg = gl_WorkGroupID.x;
     uint set = 0u;
@@ -214,7 +272,13 @@ void main() {
     const uint64_t Y = arg(5u + set);
     const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
     const uint lane = gl_SubgroupInvocationID;
+#ifdef GEMV_R2
+    const uint n = 2u * ((tg * 8u + gl_SubgroupID) * per_sg + lane / width);
+    const uint64_t row_b = W + uint64_t(min(n + 1u, N - 1u)) * row_bytes;
+    float acc_b = 0.0;
+#else
     const uint n = (tg * 8u + gl_SubgroupID) * per_sg + lane / width;
+#endif
     const uint sub = lane % width;
     const bool live = n < N;
     const uint64_t row = W + uint64_t(min(n, N - 1u)) * row_bytes;
@@ -254,38 +318,25 @@ void main() {
     // multiply its row sums of code times x and of x, not every weight, and
     // the block is read in 16-byte loads (d, dmin and the scales in one;
     // 176-byte blocks are 16-byte aligned in Gemma's rows): the kernel is
-    // bound by its loads, one at a time per thread.
+    // bound by its loads, one at a time per thread. With one row of x the
+    // x loads were 8 of a task's 13: for the LM head two weight rows a
+    // subgroup share them (glm53_gemv_q5_k_m1_r2: 262144 x 2816 1253 ->
+    // 1100 us; o 2816 x 4096 27.6 -> 32.0, 2026-11-15).
     for (uint t = sub; t < tasks; t += width) {
-        const uint64_t b = row + uint64_t(t >> 3u) * 176u;
-        const uint j = t & 7u;
-        const uvec4 hd = U32x4(b).v[0];
-        const uvec3 sw = hd.yzw;
-        #define K5_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
-        uint sc, mn;
-        if (j < 4u) {
-            sc = K5_BYTE(j) & 63u;
-            mn = K5_BYTE(j + 4u) & 63u;
-        } else {
-            sc = (K5_BYTE(j + 4u) & 0xfu) | ((K5_BYTE(j - 4u) >> 6u) << 4u);
-            mn = (K5_BYTE(j + 4u) >> 4u) | ((K5_BYTE(j) >> 6u) << 4u);
-        }
-        #undef K5_BYTE
-        const float scale = glm53_h2f(hd.x & 0xffffu) * float(sc);
-        const float minv = glm53_h2f(hd.x >> 16u) * float(mn);
-        const uint shift = (j & 1u) * 4u;
-        const uvec4 qa = U32x4(b + 48u + (j >> 1u) * 32u).v[0];
-        const uvec4 qb = U32x4(b + 64u + (j >> 1u) * 32u).v[0];
-        const uvec4 ha = U32x4(b + 16u).v[0];
-        const uvec4 hb = U32x4(b + 32u).v[0];
+        float scale, minv;
         float q[32];
-        [[unroll]] for (uint c = 0u; c < 8u; c++) {
-            const uint word = (c < 4u ? qa[c] : qb[c - 4u]) >> shift;
-            const uint hw = (c < 4u ? ha[c] : hb[c - 4u]) >> j;
-            [[unroll]] for (uint k = 0u; k < 4u; k++) {
-                q[4u * c + k] = float(((word >> (8u * k)) & 0xfu) | (((hw >> (8u * k)) & 1u) << 4u));
-            }
-        }
+        glm53_q5_k_codes(row, t, scale, minv, q);
+#ifdef GEMV_R2
+        float scale_b, minv_b;
+        float q_b[32];
+        glm53_q5_k_codes(row_b, t, scale_b, minv_b, q_b);
+#endif
         const uint64_t xt = X + 4u * (uint64_t(g) * K + t * GLM53_TASK);
+#ifdef GEMV_R2
+        const vec3 r2 = glm53_task_dot2_sum(q, q_b, xt);
+        acc0 += scale * r2.x - minv * r2.z;
+        acc_b += scale_b * r2.y - minv_b * r2.z;
+#else
         vec2 r = glm53_task_dot_sum(q, xt);
         acc0 += scale * r.x - minv * r.y;
         if (m > 1u) {
@@ -300,6 +351,7 @@ void main() {
             r = glm53_task_dot_sum(q, xt + 12u * uint64_t(x_row_stride));
             acc3 += scale * r.x - minv * r.y;
         }
+#endif
     }
 #else
     for (uint t = sub; t < tasks; t += width) {
@@ -319,6 +371,10 @@ void main() {
     }
 #endif
     acc0 = glm53_group_sum(acc0, width);
+#ifdef GEMV_R2
+    acc_b = glm53_group_sum(acc_b, width);
+    if (n + 1u < N && sub == 0u) F32(Y).v[n + 1u] = acc_b;
+#endif
     if (m > 1u) acc1 = glm53_group_sum(acc1, width);
     if (m > 2u) acc2 = glm53_group_sum(acc2, width);
     if (m > 3u) acc3 = glm53_group_sum(acc3, width);
@@ -437,6 +493,69 @@ void main() {
         [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(X).v[8u * t + q];
         ag += glm53_dot_iq2_xxs(gate, t, xv);
         au += glm53_dot_iq2_xxs(up, t, xv);
+    }
+    ag = subgroupAdd(ag);
+    au = subgroupAdd(au);
+    if (gl_SubgroupInvocationID == 0u) {
+        F32(arg(5)).v[slot * F + r] = glm53_moe_act(ag, au, limit, we);
+    }
+}
+#endif
+
+// The IQ2_XXS gate/up over activations given as f16 in the dot's pairing
+// (DeepSeek V4's decode and verify rows; ds4_x_f16_iq2): of each 8 values,
+// word p holds values p and p + 4, so a task's 32 activations are four
+// 16-byte loads where f32 takes eight; products and sums as
+// glm53_dot_iq2_xxs's, in its order. moe_timing at GLM's shape (8 of 288
+// experts, 2048 x 4096): 108.3 -> 91.2 us a layer (2026-11-15); the same
+// for the Q2_K down kernel's activations gained nothing (74.4 -> 73.7).
+#ifdef KERNEL_glm53_moe_gate_up_iq2_xxs_xh
+float glm53_dot_iq2_xxs_xh(uint64_t row, uint t, in uvec4 xh[4]) {
+    const uint bw = (t >> 3u) * 33u;
+    const uint qw = bw + 1u + 4u * (t & 7u);
+    const float d = glm53_h2f(uint(U16(row).v[bw]));
+    const uint aux0 = uint(U16(row).v[qw]) | (uint(U16(row).v[qw + 1u]) << 16u);
+    const uint aux1 = uint(U16(row).v[qw + 2u]) | (uint(U16(row).v[qw + 3u]) << 16u);
+    precise float s = 0.0;
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const uint gi = (aux0 >> (8u * l)) & 0xffu;
+        const uint si = (aux1 >> (7u * l)) & 127u;
+        const uvec4 g = glm53_iq2xxs_grid_h[gi] ^ glm53_iq2xxs_signs_h[si];
+        const vec2 p0 = unpackHalf2x16(g.x), p1 = unpackHalf2x16(g.y);
+        const vec2 p2 = unpackHalf2x16(g.z), p3 = unpackHalf2x16(g.w);
+        const vec2 a0 = unpackHalf2x16(xh[l].x), a1 = unpackHalf2x16(xh[l].y);
+        const vec2 a2 = unpackHalf2x16(xh[l].z), a3 = unpackHalf2x16(xh[l].w);
+        precise float e = ((p0.x * a0.x + p0.y * a0.y) + (p1.x * a1.x + p1.y * a1.y))
+                        + ((p2.x * a2.x + p2.y * a2.y) + (p3.x * a3.x + p3.y * a3.y));
+        s += e;
+    }
+    precise float k = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
+    precise float v = k * s;
+    return v;
+}
+void main() {
+    const uint K = arg_u32(6);
+    const uint F = arg_u32(7);
+    const uint row_bytes = arg_u32(8);
+    const uint used = arg_u32(9);
+    const float limit = arg_f32(10);
+    const uint slot = gl_WorkGroupID.y;
+    const uint i = slot / used;
+    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    if (r >= F) return;
+    const uint e = U32(arg(3)).v[slot];
+    const float we = F32(arg(4)).v[slot];
+    const uint64_t off = (uint64_t(e) * F + r) * row_bytes;
+    const uint64_t gate = arg(0) + off;
+    const uint64_t up = arg(1) + off;
+    U32x4 X = U32x4(arg(2) + 2u * uint64_t(i) * K);
+    const uint tasks = K / GLM53_TASK;
+    float ag = 0.0, au = 0.0;
+    for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
+        uvec4 xh[4];
+        [[unroll]] for (uint q = 0u; q < 4u; q++) xh[q] = X.v[4u * t + q];
+        ag += glm53_dot_iq2_xxs_xh(gate, t, xh);
+        au += glm53_dot_iq2_xxs_xh(up, t, xh);
     }
     ag = subgroupAdd(ag);
     au = subgroupAdd(au);
@@ -915,6 +1034,14 @@ void main() {
 // ---------------------------------------------------------------------------
 // out[j] = a[j] + b[j]. Grid::Threads (n). Buffers: 0 a, 1 b, 2 out.
 // ---------------------------------------------------------------------------
+// Zeroes buffer 0's first 16 * n bytes. Grid::Threads (n). Params: 1 n.
+#ifdef KERNEL_glm53_zero
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    U32x4(arg(0)).v[gl_GlobalInvocationID.x] = uvec4(0u);
+}
+#endif
+
 #ifdef KERNEL_glm53_add
 void main() {
     if (!LILY_THREAD_IN_GRID) return;

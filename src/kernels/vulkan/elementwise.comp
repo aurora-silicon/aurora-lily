@@ -186,6 +186,95 @@ void main() {
 }
 #endif
 
+// argmax_prob_f32_partial / _final: argmax_f32 (the same first-max index)
+// that also writes the softmax probability of the maximum, 1 / sum of
+// exp(x - max): each threadgroup keeps a running maximum and the sum of
+// exponentials under it, rescaled when the maximum grows; -inf entries add
+// nothing. Partial buffers: 0 x, 1 pairs, 2 sums f32 [groups]; params 3 n,
+// 4 chunk. Final: 0 pairs, 1 sums, 2 index out, 3 probability out; param
+// 4 groups.
+#if defined(KERNEL_argmax_prob_f32_partial) || defined(KERNEL_argmax_prob_f32_final)
+#define ARGMAX_TG 256
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer ArgMaxPairs { uvec2 v[]; };
+shared float part_v[ARGMAX_TG / 32];
+shared uint part_i[ARGMAX_TG / 32];
+shared float part_s[ARGMAX_TG / 32];
+
+// (bv, bi, bs) absorbs (v, i, s): s is the sum of exp(. - v) of its part.
+void argmax_prob_merge(inout float bv, inout uint bi, inout float bs, float v, uint i, float s) {
+    if (v == -1.0 / 0.0) return;
+    if (bv == -1.0 / 0.0) {
+        bv = v;
+        bi = i;
+        bs = s;
+        return;
+    }
+    const float m = max(bv, v);
+    bs = bs * exp(bv - m) + s * exp(v - m);
+    if (v > bv || (v == bv && i < bi)) {
+        bi = i;
+    }
+    bv = m;
+}
+void argmax_prob_fold(inout float bv, inout uint bi, inout float bs) {
+    for (uint off = 16; off > 0; off >>= 1) {
+        float ov = subgroupShuffleXor(bv, off);
+        uint oi = subgroupShuffleXor(bi, off);
+        float os = subgroupShuffleXor(bs, off);
+        argmax_prob_merge(bv, bi, bs, ov, oi, os);
+    }
+}
+void argmax_prob_group(inout float bv, inout uint bi, inout float bs) {
+    argmax_prob_fold(bv, bi, bs);
+    if (thread_index_in_simdgroup == 0) {
+        part_v[simdgroup_index_in_threadgroup] = bv;
+        part_i[simdgroup_index_in_threadgroup] = bi;
+        part_s[simdgroup_index_in_threadgroup] = bs;
+    }
+    barrier();
+    if (thread_index_in_threadgroup == 0) {
+        for (uint s = 1; s < ARGMAX_TG / 32; ++s) {
+            argmax_prob_merge(bv, bi, bs, part_v[s], part_i[s], part_s[s]);
+        }
+    }
+}
+#endif
+
+#ifdef KERNEL_argmax_prob_f32_partial
+void main() {
+    F32 x = F32(arg(0));
+    uint n = arg_u32(3), chunk = arg_u32(4);
+    uint g = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    float bv = -1.0 / 0.0, bs = 0.0;
+    uint bi = 0;
+    uint end = min((g + 1) * chunk, n);
+    for (uint i = g * chunk + tid; i < end; i += ARGMAX_TG) argmax_prob_merge(bv, bi, bs, x.v[i], i, 1.0);
+    argmax_prob_group(bv, bi, bs);
+    if (tid == 0) {
+        ArgMaxPairs(arg(1)).v[g] = uvec2(floatBitsToUint(bv), bi);
+        F32(arg(2)).v[g] = bs;
+    }
+}
+#endif
+
+#ifdef KERNEL_argmax_prob_f32_final
+void main() {
+    ArgMaxPairs partials = ArgMaxPairs(arg(0));
+    uint groups = arg_u32(4), tid = thread_index_in_threadgroup;
+    float bv = -1.0 / 0.0, bs = 0.0;
+    uint bi = 0;
+    for (uint g = tid; g < groups; g += ARGMAX_TG) {
+        uvec2 pair = partials.v[g];
+        argmax_prob_merge(bv, bi, bs, uintBitsToFloat(pair.x), pair.y, F32(arg(1)).v[g]);
+    }
+    argmax_prob_group(bv, bi, bs);
+    if (tid == 0) {
+        U32(arg(2)).v[0] = bi;
+        F32(arg(3)).v[0] = bs > 0.0 ? 1.0 / bs : 0.0;
+    }
+}
+#endif
+
 #ifdef KERNEL_gelu_bf16
 // erf for the exact GELU: Abramowitz and Stegun 7.1.26, as the Metal kernel.
 float erf_f32(float x) {

@@ -228,6 +228,7 @@ fn synthetic_state(
         spec: None,
         #[cfg(target_os = "linux")]
         ahead: Default::default(),
+        draft_vocab: Default::default(),
         kv_format: format,
         kv_heads: HEADS,
         head_dim: HEAD_DIM,
@@ -386,4 +387,49 @@ fn a_layout_of_the_wrong_length_is_refused() {
     assert!(
         dst.read_prefix(&ctx, written + 4, 5000, &mut Cursor::new(&bytes)).is_err()
     );
+}
+
+/// A token outside the draft head's narrow LM head, and two inside it (a
+/// low id and an added token).
+const WIDE_TOKEN: u32 = 200_000;
+const LOW_TOKEN: u32 = 1_000;
+const ADDED_TOKEN: u32 = 248_046;
+
+/// The draft head's LM head choice goes with the state through snapshots:
+/// a restore into a new state takes the snapshot's, a rollback to an older
+/// snapshot forgets what was fed after it, a fork (prefix copy + restore)
+/// copies it, and a disk read starts on the whole head.
+#[test]
+fn the_draft_vocabulary_travels_with_snapshots() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut a = synthetic_state(&ctx, KvFormat::Bf16, 64);
+    // Positions 0..5 in the narrow head: a snapshot there drafts narrow.
+    a.draft_vocab.note(0, &[LOW_TOKEN; 5]);
+    a.pos = 5;
+    let early = a.snapshot(&ctx).expect("snapshot");
+    // Position 7 outside it, then in-range tokens up to 10.
+    a.draft_vocab.note(5, &[LOW_TOKEN, LOW_TOKEN, WIDE_TOKEN, LOW_TOKEN, ADDED_TOKEN]);
+    a.pos = 10;
+    assert!(a.draft_vocab.wide(a.pos));
+    let late = a.snapshot(&ctx).expect("snapshot");
+
+    // Restore into a new state.
+    let mut b = synthetic_state(&ctx, KvFormat::Bf16, 64);
+    b.restore(&ctx, &late).expect("restore");
+    assert!(b.draft_vocab.wide(b.pos), "new-state restore");
+
+    // Rollback of the same state to before the excluded token.
+    a.restore(&ctx, &early).expect("rollback");
+    assert!(!a.draft_vocab.wide(a.pos), "rollback keeps the later history");
+
+    // Fork: the prefix copy, then the source's snapshot.
+    let mut c = synthetic_state(&ctx, KvFormat::Bf16, 64);
+    c.copy_prefix_from(&ctx, &b, 10).expect("prefix copy");
+    c.restore(&ctx, &late).expect("fork restore");
+    assert_eq!(c.draft_vocab, b.draft_vocab, "fork");
+
+    // A disk read has no history: the whole head first.
+    let disk = super::super::spec::DraftVocab::after_disk_restore(10);
+    assert!(disk.wide(10));
+    assert!(!disk.wide(10 + 200), "the window still ends");
 }

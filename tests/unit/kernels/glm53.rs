@@ -179,29 +179,70 @@ fn gemv_matches_cpu_for_every_type_and_row_count() {
 
 #[test]
 fn gemv_grouped_matches_cpu() {
-    // attn_k_b's shape: 64 heads x 512 rows of 256, input per head.
+    // attn_k_b's shape: 64 heads x 512 rows of 256, input per head; Q5_K
+    // at all 64 heads is past the two-rows-a-subgroup threshold (32768
+    // rows), which grouped inputs must not take.
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(54);
-    let (heads, per, cols) = (8, 512, 256);
-    let raw = random_blocks(&mut rng, GgmlType::Q8_0, heads * per * cols);
-    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, heads * per).unwrap();
-    let cpu = mat(GgmlType::Q8_0, &raw, heads * per, cols);
-    for m in [1, 3] {
-        let x = f32s(&mut rng, m * heads * cols, -1.0, 1.0);
-        let tx = tensor(&ctx, &x);
-        let out = zeros(&ctx, m * heads * per);
-        let layout = GemvLayout {
-            x_group: per,
-            x_row_stride: heads * cols,
-            y_row_stride: heads * per,
-        };
-        run(&ctx, |p| gemv_with(&ctx, p, &w, &tx, &out, m, layout).unwrap());
-        let expected: Vec<f32> = (0..m)
-            .flat_map(|i| {
-                cpu.mv_grouped(&x[i * heads * cols..(i + 1) * heads * cols], per)
-            })
-            .collect();
-        assert_close(&out.to_f32().unwrap(), &expected, 1e-4, 1e-4);
+    let (per, cols) = (512, 256);
+    for (ty, heads) in [(GgmlType::Q8_0, 8), (GgmlType::Q5K, 64)] {
+        let raw = random_blocks(&mut rng, ty, heads * per * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, cols, heads * per).unwrap();
+        let cpu = mat(ty, &raw, heads * per, cols);
+        for m in [1, 3] {
+            let x = f32s(&mut rng, m * heads * cols, -1.0, 1.0);
+            let tx = tensor(&ctx, &x);
+            let out = zeros(&ctx, m * heads * per);
+            let layout = GemvLayout {
+                x_group: per,
+                x_row_stride: heads * cols,
+                y_row_stride: heads * per,
+            };
+            run(&ctx, |p| gemv_with(&ctx, p, &w, &tx, &out, m, layout).unwrap());
+            let expected: Vec<f32> = (0..m)
+                .flat_map(|i| {
+                    cpu.mv_grouped(&x[i * heads * cols..(i + 1) * heads * cols], per)
+                })
+                .collect();
+            assert_close(&out.to_f32().unwrap(), &expected, 1e-4, 1e-4);
+        }
+    }
+}
+
+/// The routed gate/up over f16 activations (decode rows of DeepSeek V4)
+/// against the f32-activation kernel: six rows of six slots, within f16's
+/// rounding of the activations.
+#[test]
+fn moe_xh_matches_f32_kernel() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(81);
+    let (experts, hidden, ff, used, m) = (12, 512, 256, 6, 6);
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+    let sel: Vec<u32> = (0..m * used).map(|s| ((s * 7 + s / used) % experts) as u32).collect();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+    let (mid, mid_h) = (zeros(&ctx, m * used * ff), zeros(&ctx, m * used * ff));
+    let xh = Tensor::zeros(&ctx, &[m * hidden], DType::F16).unwrap();
+    run(&ctx, |p| {
+        moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid, m, used, 10.0).unwrap();
+        crate::kernels::deepseek4::x_f16_iq2(&ctx, p, &x, &xh, m, hidden).unwrap();
+        p.memory_barrier().unwrap();
+        moe_gate_up_xh(&ctx, p, &gw, &uw, ff, &xh, &tsel, &tw, &mid_h, m, used, 10.0)
+            .unwrap();
+    });
+    let (a, b) = (mid_h.to_f32().unwrap(), mid.to_f32().unwrap());
+    let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
+    for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+        // f16 activations: a half-ulp (2^-12) per product, with cancellation.
+        assert!((x - y).abs() <= 5e-3 * scale + 1e-3 * y.abs(), "mid {k}: {x} vs {y}");
     }
 }
 
@@ -1988,27 +2029,32 @@ fn moe_timing() {
     let tw = tensor(&ctx, &vec![0.3f32; used]);
     let mid = zeros(&ctx, used * ff);
     let out = zeros(&ctx, hidden);
-    for (label, part) in [("gate_up", 0), ("down", 1)] {
+    let xh = Tensor::zeros(&ctx, &[hidden], DType::F16).unwrap();
+    run(&ctx, |p| crate::kernels::deepseek4::x_f16_iq2(&ctx, p, &x, &xh, 1, hidden).unwrap());
+    for (label, part) in [("gate_up", 0), ("down", 1), ("gate_up f16 x", 2)] {
         let mut best = f64::MAX;
         for _ in 0..5 {
             let pass = ctx.begin().unwrap();
             for r in 0..repeat {
                 let (g, u, d) = &layers[r % 4];
-                if part == 0 {
-                    moe_gate_up(
+                match part {
+                    0 => moe_gate_up(
                         &ctx, &pass, g, u, ff, &x, &tsel, &tw, &mid, 1, used, 10.0,
                     )
-                    .unwrap();
-                } else {
-                    moe_down(&ctx, &pass, d, hidden, &mid, &tsel, None, &out, 1, used)
-                        .unwrap();
+                    .unwrap(),
+                    1 => moe_down(&ctx, &pass, d, hidden, &mid, &tsel, None, &out, 1, used)
+                        .unwrap(),
+                    _ => moe_gate_up_xh(
+                        &ctx, &pass, g, u, ff, &xh, &tsel, &tw, &mid, 1, used, 10.0,
+                    )
+                    .unwrap(),
                 }
             }
             let t = std::time::Instant::now();
             pass.commit_wait().unwrap();
             best = best.min(t.elapsed().as_secs_f64());
         }
-        let bytes = if part == 0 { 2 * used * ff * 1056 } else { used * hidden * 672 };
+        let bytes = if part % 2 == 0 { 2 * used * ff * 1056 } else { used * hidden * 672 };
         let per = best / repeat as f64;
         println!(
             "moe {label:24} {:8.1} us  {:6.1} GB/s",
@@ -2325,6 +2371,13 @@ fn gemm_bx_matches_gemm() {
         (GgmlType::Q4K, 256, 40, 257),
         (GgmlType::Q4K, 256, 72, 513),
         (GgmlType::Q4K, 512, 136, 1024),
+        (GgmlType::F16, 256, 72, 255),
+        (GgmlType::F16, 512, 100, 513),
+        // Short runs over 8 192 weight rows (four-subgroup tiles), and
+        // their edge at 128 and 129 rows.
+        (GgmlType::Q8_0, 256, 8192, 24),
+        (GgmlType::Q4K, 256, 8200, 128),
+        (GgmlType::Q8_0, 256, 8192, 129),
     ] {
         let raw = random_blocks(&mut rng, ty, rows * cols);
         let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
@@ -2348,6 +2401,76 @@ fn gemm_bx_matches_gemm() {
             "{ty:?} {rows} x {cols}, {m} rows"
         );
     }
+}
+
+/// The batched layout over a bfloat copy (DeepSeek V4's grouped output
+/// projection) gives the f32-input batched GEMM's results bit for bit.
+#[test]
+fn gemm_bx_batched_matches_gemm_with() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(79);
+    let (heads, per, cols, m) = (4, 128, 256, 300);
+    let raw = random_blocks(&mut rng, GgmlType::Q8_0, heads * per * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, heads * per).unwrap();
+    let x = f32s(&mut rng, m * heads * cols, -1.0, 1.0);
+    let tx = tensor(&ctx, &x);
+    let xb = Tensor::zeros(&ctx, &[m * heads * cols], DType::BF16).unwrap();
+    let (y, yb) = (zeros(&ctx, m * heads * per), zeros(&ctx, m * heads * per));
+    let l = GemmLayout {
+        ldx: heads * cols,
+        ldy: heads * per,
+        batches: heads,
+        x_batch: cols,
+        w_batch: per,
+        y_batch: per,
+    };
+    run(&ctx, |p| {
+        gemm_with(&ctx, p, &w, &tx, &y, m, per, l).unwrap();
+        to_bf16(&ctx, p, &tx, &xb, m * heads * cols).unwrap();
+        p.memory_barrier().unwrap();
+        gemm_bx_with(&ctx, p, &w, &xb, &yb, m, per, l).unwrap();
+    });
+    let (a, b) = (y.to_f32().unwrap(), yb.to_f32().unwrap());
+    assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+}
+
+/// DeepSeek V4's grouped output projection as it runs (a dispatch a group
+/// over offset views of the weights, input and output) gives the batched
+/// grid's results bit for bit: eight groups, 300 rows (a partial 256-row
+/// tile), the last group's last row at the tensors' ends.
+#[test]
+fn gemm_bx_split_groups_match_batched() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(83);
+    let (groups, per, cols, m) = (8, 128, 256, 300);
+    let raw = random_blocks(&mut rng, GgmlType::Q8_0, groups * per * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, groups * per).unwrap();
+    let x = tensor(&ctx, &f32s(&mut rng, m * groups * cols, -1.0, 1.0));
+    let xb = Tensor::zeros(&ctx, &[m * groups * cols], DType::BF16).unwrap();
+    let (y, ys) = (zeros(&ctx, m * groups * per), zeros(&ctx, m * groups * per));
+    let l = GemmLayout {
+        ldx: groups * cols,
+        ldy: groups * per,
+        batches: groups,
+        x_batch: cols,
+        w_batch: per,
+        y_batch: per,
+    };
+    let one = GemmLayout { batches: 1, x_batch: 0, w_batch: 0, y_batch: 0, ..l };
+    run(&ctx, |p| {
+        to_bf16(&ctx, p, &x, &xb, m * groups * cols).unwrap();
+        p.memory_barrier().unwrap();
+        gemm_bx_with(&ctx, p, &w, &xb, &y, m, per, l).unwrap();
+        for g in 0..groups {
+            let t = w.t.view(g * per * w.row_bytes, &[per * w.row_bytes]).unwrap();
+            let wg = QWeight::new(t, GgmlType::Q8_0, cols, per).unwrap();
+            let xv = xb.view(g * cols, &[xb.numel() - g * cols]).unwrap();
+            let yv = ys.view(g * per, &[ys.numel() - g * per]).unwrap();
+            gemm_bx_with(&ctx, p, &wg, &xv, &yv, m, per, one).unwrap();
+        }
+    });
+    let (a, b) = (y.to_f32().unwrap(), ys.to_f32().unwrap());
+    assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
 }
 
 #[test]
@@ -2456,10 +2579,312 @@ fn moe_grouped_case(used: usize) {
     }
 }
 
+/// The register path of short runs' experts ([`moe_grouped_dot`]) on a
+/// sparse selection (40 experts; 6, 9 and 7 rows: experts of one to three
+/// rows, all on the register path) against the per-pair f32 kernels, at
+/// least as close as the bfloat tiles ([`moe_grouped`]), for 8 and 6 slots.
+/// The route boundaries are `moe_grouped_dot_route_boundaries`'.
+#[test]
+fn moe_grouped_dot_matches_per_pair_kernels() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(80);
+    let (experts, hidden, ff) = (40, 512, 256);
+    let g_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
+    let u_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
+    let d_raw = random_blocks(&mut rng, GgmlType::Q2K, experts * hidden * ff);
+    let gw = QWeight::from_bytes(&ctx, &g_raw, GgmlType::Iq2Xxs, hidden, experts * ff)
+        .unwrap();
+    let uw = QWeight::from_bytes(&ctx, &u_raw, GgmlType::Iq2Xxs, hidden, experts * ff)
+        .unwrap();
+    let dw =
+        QWeight::from_bytes(&ctx, &d_raw, GgmlType::Q2K, ff, experts * hidden).unwrap();
+    for (m, used) in [(6usize, 8usize), (9, 8), (7, 6)] {
+        let x = f32s(&mut rng, m * hidden, -2.0, 2.0);
+        // Distinct experts a row; rows 0 and 1 share three, so some experts
+        // have two rows and a few three.
+        let sel: Vec<u32> = (0..m)
+            .flat_map(|i| (0..used).map(move |s| ((i * 5 + s * 7) % experts) as u32))
+            .collect();
+        for i in 0..m {
+            let row = &sel[i * used..(i + 1) * used];
+            for a in 0..used {
+                assert!(!row[a + 1..].contains(&row[a]), "row {i} repeats an expert");
+            }
+        }
+        let wts = f32s(&mut rng, m * used, 0.1, 0.6);
+        let shared = f32s(&mut rng, m * hidden, -1.0, 1.0);
+        let tx = tensor(&ctx, &x);
+        let tsel = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&sel),
+            &[sel.len()],
+            DType::U32,
+        )
+        .unwrap();
+        let tw = tensor(&ctx, &wts);
+        let (tiles, dot, reference) =
+            (tensor(&ctx, &shared), tensor(&ctx, &shared), tensor(&ctx, &shared));
+        let mid = zeros(&ctx, m * used * ff);
+        let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+        run(&ctx, |p| {
+            moe_grouped(
+                &ctx, p, &gw, &uw, &dw, ff, hidden, &tx, &tsel, &tw, &tiles, &gs, m,
+                used, experts, 0.05,
+            )
+            .unwrap();
+        });
+        run(&ctx, |p| {
+            moe_grouped_dot(
+                &ctx, p, &gw, &uw, &dw, ff, hidden, &tx, &tsel, &tw, &dot, &gs, m,
+                used, experts, 0.05,
+            )
+            .unwrap();
+            moe_gate_up(&ctx, p, &gw, &uw, ff, &tx, &tsel, &tw, &mid, m, used, 0.05)
+                .unwrap();
+            moe_down(
+                &ctx,
+                p,
+                &dw,
+                hidden,
+                &mid,
+                &tsel,
+                Some(&reference),
+                &reference,
+                m,
+                used,
+            )
+            .unwrap();
+        });
+        let b = reference.to_f32().unwrap();
+        let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
+        let mut err = [0f64; 2];
+        for (route, t) in [&tiles, &dot].into_iter().enumerate() {
+            let a = t.to_f32().unwrap();
+            for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    (x - y).abs() <= 3e-2 * scale,
+                    "m {m} route {route} element {k}: {x} vs {y}"
+                );
+                err[route] += f64::from(x - y).powi(2);
+            }
+        }
+        assert!(
+            err[1] <= err[0],
+            "m {m}: register path error {} above tiles' {}",
+            err[1],
+            err[0]
+        );
+    }
+}
+
+/// The register path's route boundaries ([`moe_grouped_dot`]) with
+/// controlled expert occupancies: single-tile experts of 1, 2, 3 and 4 rows
+/// take it, one of 5 rows does not, nor do experts split over tiles whose
+/// last tile has 1 to 4 rows (64 + 1..4 with 64-row tiles, 128 + 1..4 with
+/// 128-row tiles), nor full 64-row fillers. Per pair, the gate/up output
+/// (`mid`) and the down output of an expert on the register path differ
+/// from the tile route's and are at least as close to the per-pair f32
+/// kernels; every other expert's are the tile route's bit for bit. Two runs
+/// give the same bits. Unclamped and clamped (10) SwiGLU.
+#[test]
+fn moe_grouped_dot_route_boundaries() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(81);
+    let (hidden, ff, used, m) = (512usize, 256usize, 8usize, 140usize);
+    // Experts 0-4: 1..5 rows; 5-8: 65..68; 9-12: 129..132; then fillers.
+    let mut occ: Vec<usize> = vec![1, 2, 3, 4, 5, 65, 66, 67, 68, 129, 130, 131, 132];
+    let mut left = m * used - occ.iter().sum::<usize>();
+    while left > 0 {
+        let c = left.min(64);
+        occ.push(c);
+        left -= c;
+    }
+    let experts = occ.len();
+    // Pairs of an expert go to consecutive rows (mod m): no row repeats an
+    // expert (every count <= m), and every row gets `used` pairs.
+    let mut rows: Vec<Vec<u32>> = vec![Vec::new(); m];
+    let mut cursor = 0;
+    for (e, &c) in occ.iter().enumerate() {
+        for _ in 0..c {
+            rows[cursor % m].push(e as u32);
+            cursor += 1;
+        }
+    }
+    assert!(rows.iter().all(|r| r.len() == used), "rows of {used} slots");
+    let sel: Vec<u32> = rows.concat();
+    let mut count = vec![0usize; experts];
+    for &e in &sel {
+        count[e as usize] += 1;
+    }
+    assert_eq!(count, occ, "occupancies as built");
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+    let shared = f32s(&mut rng, m * hidden, -1.0, 1.0);
+    let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+    for limit in [0.0f32, 10.0] {
+        // The per-pair f32 kernels: mid and the routed sum plus shared.
+        let mid_ref = zeros(&ctx, m * used * ff);
+        let out_ref = tensor(&ctx, &shared);
+        run(&ctx, |p| {
+            moe_gate_up(
+                &ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid_ref, m, used, limit,
+            )
+            .unwrap();
+            moe_down(
+                &ctx,
+                p,
+                &dw,
+                hidden,
+                &mid_ref,
+                &tsel,
+                Some(&out_ref),
+                &out_ref,
+                m,
+                used,
+            )
+            .unwrap();
+        });
+        let mid_ref = mid_ref.to_f32().unwrap();
+        let out_ref = out_ref.to_f32().unwrap();
+        for (tile_rows, tiles) in [(64usize, MoeTiles::R64), (128, MoeTiles::R128)] {
+            let route = |dot: usize| {
+                let out = tensor(&ctx, &shared);
+                run(&ctx, |p| {
+                    moe_grouped_with(
+                        &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs,
+                        m, used, experts, limit, true, tiles, dot,
+                    )
+                    .unwrap()
+                });
+                (
+                    gs.mid.to_f32().unwrap(),
+                    gs.down.to_f32().unwrap(),
+                    out.to_f32().unwrap(),
+                )
+            };
+            let tiles = route(0);
+            let dot = route(MOE_DOT_ROWS);
+            let again = route(MOE_DOT_ROWS);
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&dot.0), bits(&again.0), "mid repeat, tiles {tile_rows}");
+            assert_eq!(bits(&dot.2), bits(&again.2), "out repeat, tiles {tile_rows}");
+            // Routed sums against the f32 kernels, both routes.
+            let scale = (out_ref.iter().map(|v| v * v).sum::<f32>()
+                / out_ref.len() as f32)
+                .sqrt();
+            // Unclamped, the tiles' worst element is ~3.1% of the RMS, the
+            // register path's ~2.3% (bfloat inputs and intermediate).
+            for (k, ((a, b), r)) in tiles.2.iter().zip(&dot.2).zip(&out_ref).enumerate()
+            {
+                assert!(
+                    (a - r).abs() <= 4e-2 * scale,
+                    "limit {limit} tiles {tile_rows} out {k}"
+                );
+                assert!(
+                    (b - r).abs() <= 4e-2 * scale,
+                    "limit {limit} dot {tile_rows} out {k}"
+                );
+            }
+            let mut err = [0f64; 2];
+            for (pair, &e) in sel.iter().enumerate() {
+                let c = occ[e as usize];
+                let on_dot = c <= MOE_DOT_ROWS && c <= tile_rows;
+                let (mr, mt, md) = (
+                    &mid_ref[pair * ff..(pair + 1) * ff],
+                    &tiles.0[pair * ff..(pair + 1) * ff],
+                    &dot.0[pair * ff..(pair + 1) * ff],
+                );
+                let (dt, dd) = (
+                    &tiles.1[pair * hidden..(pair + 1) * hidden],
+                    &dot.1[pair * hidden..(pair + 1) * hidden],
+                );
+                if on_dot {
+                    assert_ne!(
+                        bits(mt),
+                        bits(md),
+                        "expert {e} ({c} rows) took the tiles"
+                    );
+                    assert_ne!(
+                        bits(dt),
+                        bits(dd),
+                        "expert {e} ({c} rows) down took the tiles"
+                    );
+                    let ms = (mr.iter().map(|v| v * v).sum::<f32>() / ff as f32).sqrt();
+                    // mid is bfloat: half a bfloat step of the value plus the
+                    // inputs' bfloat rounding over the row. (The tiles round
+                    // every weight too: their worst element is a few times
+                    // that, compared in aggregate below.)
+                    for (j, ((t, d), r)) in mt.iter().zip(md).zip(mr).enumerate() {
+                        let tol = r.abs() / 128.0 + 2e-2 * ms + 1e-6;
+                        assert!(
+                            (d - r).abs() <= tol,
+                            "limit {limit} expert {e} pair {pair} mid {j}: {d} vs {r}"
+                        );
+                        err[0] += f64::from(t - r).powi(2);
+                        err[1] += f64::from(d - r).powi(2);
+                    }
+                } else {
+                    assert_eq!(
+                        bits(mt),
+                        bits(md),
+                        "expert {e} ({c} rows) mid, tiles {tile_rows}"
+                    );
+                    assert_eq!(
+                        bits(dt),
+                        bits(dd),
+                        "expert {e} ({c} rows) down, tiles {tile_rows}"
+                    );
+                }
+            }
+            assert!(
+                err[1] <= err[0],
+                "limit {limit} tiles {tile_rows}: register path mid error {} above tiles' {}",
+                err[1],
+                err[0]
+            );
+        }
+    }
+}
+
+/// The GPU zero fill (`zero`) clears exactly its tensor: a view 64 values
+/// into a nonzero buffer, 3 140 values long (785 16-byte units: the last
+/// 256-thread group partial), with the values around it untouched.
+#[test]
+fn gpu_zero_fills_its_view_only() {
+    let ctx = ctx();
+    let (lead, len, tail) = (64usize, 4 * (256 * 3 + 17), 64usize);
+    let n = lead + len + tail;
+    let pattern: Vec<f32> = (0..n).map(|i| 1.0 + i as f32).collect();
+    let all = tensor(&ctx, &pattern);
+    let view = all.view(lead, &[len]).unwrap();
+    run(&ctx, |p| zero(&ctx, p, &view).unwrap());
+    let got = all.to_f32().unwrap();
+    for (i, (&g, &p)) in got.iter().zip(&pattern).enumerate() {
+        let want = if (lead..lead + len).contains(&i) { 0.0 } else { p };
+        assert_eq!(g.to_bits(), want.to_bits(), "value {i}");
+    }
+    // A length that is not whole 16-byte units is refused.
+    let odd = all.view(lead, &[len - 1]).unwrap();
+    let pass = ctx.begin().unwrap();
+    assert!(zero(&ctx, &pass, &odd).is_err());
+    pass.commit_wait().unwrap();
+}
+
 /// The prefill's grouped routed experts at the model's shapes (gate/up
 /// IQ2_XXS 2048 x 4096, down Q2_K 4096 x 2048) over 64 experts, for runs
 /// whose pairs per expert match a 256-token and a 4K-token prompt of the
-/// model (288 experts, 8 used): best of three passes of one call.
+/// model (288 experts, 8 used), and a 24- and 64-token prompt: best of five
+/// passes of four calls.
 #[test]
 #[ignore = "timing only"]
 fn moe_grouped_timing() {
@@ -2474,11 +2899,16 @@ fn moe_grouped_timing() {
     let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
     // Rows such that pairs per expert = n * 8 / 288 for prompts of 256, 1K
-    // and 4K tokens.
+    // and 4K tokens; DeepSeek V4's 2K (6 of 256: 48 a expert). A 24-token
+    // prompt picks ~140 of 288 experts, 1.4 pairs each; 64 tokens ~240, 2.1
+    // each.
     for (label, m) in [
+        ("24-token density", 11),
+        ("64-token density", 17),
         ("256-token density", 57),
         ("1K-token density", 228),
         ("4K-token density", 910),
+        ("DS4 2K density", 384),
     ] {
         let sel: Vec<u32> = (0..m)
             .flat_map(|i| {
@@ -2497,24 +2927,95 @@ fn moe_grouped_timing() {
         let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
         let out = zeros(&ctx, m * hidden);
         let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
-        for tile_rows in [64, 128] {
+        for (tile_rows, dot) in
+            [(MoeTiles::R64, 0), (MoeTiles::R64, MOE_DOT_ROWS), (MoeTiles::R128, 0)]
+        {
             let mut best = f64::MAX;
-            for _ in 0..3 {
+            for _ in 0..5 {
                 let pass = ctx.begin().unwrap();
-                moe_grouped_with(
-                    &ctx, &pass, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs,
-                    m, used, experts, 10.0, true, tile_rows,
-                )
-                .unwrap();
+                for _ in 0..4 {
+                    moe_grouped_with(
+                        &ctx, &pass, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out,
+                        &gs, m, used, experts, 10.0, true, tile_rows, dot,
+                    )
+                    .unwrap();
+                    pass.memory_barrier().unwrap();
+                }
                 let t = std::time::Instant::now();
                 pass.commit_wait().unwrap();
-                best = best.min(t.elapsed().as_secs_f64());
+                best = best.min(t.elapsed().as_secs_f64() / 4.0);
             }
             println!(
-                "moe grouped {label:20} m {m:4} tiles {tile_rows:3}: {:8.1} us",
+                "moe grouped {label:20} m {m:4} tiles {tile_rows:?}{}: {:8.1} us",
+                if dot > 0 { " dot" } else { "    " },
                 best * 1e6
             );
         }
+    }
+}
+
+/// DeepSeek V4's prompt-run Q8_0 GEMMs over bfloat input at a run of 2 048
+/// rows; the grouped output projection's eight groups as one batched grid
+/// and as a dispatch a group (the model's): best of three passes of four
+/// calls.
+#[test]
+#[ignore = "timing only"]
+fn gemm_bx_timing_ds4() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(80);
+    let m = 2048;
+    for (label, cols, rows, batches, split) in [
+        ("q_a 1024x4096", 4096usize, 1024usize, 1usize, false),
+        ("kv 512x4096", 4096, 512, 1, false),
+        ("q_b 32768x1024", 1024, 32768, 1, false),
+        ("out_a 8 x 1024x4096 batched", 4096, 8192, 8, false),
+        ("out_a 8 dispatches", 4096, 8192, 8, true),
+        ("out_b 4096x8192", 8192, 4096, 1, false),
+        ("shexp gate 2048x4096", 4096, 2048, 1, false),
+        ("shexp down 4096x2048", 2048, 4096, 1, false),
+    ] {
+        let raw = random_blocks(&mut rng, GgmlType::Q8_0, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap();
+        let xcols = cols * batches;
+        let x = tensor(&ctx, &f32s(&mut rng, m * xcols, -1.0, 1.0));
+        let n = rows / batches;
+        let y = zeros(&ctx, m * rows);
+        let xb = Tensor::zeros(&ctx, &[m * xcols], DType::BF16).unwrap();
+        run(&ctx, |p| to_bf16(&ctx, p, &x, &xb, m * xcols).unwrap());
+        let l = GemmLayout {
+            ldx: xcols,
+            ldy: rows,
+            batches,
+            x_batch: cols,
+            w_batch: n,
+            y_batch: n,
+        };
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let pass = ctx.begin().unwrap();
+            for _ in 0..4 {
+                if !split {
+                    gemm_bx_with(&ctx, &pass, &w, &xb, &y, m, n, l).unwrap();
+                    continue;
+                }
+                for b in 0..batches {
+                    let one = GemmLayout { batches: 1, ..l };
+                    let xv = xb.view(b * cols, &[m * xcols - b * cols]).unwrap();
+                    let yv = y.view(b * n, &[m * rows - b * n]).unwrap();
+                    let t = w.t.view(b * n * w.row_bytes, &[n * w.row_bytes]).unwrap();
+                    let wv = QWeight::new(t, GgmlType::Q8_0, cols, n).unwrap();
+                    gemm_bx_with(&ctx, &pass, &wv, &xv, &yv, m, n, one).unwrap();
+                }
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64() / 4.0);
+        }
+        println!(
+            "gemm_bx {label:28} m {m}: {:8.1} us  {:5.1} TFLOP/s",
+            best * 1e6,
+            2.0 * (m * rows * cols) as f64 / best / 1e12
+        );
     }
 }
 
@@ -2604,12 +3105,17 @@ fn moe_grouped_fused_matches_separate() {
     let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
     for limit in [0.0f32, 1e-3, 10.0] {
         let mut got = Vec::new();
-        for (fused, tile_rows) in [(true, 64), (false, 64), (true, 128), (false, 128)] {
+        for (fused, tile_rows) in [
+            (true, MoeTiles::R64),
+            (false, MoeTiles::R64),
+            (true, MoeTiles::R128),
+            (false, MoeTiles::R128),
+        ] {
             let out = zeros(&ctx, m * hidden);
             run(&ctx, |p| {
                 moe_grouped_with(
                     &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m,
-                    used, experts, limit, fused, tile_rows,
+                    used, experts, limit, fused, tile_rows, 0,
                 )
                 .unwrap()
             });
@@ -2620,6 +3126,60 @@ fn moe_grouped_fused_matches_separate() {
             assert_eq!(bits(&got[0].0), bits(&got[k].0), "mid, limit {limit}, {k}");
             assert_eq!(bits(&got[0].1), bits(&got[k].1), "out, limit {limit}, {k}");
         }
+    }
+}
+
+/// DeepSeek V4's prompt scratch for Q2_K gate/up experts (which its schema
+/// accepts): the model picks the separate route's scratch, and the grouped
+/// experts over it give the per-pair kernels' result; the compact fused
+/// scratch is refused for that route instead of written past.
+#[test]
+fn deepseek4_q2_k_gate_up_scratch() {
+    use crate::deepseek4::model::{moe_group_scratch, separate_gate_up};
+    assert!(separate_gate_up([GgmlType::Iq2Xxs, GgmlType::Q2K]));
+    assert!(!separate_gate_up([GgmlType::Iq2Xxs, GgmlType::Iq2Xxs]));
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(82);
+    let (experts, hidden, ff, used, m) = (12, 512, 256, 6, 40);
+    let mk = |rng: &mut StdRng, cols, rows| {
+        let raw = random_blocks(rng, GgmlType::Q2K, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, GgmlType::Q2K, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, hidden, experts * ff);
+    let uw = mk(&mut rng, hidden, experts * ff);
+    let dw = mk(&mut rng, ff, experts * hidden);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+    let sel: Vec<u32> = (0..m * used).map(|s| ((s * 5 + s / used) % experts) as u32).collect();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+    let dims = (used, experts, ff, hidden);
+    let gs = moe_group_scratch(&ctx, m, dims, separate_gate_up([GgmlType::Q2K])).unwrap();
+    let compact = moe_group_scratch(&ctx, m, dims, false).unwrap();
+    let (out, refused) = (zeros(&ctx, m * hidden), zeros(&ctx, m * hidden));
+    let (mid, want) = (zeros(&ctx, m * used * ff), zeros(&ctx, m * hidden));
+    let mut err = None;
+    run(&ctx, |p| {
+        moe_grouped_tiles(
+            &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m, used,
+            experts, 10.0, MoeTiles::R64,
+        )
+        .unwrap();
+        err = moe_grouped_tiles(
+            &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &refused, &compact, m,
+            used, experts, 10.0, MoeTiles::R64,
+        )
+        .err();
+        moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid, m, used, 10.0).unwrap();
+        p.memory_barrier().unwrap();
+        moe_down(&ctx, p, &dw, hidden, &mid, &tsel, None, &want, m, used).unwrap();
+    });
+    assert!(err.is_some(), "the compact scratch must be refused for Q2_K gate/up");
+    let (a, b) = (out.to_f32().unwrap(), want.to_f32().unwrap());
+    let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
+    for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!((x - y).abs() <= 3e-2 * scale, "element {k}: {x} vs {y}");
     }
 }
 
@@ -2934,6 +3494,56 @@ fn gemv_g16_edges_match_cpu() {
                 g16(m, &l).is_some(),
                 ctx.g16() && takes,
                 "x_group {x_group} stride {x_row_stride} at m={m}"
+            );
+        }
+    }
+}
+
+/// The dense bfloat-input GEMM at a short prompt's rows (`LILY_GLM53_ROWS`,
+/// default 8,24,64): us a call, eight calls a pass (independent: they
+/// overlap as a level's do).
+#[test]
+#[ignore = "timing only"]
+fn gemm_small_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(74);
+    let rows_list: Vec<usize> = std::env::var("LILY_GLM53_ROWS")
+        .unwrap_or_else(|_| "8,24,64".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    for (label, ty, cols, rows) in [
+        ("kda_v Q8_0 8192x4096", GgmlType::Q8_0, 4096usize, 8192usize),
+        ("kda_out Q8_0 4096x8192", GgmlType::Q8_0, 8192, 4096),
+        ("kda_q Q4_K 8192x4096", GgmlType::Q4K, 4096, 8192),
+        ("shexp Q8_0 2048x4096", GgmlType::Q8_0, 4096, 2048),
+    ] {
+        let ws: Vec<QWeight> = (0..4)
+            .map(|_| {
+                let raw = random_blocks(&mut rng, ty, rows * cols);
+                QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+            })
+            .collect();
+        let bytes = ws[0].t.byte_len() as f64;
+        for &m in &rows_list {
+            let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
+            let xb = Tensor::zeros(&ctx, &[m * cols], DType::BF16).unwrap();
+            run(&ctx, |p| to_bf16(&ctx, p, &x, &xb, m * cols).unwrap());
+            let ys: Vec<Tensor> = (0..8).map(|_| zeros(&ctx, m * rows)).collect();
+            let mut best = f64::MAX;
+            for _ in 0..4 {
+                let pass = ctx.begin().unwrap();
+                for (r, y) in ys.iter().enumerate() {
+                    gemm_bx(&ctx, &pass, &ws[r % 4], &xb, y, m).unwrap();
+                }
+                let t = std::time::Instant::now();
+                pass.commit_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64() / 8.0);
+            }
+            println!(
+                "gemm small {label:24} m {m:3}: {:7.1} us {:4.0} GB/s",
+                best * 1e6,
+                bytes / best / 1e9
             );
         }
     }

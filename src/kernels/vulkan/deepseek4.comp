@@ -94,6 +94,25 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
+// Activations as f16 in the IQ2 dot's pairing (glm53_moe_gate_up_iq2_xxs_xh):
+// of each 8 values, word p holds values p and p + 4. Grid (K / 8, m).
+// Buffers: 0 x f32 [m][K], 1 out f16 [m][K]. Params: 2 K.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_x_f16_iq2
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint K = arg_u32(2);
+    const uint j = gl_GlobalInvocationID.x;
+    const uint i = gl_GlobalInvocationID.y;
+    if (8u * j >= K) return;
+    const uint at = i * (K / 8u) + j;
+    const vec4 a = F32x4(arg(0)).v[2u * at], b = F32x4(arg(0)).v[2u * at + 1u];
+    U32x4(arg(1)).v[at] = uvec4(packHalf2x16(vec2(a.x, b.x)), packHalf2x16(vec2(a.y, b.y)),
+                                packHalf2x16(vec2(a.z, b.z)), packHalf2x16(vec2(a.w, b.w)));
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Per-head RMSNorm without weight (when do_norm) then RoPE of the head's
 // last n_rot dims, in place, for heads of up to 512 values: the queries
 // (norm + rope), the attention output (inverse rope), the indexer queries
@@ -416,6 +435,93 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
+// ds4_indexer_scores for prompt runs on the matrix units: a threadgroup
+// takes step row i, its 64 queries staged transposed in threadgroup memory
+// as f16 (their FP4 values times a power of two: exact), and subgroup g
+// the keys 16 g, 16 g + 128, ..: S (16 keys x 64 heads) = keys . Q^T with
+// f32 accumulators, then each key's sum over heads of max(S, 0) w_h scale.
+// Grid (m), 256 threads; buffers and params as ds4_indexer_scores' (heads
+// 64).
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_indexer_scores_mu
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#include "matmul.glsl"
+#define MatAh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MatBh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define DS4_HLO(w) uint16BitsToHalf(uint16_t(w))
+// Row stride of Q^T ([dim][head]), in f16.
+#define DS4_QT 72u
+shared float16_t qt[128u * DS4_QT];
+shared float ws[64];
+void main() {
+    const uint cap = arg_u32(4);
+    const uint pos0 = arg_u32(5);
+    const float scale = arg_f32(6);
+    const uint i = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    const uint n = min((pos0 + i + 1u) / 4u, cap);
+    {
+        const uint h = tid >> 2u, d0 = (tid & 3u) * 32u;
+        const uint64_t Q = arg(0) + 4u * ((uint64_t(i) * 64u + h) * 128u + d0);
+        vec4 v[8];
+        [[unroll]] for (uint u = 0u; u < 8u; u++) v[u] = F32x4(Q + 16u * u).v[0];
+        [[unroll]] for (uint u = 0u; u < 8u; u++) {
+            [[unroll]] for (uint e = 0u; e < 4u; e++) qt[(d0 + 4u * u + e) * DS4_QT + h] = float16_t(v[u][e]);
+        }
+        if (tid < 64u) ws[tid] = F32(arg(1) + 4u * uint64_t(i) * 64u).v[tid] * scale;
+    }
+    barrier();
+    const uint lrow = mat_lane_row(), lcol = mat_lane_col();
+    const uint a_half = mat_a_half(), odd16 = 16u * mat_a_odd();
+    float wl[16];
+    [[unroll]] for (uint hb = 0u; hb < 4u; hb++) {
+        [[unroll]] for (uint c = 0u; c < 4u; c++) wl[4u * hb + c] = ws[16u * hb + lcol + c];
+    }
+    const uint64_t SC = arg(3) + 4u * uint64_t(i) * cap;
+    for (uint kb = 16u * sg; kb < n; kb += 128u) {
+        // The lane's two key rows (clamped: rows past n are not stored).
+        U32x4 k0 = U32x4(arg(2) + 256u * uint64_t(min(kb + lrow, n - 1u)));
+        U32x4 k1 = U32x4(arg(2) + 256u * uint64_t(min(kb + lrow + 1u, n - 1u)));
+        uvec4 v0[8], v1[8];
+        [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            v0[j] = k0.v[2u * j + a_half];
+            v1[j] = k1.v[2u * j + a_half];
+        }
+        MatC acc[4];
+        [[unroll]] for (uint hb = 0u; hb < 4u; hb++) acc[hb] = MatC(0.0);
+        [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            MatAh a;
+            const uvec4 x0 = v0[j] >> odd16, x1 = v1[j] >> odd16;
+            a[0] = DS4_HLO(x0[0]); a[1] = DS4_HLO(x0[1]); a[2] = DS4_HLO(x0[2]); a[3] = DS4_HLO(x0[3]);
+            a[4] = DS4_HLO(x1[0]); a[5] = DS4_HLO(x1[1]); a[6] = DS4_HLO(x1[2]); a[7] = DS4_HLO(x1[3]);
+            [[unroll]] for (uint hb = 0u; hb < 4u; hb++) {
+                MatBh b;
+                coopMatLoad(b, qt, 16u * j * DS4_QT + 16u * hb, DS4_QT, gl_CooperativeMatrixLayoutRowMajor);
+                acc[hb] = coopMatMulAdd(a, b, acc[hb]);
+            }
+        }
+        float s0 = 0.0, s1 = 0.0;
+        [[unroll]] for (uint hb = 0u; hb < 4u; hb++) {
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                s0 += max(acc[hb][c], 0.0) * wl[4u * hb + c];
+                s1 += max(acc[hb][4u + c], 0.0) * wl[4u * hb + c];
+            }
+        }
+        s0 += subgroupShuffleXor(s0, 1u);
+        s1 += subgroupShuffleXor(s1, 1u);
+        s0 += subgroupShuffleXor(s0, 8u);
+        s1 += subgroupShuffleXor(s1, 8u);
+        if ((lane & 9u) == 0u) {
+            if (kb + lrow < n) F32(SC).v[kb + lrow] = s0;
+            if (kb + lrow + 1u < n) F32(SC).v[kb + lrow + 1u] = s1;
+        }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // The indexer's selection of step row i: the k best of its n = (pos0 + i +
 // 1) / 4 scores (ties to the lower row), in ascending row order; all n
 // rows when n <= k. count[i] gets the number kept. A radix select of the
@@ -530,28 +636,32 @@ void main() {
 // at the end. Grid (heads, m), 256 threads. Buffers: 0 q f32 [m][heads][512],
 // 1 kv_run f16 [m][512], 2 ring f16 [128][512], 3 comp f16 [cap][512], 4 sel
 // u32 [m][S], 5 count u32 [m], 6 sinks f32 [heads], 7 out f32
-// [m][heads][512]. Params: 8 pos0, 9 ratio, 10 use_sel, 11 S, 12 scale, 13
-// p_last (0: each row at its own position; else every row at position
-// p_last - 1, DSpark's non-causal block), 14 window (raw rows a row sees at
-// most, 128 for the model), 15 raw_lo (the first position whose raw row is
-// valid).
+// [m][heads][512], 8 RoPE table. Params: 9 pos0, 10 ratio, 11 use_sel, 12
+// S, 13 scale, 14 p_last (0: each row at its own position; else every row
+// at position p_last - 1, DSpark's non-causal block), 15 window (raw rows a
+// row sees at most, 128 for the model), 16 raw_lo (the first position whose
+// raw row is valid), 17 table row of row 0, 18 flags, 19 eps. Flags bit 0:
+// Q as projected, its per-head norm and RoPE (ds4_head_norm_rope's
+// NormRope) applied as it loads; bit 1: the output's inverse RoPE applied.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_ds4_attend
 shared float sm_m[8];
 shared float sm_l[8];
 shared float sm_acc[8 * 512];
 void main() {
-    const uint pos0 = arg_u32(8);
-    const uint ratio = arg_u32(9);
-    const bool use_sel = arg_u32(10) != 0u;
-    const uint S = arg_u32(11);
-    const float scale = arg_f32(12);
+    const uint pos0 = arg_u32(9);
+    const uint ratio = arg_u32(10);
+    const bool use_sel = arg_u32(11) != 0u;
+    const uint S = arg_u32(12);
+    const float scale = arg_f32(13);
     const uint h = gl_WorkGroupID.x;
     const uint i = gl_WorkGroupID.y;
     const uint heads = gl_NumWorkGroups.x;
-    const uint p_last = arg_u32(13);
-    const uint window = arg_u32(14);
-    const uint raw_lo = arg_u32(15);
+    const uint p_last = arg_u32(14);
+    const uint window = arg_u32(15);
+    const uint raw_lo = arg_u32(16);
+    const uint t0 = arg_u32(17);
+    const uint flags = arg_u32(18);
     const uint p = p_last != 0u ? p_last - 1u : pos0 + i;
     const uint lane = gl_SubgroupInvocationID;
     const uint sg = gl_SubgroupID;
@@ -562,6 +672,22 @@ void main() {
     const uint64_t Q = arg(0) + 4u * ((uint64_t(i) * heads + h) * 512u + 16u * lane);
     vec4 q[4];
     [[unroll]] for (uint c = 0u; c < 4u; c++) q[c] = F32x4(Q + 16u * c).v[0];
+    if ((flags & 1u) != 0u) {
+        // Every subgroup holds the whole head (16 dims a lane).
+        float ss = 0.0;
+        [[unroll]] for (uint c = 0u; c < 4u; c++) ss += dot(q[c], q[c]);
+        const float norm = inversesqrt(subgroupAdd(ss) / 512.0 + arg_f32(19));
+        [[unroll]] for (uint c = 0u; c < 4u; c++) q[c] *= norm;
+        if (lane >= 28u) {
+            // Dims 16 lane .. + 16: rotated pairs 8 (lane - 28) ...
+            const uint64_t T = arg(8) + 8u * (uint64_t(t0 + i) * 32u + 8u * (lane - 28u));
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                const vec4 cs = F32x4(T + 16u * c).v[0];
+                q[c].xy = ds4_rotate(q[c].xy, cs.xy, false);
+                q[c].zw = ds4_rotate(q[c].zw, cs.zw, false);
+            }
+        }
+    }
     float m = DS4_NEG_INF, l = 0.0;
     vec4 acc[4];
     [[unroll]] for (uint c = 0u; c < 4u; c++) acc[c] = vec4(0.0);
@@ -612,11 +738,263 @@ void main() {
     }
     const uint tid = gl_LocalInvocationIndex;
     const uint64_t O = arg(7) + 4u * (uint64_t(i) * heads + h) * 512u;
+    vec2 o = vec2(0.0);
     [[unroll]] for (uint e = 0u; e < 2u; e++) {
         const uint dd = 2u * tid + e;
-        float o = 0.0;
-        [[unroll]] for (uint s = 0u; s < 8u; s++) o += sm_acc[s * 512u + dd] * fs[s];
-        F32(O).v[dd] = o / L;
+        [[unroll]] for (uint s = 0u; s < 8u; s++) o[e] += sm_acc[s * 512u + dd] * fs[s];
+    }
+    o /= L;
+    if ((flags & 2u) != 0u && tid >= 224u) {
+        const uint64_t T = arg(8) + 8u * (uint64_t(t0 + i) * 32u + tid - 224u);
+        o = ds4_rotate(o, vec2(F32(T).v[0], F32(T).v[1]), true);
+    }
+    F32(O).v[2u * tid] = o.x;
+    F32(O).v[2u * tid + 1u] = o.y;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// ds4_attend's attention for prompt runs on the matrix units: a threadgroup
+// takes 16 heads of step row i (they see the same keys), the row's keys in
+// steps of 128 (subgroup g scores keys 16 g .. of the step, then owns output
+// dims 64 g .. of all 16 heads), an online softmax per head. Q and the keys
+// are f16 operands with f32 score accumulators; maxima, exponentials, the
+// denominator and the output sums are f32, and each weight is rounded to f16
+// only as the P V operand (the denominator sums the unrounded weights). ds4's
+// prefill attention (flash_attn_ext, FA_NONVEC_TYPES) also takes Q, K and V
+// in half but keeps the softmax weights in f32 for P V: the f16 weights are
+// this kernel's own approximation (attention_mu_sharp_scores bounds it). The
+// scores take K 64 at a time in MAT_K64's order, Q staged in that order at
+// the A operand's places. Grid
+// (heads / 16, m), 256 threads. Buffers 0-7 as ds4_attend's, 8 the RoPE
+// table. Params: 9 pos0, 10 ratio, 11 use_sel, 12 S, 13 scale, 14 window,
+// 15 raw_lo, 16 table row of row 0, 17 flags, 18 eps. Flags bit 0: Q as
+// projected, its per-head norm and RoPE (ds4_head_norm_rope's NormRope)
+// applied as it is staged; bit 1: the output's inverse RoPE applied and
+// the result stored as bfloat (the grouped output GEMM's operand).
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_attend_mu
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#include "matmul.glsl"
+#define MatAh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MatBh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define DS4_HLO(w) uint16BitsToHalf(uint16_t(w))
+#define DS4_HHI(w) uint16BitsToHalf(uint16_t((w) >> 16))
+// Row strides of the staged Q and weights, in f16 (padded off the banks).
+#define DS4_QS 520u
+#define DS4_PS 136u
+shared float16_t qs[16u * DS4_QS];
+shared float16_t ps[16u * DS4_PS];
+shared uint64_t kaddr[128];
+shared float red_m[8u * 16u];
+shared float red_l[8u * 16u];
+void main() {
+    const uint pos0 = arg_u32(9);
+    const uint ratio = arg_u32(10);
+    const bool use_sel = arg_u32(11) != 0u;
+    const uint S = arg_u32(12);
+    const float scale = arg_f32(13);
+    const uint window = arg_u32(14);
+    const uint raw_lo = arg_u32(15);
+    const uint t0 = arg_u32(16);
+    const uint flags = arg_u32(17);
+    const float eps = arg_f32(18);
+    const uint hg = gl_WorkGroupID.x;
+    const uint i = gl_WorkGroupID.y;
+    const uint heads = 16u * gl_NumWorkGroups.x;
+    const uint p = pos0 + i;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    const uint n_raw = min(window, p + 1u - min(raw_lo, p));
+    const uint n_comp = ratio == 0u ? 0u
+        : (use_sel ? U32(arg(5)).v[i] : (p + 1u) / ratio);
+    const uint total = n_raw + n_comp;
+    // Q of the 16 heads into qs: value k of a 64-deep group G goes to
+    // multiply t = (k >> 1) & 3, A column c = 2 (k >> 3) + (k & 1).
+    {
+        const uint r = tid >> 4u, k0 = (tid & 15u) * 32u;
+        const uint64_t Q = arg(0) + 4u * ((uint64_t(i) * heads + 16u * hg + r) * 512u + k0);
+        vec4 v[8];
+        [[unroll]] for (uint u = 0u; u < 8u; u++) v[u] = F32x4(Q + 16u * u).v[0];
+        if ((flags & 1u) != 0u) {
+            // The head's 512 values are 16 lanes' (lane bits 0-3).
+            float ss = 0.0;
+            [[unroll]] for (uint u = 0u; u < 8u; u++) ss += dot(v[u], v[u]);
+            ss += subgroupShuffleXor(ss, 1u);
+            ss += subgroupShuffleXor(ss, 2u);
+            ss += subgroupShuffleXor(ss, 4u);
+            ss += subgroupShuffleXor(ss, 8u);
+            const float norm = inversesqrt(ss / 512.0 + eps);
+            [[unroll]] for (uint u = 0u; u < 8u; u++) v[u] *= norm;
+            if (k0 >= 448u) {
+                const uint64_t T = arg(8) + 8u * (uint64_t(t0 + i) * 32u + (k0 - 448u) / 2u);
+                [[unroll]] for (uint u = 0u; u < 8u; u++) {
+                    const vec4 cs = F32x4(T + 16u * u).v[0];
+                    v[u].xy = ds4_rotate(v[u].xy, cs.xy, false);
+                    v[u].zw = ds4_rotate(v[u].zw, cs.zw, false);
+                }
+            }
+        }
+        [[unroll]] for (uint u = 0u; u < 8u; u++) {
+            [[unroll]] for (uint e = 0u; e < 4u; e++) {
+                const uint k = k0 + 4u * u + e;
+                const uint kk = k & 63u;
+                const uint c = ((kk >> 3u) << 1u) | (kk & 1u);
+                qs[r * DS4_QS + (k & ~63u) + 16u * ((kk >> 1u) & 3u) + mat_a_place(c)] = float16_t(v[u][e]);
+            }
+        }
+    }
+    const uint lrow = mat_lane_row(), lcol = mat_lane_col();
+    float m0 = DS4_NEG_INF, m1 = DS4_NEG_INF, l0 = 0.0, l1 = 0.0;
+    MatC o[4];
+    [[unroll]] for (uint c = 0u; c < 4u; c++) o[c] = MatC(0.0);
+    const uint64_t SEL = arg(4) + 4u * uint64_t(i) * S;
+    for (uint kb = 0u; kb < total; kb += 128u) {
+        barrier();
+        if (tid < 128u) {
+            const uint r = min(kb + tid, total - 1u);
+            uint64_t K;
+            if (r < n_raw) {
+                const uint pr = p + 1u - n_raw + r;
+                K = pr >= pos0 ? arg(1) + 1024u * uint64_t(pr - pos0)
+                               : arg(2) + 1024u * uint64_t(pr % 128u);
+            } else {
+                const uint c = r - n_raw;
+                const uint row = use_sel ? U32(SEL).v[c] : c;
+                K = arg(3) + 1024u * uint64_t(row);
+            }
+            kaddr[tid] = K;
+        }
+        barrier();
+        // Scores of keys kb + 16 sg ..: S = Q K^T over K = 512.
+        MatC s = MatC(0.0);
+        {
+            U32x4 k0 = U32x4(kaddr[16u * sg + lcol]);
+            U32x4 k1 = U32x4(kaddr[16u * sg + lcol + 1u]);
+            U32x4 k2 = U32x4(kaddr[16u * sg + lcol + 2u]);
+            U32x4 k3 = U32x4(kaddr[16u * sg + lcol + 3u]);
+            const uint vr = lrow >> 1u;
+            uvec4 w0 = k0.v[vr], w1 = k1.v[vr], w2 = k2.v[vr], w3 = k3.v[vr];
+            [[unroll]] for (uint G = 0u; G < 512u; G += 64u) {
+                const uint ng = min(G + 64u, 448u) / 8u + vr;
+                const uvec4 n0 = k0.v[ng], n1 = k1.v[ng], n2 = k2.v[ng], n3 = k3.v[ng];
+                [[unroll]] for (uint t = 0u; t < 4u; t++) {
+                    MatBh placed, b;
+                    MatAh a;
+                    coopMatLoad(placed, qs, G + 16u * t, DS4_QS, gl_CooperativeMatrixLayoutRowMajor);
+                    for (uint e = 0u; e < 8u; e++) a[e] = placed[e];
+                    b[0] = DS4_HLO(w0[t]); b[1] = DS4_HLO(w1[t]); b[2] = DS4_HLO(w2[t]); b[3] = DS4_HLO(w3[t]);
+                    b[4] = DS4_HHI(w0[t]); b[5] = DS4_HHI(w1[t]); b[6] = DS4_HHI(w2[t]); b[7] = DS4_HHI(w3[t]);
+                    s = coopMatMulAdd(a, b, s);
+                }
+                w0 = n0; w1 = n1; w2 = n2; w3 = n3;
+            }
+        }
+        // The softmax: block maxima per head row through red_m, then the
+        // weights (f16, at their A places) and their sums through red_l.
+        float sv[8];
+        float bm0 = DS4_NEG_INF, bm1 = DS4_NEG_INF;
+        [[unroll]] for (uint e = 0u; e < 8u; e++) {
+            const bool live = kb + 16u * sg + mat_col(e) < total;
+            sv[e] = live ? s[e] * scale : DS4_NEG_INF;
+            if (e < 4u) bm0 = max(bm0, sv[e]); else bm1 = max(bm1, sv[e]);
+        }
+        bm0 = max(bm0, subgroupShuffleXor(bm0, 1u));
+        bm1 = max(bm1, subgroupShuffleXor(bm1, 1u));
+        bm0 = max(bm0, subgroupShuffleXor(bm0, 8u));
+        bm1 = max(bm1, subgroupShuffleXor(bm1, 8u));
+        if ((lane & 9u) == 0u) {
+            red_m[sg * 16u + lrow] = bm0;
+            red_m[sg * 16u + lrow + 1u] = bm1;
+        }
+        barrier();
+        float n0 = m0, n1 = m1;
+        [[unroll]] for (uint g = 0u; g < 8u; g++) {
+            n0 = max(n0, red_m[g * 16u + lrow]);
+            n1 = max(n1, red_m[g * 16u + lrow + 1u]);
+        }
+        const float f0 = exp(m0 - n0), f1 = exp(m1 - n1);
+        float s0 = 0.0, s1 = 0.0;
+        [[unroll]] for (uint e = 0u; e < 8u; e++) {
+            const float w = exp(sv[e] - (e < 4u ? n0 : n1));
+            if (e < 4u) s0 += w; else s1 += w;
+            const uint row = lrow + (e >> 2u);
+            ps[row * DS4_PS + 16u * sg + mat_a_place(mat_col(e))] = float16_t(w);
+        }
+        s0 += subgroupShuffleXor(s0, 1u);
+        s1 += subgroupShuffleXor(s1, 1u);
+        s0 += subgroupShuffleXor(s0, 8u);
+        s1 += subgroupShuffleXor(s1, 8u);
+        if ((lane & 9u) == 0u) {
+            red_l[sg * 16u + lrow] = s0;
+            red_l[sg * 16u + lrow + 1u] = s1;
+        }
+        barrier();
+        float t0 = 0.0, t1 = 0.0;
+        [[unroll]] for (uint g = 0u; g < 8u; g++) {
+            t0 += red_l[g * 16u + lrow];
+            t1 += red_l[g * 16u + lrow + 1u];
+        }
+        l0 = l0 * f0 + t0;
+        l1 = l1 * f1 + t1;
+        m0 = n0;
+        m1 = n1;
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            [[unroll]] for (uint e = 0u; e < 8u; e++) o[c][e] *= e < 4u ? f0 : f1;
+        }
+        // O += P V: this subgroup's dims 64 sg .. of all 16 heads.
+        const uint steps = min(8u, (total - kb + 15u) / 16u);
+        for (uint j = 0u; j < steps; j++) {
+            U32x2 va = U32x2(kaddr[16u * j + lrow]);
+            U32x2 vb = U32x2(kaddr[16u * j + lrow + 1u]);
+            uvec2 h0[4], h1[4];
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                h0[c] = va.v[(64u * sg + 16u * c + lcol) / 4u];
+                h1[c] = vb.v[(64u * sg + 16u * c + lcol) / 4u];
+            }
+            MatBh placed;
+            MatAh a;
+            coopMatLoad(placed, ps, 16u * j, DS4_PS, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint e = 0u; e < 8u; e++) a[e] = placed[e];
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                MatBh b;
+                b[0] = DS4_HLO(h0[c].x); b[1] = DS4_HHI(h0[c].x); b[2] = DS4_HLO(h0[c].y); b[3] = DS4_HHI(h0[c].y);
+                b[4] = DS4_HLO(h1[c].x); b[5] = DS4_HHI(h1[c].x); b[6] = DS4_HLO(h1[c].y); b[7] = DS4_HHI(h1[c].y);
+                o[c] = coopMatMulAdd(a, b, o[c]);
+            }
+        }
+    }
+    // The sink in the denominator only.
+    const float k0s = F32(arg(6)).v[16u * hg + lrow];
+    const float k1s = F32(arg(6)).v[16u * hg + lrow + 1u];
+    const float M0 = max(m0, k0s), M1 = max(m1, k1s);
+    const float g0 = exp(m0 - M0) / (l0 * exp(m0 - M0) + exp(k0s - M0));
+    const float g1 = exp(m1 - M1) / (l1 * exp(m1 - M1) + exp(k1s - M1));
+    const uint64_t at = (uint64_t(i) * heads + 16u * hg + lrow) * 512u + 64u * sg + lcol;
+    if ((flags & 2u) == 0u) {
+        const uint64_t O = arg(7) + 4u * at;
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            F32x4(O + 64u * c).v[0] = vec4(o[c][0], o[c][1], o[c][2], o[c][3]) * g0;
+            F32x4(O + 2048u + 64u * c).v[0] = vec4(o[c][4], o[c][5], o[c][6], o[c][7]) * g1;
+        }
+        return;
+    }
+    const uint64_t O = arg(7) + 2u * at;
+    [[unroll]] for (uint c = 0u; c < 4u; c++) {
+        vec4 a = vec4(o[c][0], o[c][1], o[c][2], o[c][3]) * g0;
+        vec4 b = vec4(o[c][4], o[c][5], o[c][6], o[c][7]) * g1;
+        if (sg == 7u) {
+            // Dims 448 + 16 c + lcol ..: pairs (16 c + lcol) / 2 and the next.
+            const uint64_t T = arg(8) + 8u * (uint64_t(t0 + i) * 32u + (16u * c + lcol) / 2u);
+            const vec4 cs = F32x4(T).v[0];
+            a.xy = ds4_rotate(a.xy, cs.xy, true);
+            a.zw = ds4_rotate(a.zw, cs.zw, true);
+            b.xy = ds4_rotate(b.xy, cs.xy, true);
+            b.zw = ds4_rotate(b.zw, cs.zw, true);
+        }
+        U32x2(O + 32u * c).v[0] = mat_bf16_words(a);
+        U32x2(O + 1024u + 32u * c).v[0] = mat_bf16_words(b);
     }
 }
 #endif

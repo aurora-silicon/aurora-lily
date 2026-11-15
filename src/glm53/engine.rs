@@ -25,10 +25,21 @@ fn host_copy(src: &Tensor, dst: &Tensor, bytes: usize) {
     }
 }
 
-fn clone_tensor(ctx: &MetalContext, t: &Tensor) -> Result<Tensor> {
-    let c = Tensor::zeros(ctx, t.shape(), t.dtype())?;
-    host_copy(t, &c, t.byte_len());
-    Ok(c)
+/// Copies whole tensors `(src, dst)` on the GPU and waits: a snapshot's
+/// 143 MB in about a millisecond, where the host copy took ~10 ms
+/// (2026-11-15).
+fn gpu_copy(ctx: &MetalContext, pairs: &[(&Tensor, &Tensor)]) -> Result<()> {
+    let copies: Vec<crate::metal::BlitCopy<'_>> = pairs
+        .iter()
+        .map(|&(src, dst)| crate::metal::BlitCopy {
+            src,
+            src_offset: 0,
+            dst,
+            dst_offset: 0,
+            len: src.byte_len(),
+        })
+        .collect();
+    ctx.blit_copy(&copies)
 }
 
 /// The recurrent part of a state: KDA conv windows and states, the
@@ -125,18 +136,39 @@ impl DecodeStateApi for Glm53State {
     }
 
     fn snapshot(&self, ctx: &MetalContext) -> Result<Glm53Snapshot> {
-        let tensors = recurrent(self)
-            .into_iter()
-            .map(|t| clone_tensor(ctx, t))
-            .collect::<Result<_>>()?;
+        let live = recurrent(self);
+        // One allocation, a view a tensor (all f32, whole 16-byte units):
+        // 68 allocations of their own cost about 5 ms (2026-11-15).
+        ensure!(
+            live.iter().all(|t| t.dtype() == DType::F32 && t.byte_len() % 16 == 0),
+            "recurrent state of unexpected tensors"
+        );
+        let total: usize = live.iter().map(|t| t.numel()).sum();
+        let all = Tensor::uninit(ctx, &[total], DType::F32)?;
+        let mut at = 0;
+        let tensors = live
+            .iter()
+            .map(|t| {
+                let v = all.view(at, t.shape());
+                at += t.numel();
+                v
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let pairs: Vec<(&Tensor, &Tensor)> = live.into_iter().zip(&tensors).collect();
+        gpu_copy(ctx, &pairs)?;
         Ok(Glm53Snapshot { pos: self.pos, tensors })
     }
 
-    fn restore(&mut self, _ctx: &MetalContext, snapshot: &Glm53Snapshot) -> Result<()> {
+    fn restore(&mut self, ctx: &MetalContext, snapshot: &Glm53Snapshot) -> Result<()> {
         ensure!(snapshot.pos <= self.capacity, "snapshot past the state's capacity");
-        for (dst, src) in recurrent(self).into_iter().zip(&snapshot.tensors) {
-            host_copy(src, dst, src.byte_len());
+        let live = recurrent(self);
+        ensure!(live.len() == snapshot.tensors.len(), "snapshot of another layout");
+        for (dst, src) in live.iter().zip(&snapshot.tensors) {
+            ensure!(dst.byte_len() == src.byte_len(), "snapshot tensor sizes differ");
         }
+        let pairs: Vec<(&Tensor, &Tensor)> =
+            snapshot.tensors.iter().zip(live).collect();
+        gpu_copy(ctx, &pairs)?;
         self.pos = snapshot.pos;
         Ok(())
     }

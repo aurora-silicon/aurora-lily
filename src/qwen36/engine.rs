@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 
 use super::model::{
-    LayerState, Logits, PREFILL_ROWS, Qwen36Model, Qwen36State, Scratch,
+    LayerState, Logits, PREFILL_ROWS_LIMITED, Qwen36Model, Qwen36State, Scratch,
 };
 use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
@@ -263,7 +263,7 @@ impl ScratchApi for Scratch {
 }
 
 impl Qwen36Model {
-    /// Feeds `tokens` in runs of [`PREFILL_ROWS`], drawing after the last
+    /// Feeds `tokens` in runs of [`Qwen36Model::prefill_rows`], drawing after the last
     /// when `draw`; before committing each run, stops if `stop` says so
     /// (the state then sits at a run boundary). Returns the tokens fed.
     fn prefill_chunks(
@@ -278,7 +278,7 @@ impl Qwen36Model {
         ensure!(!tokens.is_empty(), "empty prefill");
         super::model::check_tokens(tokens, self.cfg.vocab)?;
         state.ensure_capacity(ctx, state.pos + tokens.len())?;
-        let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_ROWS).collect();
+        let chunks: Vec<&[u32]> = tokens.chunks(self.prefill_rows).collect();
         let mut fed = 0;
         for (i, chunk) in chunks.iter().enumerate() {
             if stop() {
@@ -329,6 +329,21 @@ impl Qwen36Model {
     }
 }
 
+/// A draft whose probability under the MTP head is below this is not
+/// proposed (GLM's heuristic, `glm53::engine`): the raw MTP softmax at
+/// temperature 1, not a calibrated acceptance probability.
+const DRAFT_MIN_PROB: f32 = 0.3;
+
+impl Qwen36Model {
+    /// The MTP head's draft from its drafted row `j` as a proposal list:
+    /// empty when its probability is below [`Qwen36Model::draft_min_prob`].
+    fn proposal(&self, scratch: &Scratch, j: usize) -> Result<Vec<u32>> {
+        let p = scratch.mtp_prob.to_f32()?[j];
+        let draft = scratch.mtp_io.to_u32()?[1 + j];
+        Ok(if p >= self.draft_min_prob { vec![draft] } else { Vec::new() })
+    }
+}
+
 impl LanguageModel for Qwen36Model {
     type State = Qwen36State;
     type Scratch = Scratch;
@@ -337,7 +352,11 @@ impl LanguageModel for Qwen36Model {
 
     fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
         let mut model = Qwen36Model::load(ctx, path)?;
+        model.draft_min_prob = DRAFT_MIN_PROB;
         model.memory_limit = options.memory_limit;
+        if model.memory_limit.is_some() {
+            model.prefill_rows = PREFILL_ROWS_LIMITED;
+        }
         if options.mtp_drafts > 0 {
             match model.find_mtp(path)? {
                 Some(p) => {
@@ -413,12 +432,12 @@ impl LanguageModel for Qwen36Model {
         let pass = self.begin(ctx)?;
         let token = sc.mtp_io.view(0, &[1])?;
         let hin = Qwen36Model::hbuf(sc).view(0, &[self.cfg.hidden])?;
-        self.encode_mtp(ctx, &pass, st, sc, &token, &hin, p, 1, true)?;
+        self.encode_mtp(ctx, &pass, st, sc, &token, &hin, p, 1, 1)?;
         pass.commit_wait()?;
         if let Some(m) = &mut state.mtp {
             m.pos = p + 1;
         }
-        Ok(vec![scratch.mtp_io.to_u32()?[1]])
+        self.proposal(scratch, 0)
     }
 
     fn verify<'a>(
@@ -449,18 +468,43 @@ impl LanguageModel for Qwen36Model {
         // draft is rejected.
         let snap = (rows > 1).then_some(0);
         let vocab = self.cfg.vocab;
+        // With the head caught up (its row at the pending token written) and
+        // room for a row a pair, the head runs over every row's pair (hidden
+        // row r, draw r) in this pass, drafting from each: whichever count
+        // finish_speculation keeps, its draft is the head's output at that
+        // row (the head is causal; a rejected row's pair is rewritten before
+        // it is read). One pass a step where the head took a second.
+        let fold = state.mtp.as_ref().is_some_and(|m| m.pos == state.pos + 1)
+            && state.pos + 1 + rows <= state.capacity;
         let sc: &Scratch = scratch;
-        self.run_rows(ctx, state, sc, rows, Logits::All, snap, |pass| {
+        let st: &Qwen36State = state;
+        let h = self.cfg.hidden;
+        self.run_rows(ctx, st, sc, rows, Logits::All, snap, |pass| {
             for r in 0..rows {
                 let logits = sc.logits.view(r * vocab, &[vocab])?;
                 let out = sc.draws.view(r, &[1])?;
                 sample_f32(ctx, pass, &logits, sc.sampler(), params, step0 + r, &out)?;
                 pass.memory_barrier()?;
             }
+            if fold {
+                let tokens = sc.draws.view(0, &[rows])?;
+                let hin = sc.hidden_norm.view(0, &[rows * h])?;
+                self.encode_mtp(
+                    ctx,
+                    pass,
+                    st,
+                    sc,
+                    &tokens,
+                    &hin,
+                    st.pos + 1,
+                    rows,
+                    rows,
+                )?;
+            }
             Ok(())
         })?;
         let draws = scratch.draws.to_u32()?[..rows].to_vec();
-        state.spec = Some((state.pos, rows, draws.clone()));
+        state.spec = Some((state.pos, rows, draws.clone(), fold));
         state.pos += rows;
         Ok((draws, ctx.begin()?.commit()?))
     }
@@ -475,7 +519,7 @@ impl LanguageModel for Qwen36Model {
         draft: PendingPass<'_>,
     ) -> Result<Vec<u32>> {
         draft.wait()?;
-        let (pos0, rows, draws) = state
+        let (pos0, rows, draws, folded) = state
             .spec
             .take()
             .ok_or_else(|| anyhow::anyhow!("no verify pass pending"))?;
@@ -494,14 +538,24 @@ impl LanguageModel for Qwen36Model {
         // No draft for the context's last rows ([`draft_fits`]).
         let propose = propose && draft_fits(pos0 + 1 + accepted, state.max_capacity);
         let (pairs, draft) = mtp_pairs(pos0, accepted, propose, state.capacity);
-        if pairs > 0 {
+        if pairs > 0 && !folded {
             let sc: &Scratch = scratch;
             let st: &Qwen36State = state;
             let h = self.cfg.hidden;
             let pass = self.begin(ctx)?;
             let tokens = sc.draws.view(0, &[pairs])?;
             let hin = sc.hidden_norm.view(0, &[pairs * h])?;
-            self.encode_mtp(ctx, &pass, st, sc, &tokens, &hin, pos0 + 1, pairs, draft)?;
+            self.encode_mtp(
+                ctx,
+                &pass,
+                st,
+                sc,
+                &tokens,
+                &hin,
+                pos0 + 1,
+                pairs,
+                usize::from(draft),
+            )?;
             pass.commit_wait()?;
         }
         let m = state.mtp.as_mut().ok_or_else(|| anyhow::anyhow!("no MTP state"))?;
@@ -512,7 +566,9 @@ impl LanguageModel for Qwen36Model {
             self.copy_row(&scratch.hidden_norm, accepted, &m.pending_h)?;
             return Ok(Vec::new());
         }
-        Ok(vec![scratch.mtp_io.to_u32()?[1]])
+        // The draft of the last pair: the verify pass's row `accepted` when
+        // it ran the head, else this pass's only drafted row.
+        self.proposal(scratch, if folded { accepted } else { 0 })
     }
 
     /// The file's context, or less: what the attention kernel or the
@@ -576,7 +632,7 @@ impl LanguageModel for Qwen36Model {
     }
 
     fn prefill_chunk_tokens(&self) -> Option<usize> {
-        Some(PREFILL_ROWS)
+        Some(self.prefill_rows)
     }
 
     fn prefill_until(
