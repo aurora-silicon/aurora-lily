@@ -285,3 +285,83 @@ fn a_fitted_context_covers_the_session_peak_and_partials() {
         assert!(need(c + 256) > room, "{room}: {} would fit too", c + 256);
     }
 }
+
+/// Prompt runs of 256, 512 and 1024 rows (the scratch's shared buffers at
+/// each size) at lengths around every run boundary: the same last-row
+/// logits and greedy continuation, bit for bit, where the runs end in the
+/// same tail of at most MAX_ROWS rows (such a tail takes the GEMV path,
+/// longer runs the GEMMs, whose rows do not depend on their run; a GEMV
+/// tail's logits differ from a GEMM's by up to ~2.5 on these arbitrary
+/// tokens); speculation from each (every step proposing,
+/// so verify passes keep rows below their last and the draft model's
+/// input comes from `h`) equals that configuration's plain greedy.
+#[test]
+#[ignore = "requires LILY_GEMMA4_GGUF"]
+fn prompt_runs_agree_at_every_boundary() {
+    use crate::engine::{Draw, LanguageModel, LoadOptions};
+    use crate::kernels::sample::SamplingParams;
+    let path = std::env::var("LILY_GEMMA4_GGUF").expect("LILY_GEMMA4_GGUF");
+    let ctx = MetalContext::new().unwrap();
+    let options = LoadOptions { mtp_drafts: 3, ..Default::default() };
+    let mut model =
+        <Gemma4Model as LanguageModel>::load(&ctx, std::path::Path::new(&path), &options)
+            .unwrap();
+    assert!(model.draft.is_some(), "no draft model beside {path}");
+    model.draft_min_prob = 0.0;
+    let greedy = SamplingParams::greedy();
+    let n = 12;
+    let mut partial_steps = 0;
+    for len in [1, 2, 3, 4, 5, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025] {
+        let prompt: Vec<u32> = (0..len as u32).map(|i| 1000 + (i * 7919) % 50000).collect();
+        let cap = len + 64;
+        // Per tail length (0: no run of MAX_ROWS rows or fewer after a
+        // longer one), the first configuration's tokens and logits.
+        let mut reference: std::collections::HashMap<usize, (Vec<u32>, Vec<f32>)> =
+            Default::default();
+        for rows in [256, 512, 1024] {
+            model.prefill_rows = rows;
+            let mut sc = LanguageModel::new_scratch_with_capacity(&model, &ctx, cap).unwrap();
+            let mut st = LanguageModel::new_state(&model, &ctx, cap).unwrap();
+            let d = Draw { params: &greedy, step: 0 };
+            LanguageModel::prefill(&model, &ctx, &mut st, &mut sc, &prompt, Some(d)).unwrap();
+            let logits = sc.logits_last.to_f32().unwrap();
+            let mut plain = vec![sc.next_token.to_u32().unwrap()[0]];
+            while plain.len() < n {
+                let last = *plain.last().unwrap();
+                model.forward(&ctx, &mut st, &sc, &[last], Logits::Last).unwrap();
+                plain.push(argmax(&sc.logits_last.to_f32().unwrap()));
+            }
+            let tail = if len > rows && len % rows <= MAX_ROWS { len % rows } else { 0 };
+            match reference.get(&tail) {
+                None => {
+                    reference.insert(tail, (plain.clone(), logits));
+                }
+                Some((tokens, first)) => {
+                    assert!(
+                        first.iter().zip(&logits).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{len} tokens: logits with {rows}-row runs"
+                    );
+                    assert_eq!(tokens, &plain, "{len} tokens, {rows}-row runs");
+                }
+            }
+            // Speculation from the same prompt.
+            let first = {
+                st.reset().unwrap();
+                let d = Draw { params: &greedy, step: 0 };
+                LanguageModel::prefill(&model, &ctx, &mut st, &mut sc, &prompt, Some(d)).unwrap();
+                sc.next_token.to_u32().unwrap()[0]
+            };
+            let (spec, log) = speculate(&model, &ctx, &mut st, &mut sc, first, n, None);
+            assert_eq!(&spec[..n], &plain[..], "{len} tokens, {rows}-row runs: speculation");
+            // Steps that kept some drafts but not all: rows below the last.
+            partial_steps += log
+                .windows(2)
+                .filter(|w| {
+                    let kept = w[1].0 - w[0].0 - 1;
+                    kept > 0 && kept < w[0].1.len()
+                })
+                .count();
+        }
+    }
+    assert!(partial_steps > 0, "no verify pass kept rows below its last");
+}
