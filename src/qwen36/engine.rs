@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 
 use super::model::{
-    LayerState, Logits, PREFILL_ROWS, Qwen36Model, Qwen36State, Scratch,
+    LayerState, Logits, PREFILL_ROWS_LIMITED, Qwen36Model, Qwen36State, Scratch,
 };
 use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
@@ -263,7 +263,7 @@ impl ScratchApi for Scratch {
 }
 
 impl Qwen36Model {
-    /// Feeds `tokens` in runs of [`PREFILL_ROWS`], drawing after the last
+    /// Feeds `tokens` in runs of [`Qwen36Model::prefill_rows`], drawing after the last
     /// when `draw`; before committing each run, stops if `stop` says so
     /// (the state then sits at a run boundary). Returns the tokens fed.
     fn prefill_chunks(
@@ -278,7 +278,7 @@ impl Qwen36Model {
         ensure!(!tokens.is_empty(), "empty prefill");
         super::model::check_tokens(tokens, self.cfg.vocab)?;
         state.ensure_capacity(ctx, state.pos + tokens.len())?;
-        let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_ROWS).collect();
+        let chunks: Vec<&[u32]> = tokens.chunks(self.prefill_rows).collect();
         let mut fed = 0;
         for (i, chunk) in chunks.iter().enumerate() {
             if stop() {
@@ -329,6 +329,21 @@ impl Qwen36Model {
     }
 }
 
+/// A draft whose probability under the MTP head is below this is not
+/// proposed (GLM's heuristic, `glm53::engine`): the raw MTP softmax at
+/// temperature 1, not a calibrated acceptance probability.
+const DRAFT_MIN_PROB: f32 = 0.3;
+
+impl Qwen36Model {
+    /// The MTP step's draft as a proposal list: empty when its probability
+    /// is below [`Qwen36Model::draft_min_prob`].
+    fn proposal(&self, scratch: &Scratch) -> Result<Vec<u32>> {
+        let p = scratch.mtp_prob.to_f32()?[0];
+        let draft = scratch.mtp_io.to_u32()?[1];
+        Ok(if p >= self.draft_min_prob { vec![draft] } else { Vec::new() })
+    }
+}
+
 impl LanguageModel for Qwen36Model {
     type State = Qwen36State;
     type Scratch = Scratch;
@@ -337,7 +352,11 @@ impl LanguageModel for Qwen36Model {
 
     fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
         let mut model = Qwen36Model::load(ctx, path)?;
+        model.draft_min_prob = DRAFT_MIN_PROB;
         model.memory_limit = options.memory_limit;
+        if model.memory_limit.is_some() {
+            model.prefill_rows = PREFILL_ROWS_LIMITED;
+        }
         if options.mtp_drafts > 0 {
             match model.find_mtp(path)? {
                 Some(p) => {
@@ -418,7 +437,7 @@ impl LanguageModel for Qwen36Model {
         if let Some(m) = &mut state.mtp {
             m.pos = p + 1;
         }
-        Ok(vec![scratch.mtp_io.to_u32()?[1]])
+        self.proposal(scratch)
     }
 
     fn verify<'a>(
@@ -512,7 +531,7 @@ impl LanguageModel for Qwen36Model {
             self.copy_row(&scratch.hidden_norm, accepted, &m.pending_h)?;
             return Ok(Vec::new());
         }
-        Ok(vec![scratch.mtp_io.to_u32()?[1]])
+        self.proposal(scratch)
     }
 
     /// The file's context, or less: what the attention kernel or the
@@ -576,7 +595,7 @@ impl LanguageModel for Qwen36Model {
     }
 
     fn prefill_chunk_tokens(&self) -> Option<usize> {
-        Some(PREFILL_ROWS)
+        Some(self.prefill_rows)
     }
 
     fn prefill_until(

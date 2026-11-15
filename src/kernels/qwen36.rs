@@ -132,20 +132,45 @@ pub fn gdn(
             "snapshot shapes"
         );
     }
-    let conv = ctx.pipeline("qwen36_gdn_conv", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
-        &conv,
-        &[
-            qkv.binding(),
-            p.conv_w.binding(),
-            st.conv.binding(),
-            c.binding(),
-            snap.map_or(st.conv, |s| s.conv).binding(),
-        ],
-        &[&u32_bytes(ch), &u32_bytes(m), &snap_row.to_ne_bytes()],
-        Grid::Threads { grid: (ch, 1, 1), threadgroup: (128, 1, 1) },
-    )?;
+    let conv_bindings = [
+        qkv.binding(),
+        p.conv_w.binding(),
+        st.conv.binding(),
+        c.binding(),
+        snap.map_or(st.conv, |s| s.conv).binding(),
+    ];
+    let conv_params: [&[u8]; 3] =
+        [&u32_bytes(ch), &u32_bytes(m), &snap_row.to_ne_bytes()];
+    // Prompt runs: the conv row-parallel, its window moved beside the scan.
+    let rows = m > 4;
+    if rows {
+        let conv = ctx.pipeline("qwen36_gdn_conv_rows", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &conv,
+            &conv_bindings,
+            &conv_params,
+            Grid::Threads { grid: (ch, m, 1), threadgroup: (256, 1, 1) },
+        )?;
+    } else {
+        let conv = ctx.pipeline("qwen36_gdn_conv", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &conv,
+            &conv_bindings,
+            &conv_params,
+            Grid::Threads { grid: (ch, 1, 1), threadgroup: (128, 1, 1) },
+        )?;
+    }
     pass.memory_barrier()?;
+    if rows {
+        let window =
+            ctx.pipeline("qwen36_gdn_conv_window", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &window,
+            &conv_bindings,
+            &conv_params,
+            Grid::Threads { grid: (ch, 1, 1), threadgroup: (256, 1, 1) },
+        )?;
+    }
     let scan = ctx.pipeline("qwen36_gdn_scan", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &scan,
@@ -408,7 +433,9 @@ pub fn shared_gate(
 
 /// Routed experts' down projection summed over each row's `used` slots
 /// (`glm53::moe_down` without `add`) for rows of 256 or 512 values: all
-/// lanes at work.
+/// lanes at work. The model's 8 slots of rows of 512 take the wide kernel
+/// (`wide`; a thread a slot and task, the sum regrouped), others the one
+/// whose lanes walk the slots.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_down(
     ctx: &MetalContext,
@@ -421,6 +448,25 @@ pub fn moe_down(
     m: usize,
     used: usize,
 ) -> Result<()> {
+    let wide = used == 8 && down.cols == 512;
+    moe_down_with(ctx, pass, down, hidden, mid, sel, out, m, used, wide)
+}
+
+/// [`moe_down`] through the wide kernel (`wide`: 8 slots of rows of 512)
+/// or the lane-walk one.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_down_with(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    down: &QWeight,
+    hidden: usize,
+    mid: &Tensor,
+    sel: &Tensor,
+    out: &Tensor,
+    m: usize,
+    used: usize,
+    wide: bool,
+) -> Result<()> {
     check(&[(mid, DType::F32), (out, DType::F32), (sel, DType::U32)])?;
     ensure!(down.cols == 256 || down.cols == 512, "down rows of {}", down.cols);
     ensure!(down.rows.is_multiple_of(hidden), "down rows {} of {hidden}", down.rows);
@@ -428,13 +474,30 @@ pub fn moe_down(
         out.numel() >= m * hidden && mid.numel() >= m * used * down.cols,
         "down shapes"
     );
-    let name = match down.ty {
-        GgmlType::Q4K => "qwen36_moe_down_q4_k",
-        GgmlType::Q8_0 => "qwen36_moe_down_q8_0",
-        t => anyhow::bail!("no Qwen3.6 expert down kernel for {t:?}"),
+    ensure!(
+        !wide || (used == 8 && down.cols == 512),
+        "the wide down kernel takes 8 slots of 512"
+    );
+    let name = match (down.ty, wide) {
+        (GgmlType::Q4K, true) => "qwen36_moe_down_wide_q4_k",
+        (GgmlType::Q8_0, true) => "qwen36_moe_down_wide_q8_0",
+        (GgmlType::Q4K, false) => "qwen36_moe_down_q4_k",
+        (GgmlType::Q8_0, false) => "qwen36_moe_down_q8_0",
+        (t, _) => anyhow::bail!("no Qwen3.6 expert down kernel for {t:?}"),
     };
-    let rows_per_tg = 8 * 32 / (down.cols / 32);
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    if wide {
+        return pass.dispatch_at(
+            &pipeline,
+            &[down.t.binding(), mid.binding(), sel.binding(), out.binding()],
+            &[&u32_bytes(down.cols), &u32_bytes(hidden), &u32_bytes(down.row_bytes)],
+            Grid::Threadgroups {
+                groups: (hidden.div_ceil(2), m, 1),
+                threadgroup: (256, 1, 1),
+            },
+        );
+    }
+    let rows_per_tg = 8 * 32 / (down.cols / 32);
     pass.dispatch_at(
         &pipeline,
         &[down.t.binding(), mid.binding(), sel.binding(), out.binding()],
@@ -481,6 +544,106 @@ pub fn mtp_cat(
         &[e.binding(), h.binding(), enorm.binding(), hnorm.binding(), cat.binding()],
         &[&u32_bytes(hidden), &f32_bytes(eps)],
         Grid::Threadgroups { groups: (m, 2, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
+/// `x += a`, then `out = rmsnorm(x) * w` (`glm53::add` then
+/// `glm53::rmsnorm`; the residual the same bits, the normed rows within
+/// 1e-6, as [`rmsnorm`]) over `m` rows of `hidden` (2048);
+/// with `shared`, `x += a + shared * sigmoid(g)` (`ffn_residual`).
+#[allow(clippy::too_many_arguments)]
+pub fn residual_norm(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    a: &Tensor,
+    shared: Option<(&Tensor, &Tensor)>,
+    w: &Tensor,
+    out: &Tensor,
+    m: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<()> {
+    for t in [x, a, w, out] {
+        check(&[(t, DType::F32)])?;
+    }
+    ensure!(hidden == 2048 && w.numel() >= hidden, "residual norm of rows of {hidden}");
+    ensure!(
+        x.numel() >= m * hidden && a.numel() >= m * hidden && out.numel() >= m * hidden,
+        "residual norm of {m} rows"
+    );
+    let (s, g) = shared.unwrap_or((a, a));
+    check(&[(s, DType::F32), (g, DType::F32)])?;
+    let name = if shared.is_some() {
+        ensure!(s.numel() >= m * hidden && g.numel() >= m, "residual norm shared rows");
+        "qwen36_ffn_residual_norm"
+    } else {
+        "qwen36_add_norm"
+    };
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            x.binding(),
+            a.binding(),
+            s.binding(),
+            g.binding(),
+            w.binding(),
+            out.binding(),
+        ],
+        &[&u32_bytes(hidden), &f32_bytes(eps)],
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
+/// `glm53::rmsnorm` with its weight for rows of 2048 (the model's hidden
+/// width; other widths take GLM's): a thread's 8 loads in flight at once
+/// where GLM's loop waits for each. The sum of squares rounds as the
+/// compiler fuses it here (normed values within 1e-6 of GLM's).
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    w: &Tensor,
+    out: &Tensor,
+    m: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<()> {
+    if hidden != 2048 {
+        return crate::kernels::glm53::rmsnorm(
+            ctx,
+            pass,
+            x,
+            Some(w),
+            out,
+            m,
+            hidden,
+            eps,
+        );
+    }
+    for t in [x, w, out] {
+        check(&[(t, DType::F32)])?;
+    }
+    ensure!(w.numel() >= hidden, "rmsnorm weight shorter than {hidden}");
+    ensure!(
+        x.numel() >= m * hidden && out.numel() >= m * hidden,
+        "rmsnorm of {m} rows"
+    );
+    let pipeline = ctx.pipeline("qwen36_rmsnorm_h2048", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            x.binding(),
+            x.binding(),
+            x.binding(),
+            x.binding(),
+            w.binding(),
+            out.binding(),
+        ],
+        &[&u32_bytes(hidden), &f32_bytes(eps)],
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (256, 1, 1) },
     )
 }
 
