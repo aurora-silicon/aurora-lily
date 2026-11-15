@@ -939,22 +939,23 @@ void main() {
 #endif
 // ---------------------------------------------------------------------------
 // glm53_gemv_q8_0_m1 for rows of K = 4096 (the GDN and attention output
-// projections, 2048 rows: 256 threadgroups) with each row split over KS = 2
-// subgroups of a threadgroup, each taking half its values: twice the
-// threadgroups and half the dependent task rounds a lane. The sum
-// regrouped: each half's lanes summed, then the halves.
+// projections, 2048 rows: 256 threadgroups) with each row split over KS = 4
+// subgroups of a threadgroup, each taking a quarter of its values: four
+// times the threadgroups and one task a lane (two parts: 7.5 -> 7.4 ms a
+// decode step, 2026-11-15). The sum regrouped: each part's lanes summed,
+// then the parts in order.
 // Threadgroups of 256 (8 / KS rows). Buffers: 0 x [K], 1 W, 2 y. Param: 3 N.
 // ---------------------------------------------------------------------------
-#if defined(KERNEL_qwen36_gemv_q8_0_k4096_s2) || defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m2) || \
-    defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m3) || defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m4)
-#define KS 2u
+#if defined(KERNEL_qwen36_gemv_q8_0_k4096_s4) || defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m2) || \
+    defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m3) || defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m4)
+#define KS 4u
 // Activation rows: _m2 .. _m4 (verify passes) take each row's sums in the
 // one-row kernel's order, so a verify row is the same bits as a decode step.
-#if defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m2)
+#if defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m2)
 #define KM 2u
-#elif defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m3)
+#elif defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m3)
 #define KM 3u
-#elif defined(KERNEL_qwen36_gemv_q8_0_k4096_s2_m4)
+#elif defined(KERNEL_qwen36_gemv_q8_0_k4096_s4_m4)
 #define KM 4u
 #else
 #define KM 1u

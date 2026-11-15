@@ -863,7 +863,7 @@ pub fn gemv_q8_0_k4096_takes(w: &QWeight) -> bool {
 }
 
 /// `y[i] = w x[i]` for `m` rows of x (1 to 4) through Q8_0 rows of 4096
-/// values, each row over two subgroups (the sum regrouped against
+/// values, each row over four subgroups (the sum regrouped against
 /// `glm53::gemv`; a row's sums are the same bits at any `m`, so a verify
 /// row is a decode step's).
 pub fn gemv_q8_0_k4096(
@@ -883,12 +883,12 @@ pub fn gemv_q8_0_k4096(
     check(&[(x, DType::F32), (y, DType::F32)])?;
     ensure!((1..=4).contains(&m), "K-split GEMV of {m} rows");
     ensure!(x.numel() >= m * w.cols && y.numel() >= m * w.rows, "K-split GEMV shapes");
-    let ks = 2;
+    let ks = 4;
     let name = [
-        "qwen36_gemv_q8_0_k4096_s2",
-        "qwen36_gemv_q8_0_k4096_s2_m2",
-        "qwen36_gemv_q8_0_k4096_s2_m3",
-        "qwen36_gemv_q8_0_k4096_s2_m4",
+        "qwen36_gemv_q8_0_k4096_s4",
+        "qwen36_gemv_q8_0_k4096_s4_m2",
+        "qwen36_gemv_q8_0_k4096_s4_m3",
+        "qwen36_gemv_q8_0_k4096_s4_m4",
     ][m - 1];
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
