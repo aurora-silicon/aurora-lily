@@ -1,7 +1,7 @@
 //! CPU reference operations shared by the GGUF models (GLM 5.3 Flash,
 //! DeepSeek V4 Flash): weights decoded to f32 rows, f64-accumulated dot
-//! products, RMSNorm, the hyper-connection Sinkhorn split and post mix, and
-//! the clamped SwiGLU. The semantics are antirez's ds4 (MIT): `rms_norm_*`,
+//! products, RMSNorm, the hyper-connection Sinkhorn split and post mix, the
+//! clamped SwiGLU, and the tanh GELU (Gemma 4's, ggml's `ggml_gelu_f32`). The semantics are antirez's ds4 (MIT): `rms_norm_*`,
 //! `hc_split_sinkhorn_one`, `hc_weighted_sum_one`, `hc_post_one`, `swiglu`
 //! (ds4.c).
 
@@ -85,6 +85,11 @@ pub fn silu(x: f32) -> f32 {
 
 pub fn round_f16(x: f32) -> f32 {
     f16::from_f32(x).to_f32()
+}
+
+/// GELU, tanh approximation (`gelu_pytorch_tanh`, ggml's `ggml_gelu_f32`).
+pub fn gelu_tanh(x: f32) -> f32 {
+    0.5 * x * (1.0 + (0.797_884_6 * x * (1.0 + 0.044715 * x * x)).tanh())
 }
 
 /// `x / sqrt(mean(x^2) + eps)`, times `w` when given.

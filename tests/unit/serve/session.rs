@@ -644,6 +644,69 @@ mod store {
         assert_eq!(state.recurrent, expected.recurrent);
     }
 
+    /// A conversation extended over several requests, each generating past
+    /// several decode intervals: the snapshots its session holds at any
+    /// allocation never exceed the prompt-end checkpoints the store keeps
+    /// plus the decode checkpoints one generation holds, which is what a
+    /// memory-limit fit counts (`LoadOptions::session_checkpoints`). The
+    /// request drops what its release would drop before it snapshots.
+    #[test]
+    fn a_conversation_never_holds_more_snapshots_than_the_store_keeps() {
+        let ctx = MetalContext::new().expect("metal");
+        for (max, decode) in [(1, false), (1, true), (3, false), (3, true)] {
+            let mut store = SessionStore::<Model>::new(1 << 40, 16, max)
+                .with_decode_checkpoints(if decode { 50 } else { 0 }, 4);
+            let mut convo = prompt(1, 120);
+            let mut peak = 0;
+            for turn in 0..6u32 {
+                let n = convo.len();
+                let mut acquired =
+                    store.acquire(&ctx, &Model, &convo, &[], None).expect("acquire");
+                let reused = acquired.reused;
+                assert_eq!(reused, if turn == 0 { 0 } else { n - 30 }, "turn {turn}");
+                let mut session = std::mem::replace(
+                    &mut acquired.session,
+                    super::super::Session::new(
+                        State { data: vec![], recurrent: 0, capacity: 0 },
+                        Lineage { id: 0, created_ms: 0 },
+                    ),
+                );
+                session.state.feed(&convo[reused..n - 1]);
+                if session.prepare_prompt_checkpoint(store.max_checkpoints()) {
+                    peak = peak.max(session.checkpoints.len() + 1);
+                    let snapshot = session.state.snapshot(&ctx).expect("snapshot");
+                    session.add_checkpoint(snapshot);
+                }
+                session.state.feed(&convo[n - 1..]);
+                let mut held = store.decode_checkpoints(n - 1);
+                let answer = prompt(10 + turn, 300);
+                for &t in &answer {
+                    let pos = session.state.pos();
+                    if held.due(pos) {
+                        peak = peak.max(
+                            session.checkpoints.len() + held.positions().len() + 1,
+                        );
+                        held.take(&ctx, &session.state).expect("decode checkpoint");
+                    }
+                    session.state.feed(&[t]);
+                }
+                session.tokens.truncate(reused);
+                session.tokens.extend_from_slice(&convo[reused..]);
+                session.tokens.extend_from_slice(&answer);
+                session
+                    .add_decode_checkpoints(held.into_snapshots(), &[])
+                    .expect("add");
+                store.release(&ctx, session, &[], None);
+                // The client sends the answer back with its next message.
+                convo.extend_from_slice(&answer);
+                convo.extend(prompt(30 + turn, 30));
+            }
+            let fit = max + if decode { 4 } else { 0 };
+            assert_eq!(peak, fit, "{max} prompt checkpoints, decode {decode}");
+            store.drop_all();
+        }
+    }
+
     #[test]
     fn a_session_written_ahead_is_evicted_without_a_write_and_resumes_exactly() {
         // Two 300-token sessions fit a 700 000-byte budget, a third does not.

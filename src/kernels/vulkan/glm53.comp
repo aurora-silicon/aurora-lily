@@ -6,6 +6,29 @@
 // metal/glm53_kda.metal, the pooled indexer update of
 // kernel_glm53_indexer_pool_update (metal/dsv4_misc.metal), the Sinkhorn
 // split of hc_split_sinkhorn_one (ds4.c).
+// Gemma 4's block types (glm53_quant.glsl).
+#if defined(KERNEL_glm53_gemv_q4_0_m1) || \
+    defined(KERNEL_glm53_gemv_q4_0_m2) || \
+    defined(KERNEL_glm53_gemv_q4_0_m3) || \
+    defined(KERNEL_glm53_gemv_q4_0_m4) || \
+    defined(KERNEL_glm53_gemv_q5_k_m1) || \
+    defined(KERNEL_glm53_gemv_q5_k_m2) || \
+    defined(KERNEL_glm53_gemv_q5_k_m3) || \
+    defined(KERNEL_glm53_gemv_q5_k_m4) || \
+    defined(KERNEL_glm53_gemv_q6_k_m1) || \
+    defined(KERNEL_glm53_gemv_q6_k_m2) || \
+    defined(KERNEL_glm53_gemv_q6_k_m3) || \
+    defined(KERNEL_glm53_gemv_q6_k_m4) || \
+    defined(KERNEL_glm53_gemv_iq4_nl_m1) || \
+    defined(KERNEL_glm53_gemv_iq4_nl_m2) || \
+    defined(KERNEL_glm53_gemv_iq4_nl_m3) || \
+    defined(KERNEL_glm53_gemv_iq4_nl_m4) || \
+    defined(KERNEL_glm53_gemv_iq2_s_m1) || \
+    defined(KERNEL_glm53_gemv_iq2_s_m2) || \
+    defined(KERNEL_glm53_gemv_iq2_s_m3) || \
+    defined(KERNEL_glm53_gemv_iq2_s_m4)
+#define GLM53_EXT_TYPES
+#endif
 #include "common.glsl"
 #include "glm53_quant.glsl"
 
@@ -74,6 +97,27 @@ float glm53_group_sum(float v, uint width) {
     defined(KERNEL_glm53_gemv_f16_m6) || defined(KERNEL_glm53_gemv_f16_m7) || \
     defined(KERNEL_glm53_gemv_f16_m8)
 #define GEMV_TYPE GLM53_F16
+#elif defined(KERNEL_glm53_gemv_q4_0_m1) || \
+    defined(KERNEL_glm53_gemv_q4_0_m2) || \
+    defined(KERNEL_glm53_gemv_q4_0_m3) || defined(KERNEL_glm53_gemv_q4_0_m4)
+#define GEMV_TYPE GLM53_Q4_0
+#elif defined(KERNEL_glm53_gemv_q5_k_m1) || \
+    defined(KERNEL_glm53_gemv_q5_k_m2) || \
+    defined(KERNEL_glm53_gemv_q5_k_m3) || defined(KERNEL_glm53_gemv_q5_k_m4)
+#define GEMV_TYPE GLM53_Q5_K
+#define GEMV_Q5_K 1
+#elif defined(KERNEL_glm53_gemv_q6_k_m1) || \
+    defined(KERNEL_glm53_gemv_q6_k_m2) || \
+    defined(KERNEL_glm53_gemv_q6_k_m3) || defined(KERNEL_glm53_gemv_q6_k_m4)
+#define GEMV_TYPE GLM53_Q6_K
+#elif defined(KERNEL_glm53_gemv_iq4_nl_m1) || \
+    defined(KERNEL_glm53_gemv_iq4_nl_m2) || \
+    defined(KERNEL_glm53_gemv_iq4_nl_m3) || defined(KERNEL_glm53_gemv_iq4_nl_m4)
+#define GEMV_TYPE GLM53_IQ4_NL
+#elif defined(KERNEL_glm53_gemv_iq2_s_m1) || \
+    defined(KERNEL_glm53_gemv_iq2_s_m2) || \
+    defined(KERNEL_glm53_gemv_iq2_s_m3) || defined(KERNEL_glm53_gemv_iq2_s_m4)
+#define GEMV_TYPE GLM53_IQ2_S
 #endif
 #ifdef GEMV_TYPE
 #if defined(KERNEL_glm53_gemv_q8_0_m1) || \
@@ -81,28 +125,48 @@ float glm53_group_sum(float v, uint width) {
     defined(KERNEL_glm53_gemv_q2_k_m1) || \
     defined(KERNEL_glm53_gemv_iq2_xxs_m1) || \
     defined(KERNEL_glm53_gemv_bf16_m1) || defined(KERNEL_glm53_gemv_f32_m1) || \
-    defined(KERNEL_glm53_gemv_f16_m1)
+    defined(KERNEL_glm53_gemv_f16_m1) || \
+    defined(KERNEL_glm53_gemv_q4_0_m1) || \
+    defined(KERNEL_glm53_gemv_q5_k_m1) || \
+    defined(KERNEL_glm53_gemv_q6_k_m1) || \
+    defined(KERNEL_glm53_gemv_iq4_nl_m1) || \
+    defined(KERNEL_glm53_gemv_iq2_s_m1)
 #define GEMV_M 1u
 #elif defined(KERNEL_glm53_gemv_q8_0_m2) || \
     defined(KERNEL_glm53_gemv_q4_k_m2) || \
     defined(KERNEL_glm53_gemv_q2_k_m2) || \
     defined(KERNEL_glm53_gemv_iq2_xxs_m2) || \
     defined(KERNEL_glm53_gemv_bf16_m2) || defined(KERNEL_glm53_gemv_f32_m2) || \
-    defined(KERNEL_glm53_gemv_f16_m2)
+    defined(KERNEL_glm53_gemv_f16_m2) || \
+    defined(KERNEL_glm53_gemv_q4_0_m2) || \
+    defined(KERNEL_glm53_gemv_q5_k_m2) || \
+    defined(KERNEL_glm53_gemv_q6_k_m2) || \
+    defined(KERNEL_glm53_gemv_iq4_nl_m2) || \
+    defined(KERNEL_glm53_gemv_iq2_s_m2)
 #define GEMV_M 2u
 #elif defined(KERNEL_glm53_gemv_q8_0_m3) || \
     defined(KERNEL_glm53_gemv_q4_k_m3) || \
     defined(KERNEL_glm53_gemv_q2_k_m3) || \
     defined(KERNEL_glm53_gemv_iq2_xxs_m3) || \
     defined(KERNEL_glm53_gemv_bf16_m3) || defined(KERNEL_glm53_gemv_f32_m3) || \
-    defined(KERNEL_glm53_gemv_f16_m3)
+    defined(KERNEL_glm53_gemv_f16_m3) || \
+    defined(KERNEL_glm53_gemv_q4_0_m3) || \
+    defined(KERNEL_glm53_gemv_q5_k_m3) || \
+    defined(KERNEL_glm53_gemv_q6_k_m3) || \
+    defined(KERNEL_glm53_gemv_iq4_nl_m3) || \
+    defined(KERNEL_glm53_gemv_iq2_s_m3)
 #define GEMV_M 3u
 #elif defined(KERNEL_glm53_gemv_q8_0_m4) || \
     defined(KERNEL_glm53_gemv_q4_k_m4) || \
     defined(KERNEL_glm53_gemv_q2_k_m4) || \
     defined(KERNEL_glm53_gemv_iq2_xxs_m4) || \
     defined(KERNEL_glm53_gemv_bf16_m4) || defined(KERNEL_glm53_gemv_f32_m4) || \
-    defined(KERNEL_glm53_gemv_f16_m4)
+    defined(KERNEL_glm53_gemv_f16_m4) || \
+    defined(KERNEL_glm53_gemv_q4_0_m4) || \
+    defined(KERNEL_glm53_gemv_q5_k_m4) || \
+    defined(KERNEL_glm53_gemv_q6_k_m4) || \
+    defined(KERNEL_glm53_gemv_iq4_nl_m4) || \
+    defined(KERNEL_glm53_gemv_iq2_s_m4)
 #define GEMV_M 4u
 // Five to eight rows (DeepSeek V4's verify passes and draft blocks): Q8_0
 // and F16 only; the rows past four take accumulators acc4 .. acc7.
@@ -184,6 +248,58 @@ void main() {
         if (m > 6u) acc6 += d * glm53_task_dot(w, xt + 24u * uint64_t(x_row_stride));
         if (m > 7u) acc7 += d * glm53_task_dot(w, xt + 28u * uint64_t(x_row_stride));
 #endif
+    }
+#elif defined(GEMV_Q5_K)
+    // Q5_K (Gemma 4's attention and dense FFN): a sub-block's scale and min
+    // multiply its row sums of code times x and of x, not every weight, and
+    // the block is read in 16-byte loads (d, dmin and the scales in one;
+    // 176-byte blocks are 16-byte aligned in Gemma's rows): the kernel is
+    // bound by its loads, one at a time per thread.
+    for (uint t = sub; t < tasks; t += width) {
+        const uint64_t b = row + uint64_t(t >> 3u) * 176u;
+        const uint j = t & 7u;
+        const uvec4 hd = U32x4(b).v[0];
+        const uvec3 sw = hd.yzw;
+        #define K5_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
+        uint sc, mn;
+        if (j < 4u) {
+            sc = K5_BYTE(j) & 63u;
+            mn = K5_BYTE(j + 4u) & 63u;
+        } else {
+            sc = (K5_BYTE(j + 4u) & 0xfu) | ((K5_BYTE(j - 4u) >> 6u) << 4u);
+            mn = (K5_BYTE(j + 4u) >> 4u) | ((K5_BYTE(j) >> 6u) << 4u);
+        }
+        #undef K5_BYTE
+        const float scale = glm53_h2f(hd.x & 0xffffu) * float(sc);
+        const float minv = glm53_h2f(hd.x >> 16u) * float(mn);
+        const uint shift = (j & 1u) * 4u;
+        const uvec4 qa = U32x4(b + 48u + (j >> 1u) * 32u).v[0];
+        const uvec4 qb = U32x4(b + 64u + (j >> 1u) * 32u).v[0];
+        const uvec4 ha = U32x4(b + 16u).v[0];
+        const uvec4 hb = U32x4(b + 32u).v[0];
+        float q[32];
+        [[unroll]] for (uint c = 0u; c < 8u; c++) {
+            const uint word = (c < 4u ? qa[c] : qb[c - 4u]) >> shift;
+            const uint hw = (c < 4u ? ha[c] : hb[c - 4u]) >> j;
+            [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                q[4u * c + k] = float(((word >> (8u * k)) & 0xfu) | (((hw >> (8u * k)) & 1u) << 4u));
+            }
+        }
+        const uint64_t xt = X + 4u * (uint64_t(g) * K + t * GLM53_TASK);
+        vec2 r = glm53_task_dot_sum(q, xt);
+        acc0 += scale * r.x - minv * r.y;
+        if (m > 1u) {
+            r = glm53_task_dot_sum(q, xt + 4u * uint64_t(x_row_stride));
+            acc1 += scale * r.x - minv * r.y;
+        }
+        if (m > 2u) {
+            r = glm53_task_dot_sum(q, xt + 8u * uint64_t(x_row_stride));
+            acc2 += scale * r.x - minv * r.y;
+        }
+        if (m > 3u) {
+            r = glm53_task_dot_sum(q, xt + 12u * uint64_t(x_row_stride));
+            acc3 += scale * r.x - minv * r.y;
+        }
     }
 #else
     for (uint t = sub; t < tasks; t += width) {

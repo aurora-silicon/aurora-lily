@@ -7,8 +7,6 @@ use anyhow::Result;
 use super::tools::{ParsedToolCall, ToolGrammar, ToolSchema, parse_tool_calls_as};
 use crate::thinking::ReasoningScan;
 
-const THINK_END: &str = "</think>";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Reasoning(String),
@@ -68,6 +66,9 @@ pub struct OutputParser<D: FnMut(&[u32]) -> Result<String>> {
     /// ([`ReasoningScan`]), so a `<tool_call>` quoted in a fence, written
     /// mid-line or nested in a kept call is reasoning to both.
     reasoning_scan: ReasoningScan,
+    /// The grammar's reasoning opener (Gemma's `<|channel>thought`) has been
+    /// seen or ruled out.
+    think_open_settled: bool,
 }
 
 impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
@@ -92,12 +93,28 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
             reasoning_tokens: 0,
             tool_call_ends_thinking: config.tool_call_ends_thinking,
             reasoning_scan: ReasoningScan::new(),
+            think_open_settled: false,
         }
     }
 
     /// Parses tool calls in `grammar` (Qwen's unless set).
     pub fn with_tool_grammar(mut self, grammar: ToolGrammar) -> Self {
         self.tool_grammar = grammar;
+        self
+    }
+
+    /// For a grammar whose model opens its reasoning itself (Gemma): when
+    /// the prompt's text (`tail`, its last tokens) already opened the block
+    /// (Gemma's template does after a tool response with thinking on), the
+    /// output starts inside it, without the opener. Call after
+    /// [`Self::with_tool_grammar`].
+    pub fn with_prompt_tail(mut self, tail: &str) -> Self {
+        if let (Some(open), false) = (self.tool_grammar.think_open(), self.raw)
+            && tail.trim_end().ends_with(open)
+        {
+            self.phase = Phase::Reasoning;
+            self.think_open_settled = true;
+        }
         self
     }
 
@@ -174,7 +191,26 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
         loop {
             match self.phase {
                 Phase::Reasoning => {
-                    let think_end = self.buf.find(THINK_END);
+                    // A grammar whose model opens the reasoning itself:
+                    // drop the opener, or take the output as content when
+                    // it starts otherwise.
+                    if let (false, Some(open)) =
+                        (self.think_open_settled, self.tool_grammar.think_open())
+                    {
+                        let lead = self.buf.trim_start();
+                        if let Some(rest) = lead.strip_prefix(open) {
+                            self.buf = rest.to_string();
+                            self.think_open_settled = true;
+                        } else if open.starts_with(lead) && !final_flush {
+                            return events;
+                        } else {
+                            self.think_open_settled = true;
+                            self.phase = Phase::Content;
+                            continue;
+                        }
+                    }
+                    let think_end_marker = self.tool_grammar.think_end();
+                    let think_end = self.buf.find(think_end_marker);
                     if let Some(idx) = self.tool_call_in_reasoning()
                         && think_end.is_none_or(|end| idx < end)
                     {
@@ -194,7 +230,7 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                     }
                     if let Some(idx) = think_end {
                         let reasoning = self.buf[..idx].to_string();
-                        let rest = self.buf[idx + THINK_END.len()..].to_string();
+                        let rest = self.buf[idx + think_end_marker.len()..].to_string();
                         self.emit_text(
                             &mut events,
                             reasoning.trim_end_matches('\n'),
@@ -217,7 +253,7 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                         } else {
                             0
                         };
-                        partial_suffix_len(&self.buf, THINK_END)
+                        partial_suffix_len(&self.buf, think_end_marker)
                             .max(tool_hold)
                             .max(trailing_newlines(&self.buf))
                     };
@@ -234,6 +270,27 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                     return events;
                 }
                 Phase::Content => {
+                    // A grammar whose model may open a reasoning block at
+                    // the start of its output on its own (Gemma after a
+                    // tool response, where the template opens none): that
+                    // block is reasoning.
+                    if let (false, Some(open), false) = (
+                        self.think_open_settled,
+                        self.tool_grammar.think_open(),
+                        self.raw,
+                    ) {
+                        let lead = self.buf.trim_start();
+                        if let Some(rest) = lead.strip_prefix(open) {
+                            self.buf = rest.to_string();
+                            self.think_open_settled = true;
+                            self.phase = Phase::Reasoning;
+                            self.phase_started = false;
+                            continue;
+                        } else if open.starts_with(lead) && !final_flush {
+                            return events;
+                        }
+                        self.think_open_settled = true;
+                    }
                     let tools_on = self.tools.is_some() && !self.raw;
                     let (tool_start, _) = self.tool_grammar.markers();
                     let tool_idx =

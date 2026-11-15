@@ -49,9 +49,69 @@ fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
                 blk.copy_from_slice(&v.to_bits().to_le_bytes());
             }
             GgmlType::I32 | GgmlType::Mxfp4 => unreachable!(),
+            GgmlType::Q4_0 | GgmlType::Iq4Nl | GgmlType::Iq2S => {
+                put_f16(blk, 0, rng.gen_range(0.001..0.01))
+            }
+            GgmlType::Q5K => {
+                put_f16(blk, 0, rng.gen_range(0.001..0.01));
+                put_f16(blk, 2, rng.gen_range(0.001..0.01));
+            }
+            GgmlType::Q6K => put_f16(blk, 208, rng.gen_range(0.0001..0.001)),
         }
     }
     b
+}
+
+/// Gemma 4's block types through the GEMV (every row count) and the
+/// matrix-unit GEMM, at Gemma's widths (hidden 2816, shared FF 2112, local
+/// heads 4096).
+#[test]
+fn gemv_and_gemm_match_cpu_for_gemma4_types() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(44);
+    for ty in
+        [GgmlType::Q4_0, GgmlType::Q5K, GgmlType::Q6K, GgmlType::Iq4Nl, GgmlType::Iq2S]
+    {
+        for (cols, rows) in [(2816usize, 72usize), (2112, 40), (4096, 24)] {
+            if !cols.is_multiple_of(ty.block_values()) {
+                continue;
+            }
+            let raw = random_blocks(&mut rng, ty, rows * cols);
+            let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+            let cpu = mat(ty, &raw, rows, cols);
+            for m in 1..=GEMV_MAX_ROWS {
+                let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+                let tx = tensor(&ctx, &x);
+                let y = zeros(&ctx, m * rows);
+                run(&ctx, |p| gemv(&ctx, p, &w, &tx, &y, m).unwrap());
+                let expected: Vec<f32> =
+                    (0..m).flat_map(|i| cpu.mv(&x[i * cols..(i + 1) * cols])).collect();
+                assert_close(&y.to_f32().unwrap(), &expected, 1e-4, 1e-4);
+            }
+            if cols.is_multiple_of(64) {
+                // The GEMM rounds both operands to bfloat: so does the
+                // reference.
+                let m = 37;
+                let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+                let tx = tensor(&ctx, &x);
+                let y = zeros(&ctx, m * rows);
+                run(&ctx, |p| gemm(&ctx, p, &w, &tx, &y, m).unwrap());
+                // Weights to nearest with ties away from zero (gm_round_w),
+                // activations to nearest even.
+                let bf = |v: f32| half::bf16::from_f32(v).to_f32();
+                let bfw = |v: f32| f32::from_bits((v.to_bits() + 0x8000) & 0xffff_0000);
+                let wb = r::Mat {
+                    rows,
+                    cols,
+                    w: cpu.w.iter().map(|&v| bfw(v)).collect(),
+                };
+                let xb: Vec<f32> = x.iter().map(|&v| bf(v)).collect();
+                let expected: Vec<f32> =
+                    (0..m).flat_map(|i| wb.mv(&xb[i * cols..(i + 1) * cols])).collect();
+                assert_close(&y.to_f32().unwrap(), &expected, 1e-3, 1e-3);
+            }
+        }
+    }
 }
 
 fn decoded(ty: GgmlType, raw: &[u8], values: usize) -> r::Mat {

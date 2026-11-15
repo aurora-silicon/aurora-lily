@@ -105,7 +105,8 @@ fn a_memory_limit_lowers_the_derived_budget_to_what_it_leaves() {
 #[test]
 fn memory_options_the_configuration_cannot_honour_fail_the_start() {
     const GB: usize = 1 << 30;
-    let check = check_memory_options;
+    let check =
+        |f, small, bytes, batch| check_memory_options(f, small, bytes, batch, None);
     use KvFormat::{Bf16, Q8};
     // Small-machine mode.
     assert!(check(Q8, true, None, None).is_ok());
@@ -118,6 +119,9 @@ fn memory_options_the_configuration_cannot_honour_fail_the_start() {
     assert!(check(Bf16, false, Some(8 * GB), None).is_ok());
     assert!(check(Bf16, false, Some(8 * GB - 1), None).is_err());
     assert!(check(Bf16, false, Some(2 * GB), None).is_err());
+    // A model's own floor (Gemma 4) replaces the format's.
+    assert!(check_memory_options(Bf16, false, Some(GB), None, Some(GB)).is_ok());
+    assert!(check_memory_options(Bf16, false, Some(GB - 1), None, Some(GB)).is_err());
 }
 
 #[test]
@@ -475,6 +479,7 @@ fn warm_up_on_load_and_reload() {
         session_context: None,
         kv_format: Default::default(),
         ngram_checkpoint: None,
+        session_checkpoints: None,
     };
     for round in ["load", "reload"] {
         let ctx = MetalContext::new().expect("metal");

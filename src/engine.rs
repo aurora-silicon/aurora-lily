@@ -382,6 +382,11 @@ pub struct LoadOptions {
     /// 4-bit n-gram table is paged in place of the file's BF16 one
     /// (`--ngram-checkpoint`; `LILY_NGRAM_TABLE` when `None`).
     pub ngram_checkpoint: Option<std::path::PathBuf>,
+    /// Snapshots one server session may hold: its prompt checkpoints, plus
+    /// its decode checkpoints when those are on. Gemma 4 fits the context
+    /// of `memory_limit` around them; `None` (the bench, the tools) means
+    /// the server's defaults.
+    pub session_checkpoints: Option<usize>,
 }
 
 /// Which draw a decode pass ends with.
@@ -643,6 +648,13 @@ pub trait LanguageModel: Sized {
     /// The attention K/V caches' element format the model runs with.
     fn kv_format(&self) -> crate::kernels::attention::KvFormat {
         crate::kernels::attention::KvFormat::Bf16
+    }
+
+    /// The least session-cache budget the server derives or accepts in
+    /// `--cache-bytes`; `None` for the server's floor of the K/V format
+    /// (sized for Qwen3.8's caches).
+    fn cache_budget_floor(&self) -> Option<usize> {
+        None
     }
 
     /// A tag identifying the on-disk layout of this model's sessions (model,

@@ -120,6 +120,13 @@ struct Cli {
     #[arg(long, default_value_t = 2048)]
     decode_checkpoint_tokens: usize,
 
+    /// Prompt-end checkpoints a session keeps (the newest ones), 1 to 3:
+    /// each is one snapshot of the recurrent state in the session budget.
+    /// Fewer let `--memory-limit-gb` fit a longer context where snapshots
+    /// are large (Gemma 4's sliding-window caches: 210 MB each).
+    #[arg(long, default_value_t = 3)]
+    checkpoints_per_session: usize,
+
     /// Unload the model (weights, caches, the n-gram table) after this long
     /// without a request, e.g. `30m`, `2h`; resident sessions go to the disk
     /// tier first, a preload still running stops, and the next request
@@ -445,6 +452,7 @@ fn run() -> Result<()> {
         disk_cache_ttl_secs: parse_duration_secs(&cli.disk_cache_ttl)?,
         durable_min_tokens: cli.durable_min_tokens,
         decode_checkpoint_tokens: cli.decode_checkpoint_tokens,
+        checkpoints_per_session: cli.checkpoints_per_session,
         ngram_storage: cli.ngram_table,
         ngram_checkpoint: cli.ngram_checkpoint.clone(),
         ngram_preload: cli.ngram_preload,

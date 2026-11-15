@@ -5,8 +5,8 @@ lily-qwen3.8-flash-next, a modified version of lily
 Copyright 2026 Fabio Greter
 
 lily on Linux, a modified version of lily-qwen3.8-flash-next: the Vulkan
-backend and its GLSL kernels, GLM 5.3 Flash support and DeepSeek V4 Flash
-support
+backend and its GLSL kernels, GLM 5.3 Flash support, DeepSeek V4 Flash
+support and Gemma 4 support
 Copyright 2026 Erik Bourget
 The files changed, and how, are recorded in this repository's git history.
 
@@ -203,8 +203,21 @@ https://github.com/ggml-org/llama.cpp
   expert, the MTP head's inputs and cache positions) and the arithmetic of
   src/kernels/vulkan/qwen36.comp (ggml's gated delta net, ssm_conv, RoPE
   angle, L2 norm and softplus as its CPU ops compute them), and the
-  qwen35 pre-tokenizer split (src/qwen36/tokenizer.rs). Licensed under the
-  MIT License:
+  qwen35 pre-tokenizer split (src/qwen36/tokenizer.rs).
+
+  lily serves Gemma 4 from the published GGUF files and follows llama.cpp's
+  implementation of the model: the graph (src/gemma4/model.rs, from
+  src/models/gemma4.cpp), the draft model's graph and drafting loop
+  (src/gemma4/draft.rs, from src/models/gemma4-assistant.cpp and
+  common/speculative.cpp), the tokenizer's pre-tokenization
+  (src/gemma4/tokenizer.rs), and ggml's GGUF block formats Q4_0, Q5_K, Q6_K,
+  IQ4_NL and IQ2_S with their value formulas, the IQ4_NL values and the
+  IQ2_S grid (src/gguf.rs, src/kernels/vulkan/glm53_quant.glsl,
+  glm53_iq2s_grid.glsl, from ggml/src/ggml-quants.c and ggml-common.h).
+  tools/reference/gemma4/gguf_dequant_golden.c and llama_score.c link
+  ggml and llama.cpp to compute reference values.
+
+  Licensed under the MIT License:
 
   MIT License
 

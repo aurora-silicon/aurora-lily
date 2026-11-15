@@ -515,3 +515,92 @@ fn dsml_block_of_two_invokes_becomes_two_calls() {
     );
     assert_eq!(p.tool_calls_emitted(), 2);
 }
+
+const GEMMA: &[&str] = &[
+    "<|channel>",
+    "thought",
+    "\n",
+    "Let me add.",
+    "<channel|>",
+    "391",
+    "<|tool_call>",
+    "call:get_weather{city:",
+    "<|\"|>",
+    "Paris",
+    "}",
+    "<tool_call|>",
+    "<|chan",
+    "nel>",
+    "Done.",
+];
+
+fn gemma_parser(
+    thinking_open: bool,
+    tools: bool,
+) -> OutputParser<impl FnMut(&[u32]) -> Result<String>> {
+    OutputParser::new(
+        detok(GEMMA),
+        ParserConfig {
+            thinking_open,
+            tools: tools.then(|| {
+                crate::serve::tools::ToolSchema::from_request(&[serde_json::json!({
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": {"type": "object",
+                        "properties": {"city": {"type": "string"}}}}
+                })])
+                .unwrap()
+            }),
+            stop_strings: vec![],
+            raw: false,
+            tool_call_ends_thinking: false,
+        },
+    )
+    .with_tool_grammar(ToolGrammar::Gemma)
+}
+
+#[test]
+fn gemma_thinking_channel_is_reasoning() {
+    // Thinking on: "<|channel>thought\nLet me add.<channel|>391", the opener
+    // split across tokens.
+    let mut p = gemma_parser(true, false);
+    let (r, c, _) = text_of(&run(&mut p, &[12, 13, 1, 2, 3, 4, 5]));
+    assert_eq!((r.as_str(), c.as_str()), ("Let me add.", "391"));
+    // Thinking on, but the model answers without a channel.
+    let mut p = gemma_parser(true, false);
+    let (r, c, _) = text_of(&run(&mut p, &[5, 14]));
+    assert_eq!((r.as_str(), c.as_str()), ("", "391Done."));
+}
+
+#[test]
+fn gemma_self_opened_channel_after_a_tool_response_is_not_content() {
+    // Thinking off: "<|channel>thought\n<channel|>Done."
+    let mut p = gemma_parser(false, false);
+    let (r, c, _) = text_of(&run(&mut p, &[0, 1, 2, 4, 14]));
+    assert_eq!((r.as_str(), c.as_str()), ("", "Done."));
+}
+
+#[test]
+fn gemma_reasoning_opened_by_the_prompt_is_reasoning() {
+    // After a tool response with thinking on the template ends the prompt
+    // with "<|channel>thought\n": the output starts inside the block,
+    // "Let me add.<channel|>391".
+    let mut p = gemma_parser(true, false)
+        .with_prompt_tail("<tool_response|><|channel>thought\n");
+    let (r, c, _) = text_of(&run(&mut p, &[3, 4, 5]));
+    assert_eq!((r.as_str(), c.as_str()), ("Let me add.", "391"));
+    // A prompt that did not open it leaves the opener to the model.
+    let mut p = gemma_parser(true, false).with_prompt_tail("<|turn>model\n");
+    let (r, c, _) = text_of(&run(&mut p, &[12, 13, 1, 2, 3, 4, 5]));
+    assert_eq!((r.as_str(), c.as_str()), ("Let me add.", "391"));
+}
+
+#[test]
+fn gemma_tool_call_block_is_a_call() {
+    // "<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"
+    let mut p = gemma_parser(false, true);
+    let (_, c, calls) = text_of(&run(&mut p, &[6, 7, 8, 9, 8, 10, 11]));
+    assert_eq!(c, "");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "get_weather");
+    assert_eq!(calls[0].arguments, r#"{"city":"Paris"}"#);
+}
