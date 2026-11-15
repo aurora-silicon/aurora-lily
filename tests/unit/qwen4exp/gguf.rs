@@ -188,3 +188,66 @@ fn shapes_the_kernels_do_not_take_are_refused() {
         );
     }
 }
+
+/// Under `--memory-limit-gb` the context the fit picks is the longest whose
+/// reserve fits, and the reserve covers the most a session holds on its way
+/// there: every growth step (the layer being replaced lives twice, old and
+/// new caches) with all the server's checkpoints.
+#[test]
+fn the_fit_covers_a_session_growing_to_the_fitted_context() {
+    use crate::kernels::attention::{KvFormat, MAX_SEQ};
+    use crate::qwen4exp::config::LayerType;
+    use crate::qwen4exp::model::{
+        CAPACITY_STEP, LOOKAHEAD, attn_layer_bytes, longest_context, session_bytes,
+        session_peak,
+    };
+    let c = config_from_metadata(&published(), 768).unwrap();
+    let checkpoints = crate::serve::CHECKPOINTS_PER_SESSION
+        + crate::serve::DECODE_CHECKPOINTS_PER_SESSION;
+    let layers =
+        c.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count() + 1;
+    for kv in [KvFormat::Bf16, KvFormat::Q8] {
+        let layer = |capacity: usize| attn_layer_bytes(&c, kv, capacity) as u64;
+        for room_gb in [0.6, 1.7, 4.2, 12.0, 40.0] {
+            let room = (room_gb * 1e9) as u64;
+            let context =
+                longest_context(&c, true, kv, MAX_SEQ - LOOKAHEAD, room, checkpoints)
+                    .unwrap();
+            if context == 4096 {
+                // Nothing longer fits: the load refuses unless this does.
+                assert!(room_gb < 1.0, "{room_gb} GB");
+                continue;
+            }
+            let capacity = context + LOOKAHEAD;
+            assert_eq!(capacity % CAPACITY_STEP, 0, "{room_gb} GB: {context}");
+            let reserve = session_peak(&c, true, kv, capacity, checkpoints).unwrap();
+            assert!(reserve <= room, "{room_gb} GB: {reserve} > {room}");
+            if capacity + CAPACITY_STEP <= MAX_SEQ {
+                let next =
+                    session_peak(&c, true, kv, capacity + CAPACITY_STEP, checkpoints)
+                        .unwrap();
+                assert!(next > room, "{room_gb} GB: {context} is not the longest");
+            }
+            // The recurrent state and the snapshots do not grow.
+            let full = session_bytes(&c, true, kv, capacity, checkpoints).unwrap();
+            let fixed = full - layers as u64 * layer(capacity);
+            assert_eq!(
+                fixed,
+                session_bytes(&c, true, kv, CAPACITY_STEP, checkpoints).unwrap()
+                    - layers as u64 * layer(CAPACITY_STEP)
+            );
+            let mut peak = full;
+            for from in (CAPACITY_STEP..capacity).step_by(CAPACITY_STEP) {
+                for i in 0..layers {
+                    let grown = i as u64 * layer(capacity);
+                    let old = (layers - i) as u64 * layer(from);
+                    peak = peak.max(fixed + grown + layer(capacity) + old);
+                }
+            }
+            assert!(
+                peak <= reserve,
+                "{kv:?} {room_gb} GB: growth peaks at {peak} > {reserve}"
+            );
+        }
+    }
+}

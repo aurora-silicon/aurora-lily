@@ -718,6 +718,15 @@ pub trait LanguageModel: Sized {
         None
     }
 
+    /// What the session store keeps free for the session a request holds
+    /// ([`crate::serve::session::SessionStore::with_acquire_reserve`]): the
+    /// most that session takes on its way to the fitted context under
+    /// `--memory-limit-gb`, for a load that fits one session and serves one
+    /// request at a time (`max_batch_rows` 0); `None` otherwise.
+    fn acquire_reserve(&self) -> Option<u64> {
+        None
+    }
+
     /// GPU bytes one session holds with caches for `capacity` tokens and
     /// `checkpoints` recurrent snapshots, from the model's shapes; `None`
     /// for architectures that do not compute it.

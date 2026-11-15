@@ -984,7 +984,8 @@ impl<M: LanguageModel> Engine<M> {
         let max_batch = requested_batch.clamp(1, model.max_batch_rows().max(1));
         if requested_batch > 1 && max_batch == 1 {
             eprintln!(
-                "batching: off, {} cannot batch decode steps in this configuration (the expert cache)",
+                "batching: off, {} cannot batch decode steps in this configuration (the expert cache, \
+                 or a --memory-limit-gb fit of one session)",
                 M::MODEL_ID
             );
         } else if requested_batch > 1 {
@@ -1172,6 +1173,22 @@ impl<M: LanguageModel> Engine<M> {
         let mut sessions =
             SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION)
                 .with_lineages(board.lineages());
+        // A fitted --memory-limit-gb: the request's session at its largest
+        // is kept free of resident ones.
+        if let Some(reserve) = model.acquire_reserve() {
+            eprintln!(
+                "session cache: {:.2} GB of the budget kept free for the request's session (the whole \
+                 fitted context with its checkpoints); one request at a time",
+                gb(reserve as usize)
+            );
+            if reserve as usize > budget {
+                eprintln!(
+                    "warning: the session cache budget is below one fitted session; requests evict \
+                     every resident session"
+                );
+            }
+            sessions = sessions.with_acquire_reserve(reserve as usize);
+        }
         // The expert cache's plan reserved one session with exactly
         // `CHECKPOINTS_PER_SESSION` snapshots; more would outgrow it.
         if model.session_reserve().is_some() {

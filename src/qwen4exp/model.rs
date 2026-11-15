@@ -87,7 +87,7 @@ const QSA_QUERY_BATCH: usize = 256;
 /// Per-token caches grow in steps of this many tokens (the trunk's K/V take
 /// 192 MiB a step in bf16, 102 MiB in q8, plus the indexer keys), so a
 /// session's footprint follows its length.
-const CAPACITY_STEP: usize = 8192;
+pub(crate) const CAPACITY_STEP: usize = 8192;
 
 /// Most draft tokens a speculative step may verify at once (the spec scratch
 /// is sized for it).
@@ -351,6 +351,10 @@ pub struct Qwen4ExpModel {
     /// Scratch with its full prefill chunk from the start (a fitted
     /// `--memory-limit-gb`, [`Self::fit_context`]).
     prefill_upfront: bool,
+    /// What the session store keeps free for the session a request holds
+    /// under a fitted `--memory-limit-gb`: [`session_peak`] at the fitted
+    /// context ([`LanguageModel::acquire_reserve`]).
+    acquire_reserve: Option<u64>,
 }
 
 /// Cache rows a session needs past its request's tokens: a verify pass of
@@ -1733,6 +1737,7 @@ impl Qwen4ExpModel {
             checkpoint_id,
             context_cap,
             prefill_upfront: false,
+            acquire_reserve: None,
         })
     }
 
@@ -1747,11 +1752,12 @@ impl Qwen4ExpModel {
         let mtp = self.weights.mtp.is_some();
         let checkpoints = crate::serve::CHECKPOINTS_PER_SESSION
             + crate::serve::DECODE_CHECKPOINTS_PER_SESSION;
-        let fits = |model: &Self, context: usize, allocated: u64| -> Result<bool> {
+        let peak = |model: &Self, context: usize| -> Result<u64> {
             let capacity = (context + LOOKAHEAD).min(MAX_SEQ);
-            let session =
-                session_bytes(&model.config, mtp, model.kv_format, capacity, checkpoints)?;
-            Ok(allocated + session <= limit)
+            session_peak(&model.config, mtp, model.kv_format, capacity, checkpoints)
+        };
+        let fits = |model: &Self, context: usize, allocated: u64| -> Result<bool> {
+            Ok(allocated + peak(model, context)? <= limit)
         };
         self.prefill_upfront = true;
         let measure = |model: &Self, capacity: usize| -> Result<u64> {
@@ -1762,13 +1768,14 @@ impl Qwen4ExpModel {
             Ok((before + scratch) as u64)
         };
         let longest = |model: &Self, allocated: u64| -> Result<usize> {
-            let mut context = model.context_cap;
-            while context > 4096 && !fits(model, context, allocated)? {
-                // The next smaller capacity step, less the lookahead.
-                let capacity = round_capacity(context + LOOKAHEAD)?;
-                context = capacity.saturating_sub(CAPACITY_STEP + LOOKAHEAD);
-            }
-            Ok(context)
+            longest_context(
+                &model.config,
+                mtp,
+                model.kv_format,
+                model.context_cap,
+                limit.saturating_sub(allocated),
+                checkpoints,
+            )
         };
         // The prefill chunk's scratch (about 0.55 GB per 1024 rows) against
         // the context: a smaller chunk where the full one leaves less than
@@ -1798,6 +1805,7 @@ impl Qwen4ExpModel {
             allocated as f64 / 1e9
         );
         self.context_cap = context;
+        self.acquire_reserve = Some(peak(self, context)?);
         Ok(context)
     }
 
@@ -4726,10 +4734,7 @@ pub(crate) fn session_bytes(
         |kind: LayerType| cfg.layer_types.iter().filter(|t| **t == kind).count();
     // `DecodeState::cache_bytes`: every attention layer, the draft head's too.
     let attn_layers = count(LayerType::FullAttention) + usize::from(mtp);
-    let per_token =
-        2 * cfg.num_key_value_heads * kv_format.row_bytes(cfg.head_dim) + INDEXER_D * 2;
-    let blocks = block_key_rows(capacity, cfg.indexer.compress_ratio) * INDEXER_D * 2;
-    let caches = attn_layers * (capacity * per_token + blocks);
+    let caches = attn_layers * attn_layer_bytes(cfg, kv_format, capacity);
     // `Qwen4ExpModel::new_state`: per GDN layer the state and two conv
     // windows (a snapshot keeps one), the PLE's two windows (one), the draft
     // head's hidden.
@@ -4748,6 +4753,64 @@ pub(crate) fn session_bytes(
     let live = caches + gdn_layers * (state + 2 * conv) + 2 * ple + hidden;
     let snapshot = gdn_layers * (state + conv) + ple + hidden;
     Ok((live + checkpoints * snapshot) as u64)
+}
+
+/// The most GPU memory one session holds on its way to `capacity` tokens
+/// with `checkpoints` snapshots: [`session_bytes`] at that capacity plus the
+/// one attention layer's caches that `ensure_capacity` holds twice while it
+/// replaces them (the old ones are freed layer by layer, after the copy).
+pub(crate) fn session_peak(
+    cfg: &Qwen4ExpConfig,
+    mtp: bool,
+    kv_format: KvFormat,
+    capacity: usize,
+    checkpoints: usize,
+) -> Result<u64> {
+    Ok(session_bytes(cfg, mtp, kv_format, capacity, checkpoints)?
+        + attn_layer_bytes(cfg, kv_format, round_capacity(capacity)?) as u64)
+}
+
+/// The longest context, from `cap` down by capacity steps to 4096, whose
+/// [`session_peak`] (growth to the context and the speculative lookahead,
+/// `checkpoints` snapshots) fits `room` bytes; 4096 when none longer does
+/// (the caller refuses that unless it fits).
+pub(crate) fn longest_context(
+    cfg: &Qwen4ExpConfig,
+    mtp: bool,
+    kv_format: KvFormat,
+    cap: usize,
+    room: u64,
+    checkpoints: usize,
+) -> Result<usize> {
+    let peak = |context: usize| {
+        session_peak(
+            cfg,
+            mtp,
+            kv_format,
+            (context + LOOKAHEAD).min(MAX_SEQ),
+            checkpoints,
+        )
+    };
+    let mut context = cap;
+    while context > 4096 && peak(context)? > room {
+        // The next smaller capacity step, less the lookahead.
+        let capacity = round_capacity(context + LOOKAHEAD)?;
+        context = capacity.saturating_sub(CAPACITY_STEP + LOOKAHEAD).max(4096);
+    }
+    Ok(context)
+}
+
+/// One attention layer's per-token caches for `capacity` tokens
+/// (`DecodeState::cache_bytes` per layer).
+pub(crate) fn attn_layer_bytes(
+    cfg: &Qwen4ExpConfig,
+    kv_format: KvFormat,
+    capacity: usize,
+) -> usize {
+    let per_token =
+        2 * cfg.num_key_value_heads * kv_format.row_bytes(cfg.head_dim) + INDEXER_D * 2;
+    capacity * per_token
+        + block_key_rows(capacity, cfg.indexer.compress_ratio) * INDEXER_D * 2
 }
 
 /// `LILY_KV_CACHE` (`bf16` or `q8`), which overrides the K/V format of
@@ -5139,11 +5202,12 @@ impl LanguageModel for Qwen4ExpModel {
                     + crate::serve::DECODE_CHECKPOINTS_PER_SESSION;
                 eprintln!(
                     "qwen3.8: --memory-limit-gb {:.1} ({:.1} GB): contexts of up to {context} tokens \
-                     (one session of {:.2} GB with {checkpoints} snapshots), prefill chunks of {} \
-                     rows; --max-seq is capped there",
+                     (one session of at most {:.2} GB with {checkpoints} snapshots, kept free \
+                     for each request; one request at a time), prefill chunks of {} rows; \
+                     --max-seq is capped there",
                     limit as f64 / (1u64 << 30) as f64,
                     limit as f64 / 1e9,
-                    session_bytes(
+                    session_peak(
                         &model.config,
                         mtp,
                         model.kv_format,
@@ -5172,6 +5236,10 @@ impl LanguageModel for Qwen4ExpModel {
 
     fn session_reserve(&self) -> Option<u64> {
         self.weights.session_reserve
+    }
+
+    fn acquire_reserve(&self) -> Option<u64> {
+        self.acquire_reserve
     }
 
     fn session_bytes(&self, capacity: usize, checkpoints: usize) -> Option<u64> {

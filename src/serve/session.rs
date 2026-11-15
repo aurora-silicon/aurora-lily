@@ -951,6 +951,10 @@ pub struct SessionStore<M: LanguageModel> {
     /// being acquired or released (the batch scheduler's rows, see
     /// [`Self::set_in_flight_bytes`]); 0 when one request runs at a time.
     in_flight_bytes: usize,
+    /// Bytes kept free for the session a request holds, so that it can grow
+    /// to its full context with its checkpoints (0: none,
+    /// [`Self::with_acquire_reserve`]).
+    acquire_reserve: usize,
     /// Where new sessions' lineage ids come from.
     lineages: Arc<Lineages>,
     /// The lineages of the sessions requests hold checked out.
@@ -981,6 +985,7 @@ impl<M: LanguageModel> SessionStore<M> {
             recent_new: VecDeque::with_capacity(RECENT_NEW_SESSIONS),
             evictions: Evictions::default(),
             in_flight_bytes: 0,
+            acquire_reserve: 0,
             lineages: Arc::new(Lineages::default()),
             checked_out: CheckedOut::default(),
             #[cfg(test)]
@@ -1012,6 +1017,17 @@ impl<M: LanguageModel> SessionStore<M> {
     /// Only meaningful with a disk tier attached.
     pub fn with_durable_min_tokens(mut self, min_tokens: Arc<AtomicUsize>) -> Self {
         self.durable_min_tokens = min_tokens;
+        self
+    }
+
+    /// Keeps `bytes` of the budget free for the session each request holds
+    /// ([`LanguageModel::acquire_reserve`]): an acquire evicts before it
+    /// allocates, until the resident sessions (a fork's source among them)
+    /// leave that much, so the request's session at its largest never takes
+    /// the store over budget. A fork whose source alone leaves less rewinds
+    /// the source in place instead. One request at a time.
+    pub fn with_acquire_reserve(mut self, bytes: usize) -> Self {
+        self.acquire_reserve = bytes;
         self
     }
 
@@ -1182,6 +1198,9 @@ impl<M: LanguageModel> SessionStore<M> {
         );
         let mut acquired =
             self.acquire_resumable(ctx, model, prompt, images, cache_key)?;
+        // A session taken as is or cut back grows from here: what stays
+        // resident leaves it the reserve.
+        self.keep_reserve(ctx);
         debug_assert!(acquired.reused <= agreement, "resumed past the agreement");
         // Whatever the request appends lies past where it resumed.
         acquired.session.request_start = acquired.reused;
@@ -1255,6 +1274,7 @@ impl<M: LanguageModel> SessionStore<M> {
         }
 
         let Some((index, resume_at)) = best else {
+            self.keep_reserve(ctx);
             let state = model.new_state(ctx, prompt.len())?;
             let session = Session::new(state, self.lineages.next());
             self.trim(ctx, session.bytes());
@@ -1290,9 +1310,51 @@ impl<M: LanguageModel> SessionStore<M> {
             });
         }
 
-        // Fork: copy the per-token prefix, restore the recurrent checkpoint.
-        // The new state briefly exceeds the budget until `trim` runs after
-        // the copy (the source must survive until then).
+        if self.acquire_reserve > 0 {
+            // Make room for the fork with its source kept resident; where
+            // the source alone leaves too little, rewind it in place (the
+            // fork's release would have evicted it).
+            let source = self.entries.swap_remove(index);
+            let source_bytes = source.bytes();
+            self.trim(ctx, self.acquire_reserve + source_bytes);
+            if self.used_bytes()
+                + self.in_flight_bytes
+                + source_bytes
+                + self.acquire_reserve
+                > self.budget_bytes
+            {
+                let mut session = source;
+                let dropped = session.tokens.len() - resume_at;
+                session.cut_back(ctx, resume_at)?;
+                eprintln!(
+                    "session cache: rewound a {}-token session to {resume_at} in place: a fork \
+                     next to it would not fit the budget",
+                    resume_at + dropped
+                );
+                return Ok(Acquired {
+                    reused: resume_at,
+                    cut_back: Some(dropped),
+                    ..Acquired::fresh(session)
+                });
+            }
+            self.entries.push(source);
+            return self.fork(ctx, model, prompt, self.entries.len() - 1, resume_at);
+        }
+        self.fork(ctx, model, prompt, index, resume_at)
+    }
+
+    /// Forks resident session `index` at `resume_at`: copies the per-token
+    /// prefix and restores the recurrent checkpoint there.
+    fn fork(
+        &mut self,
+        ctx: &MetalContext,
+        model: &M,
+        prompt: &[u32],
+        index: usize,
+        resume_at: usize,
+    ) -> Result<Acquired<M>> {
+        // Without a reserve the new state briefly exceeds the budget until
+        // `trim` runs after the copy (the source must survive until then).
         let mut state = model.new_state(ctx, prompt.len())?;
         let source = &self.entries[index];
         let checkpoint = source
@@ -1326,6 +1388,12 @@ impl<M: LanguageModel> SessionStore<M> {
         len: usize,
     ) -> Result<Acquired<M>> {
         let started = Instant::now();
+        self.keep_reserve(ctx);
+        if self.disk.as_ref().is_none_or(|d| !d.contains(id)) {
+            // Spilling for the reserve pushed the entry out of the disk tier.
+            let state = model.new_state(ctx, prompt.len())?;
+            return Ok(Acquired::fresh(Session::new(state, self.lineages.next())));
+        }
         // An entry whose lineage a living session holds is a copy written
         // ahead of that session (a request has it checked out, or it is
         // resident): restored, it is a lineage of its own.
@@ -1433,6 +1501,14 @@ impl<M: LanguageModel> SessionStore<M> {
             &mut |w| state.write_prefix(n, w),
             &mut |_, w| snapshot.write_to(w),
         )
+    }
+
+    /// With a reserve ([`Self::with_acquire_reserve`]), evicts until it fits
+    /// next to the resident sessions.
+    fn keep_reserve(&mut self, ctx: &MetalContext) {
+        if self.acquire_reserve > 0 {
+            self.trim(ctx, self.acquire_reserve);
+        }
     }
 
     /// Evicts least-recently-used sessions until `extra` more bytes fit the

@@ -99,15 +99,25 @@ impl Qwen4ExpModel {
     /// Rows a batched decode step takes: the fused small-batch
     /// hyper-connection read's limit (`HC_FUSED_MAX_ROWS`). None under the
     /// expert cache, whose MoE path and one-session budget are not built for
-    /// it.
+    /// it, nor under a fitted `--memory-limit-gb`, whose fit is one session
+    /// and has no room for the batch scratch.
     pub(super) fn batch_rows(&self) -> usize {
-        if self.expert_cache_stats().is_some() { 0 } else { HC_FUSED_MAX_ROWS }
+        if self.expert_cache_stats().is_some() || self.acquire_reserve.is_some() {
+            0
+        } else {
+            HC_FUSED_MAX_ROWS
+        }
     }
 
     fn ensure_batch_scratch(&self, ctx: &MetalContext, s: &mut Scratch) -> Result<()> {
         if s.batch.is_some() {
             return Ok(());
         }
+        // Outside the fit: a fitted load serves one request at a time.
+        ensure!(
+            self.acquire_reserve.is_none(),
+            "batched decoding under a fitted --memory-limit-gb"
+        );
         let cfg = &self.config;
         let slots = self.batch_rows().max(1);
         let (nq, hd) = (cfg.num_attention_heads, cfg.head_dim);
