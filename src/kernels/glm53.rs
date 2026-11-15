@@ -1276,7 +1276,7 @@ pub fn hc_post_mix(
         &[&u32_bytes(hidden), &u32_bytes(usize::from(post.is_some()))],
         Grid::Threadgroups {
             groups: (hc_mix_groups(hidden), m, 1),
-            threadgroup: (32, 1, 1),
+            threadgroup: (128, 1, 1),
         },
     )
 }
