@@ -2561,8 +2561,9 @@ impl Qwen4ExpModel {
     ) -> Result<Scratch> {
         let cfg = &self.config;
         // Dense decode only ever runs up to the indexer's dense limit.
-        let splits =
-            sdpa_split_scratch_splits(capacity_tokens.min(cfg.indexer.dense_limit()));
+        let splits = crate::kernels::attention::sdpa_split64_scratch_splits(
+            capacity_tokens.min(cfg.indexer.dense_limit()),
+        );
         let h = cfg.hidden_size;
         let wide = cfg.hc_width();
         let inter = cfg.shared_expert_intermediate_size;
@@ -4721,7 +4722,7 @@ impl Qwen4ExpModel {
         }
 
         if len <= idx.dense_limit() {
-            sdpa_decode(
+            crate::kernels::attention::sdpa_decode_split64(
                 ctx,
                 pass,
                 &s.q,
@@ -4730,7 +4731,7 @@ impl Qwen4ExpModel {
                 &s.attn_o,
                 len,
                 self.attn_scale,
-                Some((&s.sdpa_partials, &s.sdpa_stats)),
+                (&s.sdpa_partials, &s.sdpa_stats),
             )?;
         } else {
             let nb = qsa::visible_blocks(pos, idx.compress_ratio);
