@@ -325,9 +325,10 @@ void main() {
 // loads of the step, and each use of a loaded value is a wait: 1.64 ms a
 // dispatch with coopMatLoad, 2.1 to 2.3 with the wide loads however they
 // were ordered in the source.
+//
 // Qwen3.6's chunked prefill (gdn_chunk_wy3_q36, gdn_chunk_scan_q36; called
 // from kernels/qwen36.rs): the same passes over its layout. Value head h
-// reads key head h % HK (here h / vpk); q, k and v are one bf16 buffer of
+// reads key head h % HK (Qwen3.8's: h / vpk); q, k and v are one bf16 buffer of
 // the mixed rows (q pre-scaled and q, k L2-normed: qwen36_gdn_chunk_prep),
 // so arg(0) and arg(1) are the same rows of (2 HK + H) * DIM; the gates are
 // f32 (alpha and b [M][H], ssm_a = -exp(A_log) and dt_bias [H]); the state

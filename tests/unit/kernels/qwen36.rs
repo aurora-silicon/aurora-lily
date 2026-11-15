@@ -1247,3 +1247,184 @@ fn gdn_chunked_matches_cpu() {
         assert!(es < 1e-2, "{at}: state error {es:.2e}");
     }
 }
+
+/// Random GDN inputs of `m` rows for `hk` key and `h` value heads; log-decay
+/// per token softplus(alpha + dt) ssm_a with ssm_a in `a_range`.
+struct GdnInputs {
+    qkv: Vec<f32>,
+    alpha: Vec<f32>,
+    beta: Vec<f32>,
+    z: Vec<f32>,
+}
+
+fn gdn_inputs(rng: &mut StdRng, m: usize, hk: usize, h: usize) -> GdnInputs {
+    let ch = (2 * hk + h) * GDN_DIM;
+    GdnInputs {
+        qkv: f32s(rng, m * ch, -1.0, 1.0),
+        alpha: f32s(rng, m * h, -2.0, 2.0),
+        beta: f32s(rng, m * h, -2.0, 2.0),
+        z: f32s(rng, m * h * GDN_DIM, -2.0, 2.0),
+    }
+}
+
+/// Relative L2 error of `a` against `b`.
+fn rel_err(a: &[f32], b: &[f64]) -> f64 {
+    let d: f64 = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y).powi(2)).sum();
+    let n: f64 = b.iter().map(|y| y * y).sum();
+    (d / n).sqrt()
+}
+
+/// GDN prompt steps (`steps`: rows of each `gdn` call, chunked where it
+/// takes them), then decode and verify steps through `gdn_step` (`decode`:
+/// rows of each, the window moved by `gdn_conv_window` after each), all
+/// continuing one state and conv window, against the f64 recurrence
+/// continued over the same rows: per block of 128 rows (or each step) the
+/// relative error of o (prompt) and y below 1e-2, every value finite, the
+/// conv window the same bits, the final state within 1e-2. Returns the
+/// blocks' y errors and the final state's, in order.
+#[allow(clippy::too_many_arguments)]
+fn gdn_chunked_run(
+    ctx: &MetalContext,
+    rng: &mut StdRng,
+    hk: usize,
+    h: usize,
+    steps: &[usize],
+    decode: &[usize],
+    a_range: (f32, f32),
+    s0_scale: f32,
+) -> (Vec<f64>, f64) {
+    let eps = 1e-6;
+    let ch = (2 * hk + h) * GDN_DIM;
+    let inner = h * GDN_DIM;
+    let w = f32s(rng, 4 * ch, -0.5, 0.5);
+    let ssm_a = f32s(rng, h, a_range.0, a_range.1);
+    let dt = f32s(rng, h, -1.0, 1.0);
+    let norm = f32s(rng, GDN_DIM, 0.5, 1.5);
+    let conv0 = f32s(rng, 3 * ch, -1.0, 1.0);
+    let s0 = f32s(rng, h * GDN_DIM * GDN_DIM, -s0_scale, s0_scale);
+    let t = |v: &[f32]| tensor(ctx, v);
+    let (wt, at, dtt, nt) = (t(&w), t(&ssm_a), t(&dt), t(&norm));
+    let p = GdnParams { conv_w: &wt, ssm_a: &at, dt_bias: &dtt, norm: &nt };
+    let (conv, s) = (t(&conv0), t(&s0));
+    let st = GdnState { conv: &conv, s: &s };
+    let (mut conv_r, mut s_r) =
+        (conv0.clone(), s0.iter().map(|&x| x as f64).collect::<Vec<_>>());
+    let most = steps.iter().copied().max().unwrap_or(0);
+    let staging: Vec<_> = gdn_chunk_shapes(most, hk, h)
+        .iter()
+        .map(|&(n, ty)| zeros(ctx, n, ty))
+        .collect();
+    let chunk = GdnChunk {
+        qkv: &staging[0],
+        w: &staging[1],
+        u: &staging[2],
+        p: &staging[3],
+        g: &staging[4],
+    };
+    let mut errs = Vec::new();
+    for (k, &m) in steps.iter().chain(decode).enumerate() {
+        let prompt = k < steps.len();
+        let x = gdn_inputs(rng, m, hk, h);
+        let (o_r, y_r) = gdn_ref(
+            &x.qkv,
+            &x.alpha,
+            &x.beta,
+            &x.z,
+            &w,
+            &ssm_a,
+            &dt,
+            &norm,
+            &mut conv_r,
+            &mut s_r,
+            m,
+            hk,
+            eps,
+        );
+        let (qkv_t, a_t, b_t, z_t) = (t(&x.qkv), t(&x.alpha), t(&x.beta), t(&x.z));
+        let c = zeros(ctx, m * ch, DType::F32);
+        let o = zeros(ctx, m * inner, DType::F32);
+        let y = zeros(ctx, m * inner, DType::F32);
+        run(ctx, |pass| {
+            if prompt {
+                gdn(
+                    ctx,
+                    pass,
+                    &p,
+                    &st,
+                    None,
+                    Some(&chunk),
+                    &qkv_t,
+                    &a_t,
+                    &b_t,
+                    &z_t,
+                    &c,
+                    &o,
+                    &y,
+                    m,
+                    hk,
+                    eps as f32,
+                )
+                .unwrap();
+            } else {
+                gdn_step(
+                    ctx, pass, &p, &st, None, &qkv_t, &a_t, &b_t, &z_t, &y, m, hk,
+                    eps as f32,
+                )
+                .unwrap();
+                pass.memory_barrier().unwrap();
+                gdn_conv_window(ctx, pass, &p, &st, None, &qkv_t, m).unwrap();
+            }
+        });
+        let at = format!("{hk}/{h} heads, step {k} ({m} rows)");
+        let (o, y) = (o.to_f32().unwrap(), y.to_f32().unwrap());
+        assert!(y.iter().all(|v| v.is_finite()), "{at}: a non-finite output");
+        for c0 in (0..m).step_by(128) {
+            let r = c0 * inner..(c0 + 128).min(m) * inner;
+            let ey = rel_err(&y[r.clone()], &y_r[r.clone()]);
+            if prompt {
+                let eo = rel_err(&o[r.clone()], &o_r[r]);
+                assert!(eo < 1e-2, "{at} rows {c0}..: o error {eo:.2e}");
+            }
+            assert!(ey < 1e-2, "{at} rows {c0}..: y error {ey:.2e}");
+            errs.push(ey);
+        }
+        assert_eq!(conv.to_f32().unwrap(), conv_r, "{at}: conv window");
+    }
+    let s = s.to_f32().unwrap();
+    assert!(s.iter().all(|v| v.is_finite()), "a non-finite state");
+    let es = rel_err(&s, &s_r);
+    assert!(es < 1e-2, "{hk}/{h} heads: final state error {es:.2e}");
+    (errs, es)
+}
+
+/// Decode and verify steps (`gdn_step`) after a prompt run of whole chunks
+/// continue its state as the f64 recurrence does: the model's 16 and 32
+/// heads, 128 prompt rows then steps of 1, 3 and 1 rows.
+#[test]
+fn gdn_steps_after_chunked_prefill_match_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(96);
+    let (errs, es) =
+        gdn_chunked_run(&ctx, &mut rng, 16, 32, &[128], &[1, 3, 1], (-2.0, -0.1), 0.1);
+    let errs: Vec<_> = errs.iter().map(|e| format!("{e:.2e}")).collect();
+    eprintln!("steps after prefill: y errors {}, final state {es:.2e}", errs.join(" "));
+}
+
+/// Long prompts under weak decay (per-token log-decay -0.0002 to -0.02:
+/// the incoming state is carried far) with a nonzero incoming state: 2048
+/// rows in one run and as two successive prompt steps of 1024, then a
+/// decode step; error per block of 128 rows and of the final state against
+/// the f64 recurrence, which must not grow past 1e-2 with length.
+#[test]
+fn gdn_chunked_long_weak_decay_matches_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(97);
+    for steps in [&[2048][..], &[1024, 1024][..]] {
+        let (errs, es) =
+            gdn_chunked_run(&ctx, &mut rng, 2, 4, steps, &[1], (-0.01, -0.001), 0.5);
+        eprintln!(
+            "prompt steps {steps:?}: y errors by block {}, final state {es:.2e}",
+            errs.iter().map(|e| format!("{e:.2e}")).collect::<Vec<_>>().join(" ")
+        );
+    }
+}
