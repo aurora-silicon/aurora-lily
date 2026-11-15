@@ -329,6 +329,21 @@ impl Qwen36Model {
     }
 }
 
+/// A draft whose probability under the MTP head is below this is not
+/// proposed (GLM's heuristic, `glm53::engine`): the raw MTP softmax at
+/// temperature 1, not a calibrated acceptance probability.
+const DRAFT_MIN_PROB: f32 = 0.3;
+
+impl Qwen36Model {
+    /// The MTP step's draft as a proposal list: empty when its probability
+    /// is below [`Qwen36Model::draft_min_prob`].
+    fn proposal(&self, scratch: &Scratch) -> Result<Vec<u32>> {
+        let p = scratch.mtp_prob.to_f32()?[0];
+        let draft = scratch.mtp_io.to_u32()?[1];
+        Ok(if p >= self.draft_min_prob { vec![draft] } else { Vec::new() })
+    }
+}
+
 impl LanguageModel for Qwen36Model {
     type State = Qwen36State;
     type Scratch = Scratch;
@@ -337,6 +352,7 @@ impl LanguageModel for Qwen36Model {
 
     fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
         let mut model = Qwen36Model::load(ctx, path)?;
+        model.draft_min_prob = DRAFT_MIN_PROB;
         model.memory_limit = options.memory_limit;
         if model.memory_limit.is_some() {
             model.prefill_rows = PREFILL_ROWS_LIMITED;
@@ -421,7 +437,7 @@ impl LanguageModel for Qwen36Model {
         if let Some(m) = &mut state.mtp {
             m.pos = p + 1;
         }
-        Ok(vec![scratch.mtp_io.to_u32()?[1]])
+        self.proposal(scratch)
     }
 
     fn verify<'a>(
@@ -515,7 +531,7 @@ impl LanguageModel for Qwen36Model {
             self.copy_row(&scratch.hidden_norm, accepted, &m.pending_h)?;
             return Ok(Vec::new());
         }
-        Ok(vec![scratch.mtp_io.to_u32()?[1]])
+        self.proposal(scratch)
     }
 
     /// The file's context, or less: what the attention kernel or the

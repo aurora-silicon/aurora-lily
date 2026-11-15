@@ -99,6 +99,8 @@ pub struct Qwen36Model {
     /// The longest request context served: the file's, the attention
     /// kernel's, or what the memory limit fits ([`Self::fit_context`]).
     pub context_cap: usize,
+    /// A draft less probable than this under the MTP head is not proposed.
+    pub draft_min_prob: f32,
     /// Rows a prompt step takes (and its scratch holds).
     pub prefill_rows: usize,
 }
@@ -208,6 +210,7 @@ impl Qwen36Model {
             mtp: None,
             memory_limit: None,
             context_cap,
+            draft_min_prob: 0.0,
             prefill_rows: PREFILL_ROWS,
         })
     }
@@ -546,6 +549,8 @@ pub struct Scratch {
     mtp_hn: Tensor,
     /// U32[2]: the MTP step's input token (0) and its greedy draft (1).
     pub mtp_io: Tensor,
+    /// F32[1]: the draft's probability under the MTP head.
+    pub mtp_prob: Tensor,
     pub logits: Tensor,
     /// The last (or only) row's logits: `logits[0..vocab]`.
     pub logits_last: Tensor,
@@ -619,6 +624,7 @@ impl Scratch {
             cat: f(r * 2 * h)?,
             mtp_hn: f(h)?,
             mtp_io: u(2)?,
+            mtp_prob: f(1)?,
             logits,
             sampler: SamplerScratch::new(ctx, cfg.vocab)?,
             next_token: u(2)?,
@@ -940,6 +946,7 @@ impl Qwen36Model {
         self.proj(ctx, pass, &[(&self.output, &sc.logits)], &sc.mtp_hn, None, 1)?;
         pass.memory_barrier()?;
         let out = sc.mtp_io.view(1, &[1])?;
+        g::top_prob(ctx, pass, &sc.logits_last, &sc.mtp_prob, cfg.vocab)?;
         crate::kernels::sample::sample_f32(
             ctx,
             pass,
