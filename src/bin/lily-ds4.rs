@@ -100,7 +100,7 @@ enum Cmd {
     Ppl {
         #[arg(long)]
         model: PathBuf,
-        #[arg(long, num_args = 1..)]
+        #[arg(long, num_args = 1.., required = true)]
         text: Vec<PathBuf>,
         #[arg(long, default_value_t = 4096)]
         prompt_len: usize,
@@ -510,6 +510,7 @@ fn ppl(
     n: usize,
     per_token: bool,
 ) -> Result<()> {
+    anyhow::ensure!(!texts.is_empty() && n > 0, "ppl needs a text and --n of at least 1");
     let ctx = MetalContext::new()?;
     let model = Ds4Model::load(&ctx, path)?;
     let vocab = model.cfg.vocab;
