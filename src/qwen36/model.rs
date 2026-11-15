@@ -1264,7 +1264,11 @@ impl Qwen36Model {
             m,
         )?;
         pass.memory_barrier()?;
-        k::router(ctx, pass, &sc.rlogits, &sc.rsel, &sc.rw, m, cfg.n_expert, used)?;
+        if cfg.n_expert == 256 && used == 8 {
+            k::router_sg(ctx, pass, &sc.rlogits, &sc.rsel, &sc.rw, m)?;
+        } else {
+            k::router(ctx, pass, &sc.rlogits, &sc.rsel, &sc.rw, m, cfg.n_expert, used)?;
+        }
         g::swiglu(ctx, pass, &sc.sfg, &sc.sfu, &sc.sfm, m * cfg.ff_shared, 0.0)?;
         pass.memory_barrier()?;
         if m > MAX_ROWS {

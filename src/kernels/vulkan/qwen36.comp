@@ -884,3 +884,66 @@ void main() {
     }
 }
 #endif
+// ---------------------------------------------------------------------------
+// qwen36_router for 8 of 256 experts in one subgroup a row, the same picks
+// and weights bit for bit (lane l holds experts l + 32 j, so subgroup j's
+// sum of exponentials in qwen36_router is one subgroupAdd here and the 8
+// sums add in its order): no threadgroup barriers, where qwen36_router's
+// 256 threads synchronize twice a pick. Grid (m), 32 threads.
+// Buffers and params as qwen36_router.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_qwen36_router_sg
+void main() {
+    const uint i = gl_WorkGroupID.x;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint64_t lg = arg(0) + 1024u * uint64_t(i);
+    float l[8];
+    [[unroll]] for (uint j = 0u; j < 8u; j++) l[j] = F32(lg).v[lane + 32u * j];
+    float mx = l[0];
+    [[unroll]] for (uint j = 1u; j < 8u; j++) mx = max(mx, l[j]);
+    mx = subgroupMax(mx);
+    float ex[8];
+    float sum = 0.0;
+    [[unroll]] for (uint j = 0u; j < 8u; j++) {
+        ex[j] = exp(l[j] - mx);
+        sum += subgroupAdd(ex[j]);
+    }
+    float p[8];
+    [[unroll]] for (uint j = 0u; j < 8u; j++) {
+        p[j] = ex[j] / sum;
+        if (isnan(p[j])) p[j] = -1.0;
+    }
+    float chosen[8];
+    uint who_k[8];
+    [[unroll]] for (uint k = 0u; k < 8u; k++) {
+        float lb = p[0];
+        [[unroll]] for (uint j = 1u; j < 8u; j++) lb = max(lb, p[j]);
+        const float best = subgroupMax(lb);
+        uint li = 0xFFFFFFFFu;
+        [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            if (p[j] == best) li = min(li, lane + 32u * j);
+        }
+        const uint who = subgroupMin(li);
+        chosen[k] = best;
+        who_k[k] = who;
+        [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            if (lane + 32u * j == who) p[j] = -3.0;
+        }
+    }
+    float total = 0.0;
+    [[unroll]] for (uint k = 0u; k < 8u; k++) total += max(chosen[k], 0.0);
+    total = max(total, 6.103515625e-5);
+    if (lane < 8u) {
+        uint e = who_k[0];
+        float c = chosen[0];
+        [[unroll]] for (uint k = 1u; k < 8u; k++) {
+            if (lane == k) {
+                e = who_k[k];
+                c = chosen[k];
+            }
+        }
+        U32(arg(1)).v[i * 8u + lane] = e;
+        F32(arg(2)).v[i * 8u + lane] = max(c, 0.0) / total;
+    }
+}
+#endif

@@ -789,6 +789,25 @@ pub fn moe_gate_up(
     )
 }
 
+/// [`router`] for 8 of 256 experts, one subgroup a row and no threadgroup
+/// barriers (`qwen36_router_sg`): the same picks and weights, bit for bit.
+pub fn router_sg(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    logits: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    m: usize,
+) -> Result<()> {
+    let pipeline = ctx.pipeline("qwen36_router_sg", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[logits.binding(), sel.binding(), weights.binding()],
+        &[&u32_bytes(256), &u32_bytes(8)],
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (32, 1, 1) },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/qwen36.rs"]
 mod tests;

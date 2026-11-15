@@ -706,3 +706,29 @@ fn moe_gate_up_matches_glm53_bitwise() {
         }
     }
 }
+
+/// The one-subgroup router against the 256-thread one: the same picks and
+/// weights, bit for bit, ties and a non-finite row included.
+#[test]
+fn router_sg_matches_router_bitwise() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(84);
+    let (m, e, k) = (5, 256, 8);
+    let mut l = f32s(&mut rng, m * e, -6.0, 6.0);
+    l[10] = l[20];
+    l[256 + 5] = 30.0;
+    l[256 + 6] = 30.0;
+    l[2 * 256 + 7] = f32::NAN;
+    let lt = tensor(&ctx, &l);
+    let (sa, sb) = (zeros(&ctx, m * k, DType::U32), zeros(&ctx, m * k, DType::U32));
+    let (wa, wb) = (zeros(&ctx, m * k, DType::F32), zeros(&ctx, m * k, DType::F32));
+    run(&ctx, |p| {
+        router(&ctx, p, &lt, &sa, &wa, m, e, k).unwrap();
+        router_sg(&ctx, p, &lt, &sb, &wb, m).unwrap();
+    });
+    assert_eq!(sa.to_u32().unwrap(), sb.to_u32().unwrap());
+    let (wa, wb) = (wa.to_f32().unwrap(), wb.to_f32().unwrap());
+    for (i, (a, b)) in wa.iter().zip(&wb).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "weight {i}: {a} vs {b}");
+    }
+}
