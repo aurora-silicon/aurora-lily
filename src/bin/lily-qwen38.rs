@@ -17,7 +17,7 @@ use lily::qwen4exp::Qwen4ExpModel;
 use lily::tokenizer::Tokenizer;
 
 #[derive(Parser)]
-#[command(name = "lily-qwen", about = "Qwen3.8-Flash-Next quality checks")]
+#[command(name = "lily-qwen38", about = "Qwen3.8-Flash-Next quality checks")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

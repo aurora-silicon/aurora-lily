@@ -49,12 +49,12 @@ page cache cannot hold it beside the GPU's allocation.
 ## Quality and speed (M5 Max, 2026-11-14)
 
 - ds4's official continuations (`gguf-tools/quality-testing`, ds4's no-thinking
-  prompt, `lily-qwen score`): 100 short cases NLL 0.3537, first token 68/100 (ds4's
+  prompt, `lily-qwen38 score`): 100 short cases NLL 0.3537, first token 68/100 (ds4's
   CUDA run of the same file: 0.3530, 70/100); 12 long cases (2K-24K prompts)
   0.1536, 8/12 (ds4: 0.1542, 7/12).
 - llama.cpp 0.6.0 on the same file (patched to accept it) and the same n-gram rows,
   per-token NLL of 24 raw C/English/Italian continuations: within 0.011 per language
-  (`lily-qwen nll`).
+  (`lily-qwen38 nll`).
 - Prefill 1K / 4K / 8K: ~1610 / ~1900 / ~1760 tok/s; decode ~54-55 tok/s; with the
   MTP draft head ~61-79 tok/s at one draft (prose to code), up to ~91 at two on code.
 

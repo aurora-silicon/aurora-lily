@@ -164,7 +164,7 @@ https://github.com/antirez/ds4
   (the GDN value-head reorder, folded norms, -exp(A_log), the padded Q2_K
   down rows, the draft head's eh_proj), the MXFP4 decoder (ggml's
   dequantize_row_mxfp4), and ds4's no-thinking chat prompt for scoring its
-  official continuation fixtures (src/bin/lily-qwen.rs).
+  official continuation fixtures (src/bin/lily-qwen38.rs).
 
   MIT License
 

@@ -3,7 +3,7 @@
 //! the split regex of the model's own `tokenizer.json`: Qwen3.6's), and the
 //! template as the file carries it.
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use serde_json::json;
 
 use crate::gguf::Gguf;
