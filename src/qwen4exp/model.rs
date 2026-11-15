@@ -4056,8 +4056,15 @@ impl Qwen4ExpModel {
             pass.level_barrier(&[hidden_in])?;
             let ps_rows = ps.rows(rows)?;
             let hidden = hidden_in.view(0, &[rows, wide])?;
+            // With a paged embedding the chunk's x holds its own tokens'
+            // rows (staged for the trunk, which read them at the pass's
+            // start): past the first chunk they are the catch-up's ids, so
+            // the draft head embeds them exactly instead of from its narrow
+            // rows.
+            let x_staged = self.weights.embed_paged.is_some() && pos > 0;
             self.mtp_block_caches(
                 ctx, pass, mtp, mst, &hidden, &ids, pos0, s, &ps_rows, rope, &overrides,
+                x_staged,
             )?;
         }
         // The chunk's last trunk hidden pairs with the next token, whenever
@@ -4090,7 +4097,7 @@ impl Qwen4ExpModel {
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
-        let hyper = self.mtp_input(ctx, pass, mtp, hidden, ids, s, ps, overrides)?;
+        let hyper = self.mtp_input(ctx, pass, mtp, hidden, ids, s, ps, overrides, false)?;
         let theta = self.mtp_theta();
 
         // The block itself: a trunk-style attention layer with its own RoPE base.
@@ -4153,6 +4160,7 @@ impl Qwen4ExpModel {
         s: &Scratch,
         ps: &'p PrefillScratch,
         overrides: &[RowOverride],
+        x_staged: bool,
     ) -> Result<&'p Tensor> {
         let cfg = &self.config;
         let (h, g, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
@@ -4178,7 +4186,11 @@ impl Qwen4ExpModel {
             eps,
             NORM_WEIGHT_BIAS,
         )?;
-        self.embed_draft_rows(ctx, pass, ids, &ps.x)?;
+        // `x_staged`: `ps.x` already holds these ids' rows (a paged
+        // embedding's catch-up over a chunk's own tokens).
+        if !x_staged {
+            self.embed_draft_rows(ctx, pass, ids, &ps.x)?;
+        }
         if !overrides.is_empty() {
             pass.level_barrier(&[&ps.x])?;
             override_rows(ctx, pass, &ps.x, overrides, h)?;
@@ -4234,8 +4246,10 @@ impl Qwen4ExpModel {
         ps: &PrefillScratch,
         rope: Rope<'_>,
         overrides: &[RowOverride],
+        x_staged: bool,
     ) -> Result<()> {
-        let hyper = self.mtp_input(ctx, pass, mtp, hidden, ids, s, ps, overrides)?;
+        let hyper =
+            self.mtp_input(ctx, pass, mtp, hidden, ids, s, ps, overrides, x_staged)?;
         let Mixer::Attn(w) = &mtp.layer.mixer else {
             anyhow::bail!("draft head block is not attention")
         };
