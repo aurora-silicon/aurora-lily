@@ -84,11 +84,48 @@ pub struct GdnSnapshot<'a> {
     pub s: &'a Tensor,
 }
 
+/// Staging for [`gdn`]'s chunked delta rule (prompt runs of
+/// [`GDN_CHUNK_MIN_ROWS`] rows or more, on a GPU with matrix units): the
+/// conv's rows as bf16 operands and the WY pass's per-chunk tiles, for up to
+/// `rows` rows ([`gdn_chunk_shapes`]).
+pub struct GdnChunk<'a> {
+    /// BF16 `[rows][C]`: q (scaled) and k L2-normed, v.
+    pub qkv: &'a Tensor,
+    /// BF16 `[rows][H][128]` W and U.
+    pub w: &'a Tensor,
+    pub u: &'a Tensor,
+    /// BF16 `[rows][H][64]`: the chunk's decayed causal Q K^T.
+    pub p: &'a Tensor,
+    /// F32 `[rows][H]`: the chunk's cumulative log-decay.
+    pub g: &'a Tensor,
+}
+
+/// Tokens a chunk of the chunked delta rule takes (`GDN_CHUNK` in gdn.comp).
+pub const GDN_CHUNK: usize = 64;
+/// Rows from which a prompt run takes the chunked delta rule.
+pub const GDN_CHUNK_MIN_ROWS: usize = 128;
+
+/// Element counts and types of [`GdnChunk`]'s tensors (`qkv`, `w`, `u`,
+/// `p`, `g`) for `rows` rows of `k_heads` key and `h` value heads.
+pub fn gdn_chunk_shapes(rows: usize, k_heads: usize, h: usize) -> [(usize, DType); 5] {
+    let ch = (2 * k_heads + h) * GDN_DIM;
+    [
+        (rows * ch, DType::BF16),
+        (rows * h * GDN_DIM, DType::BF16),
+        (rows * h * GDN_DIM, DType::BF16),
+        (rows * h * GDN_CHUNK, DType::BF16),
+        (rows * h, DType::F32),
+    ]
+}
+
 /// The GDN over `m` consecutive rows: the conv of the mixed projection
 /// `qkv` (`[m][C]`) into `c` (silu'd), the delta rule into `o`
 /// (`[m][H][128]`), the gated RMSNorm with `z` into `y` (`[m][H][128]`).
 /// With `snap`, the conv window and state after row `snap.row` are also
-/// written there.
+/// written there. With `chunk`, a prompt run of [`GDN_CHUNK_MIN_ROWS`] or
+/// more rows without a snapshot takes the delta rule a chunk of
+/// [`GDN_CHUNK`] rows at a time on the matrix units (gdn.comp's chunked
+/// passes, bf16 operands; a ragged tail continues token by token).
 #[allow(clippy::too_many_arguments)]
 pub fn gdn(
     ctx: &MetalContext,
@@ -96,6 +133,7 @@ pub fn gdn(
     p: &GdnParams<'_>,
     st: &GdnState<'_>,
     snap: Option<&GdnSnapshot<'_>>,
+    chunk: Option<&GdnChunk<'_>>,
     qkv: &Tensor,
     alpha: &Tensor,
     beta: &Tensor,
@@ -171,32 +209,118 @@ pub fn gdn(
             Grid::Threads { grid: (ch, 1, 1), threadgroup: (256, 1, 1) },
         )?;
     }
-    let scan = ctx.pipeline("qwen36_gdn_scan", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
-        &scan,
-        &[
-            c.binding(),
-            alpha.binding(),
-            beta.binding(),
-            p.ssm_a.binding(),
-            p.dt_bias.binding(),
-            st.s.binding(),
-            o.binding(),
-            snap.map_or(st.s, |s| s.s).binding(),
-        ],
-        &[
-            &u32_bytes(k_heads),
-            &u32_bytes(h),
-            &u32_bytes(m),
-            &snap_row.to_ne_bytes(),
-            &f32_bytes(eps),
-        ],
-        Grid::Threadgroups {
-            groups: (h, GDN_DIM / GDN_SCAN_COLS, 1),
-            threadgroup: (128, 1, 1),
-        },
-    )?;
-    pass.memory_barrier()?;
+    let chunk = chunk.filter(|_| {
+        rows && snap.is_none() && m >= GDN_CHUNK_MIN_ROWS && ctx.matrix_units()
+    });
+    // The token-serial scan of rows `t0..m`.
+    let serial = |t0: usize| -> Result<()> {
+        let n = m - t0;
+        let (cv, av, bv, ov) = (
+            c.view(t0 * ch, &[n * ch])?,
+            alpha.view(t0 * h, &[n * h])?,
+            beta.view(t0 * h, &[n * h])?,
+            o.view(t0 * inner, &[n * inner])?,
+        );
+        let scan = ctx.pipeline("qwen36_gdn_scan", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &scan,
+            &[
+                cv.binding(),
+                av.binding(),
+                bv.binding(),
+                p.ssm_a.binding(),
+                p.dt_bias.binding(),
+                st.s.binding(),
+                ov.binding(),
+                snap.map_or(st.s, |s| s.s).binding(),
+            ],
+            &[
+                &u32_bytes(k_heads),
+                &u32_bytes(h),
+                &u32_bytes(n),
+                &snap_row.to_ne_bytes(),
+                &f32_bytes(eps),
+            ],
+            Grid::Threadgroups {
+                groups: (h, GDN_DIM / GDN_SCAN_COLS, 1),
+                threadgroup: (128, 1, 1),
+            },
+        )
+    };
+    if let Some(chunk) = chunk {
+        for (t, (n, ty)) in [chunk.qkv, chunk.w, chunk.u, chunk.p, chunk.g]
+            .into_iter()
+            .zip(gdn_chunk_shapes(m, k_heads, h))
+        {
+            ensure!(t.numel() >= n && t.dtype() == ty, "GDN chunk staging of {m} rows");
+        }
+        // Beside the window move: the bf16 operands.
+        let prep = ctx.pipeline("qwen36_gdn_chunk_prep", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &prep,
+            &[c.binding(), chunk.qkv.binding()],
+            &[&u32_bytes(k_heads), &u32_bytes(h), &f32_bytes(eps)],
+            Grid::Threadgroups {
+                groups: (2 * k_heads + h, m, 1),
+                threadgroup: (GDN_DIM, 1, 1),
+            },
+        )?;
+        pass.memory_barrier()?;
+        let m_main = m - m % GDN_CHUNK;
+        let vpk = h / k_heads;
+        let wy = ctx.pipeline("gdn_chunk_wy3_q36", SOURCE, MslVersion::V3_1)?;
+        ensure!(
+            vpk <= 3,
+            "the chunked WY pass takes up to 3 value heads a key head, not {vpk}"
+        );
+        pass.dispatch_at(
+            &wy,
+            &[
+                chunk.qkv.binding(),
+                chunk.qkv.binding(),
+                alpha.binding(),
+                beta.binding(),
+                p.ssm_a.binding(),
+                p.dt_bias.binding(),
+                chunk.w.binding(),
+                chunk.u.binding(),
+                chunk.p.binding(),
+                chunk.g.binding(),
+            ],
+            &[&u32_bytes(m_main), &u32_bytes(h), &u32_bytes(vpk)],
+            Grid::Threadgroups {
+                groups: (m_main / GDN_CHUNK, k_heads, 1),
+                threadgroup: (256, 1, 1),
+            },
+        )?;
+        pass.memory_barrier()?;
+        let scan = ctx.pipeline("gdn_chunk_scan_q36", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &scan,
+            &[
+                chunk.qkv.binding(),
+                chunk.w.binding(),
+                chunk.u.binding(),
+                chunk.p.binding(),
+                chunk.g.binding(),
+                st.s.binding(),
+                o.binding(),
+            ],
+            &[&u32_bytes(m_main), &u32_bytes(h), &u32_bytes(vpk)],
+            Grid::Threadgroups {
+                groups: (GDN_DIM / 16, h, 1),
+                threadgroup: (128, 1, 1),
+            },
+        )?;
+        pass.memory_barrier()?;
+        if m_main < m {
+            serial(m_main)?;
+            pass.memory_barrier()?;
+        }
+    } else {
+        serial(0)?;
+        pass.memory_barrier()?;
+    }
     let out = ctx.pipeline("qwen36_gdn_out", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &out,
