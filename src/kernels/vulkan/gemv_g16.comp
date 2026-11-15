@@ -1,0 +1,140 @@
+#version 460
+// Decode GEMVs for Apple G16 GPUs (the M4: no matrix units, 32-wide
+// subgroups), dispatched by src/kernels/glm53.rs in place of glm53.comp's
+// on those GPUs only. Same bindings, params and results per row as the
+// glm53_gemv kernels they replace; each row's sums run in one fixed order
+// whatever the row count m, so a verify pass's rows equal plain decode's.
+#define GLM53_EXT_TYPES
+#include "common.glsl"
+#include "glm53_quant.glsl"
+
+// ---------------------------------------------------------------------------
+// Q5_K GEMV (Gemma 4's attention, dense FFN and LM head): a subgroup takes
+// G16_R rows; its four groups of eight lanes take blocks b, b + 4, .. of
+// all of them, so a lane loads its activations once for G16_R rows. Lane p
+// of a group takes values 16 h .. 16 h + 15 (h = p % 2) of sub-blocks 2 g
+// and 2 g + 1 (g = p / 2): 16 code bytes (the low and high nibbles), 16
+// high-bit bytes and the block header, each one 16-byte load, the code
+// bytes of a group's lanes contiguous. A sub-block's scale and min multiply
+// its sums of code times x and of x. K a multiple of 256, x_group a
+// multiple of G16_R (a subgroup's rows share their input).
+// Buffers: 0 x, 1-4 W, 5-8 y. Params: 9 K, 10 m, 11 row_bytes, 12-15 rows
+// of each set (0: unused), 16 x_group, 17 x_row_stride, 18 y_row_stride.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_g16_gemv_q5_k_m1)
+#define GEMV_M 1u
+#define G16_R 4u
+#elif defined(KERNEL_g16_gemv_q5_k_m2)
+#define GEMV_M 2u
+#define G16_R 2u
+#elif defined(KERNEL_g16_gemv_q5_k_m3)
+#define GEMV_M 3u
+#define G16_R 2u
+#elif defined(KERNEL_g16_gemv_q5_k_m4)
+#define GEMV_M 4u
+#define G16_R 2u
+#endif
+#ifdef GEMV_M
+// One row's 32 values of the lane in block b: (scale s0 - min sxa) + (scale
+// s1 - min sxb), the code bytes and high-bit bytes at 16-byte index q4 and
+// the block header at hd4 of the weight at W.
+float g16_q5k_lane(uint64_t W, uint hd4, uint q4, uint qh4, uint j0, uint ssh, bool hi_sc,
+                   in vec4 xa[4], in vec4 xb[4], float sxa, float sxb) {
+    const uvec4 hd = U32x4(W).v[hd4];
+    const uvec4 qs = U32x4(W).v[q4];
+    const uvec4 hb = U32x4(W).v[qh4] >> j0;
+    const uvec4 lo = (qs & 0x0f0f0f0fu) | ((hb << 4u) & 0x10101010u);
+    const uvec4 hi = ((qs >> 4u) & 0x0f0f0f0fu) | ((hb << 3u) & 0x10101010u);
+    const uint a = hd.y >> ssh, bb = hd.z >> ssh, cc = hd.w >> ssh;
+    uint sc0, mn0, sc1, mn1;
+    if (hi_sc) {
+        sc0 = (cc & 0xfu) | ((a >> 2u) & 0x30u);
+        mn0 = ((cc >> 4u) & 0xfu) | ((bb >> 2u) & 0x30u);
+        sc1 = ((cc >> 8u) & 0xfu) | ((a >> 10u) & 0x30u);
+        mn1 = ((cc >> 12u) & 0xfu) | ((bb >> 10u) & 0x30u);
+    } else {
+        sc0 = a & 63u;
+        mn0 = bb & 63u;
+        sc1 = (a >> 8u) & 63u;
+        mn1 = (bb >> 8u) & 63u;
+    }
+    precise float s0 = 0.0, s1 = 0.0;
+    [[unroll]] for (uint c = 0u; c < 4u; c++) {
+        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+            s0 = fma(float((lo[c] >> (8u * k)) & 0xffu), xa[c][k], s0);
+            s1 = fma(float((hi[c] >> (8u * k)) & 0xffu), xb[c][k], s1);
+        }
+    }
+    const float d = glm53_h2f(hd.x & 0xffffu), dm = glm53_h2f(hd.x >> 16u);
+    precise float v = (d * float(sc0) * s0 - dm * float(mn0) * sxa)
+                    + (d * float(sc1) * s1 - dm * float(mn1) * sxb);
+    return v;
+}
+
+void main() {
+    const uint64_t X = arg(0);
+    const uint K = arg_u32(9);
+    const uint row_bytes = arg_u32(11);
+    const uint x_group = arg_u32(16);
+    const uint x_row_stride = arg_u32(17);
+    const uint y_stride_param = arg_u32(18);
+    const uint rows_per_tg = 8u * G16_R;
+    uint tg = gl_WorkGroupID.x;
+    uint set = 0u;
+    uint N = arg_u32(12);
+    [[unroll]] for (uint s = 0u; s < 3u; s++) {
+        const uint tgs = (N + rows_per_tg - 1u) / rows_per_tg;
+        if (set == s && tg >= tgs) {
+            tg -= tgs;
+            set = s + 1u;
+            N = arg_u32(13u + s);
+        }
+    }
+    const uint64_t W = arg(1u + set);
+    const uint64_t Y = arg(5u + set);
+    const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
+    const uint n0 = (tg * 8u + gl_SubgroupID) * G16_R;
+    if (n0 >= N) return;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint ix = lane >> 3u, pg = (lane >> 1u) & 3u, h = lane & 1u;
+    const uint j0 = 2u * pg;
+    const uint ssh = 16u * (pg & 1u);
+    const bool hi_sc = pg >= 2u;
+    // In 16-byte units: rows, blocks (11 a block), the lane's code and
+    // high-bit bytes in a block; the activations' row, block and lane.
+    const uint row16 = row_bytes / 16u;
+    const uint x4 = (n0 / x_group) * (K / 4u) + 16u * pg + 4u * h;
+    uint r16[G16_R];
+    [[unroll]] for (uint r = 0u; r < G16_R; r++) r16[r] = min(n0 + r, N - 1u) * row16;
+    float acc[G16_R][GEMV_M];
+    [[unroll]] for (uint r = 0u; r < G16_R; r++)
+        [[unroll]] for (uint i = 0u; i < GEMV_M; i++) acc[r][i] = 0.0;
+    const uint nb = K / 256u;
+    for (uint b = ix; b < nb; b += 4u) {
+        [[unroll]] for (uint i = 0u; i < GEMV_M; i++) {
+            const uint xi = x4 + i * (x_row_stride / 4u) + 64u * b;
+            vec4 xa[4], xb[4];
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                xa[c] = F32x4(X).v[xi + c];
+                xb[c] = F32x4(X).v[xi + 8u + c];
+            }
+            precise float sxa = 0.0, sxb = 0.0;
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                sxa += (xa[c].x + xa[c].y) + (xa[c].z + xa[c].w);
+                sxb += (xb[c].x + xb[c].y) + (xb[c].z + xb[c].w);
+            }
+            [[unroll]] for (uint r = 0u; r < G16_R; r++) {
+                const uint blk = r16[r] + 11u * b;
+                acc[r][i] += g16_q5k_lane(W, blk, blk + 3u + 2u * pg + h, blk + 1u + h, j0,
+                                          ssh, hi_sc, xa, xb, sxa, sxb);
+            }
+        }
+    }
+    [[unroll]] for (uint r = 0u; r < G16_R; r++) {
+        [[unroll]] for (uint i = 0u; i < GEMV_M; i++) {
+            const float v = subgroupAdd(acc[r][i]);
+            if (lane == 0u && n0 + r < N) F32(Y).v[i * y_row_stride + n0 + r] = v;
+        }
+    }
+}
+#endif

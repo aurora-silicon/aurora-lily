@@ -88,7 +88,9 @@ fn gemv_and_gemm_match_cpu_for_gemma4_types() {
                     (0..m).flat_map(|i| cpu.mv(&x[i * cols..(i + 1) * cols])).collect();
                 assert_close(&y.to_f32().unwrap(), &expected, 1e-4, 1e-4);
             }
-            if cols.is_multiple_of(64) {
+            // Without matrix units the GEMM is sgemm.comp's, f32 throughout
+            // (gemms_without_matrix_units_match_cpu checks it).
+            if cols.is_multiple_of(64) && ctx.matrix_units() {
                 // The GEMM rounds both operands to bfloat: so does the
                 // reference.
                 let m = 37;
@@ -2770,5 +2772,36 @@ fn moe_rows_timing() {
             line += &format!("  {name} {:6.1} us", best / repeat as f64 * 1e6);
         }
         println!("{line}");
+    }
+}
+
+/// A GEMV's rows of m = 2..4 are bit-identical to the same activations'
+/// one-row GEMV (a verify pass's rows to plain decode's), at Gemma's widths.
+#[test]
+fn gemv_rows_match_one_row_exactly() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(45);
+    for ty in [GgmlType::Q5K, GgmlType::Q8_0, GgmlType::Iq4Nl] {
+        for (cols, rows) in [(2816usize, 72usize), (4096, 40)] {
+            let raw = random_blocks(&mut rng, ty, rows * cols);
+            let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+            let x = f32s(&mut rng, GEMV_MAX_ROWS * cols, -1.0, 1.0);
+            let tx = tensor(&ctx, &x);
+            let mut one = Vec::new();
+            for i in 0..GEMV_MAX_ROWS {
+                let xi = tensor(&ctx, &x[i * cols..(i + 1) * cols]);
+                let y = zeros(&ctx, rows);
+                run(&ctx, |p| gemv(&ctx, p, &w, &xi, &y, 1).unwrap());
+                one.extend(y.to_f32().unwrap());
+            }
+            for m in 2..=GEMV_MAX_ROWS {
+                let y = zeros(&ctx, m * rows);
+                run(&ctx, |p| gemv(&ctx, p, &w, &tx, &y, m).unwrap());
+                let got = y.to_f32().unwrap();
+                for (n, (a, b)) in got.iter().zip(&one[..m * rows]).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{ty:?} {cols} m={m} at {n}");
+                }
+            }
+        }
     }
 }
