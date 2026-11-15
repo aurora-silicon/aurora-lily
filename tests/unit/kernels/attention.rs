@@ -1243,3 +1243,172 @@ fn cm2_converted_operand_times_tensor_load_is_exact() {
     let first = (0..256).find(|&i| got[i] != want[i]).map(|i| (i, got[i], want[i]));
     assert_eq!(wrong, 0, "{wrong} wrong, first (index, got, want) {first:?}");
 }
+
+/// The attention of `q` (`[nq, d]`) over the first `len` keys of q8
+/// caches as stored (values times their group's scale), in f64.
+fn q8_decode_ref(
+    q: &[f32],
+    k: &KvCache,
+    v: &KvCache,
+    nq: usize,
+    len: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let sh = k.values.shape();
+    let (kvh, cap, d) = (sh[0], sh[1], sh[2]);
+    let dq = |c: &KvCache| -> Vec<f64> {
+        let vals = c.values.raw_bytes();
+        let sc = c.scales.as_ref().expect("q8 scales").raw_bytes();
+        (0..kvh * cap * d)
+            .map(|i| {
+                let g = i / 32;
+                let s = half::f16::from_le_bytes([sc[2 * g], sc[2 * g + 1]]).to_f64();
+                f64::from(vals[i] as i8) * s
+            })
+            .collect()
+    };
+    let (kd, vd) = (dq(k), dq(v));
+    let group = nq / kvh;
+    let mut out = vec![0f32; nq * d];
+    for h in 0..nq {
+        let base = (h / group) * cap * d;
+        let scores: Vec<f64> = (0..len)
+            .map(|t| {
+                let row = &kd[base + t * d..base + (t + 1) * d];
+                row.iter().zip(&q[h * d..(h + 1) * d]).map(|(a, b)| a * f64::from(*b)).sum::<f64>()
+                    * f64::from(scale)
+            })
+            .collect();
+        let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let e: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+        let sum: f64 = e.iter().sum();
+        for i in 0..d {
+            let acc: f64 = (0..len).map(|t| e[t] * vd[base + t * d + i]).sum();
+            out[h * d + i] = (acc / sum) as f32;
+        }
+    }
+    out
+}
+
+/// The q8 cache's 64-key split (`sdpa_decode_split64_q8`, Qwen3.8's dense
+/// decode) and the 256-key split against [`q8_decode_ref`] over the same
+/// stored values: they differ from it only by f32 grouping and the
+/// bfloat output's rounding, so each output is within one bfloat ulp of the
+/// reference (2^-8 of its magnitude) plus a floor of 2^-12 of the largest
+/// output, at the split boundaries, the dense endpoint, and with the mass on
+/// the last valid key and sentinels past it (copies of that key with values
+/// of 1.0, which would move the outputs if read). Measured on the M5 Max
+/// (2026-11-15): worst 3.1e-3 of the largest output, RMS 8.6e-4.
+#[test]
+fn sdpa_decode_split64_q8_matches_a_reference_over_the_stored_cache() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(89);
+    let (nq, kvh, d, cap) = (24usize, 2usize, 256usize, 2056usize);
+    let splits = sdpa_split64_scratch_splits(2051);
+    let partials = Tensor::zeros(&ctx, &[nq * splits * d], DType::F32).unwrap();
+    let stats = Tensor::zeros(&ctx, &[nq * splits * 2], DType::F32).unwrap();
+    let scale = 0.0625f32;
+    let fill = |kv: &[f32], vv: &[f32]| {
+        let kc = KvCache::zeros(&ctx, KvFormat::Q8, kvh, cap, d).unwrap();
+        let vc = KvCache::zeros(&ctx, KvFormat::Q8, kvh, cap, d).unwrap();
+        let kt = Tensor::from_f32_as_bf16(&ctx, kv, &[cap, kvh, d]).unwrap();
+        let vt = Tensor::from_f32_as_bf16(&ctx, vv, &[cap, kvh, d]).unwrap();
+        let pass = ctx.begin().unwrap();
+        scatter_kv(&ctx, &pass, &kc, &kt, 0).unwrap();
+        scatter_kv(&ctx, &pass, &vc, &vt, 0).unwrap();
+        pass.commit_wait().unwrap();
+        (kc, vc)
+    };
+    let n = cap * kvh * d;
+    let rand = |rng: &mut StdRng| -> Vec<f32> { (0..n).map(|_| rng.gen_range(-1.0f32..1.0)).collect() };
+    let (kr, vr) = (rand(&mut rng), rand(&mut rng));
+    let random = fill(&kr, &vr);
+    let mut worst = (0f32, 0f64);
+    let mut check = |caches: &(KvCache, KvCache), q: &[f32], len: usize, what: &str| {
+        let tq = Tensor::from_f32_as_bf16(&ctx, q, &[nq, d]).unwrap();
+        let q: Vec<f32> = tq.to_f32().unwrap();
+        let want = q8_decode_ref(&q, &caches.0, &caches.1, nq, len, scale);
+        let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for split64 in [true, false] {
+            let out = Tensor::zeros(&ctx, &[nq * d], DType::BF16).unwrap();
+            let pass = ctx.begin().unwrap();
+            if split64 {
+                sdpa_decode_split64(&ctx, &pass, &tq, &caches.0, &caches.1, &out, len, scale, (&partials, &stats))
+                    .unwrap();
+            } else {
+                sdpa_decode(&ctx, &pass, &tq, &caches.0, &caches.1, &out, len, scale, Some((&partials, &stats)))
+                    .unwrap();
+            }
+            pass.commit_wait().unwrap();
+            let got = out.to_f32().unwrap();
+            let (mut max_abs, mut sq) = (0f32, 0f64);
+            for (g, w) in got.iter().zip(&want) {
+                let e = (g - w).abs();
+                max_abs = max_abs.max(e);
+                sq += f64::from(e) * f64::from(e);
+                assert!(
+                    e <= w.abs() / 256.0 + top / 4096.0,
+                    "{what} len {len} split64 {split64}: {g} vs {w}"
+                );
+            }
+            let rms = (sq / got.len() as f64).sqrt() / f64::from(top.max(1e-30));
+            worst = (worst.0.max(max_abs / top.max(1e-30)), worst.1.max(rms));
+        }
+    };
+    for len in [1usize, 64, 65, 128, 129, 256, 257, 300, 1100, 2000, 2050, 2051] {
+        let q: Vec<f32> = (0..nq * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        check(&random, &q, len, "random");
+    }
+    // The mass on the last valid key (q is that key, scaled up); past it,
+    // copies of that key (they would tie for the maximum if read) with
+    // values of 1.0 (which would then pull every output toward 1).
+    for len in [65usize, 129, 257, 2000] {
+        let (mut kv, mut vv) = (kr.clone(), vr.clone());
+        for t in len..cap {
+            for i in 0..kvh * d {
+                kv[t * kvh * d + i] = kr[(len - 1) * kvh * d + i];
+                vv[t * kvh * d + i] = 1.0;
+            }
+        }
+        let caches = fill(&kv, &vv);
+        let mut q = vec![0f32; nq * d];
+        for h in 0..nq {
+            let kh = h / (nq / kvh);
+            for i in 0..d {
+                q[h * d + i] = 4.0 * kv[(len - 1) * kvh * d + kh * d + i];
+            }
+        }
+        check(&caches, &q, len, "last key");
+    }
+    eprintln!("worst max |err| {:.3e}, rms {:.3e} of the largest output", worst.0, worst.1);
+}
+
+/// The 64-key entry point rejects what the kernels cannot read, before it
+/// dispatches anything (the outputs keep their sentinel through the pass's
+/// commit): a length past the cache, a short output, a query head count
+/// that is not a multiple of the key heads.
+#[test]
+fn sdpa_decode_split64_rejects_bad_shapes_before_dispatch() {
+    let ctx = MetalContext::new().expect("metal context");
+    let (d, cap) = (256usize, 64usize);
+    let partials = Tensor::zeros(&ctx, &[8 * 8 * d], DType::F32).unwrap();
+    let stats = Tensor::zeros(&ctx, &[8 * 8 * 2], DType::F32).unwrap();
+    let sentinel = |n: usize| Tensor::from_f32_as_bf16(&ctx, &vec![7.0f32; n], &[n]).unwrap();
+    for format in [KvFormat::Q8, KvFormat::Bf16] {
+        let cache = |heads| KvCache::zeros(&ctx, format, heads, cap, d).unwrap();
+        let (k1, v1, k2, v2) = (cache(1), cache(1), cache(2), cache(2));
+        let (q1, q3) = (sentinel(d), sentinel(3 * d));
+        let (out1, short, out3) = (sentinel(d), sentinel(d / 2), sentinel(3 * d));
+        let pass = ctx.begin().unwrap();
+        let call = |q: &Tensor, out: &Tensor, len: usize, k: &KvCache, v: &KvCache| {
+            sdpa_decode_split64(&ctx, &pass, q, k, v, out, len, 0.0625, (&partials, &stats))
+        };
+        assert!(call(&q1, &out1, cap + 1, &k1, &v1).is_err(), "{format:?}: len past the cache");
+        assert!(call(&q1, &short, 40, &k1, &v1).is_err(), "{format:?}: short output");
+        assert!(call(&q3, &out3, 40, &k2, &v2).is_err(), "{format:?}: 3 query heads over 2");
+        pass.commit_wait().unwrap();
+        for (t, what) in [(&out1, "out"), (&short, "short"), (&out3, "out3")] {
+            assert!(t.to_f32().unwrap().iter().all(|&v| v == 7.0), "{format:?}: {what} written");
+        }
+    }
+}

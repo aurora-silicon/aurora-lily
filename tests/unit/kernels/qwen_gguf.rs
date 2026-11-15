@@ -889,3 +889,122 @@ fn moe_accuracy() {
         println!("m={m}: act rms {ar:.3e} max {am:.3e} | out rms {or:.3e} max {om:.3e}");
     }
 }
+
+/// A GEMV row is the same bits at every row count: row i of an m-row GEMV
+/// equals the one-row GEMV of row i (a verify pass's rows then compute as
+/// a decode step's would, whatever the pass's size).
+#[test]
+fn gemv_rows_equal_the_one_row_gemv() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(83);
+    for (ty, k, n) in [
+        (GgmlType::Q8_0, 2560usize, 520usize),
+        (GgmlType::Q8_0, 6144, 64),
+        (GgmlType::Bf16, 2560, 48),
+        (GgmlType::F16, 320, 96),
+    ] {
+        let raw = random_blocks(&mut rng, ty, n * k);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, k, n).unwrap();
+        let (_, x) = bf16_input(&ctx, &mut rng, 4 * k);
+        for out in [DType::BF16, DType::F32] {
+            let one: Vec<Vec<f32>> = (0..4)
+                .map(|i| {
+                    let xi = x.view(i * k, &[k]).unwrap();
+                    let y = Tensor::zeros(&ctx, &[n], out).unwrap();
+                    run(&ctx, |p| gemv(&ctx, p, &w, &xi, &y, 1).unwrap());
+                    y.to_f32().unwrap()
+                })
+                .collect();
+            for m in 2..=4usize {
+                let y = Tensor::zeros(&ctx, &[m * n], out).unwrap();
+                run(&ctx, |p| gemv(&ctx, p, &w, &x, &y, m).unwrap());
+                let got = y.to_f32().unwrap();
+                for i in 0..m {
+                    let bad = (0..n).filter(|&r| got[i * n + r].to_bits() != one[i][r].to_bits()).count();
+                    assert_eq!(bad, 0, "{ty:?} {out:?} m {m} row {i}: {bad} of {n} differ");
+                }
+            }
+        }
+    }
+}
+
+/// The fused hyper-connection read and the routed experts give each row the
+/// same bits at every row count (row i of an m-row call against a one-row
+/// call of row i): verify passes of any size compute rows alike.
+#[test]
+fn hc_read_and_experts_rows_equal_one_row_calls() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(84);
+    let bits = |t: &Tensor| t.to_f32().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    // Hyper-connection read.
+    let (h, g, r, ni) = (2560usize, 4usize, 320usize, 4usize);
+    let wide = g * h;
+    let nw: Vec<f32> = (0..wide).map(|_| round_bf16(rng.gen_range(-0.3..0.3))).collect();
+    let tn = Tensor::from_f32_as_bf16(&ctx, &nw, &[wide]).unwrap();
+    let mk = |rng: &mut StdRng, cols, rows| {
+        let raw = random_blocks(rng, GgmlType::F16, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, GgmlType::F16, cols, rows).unwrap()
+    };
+    let (wd, wi, wu) = (mk(&mut rng, wide, r), mk(&mut rng, wide, ni), mk(&mut rng, r, wide));
+    let (_, tx) = bf16_input(&ctx, &mut rng, 4 * wide);
+    let hc = |m: usize, x: &Tensor| {
+        let od = Tensor::zeros(&ctx, &[m * r], DType::BF16).unwrap();
+        let oi = Tensor::zeros(&ctx, &[m * ni], DType::BF16).unwrap();
+        let inv = Tensor::zeros(&ctx, &[m * g], DType::F32).unwrap();
+        let mixed = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
+        run(&ctx, |p| {
+            hc_read_f16(&ctx, p, x, &tn, &wd, Some(&wi), &wu, &od, &oi, &inv, &mixed, h, g, 1e-6, 1.0, m)
+                .unwrap()
+        });
+        (bits(&od), bits(&oi), bits(&mixed), bits(&inv))
+    };
+    let ones: Vec<_> = (0..4).map(|i| hc(1, &tx.view(i * wide, &[wide]).unwrap())).collect();
+    for m in 2..=4usize {
+        let (od, oi, mixed, inv) = hc(m, &tx);
+        for i in 0..m {
+            assert_eq!(inv[i * g..(i + 1) * g], ones[i].3[..], "hc inv_rms m {m} row {i}");
+            assert_eq!(od[i * r..(i + 1) * r], ones[i].0[..], "hc down m {m} row {i}");
+            assert_eq!(oi[i * ni..(i + 1) * ni], ones[i].1[..], "hc inject m {m} row {i}");
+            assert_eq!(mixed[i * h..(i + 1) * h], ones[i].2[..], "hc mixed m {m} row {i}");
+        }
+    }
+    // Routed experts.
+    let (ff, d_cols, experts, used) = (640usize, 768usize, 12usize, 10usize);
+    let q = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let wg = q(&mut rng, GgmlType::Iq2Xxs, h, experts * ff);
+    let wup = q(&mut rng, GgmlType::Iq2Xxs, h, experts * ff);
+    let wdn = q(&mut rng, GgmlType::Q2K, d_cols, experts * h);
+    let (_, x) = bf16_input(&ctx, &mut rng, 4 * h);
+    let (_, so) = bf16_input(&ctx, &mut rng, 4 * h);
+    let sel: Vec<u32> = (0..4 * used).map(|k| ((k * 5 + k / used) % experts) as u32).collect();
+    let scores: Vec<f32> = (0..4 * used).map(|_| rng.gen_range(0.0..0.3)).collect();
+    let sg: Vec<f32> = (0..4).map(|_| rng.gen_range(-2.0..2.0)).collect();
+    let moe = |m: usize, row0: usize| {
+        let t_u32 = |v: &[u32]| Tensor::from_bytes(&ctx, bytemuck::cast_slice(v), &[v.len()], DType::U32).unwrap();
+        let tsel = t_u32(&sel[row0 * used..(row0 + m) * used]);
+        let tsc = Tensor::from_f32(&ctx, &scores[row0 * used..(row0 + m) * used], &[m * used]).unwrap();
+        let tsg = Tensor::from_f32(&ctx, &sg[row0..row0 + m], &[m]).unwrap();
+        let xv = x.view(row0 * h, &[m * h]).unwrap();
+        let sov = so.view(row0 * h, &[m * h]).unwrap();
+        let act = Tensor::zeros(&ctx, &[m * used * ff], DType::BF16).unwrap();
+        let out = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
+        run(&ctx, |p| {
+            moe_gate_up(&ctx, p, &wg, &wup, ff, &xv, &tsel, &act, m, used).unwrap();
+            p.memory_barrier().unwrap();
+            let shared = Some(SharedAdd { out: &sov, gate: &tsg });
+            moe_down(&ctx, p, &wdn, ff, h, &act, &tsel, &tsc, shared, &out, m, used).unwrap();
+        });
+        (bits(&act), bits(&out))
+    };
+    let ones: Vec<_> = (0..4).map(|i| moe(1, i)).collect();
+    for m in 2..=4usize {
+        let (act, out) = moe(m, 0);
+        for i in 0..m {
+            assert_eq!(act[i * used * ff..(i + 1) * used * ff], ones[i].0[..], "expert act m {m} row {i}");
+            assert_eq!(out[i * h..(i + 1) * h], ones[i].1[..], "expert out m {m} row {i}");
+        }
+    }
+}
