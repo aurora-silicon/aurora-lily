@@ -159,13 +159,18 @@ fn speculation_at_rest_restores_and_forks_like_plain_decoding() {
     let path = std::env::var("LILY_GEMMA4_GGUF").expect("LILY_GEMMA4_GGUF");
     let ctx = MetalContext::new().unwrap();
     let options = LoadOptions { mtp_drafts: 3, ..Default::default() };
-    let model = <Gemma4Model as LanguageModel>::load(
+    let mut model = <Gemma4Model as LanguageModel>::load(
         &ctx,
         std::path::Path::new(&path),
         &options,
     )
     .unwrap();
     assert!(model.draft.is_some(), "no draft model beside {path}");
+    // Every step proposes: the prompt is arbitrary tokens, whose drafts
+    // rarely reach the served gate's probability, and the checks below
+    // compare proposals.
+    model.draft_min_prob = 0.0;
+    let model = model;
     let greedy = SamplingParams::greedy();
     // A prompt past the sliding window, so the rings wrap.
     let prompt: Vec<u32> = (0..1500u32).map(|i| 1000 + (i * 7919) % 50000).collect();
