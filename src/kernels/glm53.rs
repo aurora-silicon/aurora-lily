@@ -330,13 +330,13 @@ pub fn gemm_with(
 ) -> Result<()> {
     check_f32(&[x])?;
     if !ctx.matrix_units() {
-        return gemm_any(ctx, pass, w, x, y, m, n, l, sgemm_name(w.ty)?, 64, 256);
+        return gemm_any(ctx, pass, w, x, y, m, n, l, sgemm_name(w.ty)?, (64, 128), 256);
     }
-    gemm_any(ctx, pass, w, x, y, m, n, l, gemm_name(w.ty)?, 64, 128)
+    gemm_any(ctx, pass, w, x, y, m, n, l, gemm_name(w.ty)?, (64, 64), 128)
 }
 
-/// The GEMM without matrix units (`sgemm.comp`: f32 operands, 64 x 64
-/// tiles of 256 threads, K in 32-deep steps).
+/// The GEMM without matrix units (`sgemm.comp`: f32 operands, tiles of 64
+/// activation rows x 128 weight rows, 256 threads, K in 32-deep steps).
 fn sgemm_name(ty: GgmlType) -> Result<&'static str> {
     Ok(match ty {
         GgmlType::Q8_0 => "sgemm_q8_0",
@@ -380,7 +380,7 @@ pub fn gemm_bx(
         w_batch: 0,
         y_batch: 0,
     };
-    gemm_any(ctx, pass, w, xb, y, m, w.rows, l, name, GEMM_BX_ROWS, GEMM_BX_THREADS)
+    gemm_any(ctx, pass, w, xb, y, m, w.rows, l, name, (GEMM_BX_ROWS, 64), GEMM_BX_THREADS)
 }
 
 /// Rows of X a threadgroup of the bfloat-input GEMM takes (the kernel's
@@ -429,7 +429,7 @@ fn gemm_any(
     n: usize,
     l: GemmLayout,
     name: &'static str,
-    tile_rows: usize,
+    (tile_rows, tile_cols): (usize, usize),
     threads: usize,
 ) -> Result<()> {
     check_f32(&[y])?;
@@ -469,7 +469,7 @@ fn gemm_any(
             &u32_bytes(l.y_batch),
         ],
         Grid::Threadgroups {
-            groups: (n.div_ceil(64), m.div_ceil(tile_rows), l.batches),
+            groups: (n.div_ceil(tile_cols), m.div_ceil(tile_rows), l.batches),
             threadgroup: (threads, 1, 1),
         },
     )

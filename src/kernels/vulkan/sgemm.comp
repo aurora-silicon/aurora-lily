@@ -5,11 +5,11 @@
 // expert (src/kernels/gemma4.rs `moe_grouped`). f32 operands and sums: the
 // weights as glm53_decode gives them, the activations as stored.
 //
-// A threadgroup of 256 computes a 64 x 64 tile of Y, a thread 4 activation
-// rows x 4 weight rows; a 32-deep K step decodes one block of 32 weights of
-// each of the tile's 64 weight rows (a thread a row) into threadgroup
-// memory beside the 64 activation rows' 32 values, both transposed so a
-// thread reads a vec4 of each.
+// A threadgroup of 256 computes a tile of 64 activation rows x 128 weight
+// rows of Y, a thread 4 x 8; a 32-deep K step decodes 32 weights of each of
+// the tile's 128 weight rows (a thread 16 of a row) into threadgroup memory
+// beside the 64 activation rows' 32 values, both transposed so a thread
+// reads vectors of each.
 #if defined(KERNEL_sgemm_q4_0) || defined(KERNEL_sgemm_q5_k) || defined(KERNEL_sgemm_q6_k) || \
     defined(KERNEL_sgemm_iq4_nl) || defined(KERNEL_sgemm_iq2_s) || \
     defined(KERNEL_sgemm_moe_iq2_s) || defined(KERNEL_sgemm_moe_q5_k) || \
@@ -48,16 +48,82 @@
 #endif
 
 #ifdef SG_TYPE
+// Weights k .. k + 8 (k a multiple of 8) of `row`, as glm53_decode gives
+// them: Gemma's prompt-run types directly (as gemma4_gemm.comp and
+// glm53_gemm.comp decode them), the others as 8 of glm53_decode's 32.
+void sg_decode8(uint64_t row, uint k, out float w[8]) {
+#if defined(KERNEL_sgemm_iq2_xxs) || defined(KERNEL_sgemm_moe_iq2_xxs)
+    const uint t = k >> 5u, l = (k >> 3u) & 3u;
+    const uint bw = (t >> 3u) * 33u;
+    const uint qw = bw + 1u + 4u * (t & 7u);
+    const float d = glm53_h2f(uint(U16(row).v[bw]));
+    const uint aux0 = uint(U16(row).v[qw]) | (uint(U16(row).v[qw + 1u]) << 16u);
+    const uint aux1 = uint(U16(row).v[qw + 2u]) | (uint(U16(row).v[qw + 3u]) << 16u);
+    const float scale = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
+    const uvec4 g = glm53_iq2xxs_grid_h[(aux0 >> (8u * l)) & 0xffu]
+                  ^ glm53_iq2xxs_signs_h[(aux1 >> (7u * l)) & 127u];
+    [[unroll]] for (uint p = 0u; p < 4u; p++) {
+        const vec2 v = unpackHalf2x16(g[p]);
+        w[p] = scale * v.x;
+        w[p + 4u] = scale * v.y;
+    }
+#elif defined(KERNEL_sgemm_q8_0) || defined(KERNEL_sgemm_moe_q8_0)
+    const uint64_t b = row + uint64_t(k >> 5u) * 34u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(U16(b + 2u).v[((k & 31u) >> 1u) + i]);
+        w[2u * i] = d * float(int(pair << 24) >> 24);
+        w[2u * i + 1u] = d * float(int(pair << 16) >> 24);
+    }
+#elif defined(KERNEL_sgemm_iq4_nl) || defined(KERNEL_sgemm_moe_iq4_nl)
+    // Values j .. j + 8 of a block: the low nibbles of bytes j.. (j < 16)
+    // or the high nibbles of bytes j - 16.. .
+    const uint64_t b = row + uint64_t(k >> 5u) * 18u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint j = k & 31u, at = j & 15u, shift = j < 16u ? 0u : 4u;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(U16(b + 2u + at).v[i]);
+        w[2u * i] = d * glm53_iq4nl_value((pair >> shift) & 0xfu);
+        w[2u * i + 1u] = d * glm53_iq4nl_value((pair >> (8u + shift)) & 0xfu);
+    }
+#elif defined(KERNEL_sgemm_q5_k) || defined(KERNEL_sgemm_moe_q5_k)
+    // Values k .. k + 8 of their 32-value sub-block j: nibbles of bytes
+    // 32 (j / 2) + l .., high bit j of bytes l .. (l = k % 32).
+    const uint64_t b = row + uint64_t(k >> 8u) * 176u;
+    const uint j = (k >> 5u) & 7u, l = k & 31u;
+    uint sc, mn;
+    glm53_k4_scale_min(b, j, sc, mn);
+    const uint dd = U32(b).v[0];
+    const float scale = glm53_h2f(dd & 0xffffu) * float(sc);
+    const float minv = glm53_h2f(dd >> 16u) * float(mn);
+    const uvec2 q = U32x2(b + 48u + (j >> 1u) * 32u + l).v[0] >> ((j & 1u) * 4u);
+    const uvec2 h = U32x2(b + 16u + l).v[0] >> j;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        const uint c = ((q[i >> 2u] >> (8u * (i & 3u))) & 0xfu) | (((h[i >> 2u] >> (8u * (i & 3u))) & 1u) << 4u);
+        w[i] = scale * float(c) - minv;
+    }
+#else
+    float t[32];
+    glm53_decode(SG_TYPE, row, k >> 5u, t);
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        if ((k & 24u) == 8u * q) {
+            [[unroll]] for (uint i = 0u; i < 8u; i++) w[i] = t[8u * q + i];
+        }
+    }
+#endif
+}
+
 #define SG_T 64u
+#define SG_TN 128u
 #define SG_K 32u
 // [k][n / 4] and [k][m / 4].
-shared vec4 sg_w[SG_K * SG_T / 4u];
+shared vec4 sg_w[SG_K * SG_TN / 4u];
 shared vec4 sg_x[SG_K * SG_T / 4u];
 
 // Y's tile: rows i < rows of the activations at x_row(i) (f32 elements
 // from X), of Y at y_row(i), weight rows n0 + j from W + j row_bytes.
 #ifdef SG_MOE
-// Grid (N / 64, max tiles), tile y = tiles[y] = (expert e, first, count):
+// Grid (N / 128, max tiles), tile y = tiles[y] = (expert e, first, count):
 // the pairs pairs[first ..] of expert e; activation row pairs[..] >>
 // x_shift of K values, Y row pairs[..] of N.
 // Buffers: 0 X f32, 1 W (the expert stack, expert e's N rows from row
@@ -70,7 +136,7 @@ uint sg_first, sg_shift;
 uint64_t sg_x_row(uint i) { return uint64_t(U32(arg(3)).v[sg_first + i] >> sg_shift) * SG_KK; }
 uint64_t sg_y_row(uint i) { return uint64_t(U32(arg(3)).v[sg_first + i]) * SG_N; }
 #else
-// Y[b][m][n] = W[b][n] . X[b][m] for m < M, n < N: grid (N / 64, M / 64,
+// Y[b][m][n] = W[b][n] . X[b][m] for m < M, n < N: grid (N / 128, M / 64,
 // batches). Buffers: 0 X f32, 1 W, 2 Y f32. Params: 3 M, 4 N, 5 K,
 // 6 row_bytes, 7 ldx, 8 ldy, 9 x_batch, 10 w_batch, 11 y_batch (elements,
 // weight rows).
@@ -89,7 +155,7 @@ uint64_t sg_y_row(uint i) {
 void main() {
     const uint N = SG_N, K = SG_KK, row_bytes = SG_ROW_BYTES;
     const uint tid = gl_LocalInvocationIndex;
-    const uint n0 = gl_WorkGroupID.x * SG_T;
+    const uint n0 = gl_WorkGroupID.x * SG_TN;
 #ifdef SG_MOE
     if (gl_WorkGroupID.y >= U32(arg(5)).v[0]) return;
     const uint expert = U32(arg(4)).v[3u * gl_WorkGroupID.y];
@@ -102,7 +168,9 @@ void main() {
     const uint rows = min(arg_u32(3) - sg_m0, SG_T);
     const uint64_t W = arg(1) + (uint64_t(gl_WorkGroupID.z) * arg_u32(10) + n0) * row_bytes;
 #endif
-    const uint64_t w_row = W + uint64_t(min(tid, N - 1u - n0)) * row_bytes;
+    // Weight decode: values dk .. dk + 16 of a step's 32 of row dr.
+    const uint dr = tid >> 1u, dk = 16u * (tid & 1u);
+    const uint64_t w_row = W + uint64_t(min(dr, N - 1u - n0)) * row_bytes;
     // X loads: two vec4 a thread, (row, 4 values) = (q >> 3, q & 7).
     uint64_t x_at[2];
     [[unroll]] for (uint h = 0u; h < 2u; h++) {
@@ -110,12 +178,13 @@ void main() {
         x_at[h] = arg(0) + 4u * (sg_x_row(min(q >> 3u, rows - 1u)) + 4u * (q & 7u));
     }
     const uint tn = tid & 15u, tm = tid >> 4u;
-    vec4 acc[4] = vec4[4](vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0));
+    vec4 acc[4][2];
+    [[unroll]] for (uint i = 0u; i < 4u; i++) acc[i][0] = acc[i][1] = vec4(0.0);
     for (uint k0 = 0u; k0 < K; k0 += SG_K) {
-        if (tid < SG_T) {
-            float w[32];
-            glm53_decode(SG_TYPE, w_row, k0 / 32u, w);
-            [[unroll]] for (uint k = 0u; k < SG_K; k++) sg_w[k * 16u + (tid >> 2u)][tid & 3u] = w[k];
+        [[unroll]] for (uint h = 0u; h < 2u; h++) {
+            float w[8];
+            sg_decode8(w_row, k0 + dk + 8u * h, w);
+            [[unroll]] for (uint k = 0u; k < 8u; k++) sg_w[(dk + 8u * h + k) * 32u + (dr >> 2u)][dr & 3u] = w[k];
         }
         [[unroll]] for (uint h = 0u; h < 2u; h++) {
             const uint q = tid + 256u * h, r = q >> 3u, kq = q & 7u;
@@ -123,22 +192,32 @@ void main() {
             [[unroll]] for (uint i = 0u; i < 4u; i++) sg_x[(4u * kq + i) * 16u + (r >> 2u)][r & 3u] = v[i];
         }
         barrier();
-        [[unroll]] for (uint k = 0u; k < SG_K; k++) {
-            const vec4 xv = sg_x[k * 16u + tm], wv = sg_w[k * 16u + tn];
-            [[unroll]] for (uint i = 0u; i < 4u; i++) acc[i] = fma(vec4(xv[i]), wv, acc[i]);
+        // Threads past the tile's rows (whole subgroups: a subgroup holds
+        // 8 rows) skip the products: expert tiles are often part full.
+        if (4u * tm < rows) {
+            [[unroll]] for (uint k = 0u; k < SG_K; k++) {
+                const vec4 xv = sg_x[k * 16u + tm];
+                const vec4 w0 = sg_w[k * 32u + 2u * tn], w1 = sg_w[k * 32u + 2u * tn + 1u];
+                [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                    acc[i][0] = fma(vec4(xv[i]), w0, acc[i][0]);
+                    acc[i][1] = fma(vec4(xv[i]), w1, acc[i][1]);
+                }
+            }
         }
         barrier();
     }
-    const uint n = n0 + 4u * tn;
-    if (n >= N) return;
-    [[unroll]] for (uint i = 0u; i < 4u; i++) {
-        const uint r = 4u * tm + i;
-        if (r < rows) {
-            const uint64_t y = arg(2) + 4u * (sg_y_row(r) + n);
-            if (n + 4u <= N) {
-                F32x4(y).v[0] = acc[i];
-            } else {
-                for (uint j = 0u; j < N - n; j++) F32(y).v[j] = acc[i][j];
+    [[unroll]] for (uint c = 0u; c < 2u; c++) {
+        const uint n = n0 + 8u * tn + 4u * c;
+        if (n >= N) return;
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            const uint r = 4u * tm + i;
+            if (r < rows) {
+                const uint64_t y = arg(2) + 4u * (sg_y_row(r) + n);
+                if (n + 4u <= N) {
+                    F32x4(y).v[0] = acc[i][c];
+                } else {
+                    for (uint j = 0u; j < N - n; j++) F32(y).v[j] = acc[i][c][j];
+                }
             }
         }
     }

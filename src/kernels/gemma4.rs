@@ -628,7 +628,7 @@ pub fn moe_grouped(
                     &u32_bytes(x_shift),
                 ],
                 Grid::Threadgroups {
-                    groups: (n.div_ceil(64), max_tiles, 1),
+                    groups: (n.div_ceil(if mu { 64 } else { 128 }), max_tiles, 1),
                     threadgroup: (if mu { 128 } else { 256 }, 1, 1),
                 },
             )
