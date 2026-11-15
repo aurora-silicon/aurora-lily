@@ -181,6 +181,60 @@ pub fn qkv(
     )
 }
 
+/// [`qkv`] of queries only (the draft model's, which reads the target's
+/// caches): per-head RMSNorm with `q_norm` and RoPE to `pos` of one row.
+#[allow(clippy::too_many_arguments)]
+pub fn qkv_queries(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &AttnShape<'_>,
+    q: &Tensor,
+    q_norm: &Tensor,
+    freq_factors: Option<&Tensor>,
+    q_out: &Tensor,
+    pos: usize,
+    base: f32,
+    eps: f32,
+) -> Result<()> {
+    ensure!(a.kv_heads == 0, "queries only");
+    let d = a.head_dim;
+    ensure!(d == 256 || d == 512, "head width {d}");
+    check_f32(&[q, q_norm, q_out])?;
+    ensure!(q.numel() >= a.heads * d && q_out.numel() >= a.heads * d, "queries");
+    let name = if d == 256 { "gemma4_qkv_256" } else { "gemma4_qkv_512" };
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            q.binding(),
+            q.binding(),
+            q.binding(),
+            q_norm.binding(),
+            q_norm.binding(),
+            q_out.binding(),
+            a.k_cache.binding(),
+            a.v_cache.binding(),
+            freq_factors.unwrap_or(q_norm).binding(),
+        ],
+        &[
+            &u32_bytes(d),
+            &u32_bytes(a.heads),
+            &u32_bytes(0),
+            &u32_bytes(pos),
+            &u32_bytes(1),
+            &f32_bytes(base),
+            &u32_bytes(usize::from(freq_factors.is_some())),
+            &f32_bytes(eps),
+            &u32_bytes(0),
+            &u32_bytes(0),
+        ],
+        Grid::Threadgroups {
+            groups: (a.heads.div_ceil(8), 1, 1),
+            threadgroup: (256, 1, 1),
+        },
+    )
+}
+
 /// Chunks of keys the decode attention of rows at `pos0..pos0 + m` takes.
 pub fn attn_chunks(a: &AttnShape<'_>, pos0: usize, m: usize) -> usize {
     let keys = pos0 + m;
@@ -672,6 +726,62 @@ pub fn ffn_out(
         ],
         &[&u32_bytes(n), &f32_bytes(eps), &u32_bytes(usize::from(next.is_some()))],
         Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (threads, 1, 1) },
+    )
+}
+
+/// The draft model's FFN end, `m` rows of `n`: `x = (rmsnorm(f) w + r) *
+/// layer_scale[0]`, and with `next = (w, h)` also `h = rmsnorm(x) w`.
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_out1(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    f: &Tensor,
+    w: &Tensor,
+    r: &Tensor,
+    layer_scale: &Tensor,
+    x: &Tensor,
+    next: Option<(&Tensor, &Tensor)>,
+    m: usize,
+    n: usize,
+    eps: f32,
+) -> Result<()> {
+    check_f32(&[f, w, r, layer_scale, x])?;
+    ensure!([f, r, x].iter().all(|t| t.numel() >= m * n), "ffn_out1 of {m} x {n}");
+    let threads = row_threads(n)?;
+    let (wn, h) = next.unwrap_or((x, x));
+    check_f32(&[wn, h])?;
+    let pipeline = ctx.pipeline("gemma4_ffn_out1", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            f.binding(),
+            w.binding(),
+            r.binding(),
+            layer_scale.binding(),
+            x.binding(),
+            wn.binding(),
+            h.binding(),
+        ],
+        &[&u32_bytes(n), &f32_bytes(eps), &u32_bytes(usize::from(next.is_some()))],
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (threads, 1, 1) },
+    )
+}
+
+/// Copies the first `n` 32-bit words of `src` to `dst`.
+pub fn copy(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    src: &Tensor,
+    dst: &Tensor,
+    n: usize,
+) -> Result<()> {
+    ensure!(src.byte_len() >= 4 * n && dst.byte_len() >= 4 * n, "copy of {n} words");
+    let pipeline = ctx.pipeline("gemma4_copy", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[src.binding(), dst.binding()],
+        &[],
+        Grid::Threads { grid: (n, 1, 1), threadgroup: (256, 1, 1) },
     )
 }
 

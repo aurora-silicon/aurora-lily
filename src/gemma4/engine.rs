@@ -11,13 +11,13 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 
 use super::model::{
-    Gemma4Model, Gemma4State, LayerCache, Logits, PREFILL_ROWS, Scratch,
+    Gemma4Model, Gemma4State, LayerCache, Logits, MAX_ROWS, PREFILL_ROWS, Scratch,
 };
 use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
 };
-use crate::kernels::sample::sample_f32;
-use crate::metal::{EncodedPass, MetalContext};
+use crate::kernels::sample::{SamplingParams, sample_f32};
+use crate::metal::{EncodedPass, MetalContext, PendingPass};
 use crate::tensor::{DType, Tensor};
 
 /// Copies `src`'s first `bytes` into `dst` through host memory (both
@@ -259,9 +259,42 @@ impl Gemma4Model {
                 Ok(())
             })?;
             state.pos += chunk.len();
+            state.h_row = chunk.len() - 1;
             fed += chunk.len();
         }
         Ok(fed)
+    }
+}
+
+/// A draft is proposed only when the draft model's probability of it is
+/// at least this; the chain stops at the first that is not.
+const DRAFT_MIN_PROB: f32 = 0.3;
+
+impl Gemma4Model {
+    /// Up to `n` greedy drafts following `token` (at the state's position),
+    /// from the target hidden in row `row` of the scratch; the proposals
+    /// end before the first draft below the probability gate. Waits.
+    fn propose(
+        &self,
+        ctx: &MetalContext,
+        state: &Gemma4State,
+        scratch: &Scratch,
+        token: u32,
+        row: usize,
+        n: usize,
+    ) -> Result<Vec<u32>> {
+        let Some(draft) = &self.draft else { return Ok(Vec::new()) };
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        draft.stage_token(token)?;
+        let h = scratch.h_row(row, self.cfg.hidden)?;
+        let pass = self.begin(ctx)?;
+        draft.encode(ctx, &pass, self, state, scratch, &h, n)?;
+        pass.commit_wait()?;
+        let (tokens, probs) = draft.read(n)?;
+        let keep = probs.iter().take_while(|&&p| p >= self.draft_min_prob).count();
+        Ok(tokens[..keep].to_vec())
     }
 }
 
@@ -271,8 +304,111 @@ impl LanguageModel for Gemma4Model {
 
     const MODEL_ID: &'static str = "gemma-4-26b-a4b";
 
-    fn load(ctx: &MetalContext, path: &Path, _options: &LoadOptions) -> Result<Self> {
-        Gemma4Model::load(ctx, path)
+    fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
+        let mut model = Gemma4Model::load(ctx, path)?;
+        if options.mtp_drafts > 0 {
+            match super::draft::find_beside(path, model.cfg.hidden)? {
+                Some(dp) => {
+                    let d = super::draft::Gemma4Draft::load(ctx, &dp, &model.cfg)?;
+                    eprintln!(
+                        "draft model: {} ({:.2} GB)",
+                        dp.display(),
+                        d.bytes() as f64 / 1e9
+                    );
+                    model.draft = Some(d);
+                    model.drafts = options.mtp_drafts.min(super::draft::MAX_DRAFTS);
+                    model.draft_min_prob = DRAFT_MIN_PROB;
+                }
+                None => eprintln!(
+                    "draft model: none beside {} (a gemma4-assistant GGUF); no speculative decoding",
+                    path.display()
+                ),
+            }
+        }
+        Ok(model)
+    }
+
+    fn max_drafts(&self) -> usize {
+        if self.draft.is_some() { self.drafts } else { 0 }
+    }
+
+    fn draft_initial(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Gemma4State,
+        scratch: &mut Scratch,
+        first: u32,
+        drafts: usize,
+        _params: &SamplingParams,
+        _step0: usize,
+    ) -> Result<Vec<u32>> {
+        let row = state.h_row;
+        self.propose(ctx, state, scratch, first, row, drafts)
+    }
+
+    fn verify<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        state: &mut Gemma4State,
+        scratch: &mut Scratch,
+        pending: u32,
+        drafts: &[u32],
+        params: &SamplingParams,
+        step0: usize,
+        _next_drafts: usize,
+    ) -> Result<(Vec<u32>, PendingPass<'a>)> {
+        let rows = 1 + drafts.len();
+        ensure!(rows <= MAX_ROWS, "verify of {rows} rows");
+        ensure!(state.spec.is_none(), "a verify pass is already pending");
+        state.ensure_capacity(ctx, state.pos + rows)?;
+        let tokens: Vec<u32> =
+            std::iter::once(pending).chain(drafts.iter().copied()).collect();
+        scratch.stage_tokens(&tokens)?;
+        let vocab = self.cfg.vocab;
+        let sc: &Scratch = scratch;
+        self.run_rows(ctx, state, sc, rows, Logits::All, |pass| {
+            for r in 0..rows {
+                let logits = sc.logits.view(r * vocab, &[vocab])?;
+                let out = sc.draws.view(r, &[1])?;
+                sample_f32(ctx, pass, &logits, sc.sampler(), params, step0 + r, &out)?;
+                pass.memory_barrier()?;
+            }
+            Ok(())
+        })?;
+        let draws = scratch.draws.to_u32()?[..rows].to_vec();
+        state.spec = Some((state.pos, rows, draws.clone()));
+        state.pos += rows;
+        // The next drafts are drawn in finish_speculation, once the kept
+        // count is known.
+        Ok((draws, ctx.begin()?.commit()?))
+    }
+
+    fn finish_speculation(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Gemma4State,
+        scratch: &mut Scratch,
+        accepted: usize,
+        propose: bool,
+        draft: PendingPass<'_>,
+    ) -> Result<Vec<u32>> {
+        draft.wait()?;
+        let (pos0, rows, draws) = state
+            .spec
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no verify pass pending"))?;
+        ensure!(accepted < rows, "{accepted} accepted of {} drafts", rows - 1);
+        // Rows past the accepted ones wrote cache slots that later
+        // positions overwrite before anything reads them.
+        state.pos = pos0 + 1 + accepted;
+        state.h_row = accepted;
+        for &token in &draws[accepted + 1..] {
+            scratch.sampler().uncount(token);
+        }
+        if !propose {
+            return Ok(Vec::new());
+        }
+        self.propose(ctx, state, scratch, draws[accepted], accepted, self.drafts)
     }
 
     fn max_position_embeddings(&self) -> usize {
@@ -370,10 +506,12 @@ impl LanguageModel for Gemma4Model {
 
     fn prepare_step_inputs(
         &self,
-        _state: &mut Gemma4State,
+        state: &mut Gemma4State,
         _scratch: &Scratch,
         _token: u32,
     ) -> Result<()> {
+        // A one-row step leaves its hidden in row 0.
+        state.h_row = 0;
         Ok(())
     }
 

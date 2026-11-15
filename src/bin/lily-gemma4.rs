@@ -97,6 +97,22 @@ enum Cmd {
         #[arg(long, default_value_t = 2)]
         runs: usize,
     },
+    /// Greedy speculative decoding with the draft model (a gemma4-assistant
+    /// GGUF beside the model) through the engine interface, against plain
+    /// greedy decoding of the same prompt: speed, acceptance, agreement.
+    Spec {
+        #[arg(long)]
+        model: PathBuf,
+        /// A chat question (rendered with the template).
+        #[arg(long)]
+        chat: String,
+        #[arg(long, default_value_t = 256)]
+        n: usize,
+        #[arg(long, default_value_t = 3)]
+        drafts: usize,
+        #[arg(long, default_value_t = 2)]
+        runs: usize,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -127,6 +143,9 @@ fn run() -> Result<()> {
             generate(&model, &parse_tokens(&tokens)?, n)
         }
         Cmd::Chat { model, prompt, n, think } => chat(&model, &prompt, n, think),
+        Cmd::Spec { model, chat, n, drafts, runs } => {
+            spec(&model, &chat, n, drafts, runs)
+        }
         Cmd::StateCheck { model, cases, n, steps } => {
             state_check(&model, &cases, n, steps)
         }
@@ -430,7 +449,13 @@ fn profile_report(steps: usize) {
     eprintln!("  {:7.3}  kernels summed per step", total / n * 1e3);
 }
 
-fn bench(path: &PathBuf, text: &PathBuf, prompt_len: usize, n: usize, runs: usize) -> Result<()> {
+fn bench(
+    path: &PathBuf,
+    text: &PathBuf,
+    prompt_len: usize,
+    n: usize,
+    runs: usize,
+) -> Result<()> {
     let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
     let text = std::fs::read_to_string(text)?;
     let mut ids = vec![2u32];
@@ -476,6 +501,126 @@ fn bench(path: &PathBuf, text: &PathBuf, prompt_len: usize, n: usize, runs: usiz
             steps[n / 2],
             steps[n / 10],
         );
+    }
+    Ok(())
+}
+
+fn spec(
+    path: &PathBuf,
+    question: &str,
+    n: usize,
+    drafts: usize,
+    runs: usize,
+) -> Result<()> {
+    use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions};
+    use lily::kernels::sample::SamplingParams;
+    use lily::tokenizer::{ChatRender, Tokenizer};
+    let tok = Tokenizer::from_gguf(path)?;
+    let messages = [serde_json::json!({"role": "user", "content": question})];
+    let ids = tok.encode_chat(&ChatRender {
+        messages: &messages,
+        tools: None,
+        enable_thinking: false,
+        reasoning_effort: None,
+        preserve_thinking: None,
+    })?;
+    let ctx = MetalContext::new()?;
+    let options = LoadOptions { mtp_drafts: drafts, ..Default::default() };
+    let model = <Gemma4Model as LanguageModel>::load(&ctx, path, &options)?;
+    ensure!(model.max_drafts() > 0, "no draft model loaded");
+    let vocab = model.cfg.vocab;
+    let greedy = SamplingParams::greedy();
+    let cap = ids.len() + n + 8;
+    let mut sc = LanguageModel::new_scratch_with_capacity(&model, &ctx, cap)?;
+    for run in 0..runs {
+        let mut st = LanguageModel::new_state(&model, &ctx, cap)?;
+        LanguageModel::prefill(
+            &model,
+            &ctx,
+            &mut st,
+            &mut sc,
+            &ids,
+            Some(Draw { params: &greedy, step: 0 }),
+        )?;
+        let mut plain = vec![sc.next_token.to_u32()?[0]];
+        let mut margins = vec![f32::NAN];
+        let t = Instant::now();
+        while plain.len() < n {
+            let last = *plain.last().unwrap();
+            model.forward(&ctx, &mut st, &sc, &[last], Logits::Last)?;
+            let l = &sc.logits.to_f32()?[..vocab];
+            let top = argmax(l);
+            let second = l
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != top)
+                .map(|(_, &v)| v)
+                .fold(f32::NEG_INFINITY, f32::max);
+            margins.push(l[top] - second);
+            plain.push(top as u32);
+        }
+        let plain_s = t.elapsed().as_secs_f64();
+        let mut st = LanguageModel::new_state(&model, &ctx, cap)?;
+        LanguageModel::prefill(
+            &model,
+            &ctx,
+            &mut st,
+            &mut sc,
+            &ids,
+            Some(Draw { params: &greedy, step: 0 }),
+        )?;
+        let mut out = vec![sc.next_token.to_u32()?[0]];
+        let t = Instant::now();
+        let mut proposals = model.draft_initial(
+            &ctx,
+            &mut st,
+            &mut sc,
+            out[0],
+            drafts,
+            &greedy,
+            out.len(),
+        )?;
+        let (mut steps, mut accepted, mut proposed) = (0usize, 0usize, 0usize);
+        while out.len() < n {
+            let pending = *out.last().unwrap();
+            let (draws, pend) = model.verify(
+                &ctx,
+                &mut st,
+                &mut sc,
+                pending,
+                &proposals,
+                &greedy,
+                out.len(),
+                drafts,
+            )?;
+            let kept = proposals.iter().zip(&draws).take_while(|(p, d)| p == d).count();
+            out.extend_from_slice(&draws[..=kept]);
+            accepted += kept;
+            proposed += proposals.len();
+            steps += 1;
+            proposals =
+                model.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pend)?;
+        }
+        let spec_s = t.elapsed().as_secs_f64();
+        out.truncate(n);
+        let same = plain.iter().zip(&out).take_while(|(a, b)| a == b).count();
+        if same < n {
+            println!(
+                "first difference at token {same}: plain's top-2 margin there {:.4}",
+                margins[same]
+            );
+        }
+        println!(
+            "run {run}: plain {:.2} tok/s; speculative {:.2} tok/s, {steps} steps, {:.2} tokens a step, accepted {accepted}/{proposed} proposed ({:.0}%); same first {same}/{n}; pos {}",
+            n as f64 / plain_s,
+            n as f64 / spec_s,
+            out.len() as f64 / steps.max(1) as f64,
+            100.0 * accepted as f64 / proposed.max(1) as f64,
+            st.pos(),
+        );
+        if run == 0 {
+            println!("speculative text: {:?}", tok.decode(&out, false)?);
+        }
     }
     Ok(())
 }

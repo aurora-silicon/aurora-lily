@@ -67,6 +67,13 @@ pub struct Gemma4Model {
     embed: QWeight,
     output_norm: Tensor,
     rope_freqs: Tensor,
+    /// The draft model (`--mtp-drafts`), when one was found and loaded.
+    pub draft: Option<super::draft::Gemma4Draft>,
+    /// Drafts a speculative step proposes.
+    pub drafts: usize,
+    /// A draft is proposed only when the draft model's softmax probability
+    /// of it is at least this (the chain stops at the first that is not).
+    pub draft_min_prob: f32,
 }
 
 fn check_w(name: &str, w: &QWeight, cols: usize, rows: usize) -> Result<()> {
@@ -187,12 +194,35 @@ impl Gemma4Model {
             "rope_freqs of {}",
             rope_freqs.numel()
         );
-        Ok(Self { cfg, gguf, mapped, layers, embed, output_norm, rope_freqs })
+        Ok(Self {
+            cfg,
+            gguf,
+            mapped,
+            layers,
+            embed,
+            output_norm,
+            rope_freqs,
+            draft: None,
+            drafts: 0,
+            draft_min_prob: 0.0,
+        })
     }
 
     /// The buffers holding the mapped file.
     pub fn weight_buffers(&self) -> Vec<Buffer> {
         self.mapped.buffers()
+    }
+
+    /// The token embedding (also the head).
+    pub(crate) fn embed(&self) -> &QWeight {
+        &self.embed
+    }
+
+    /// The layer whose caches the draft model's sliding-window (or global)
+    /// layers read: the target's last of that kind (llama.cpp's
+    /// `n_layer - 2` and `n_layer - 1` for Gemma 4).
+    pub(crate) fn shared_kv_layer(&self, swa: bool) -> usize {
+        (0..self.cfg.n_layer).rev().find(|&il| self.cfg.swa[il] == swa).unwrap_or(0)
     }
 
     pub fn new_state(
@@ -227,6 +257,12 @@ pub struct Gemma4State {
     pub pos: usize,
     pub capacity: usize,
     pub layers: Vec<LayerCache>,
+    /// The row of the scratch's `h` holding the post-norm hidden of the
+    /// last fed position (the draft model's input).
+    pub h_row: usize,
+    /// A verify pass that fed rows from this position and the draws of its
+    /// rows, until `finish_speculation` decides what stays.
+    pub(crate) spec: Option<(usize, usize, Vec<u32>)>,
     /// The sliding window: what a snapshot keeps of each ring.
     pub window: usize,
 }
@@ -246,7 +282,7 @@ impl Gemma4State {
                 })
             })
             .collect::<Result<_>>()?;
-        Ok(Self { pos: 0, capacity, layers, window: cfg.window })
+        Ok(Self { pos: 0, capacity, layers, h_row: 0, spec: None, window: cfg.window })
     }
 
     /// Bytes of the caches.
@@ -289,6 +325,8 @@ pub struct Scratch {
     sampler: SamplerScratch,
     /// U32[2]: the ping-pong slots the in-graph sampler draws into.
     pub next_token: Tensor,
+    /// U32[MAX_ROWS]: a verify pass's draws, one a row.
+    pub draws: Tensor,
 }
 
 impl Scratch {
@@ -342,6 +380,7 @@ impl Scratch {
             logits,
             sampler: SamplerScratch::new(ctx, cfg.vocab)?,
             next_token: Tensor::zeros(ctx, &[2], DType::U32)?,
+            draws: Tensor::zeros(ctx, &[MAX_ROWS], DType::U32)?,
         })
     }
 
@@ -353,6 +392,17 @@ impl Scratch {
     /// The sampler's buffers.
     pub fn sampler(&self) -> &SamplerScratch {
         &self.sampler
+    }
+
+    /// The decode attention's partials (the draft model's attention uses
+    /// them too).
+    pub(crate) fn partial(&self) -> &Tensor {
+        &self.partial
+    }
+
+    /// Row `row` of `h`: a position's post-norm hidden after a step.
+    pub fn h_row(&self, row: usize, hidden: usize) -> Result<Tensor> {
+        self.h.view(row * hidden, &[hidden])
     }
 }
 
@@ -423,6 +473,7 @@ impl Gemma4Model {
         sc.stage_tokens(tokens)?;
         self.run_rows(ctx, st, sc, m, logits, |_| Ok(()))?;
         st.pos += m;
+        st.h_row = m - 1;
         Ok(())
     }
 

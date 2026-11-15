@@ -684,6 +684,32 @@ void main() {
 }
 #endif
 
+// The draft model's FFN end: x = (rmsnorm(f) w + r) * layer_scale; with
+// has_next also h = rmsnorm(x) w_next. Grid (m), n / 4 threads.
+// Buffers: 0 f, 1 w, 2 r, 3 layer_scale [1], 4 x, 5 w_next, 6 h.
+// Params: 7 n, 8 eps, 9 has_next.
+#ifdef KERNEL_gemma4_ffn_out1
+void main() {
+    const uint n = arg_u32(7);
+    const float eps = arg_f32(8);
+    const bool next = arg_u32(9) != 0u;
+    const uint row = gl_WorkGroupID.x, e = gl_LocalInvocationIndex;
+    const uint64_t o = 16u * (uint64_t(row) * (n / 4u) + e);
+    const vec4 f = F32x4(arg(0) + o).v[0];
+    const vec4 x = (f * gemma4_inv_rms(f, n, eps) * F32x4(arg(1)).v[e] + F32x4(arg(2) + o).v[0]) * F32(arg(3)).v[0];
+    F32x4(arg(4) + o).v[0] = x;
+    if (next) F32x4(arg(6) + o).v[0] = x * gemma4_inv_rms(x, n, eps) * F32x4(arg(5)).v[e];
+}
+#endif
+
+// dst[e] = src[e]. Grid::Threads (n). Buffers: 0 src, 1 dst.
+#ifdef KERNEL_gemma4_copy
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    U32(arg(1)).v[gl_GlobalInvocationID.x] = U32(arg(0)).v[gl_GlobalInvocationID.x];
+}
+#endif
+
 // h = rmsnorm(x) w (the first layer's input, the head's). Grid (m), n / 4
 // threads. Buffers: 0 x, 1 w, 2 h. Params: 3 n, 4 eps.
 #ifdef KERNEL_gemma4_rmsnorm

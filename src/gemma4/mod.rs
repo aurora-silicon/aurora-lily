@@ -3,6 +3,7 @@
 //! the published GGUF files as they are.
 
 pub mod config;
+pub mod draft;
 pub mod engine;
 pub mod model;
 pub mod tokenizer;
