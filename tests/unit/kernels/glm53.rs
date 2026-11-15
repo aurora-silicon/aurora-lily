@@ -2805,3 +2805,96 @@ fn gemv_rows_match_one_row_exactly() {
         }
     }
 }
+
+/// Q5_K GEMVs at the edges of the G16 kernel's routing (gemv_g16.comp on a
+/// G16 GPU, an M4: a subgroup 4 output rows at m = 1, else 2): sets of 37
+/// and 41 rows and per-head inputs of 4 rows (a subgroup's last rows past
+/// the output), and activation rows a stride apart that is not a multiple
+/// of 4 (glm53_gemv then). Every row count against the CPU, the outputs'
+/// gaps and tails unwritten.
+#[test]
+fn gemv_g16_edges_match_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(46);
+    let (ty, cols) = (GgmlType::Q5K, 512usize);
+    // Outputs start as (and must keep, past what is written) this value.
+    const UNWRITTEN: f32 = 1234.5;
+    const TAIL: usize = 64;
+    let mut weight = |rows: usize| {
+        let raw = random_blocks(&mut rng, ty, rows * cols);
+        (
+            QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap(),
+            mat(ty, &raw, rows, cols),
+        )
+    };
+    let sets = [weight(37), weight(41), weight(44)];
+    let head = weight(37);
+    let strided = weight(40);
+    let out = |n: usize| tensor(&ctx, &vec![UNWRITTEN; n + TAIL]);
+    let g16 = |m: usize, l: &GemvLayout| {
+        g16_gemv_name(&ctx, ty, cols, m, l.x_group, l.x_row_stride)
+    };
+    for m in 1..=GEMV_MAX_ROWS {
+        // gemv_sets: one input row for all three sets (x_group 44).
+        let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+        let tx = tensor(&ctx, &x);
+        let ys: Vec<Tensor> = sets.iter().map(|(w, _)| out(m * w.rows)).collect();
+        let pairs: Vec<(&QWeight, &Tensor)> =
+            sets.iter().map(|(w, _)| w).zip(&ys).collect();
+        run(&ctx, |p| gemv_sets(&ctx, p, &pairs, &tx, m).unwrap());
+        for ((w, cpu), y) in sets.iter().zip(&ys) {
+            let mut want: Vec<f32> =
+                (0..m).flat_map(|i| cpu.mv(&x[i * cols..(i + 1) * cols])).collect();
+            want.resize(m * w.rows + TAIL, UNWRITTEN);
+            assert_close(&y.to_f32().unwrap(), &want, 1e-4, 1e-4);
+        }
+
+        // Per-head inputs: rows 4 n .. 4 n + 4 read input vector n of their
+        // activation row, outputs 40 apart (rows 37 .. 40 of each unwritten).
+        let (w, cpu) = &head;
+        let l = GemvLayout { x_group: 4, x_row_stride: 10 * cols, y_row_stride: 40 };
+        let x = f32s(&mut rng, m * 10 * cols, -1.0, 1.0);
+        let y = out((m - 1) * 40 + w.rows);
+        run(&ctx, |p| gemv_with(&ctx, p, w, &tensor(&ctx, &x), &y, m, l).unwrap());
+        let mut want = vec![UNWRITTEN; (m - 1) * 40 + w.rows + TAIL];
+        for i in 0..m {
+            let yi = cpu.mv_grouped(&x[i * 10 * cols..(i + 1) * 10 * cols], 4);
+            want[i * 40..i * 40 + w.rows].copy_from_slice(&yi);
+        }
+        assert_close(&y.to_f32().unwrap(), &want, 1e-4, 1e-4);
+
+        // Activation rows cols + 1 and cols + 6 apart take glm53_gemv,
+        // cols + 4 apart the G16 kernel.
+        let (w, cpu) = &strided;
+        for stride in [cols + 1, cols + 4, cols + 6] {
+            let l =
+                GemvLayout { x_group: w.rows, x_row_stride: stride, y_row_stride: 0 };
+            let x = f32s(&mut rng, (m - 1) * stride + cols, -1.0, 1.0);
+            let y = out(m * w.rows);
+            run(&ctx, |p| gemv_with(&ctx, p, w, &tensor(&ctx, &x), &y, m, l).unwrap());
+            let mut want: Vec<f32> = (0..m)
+                .flat_map(|i| cpu.mv(&x[i * stride..i * stride + cols]))
+                .collect();
+            want.resize(m * w.rows + TAIL, UNWRITTEN);
+            assert_close(&y.to_f32().unwrap(), &want, 1e-4, 1e-4);
+        }
+    }
+    // The side of the G16 routing each case is on, asserted after the
+    // outputs so that a wrong routing shows first as wrong outputs.
+    for m in 1..=GEMV_MAX_ROWS {
+        for (x_group, x_row_stride, takes) in [
+            (44, cols, true),
+            (4, 10 * cols, true),
+            (40, cols + 1, false),
+            (40, cols + 4, true),
+            (40, cols + 6, false),
+        ] {
+            let l = GemvLayout { x_group, x_row_stride, y_row_stride: 0 };
+            assert_eq!(
+                g16(m, &l).is_some(),
+                ctx.g16() && takes,
+                "x_group {x_group} stride {x_row_stride} at m={m}"
+            );
+        }
+    }
+}
