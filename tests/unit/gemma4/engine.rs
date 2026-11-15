@@ -93,7 +93,7 @@ fn staged_tokens_are_checked_against_the_vocabulary() {
     let sc = Scratch::new(&ctx, &cfg, 64).unwrap();
     assert!(sc.stage_tokens(&[1, 2, 999]).is_ok());
     assert!(sc.stage_tokens(&[1, 1000]).is_err());
-    assert!(sc.stage_tokens(&vec![1; PREFILL_ROWS + 1]).is_err());
+    assert!(sc.stage_tokens(&vec![1; cfg.prefill_rows + 1]).is_err());
 }
 
 // ---------------------------------------------------------------------------

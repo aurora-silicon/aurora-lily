@@ -1,6 +1,6 @@
 //! Gemma 4 on the GPU: weights mapped read-only from the GGUF, the
 //! per-session K/V caches, and the forward pass over up to
-//! [`PREFILL_ROWS`] consecutive tokens (decode is one row; verify passes
+//! [`prefill_rows`] consecutive tokens (decode is one row; verify passes
 //! up to [`MAX_ROWS`]).
 //!
 //! The graph is llama.cpp's (`src/models/gemma4.cpp`): per layer
@@ -29,6 +29,17 @@ pub const MAX_ROWS: usize = k::GEMV_MAX_ROWS;
 /// 16 GB tier's configuration (UD-IQ2_M, 8K context) under its 11 GB
 /// budget (512 rows: 10.84 GB with one checkpoint, 256: 10.71).
 pub const PREFILL_ROWS: usize = 256;
+
+/// Rows a prompt run takes on a GPU without matrix units (an M4), where
+/// the f32 GEMMs decode each routed expert's weights once a run: twice the
+/// rows amortize that (prefill 13% faster on the J713). The 16 GB tier at
+/// 8K context then takes 10.91 GB with one checkpoint, within its budget.
+pub const PREFILL_ROWS_NO_MATRIX_UNITS: usize = 512;
+
+/// Rows a prompt run takes on `ctx`'s device.
+pub fn prefill_rows(ctx: &MetalContext) -> usize {
+    if ctx.matrix_units() { PREFILL_ROWS } else { PREFILL_ROWS_NO_MATRIX_UNITS }
+}
 
 /// The longest context lily serves Gemma at: the server's limit (positions
 /// and cache offsets fit the kernels' u32 arithmetic well past it).
@@ -120,7 +131,8 @@ impl Gemma4Model {
     ) -> Result<Self> {
         lock()?;
         let gguf = Gguf::open(path)?;
-        let cfg = Config::from_gguf(&gguf)?;
+        let mut cfg = Config::from_gguf(&gguf)?;
+        cfg.prefill_rows = prefill_rows(ctx);
         ensure!(
             gguf.tensor("output.weight").is_none(),
             "an untied output.weight (lily ties the head to token_embd as Gemma does)"
@@ -229,7 +241,7 @@ impl Gemma4Model {
 
 /// Slots of a sliding-window layer's ring.
 pub fn ring_slots(cfg: &Config) -> usize {
-    cfg.window + PREFILL_ROWS
+    cfg.window + cfg.prefill_rows
 }
 
 /// GPU bytes of one session's caches for `capacity` tokens (the global
@@ -330,7 +342,7 @@ impl Gemma4State {
     }
 }
 
-/// Per-step intermediates for up to [`PREFILL_ROWS`] rows.
+/// Per-step intermediates for up to `cfg.prefill_rows` rows.
 pub struct Scratch {
     pub tokens: Tensor,
     pub x: Tensor,
@@ -372,7 +384,7 @@ pub struct Scratch {
 impl Scratch {
     /// Scratch for states of up to `capacity` tokens.
     pub fn new(ctx: &MetalContext, cfg: &Config, capacity: usize) -> Result<Self> {
-        let m = PREFILL_ROWS;
+        let m = cfg.prefill_rows;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let h = cfg.hidden;
         let chunks = capacity.max(1).div_ceil(g4::ATTN_CHUNK);
@@ -425,10 +437,14 @@ impl Scratch {
         })
     }
 
-    /// Stages a run's token ids (at most PREFILL_ROWS, each in the
-    /// vocabulary).
+    /// Stages a run's token ids (at most the configuration's
+    /// `prefill_rows`, each in the vocabulary).
     pub(crate) fn stage_tokens(&self, tokens: &[u32]) -> Result<()> {
-        ensure!(tokens.len() <= PREFILL_ROWS, "a run of {} tokens", tokens.len());
+        ensure!(
+            tokens.len() <= self.tokens.numel(),
+            "a run of {} tokens",
+            tokens.len()
+        );
         check_tokens(tokens, self.vocab)?;
         crate::glm53::model::write_words(&self.tokens, tokens)
     }
@@ -503,7 +519,7 @@ impl Gemma4Model {
         Ok(())
     }
 
-    /// Feeds `tokens` (at most PREFILL_ROWS) at the state's position,
+    /// Feeds `tokens` (at most `cfg.prefill_rows`) at the state's position,
     /// computes the logits `logits` asks for, and advances the state.
     pub fn forward(
         &self,
@@ -579,7 +595,7 @@ impl Gemma4Model {
     ) -> Result<()> {
         let cfg = &self.cfg;
         let pos0 = st.pos;
-        ensure!((1..=PREFILL_ROWS).contains(&m), "step of {m} rows");
+        ensure!((1..=cfg.prefill_rows).contains(&m), "step of {m} rows");
         ensure!(logits != Logits::All || m <= MAX_ROWS, "logits of {m} rows");
         ensure!(
             pos0 + m <= st.capacity,
@@ -814,7 +830,7 @@ impl Gemma4Model {
         Ok(())
     }
 
-    /// Feeds a whole prompt in runs of PREFILL_ROWS, leaving the last
+    /// Feeds a whole prompt in runs of `cfg.prefill_rows`, leaving the last
     /// row's logits.
     pub fn prefill(
         &self,
@@ -824,8 +840,9 @@ impl Gemma4Model {
         tokens: &[u32],
     ) -> Result<()> {
         ensure!(!tokens.is_empty(), "empty prefill");
-        let n = tokens.len().div_ceil(PREFILL_ROWS);
-        for (i, chunk) in tokens.chunks(PREFILL_ROWS).enumerate() {
+        let rows = self.cfg.prefill_rows;
+        let n = tokens.len().div_ceil(rows);
+        for (i, chunk) in tokens.chunks(rows).enumerate() {
             let l = if i + 1 == n { Logits::Last } else { Logits::None };
             self.forward(ctx, st, sc, chunk, l)
                 .with_context(|| format!("prefill run {i} at {}", st.pos))?;

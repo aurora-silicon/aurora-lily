@@ -12,7 +12,7 @@ use anyhow::{Result, ensure};
 
 use super::model::{
     Gemma4Model, Gemma4State, LOOKAHEAD, LayerCache, Logits, MAX_ROWS, MAX_SEQ,
-    PREFILL_ROWS, Scratch, capacity_cap, check_tokens,
+    Scratch, capacity_cap, check_tokens,
 };
 use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
@@ -226,7 +226,7 @@ impl ScratchApi for Scratch {
 }
 
 impl Gemma4Model {
-    /// Feeds `tokens` in runs of [`PREFILL_ROWS`], drawing after the last
+    /// Feeds `tokens` in runs of `cfg.prefill_rows`, drawing after the last
     /// when `draw`; before committing each run, stops if `stop` says so
     /// (the state then sits at a run boundary). Returns the tokens fed.
     fn prefill_chunks(
@@ -240,7 +240,7 @@ impl Gemma4Model {
     ) -> Result<usize> {
         ensure!(!tokens.is_empty(), "empty prefill");
         state.ensure_capacity(ctx, state.pos + tokens.len())?;
-        let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_ROWS).collect();
+        let chunks: Vec<&[u32]> = tokens.chunks(self.cfg.prefill_rows).collect();
         let mut fed = 0;
         for (i, chunk) in chunks.iter().enumerate() {
             if stop() {
@@ -592,7 +592,7 @@ impl LanguageModel for Gemma4Model {
     }
 
     fn prefill_chunk_tokens(&self) -> Option<usize> {
-        Some(PREFILL_ROWS)
+        Some(self.cfg.prefill_rows)
     }
 
     fn prefill_until(

@@ -45,6 +45,10 @@ pub struct Config {
     pub context_length: usize,
     pub bos: u32,
     pub eos: u32,
+    /// Rows a prompt run takes: not in the file, the device's
+    /// ([`super::model::prefill_rows`], set when a model is loaded; else
+    /// [`super::model::PREFILL_ROWS`]).
+    pub prefill_rows: usize,
 }
 
 /// A metadata reader over `meta` for the keys of architecture `arch`:
@@ -230,6 +234,7 @@ impl Config {
             context_length: m.u("context_length", 1 << 30)?,
             bos: token_id(meta, "bos_token_id")?,
             eos: token_id(meta, "eos_token_id")?,
+            prefill_rows: super::model::PREFILL_ROWS,
         };
         ensure!(
             m.u("attention.value_length", 1 << 12)? == c.head_dim
@@ -272,6 +277,7 @@ impl Config {
             context_length: 262144,
             bos: 2,
             eos: 106,
+            prefill_rows: super::model::PREFILL_ROWS,
         }
     }
 
