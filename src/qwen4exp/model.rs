@@ -341,8 +341,8 @@ pub struct Qwen4ExpModel {
     /// The attention K/V caches' element format (`--kv-cache`); states and
     /// scratch made after [`Self::set_kv_format`] follow it.
     kv_format: KvFormat,
-    /// Which checkpoint this is ([`super::config::checkpoint_identity`]),
-    /// part of the disk tier's key.
+    /// Which checkpoint this is ([`super::config::checkpoint_identity`],
+    /// [`super::gguf::gguf_identity`]), part of the disk tier's key.
     checkpoint_id: String,
     /// The longest request context served: the checkpoint's, less the
     /// speculative lookahead under the attention kernel's limit, or what
@@ -1653,16 +1653,20 @@ impl Qwen4ExpModel {
         ngram_checkpoint: Option<&Path>,
     ) -> Result<Self> {
         let gguf_file = super::gguf::is_qwen_gguf(dir.as_ref());
-        let config = if gguf_file {
-            super::gguf::config_from_gguf(&crate::gguf::Gguf::open(dir.as_ref())?)?
+        // A GGUF's n-gram table comes from a lily checkpoint, resolved
+        // before anything is mapped; its identity is part of the load's.
+        let (config, checkpoint_id, ngram_dir) = if gguf_file {
+            let g = crate::gguf::Gguf::open(dir.as_ref())?;
+            let config = super::gguf::config_from_gguf(&g)?;
+            let ngram_dir = match config.ple {
+                Some(_) => Some(super::gguf::ngram_table_dir(ngram_checkpoint)?),
+                None => None,
+            };
+            let id = super::gguf::gguf_identity(&g, ngram_dir.as_deref())?;
+            (config, format!("gguf-{id}"), ngram_dir)
         } else {
-            Qwen4ExpConfig::from_model_dir(&dir)?
-        };
-        let checkpoint_id = if gguf_file {
-            let len = std::fs::metadata(dir.as_ref())?.len();
-            format!("gguf:{}:{len}", dir.as_ref().display())
-        } else {
-            super::config::checkpoint_identity(dir.as_ref())?
+            let config = Qwen4ExpConfig::from_model_dir(&dir)?;
+            (config, super::config::checkpoint_identity(dir.as_ref())?, None)
         };
         ensure!(
             config.linear_key_head_dim == GDN_HEAD_DIM
@@ -1681,7 +1685,7 @@ impl Qwen4ExpModel {
                 dir.as_ref(),
                 &config,
                 with_mtp,
-                ngram_checkpoint,
+                ngram_dir.as_deref(),
                 memory_limit,
             )?
         } else {

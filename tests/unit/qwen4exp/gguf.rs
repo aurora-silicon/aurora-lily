@@ -251,3 +251,66 @@ fn the_fit_covers_a_session_growing_to_the_fitted_context() {
         }
     }
 }
+
+/// A GGUF file of one F32 tensor named `name` of `n` values (`fill` from
+/// value 0), no metadata.
+fn one_tensor_gguf(path: &Path, name: u8, n: u64, fill: impl Fn(u64) -> f32) {
+    let mut f = Vec::from(&b"GGUF"[..]);
+    f.extend(3u32.to_le_bytes());
+    f.extend(1u64.to_le_bytes());
+    f.extend(0u64.to_le_bytes());
+    f.extend(1u64.to_le_bytes());
+    f.push(name);
+    f.extend(1u32.to_le_bytes());
+    f.extend(n.to_le_bytes());
+    f.extend(0u32.to_le_bytes());
+    f.extend(0u64.to_le_bytes());
+    f.resize(f.len().next_multiple_of(32), 0);
+    for i in 0..n {
+        f.extend(fill(i).to_le_bytes());
+    }
+    std::fs::write(path, f).unwrap();
+}
+
+/// The persisted sessions' key: the same file and n-gram checkpoint give
+/// the same identity wherever they are; another header, sampled payload or
+/// n-gram checkpoint gives another.
+#[test]
+fn the_gguf_identity_follows_the_file_and_the_ngram_checkpoint() {
+    let dir = std::env::temp_dir().join(format!("lily-gguf-id-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let n = 1 << 18;
+    let id = |name: &str, ngram: Option<&Path>| {
+        gguf_identity(&Gguf::open(&dir.join(name)).unwrap(), ngram).unwrap()
+    };
+    one_tensor_gguf(&dir.join("a.gguf"), b't', n, |i| i as f32);
+    std::fs::copy(dir.join("a.gguf"), dir.join("copy.gguf")).unwrap();
+    one_tensor_gguf(&dir.join("name.gguf"), b'u', n, |i| i as f32);
+    one_tensor_gguf(&dir.join("first.gguf"), b't', n, |i| {
+        if i == 0 { 1.0 } else { i as f32 }
+    });
+    one_tensor_gguf(&dir.join("last.gguf"), b't', n, |i| {
+        if i == n - 1 { 0.5 } else { i as f32 }
+    });
+    let a = id("a.gguf", None);
+    assert_eq!(a.len(), crate::qwen4exp::config::CHECKPOINT_ID_HEX);
+    assert_eq!(a, id("a.gguf", None));
+    assert_eq!(a, id("copy.gguf", None));
+    for other in ["name.gguf", "first.gguf", "last.gguf"] {
+        assert_ne!(a, id(other, None), "{other}");
+    }
+    // The n-gram checkpoint: lily's own identity of its directory.
+    for (sub, config) in
+        [("ng1", "{\"a\":1}"), ("ng2", "{\"a\":2}"), ("ng1b", "{\"a\":1}")]
+    {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+        std::fs::write(dir.join(sub).join("config.json"), config).unwrap();
+        std::fs::write(dir.join(sub).join("model.safetensors.index.json"), "{}")
+            .unwrap();
+    }
+    let ng1 = id("a.gguf", Some(&dir.join("ng1")));
+    assert_ne!(ng1, a);
+    assert_eq!(ng1, id("a.gguf", Some(&dir.join("ng1b"))));
+    assert_ne!(ng1, id("a.gguf", Some(&dir.join("ng2"))));
+    std::fs::remove_dir_all(&dir).ok();
+}

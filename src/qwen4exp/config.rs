@@ -494,7 +494,7 @@ pub const VISION_PREFIX: &str = "model.visual.";
 pub const FORMAT: &str = "qwen4_exp-affine-v1";
 
 /// Hex digits of [`checkpoint_identity`] kept in the disk tier's key.
-const CHECKPOINT_ID_HEX: usize = 12;
+pub(crate) const CHECKPOINT_ID_HEX: usize = 12;
 
 /// An identity of the checkpoint in `dir`, for the disk tier's key: two
 /// conversions of the same architecture (q4 and q4-xl, a re-conversion, a

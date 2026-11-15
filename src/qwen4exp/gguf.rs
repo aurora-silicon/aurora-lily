@@ -951,6 +951,56 @@ fn ngram_table(dir: &Path, ple: &PleConfig) -> Result<NgramTable> {
 
 /// Where the n-gram table comes from: `given`, else `LILY_NGRAM_TABLE` (a
 /// q4-xl checkpoint directory).
+/// Bytes of tensor data hashed per sample, and the samples, for
+/// [`gguf_identity`].
+const IDENTITY_SAMPLE_BYTES: u64 = 64 << 10;
+const IDENTITY_SAMPLES: u64 = 16;
+
+/// The disk tier's identity of a GGUF load, as
+/// [`super::config::checkpoint_identity`] is a checkpoint directory's: the
+/// SHA-256 of the file's length, its header and tensor table (every byte
+/// before the first tensor's data), [`IDENTITY_SAMPLES`] blocks of
+/// [`IDENTITY_SAMPLE_BYTES`] spread evenly over the tensor data, and the
+/// identity of the checkpoint whose n-gram table the load pages (`ngram`).
+/// A re-quantization changes the table's types, offsets or the sampled
+/// blocks; another n-gram table changes the last part. A few MB read once
+/// per load.
+pub fn gguf_identity(g: &Gguf, ngram: Option<&Path>) -> Result<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(&g.path)
+        .with_context(|| format!("opening {}", g.path.display()))?;
+    let data = g.tensors.iter().map(|t| t.offset).min().unwrap_or(g.file_len);
+    let mut hash = crate::sha256::Sha256::new();
+    hash.update(&g.file_len.to_le_bytes());
+    let mut buf = vec![0u8; 1 << 20];
+    let mut hash_range =
+        |file: &mut std::fs::File, start: u64, len: u64| -> Result<()> {
+            file.seek(SeekFrom::Start(start))?;
+            let mut left = len;
+            while left > 0 {
+                let n = left.min(buf.len() as u64) as usize;
+                file.read_exact(&mut buf[..n])
+                    .with_context(|| format!("reading {}", g.path.display()))?;
+                hash.update(&buf[..n]);
+                left -= n as u64;
+            }
+            Ok(())
+        };
+    hash_range(&mut file, 0, data)?;
+    let span = g.file_len - data;
+    for i in 0..IDENTITY_SAMPLES {
+        let start = data + span / IDENTITY_SAMPLES * i;
+        hash_range(&mut file, start, IDENTITY_SAMPLE_BYTES.min(g.file_len - start))?;
+    }
+    if let Some(dir) = ngram {
+        hash.update(b"ngram:");
+        hash.update(super::config::checkpoint_identity(dir)?.as_bytes());
+    }
+    let mut id = crate::sha256::hex(&hash.finish());
+    id.truncate(super::config::CHECKPOINT_ID_HEX);
+    Ok(id)
+}
+
 pub fn ngram_table_dir(given: Option<&Path>) -> Result<PathBuf> {
     given.map(Path::to_path_buf).or_else(|| std::env::var_os("LILY_NGRAM_TABLE").map(PathBuf::from)).context(
         "the GGUF's BF16 n-gram table is not read yet: pass --ngram-checkpoint (or set \
