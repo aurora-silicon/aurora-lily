@@ -519,6 +519,16 @@ fn moe_down_matches_glm53() {
             .unwrap();
         });
         assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-5, 1e-4);
+        // The wide kernel (8 slots of 512) against the lane-walk one: the
+        // same sums regrouped.
+        if ff == 512 {
+            let c = zeros(&ctx, m * hidden, DType::F32);
+            run(&ctx, |p| {
+                moe_down_with(&ctx, p, &dw, hidden, &mid, &tsel, &c, m, used, false)
+                    .unwrap()
+            });
+            assert_close(&a.to_f32().unwrap(), &c.to_f32().unwrap(), 1e-5, 1e-5);
+        }
     }
 }
 

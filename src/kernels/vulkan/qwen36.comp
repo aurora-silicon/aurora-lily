@@ -560,3 +560,46 @@ void main() {
     }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Routed experts' down projection at decode, wide: for rows of K = 512 and
+// 8 slots, one thread a (slot, task) of an output row, so each thread has
+// one task's loads (in flight together) and no loop; four subgroups a row,
+// a subgroup's 32 lanes two slots. The sum is regrouped against
+// qwen36_moe_down (which walks the 8 slots in one lane): the two slots of
+// a subgroup in one subgroupAdd, then the four subgroups' sums as
+// (s0 + s1) + (s2 + s3). Grid (ceil(H / 2), m), 256 threads (two rows).
+// Buffers as qwen36_moe_down: 0 down, 1 mid [m * 8][K], 2 sel [m][8],
+// 3 out [m][H]. Params: 4 K (512), 5 H, 6 row_bytes.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qwen36_moe_down_wide_q4_k) || defined(KERNEL_qwen36_moe_down_wide_q8_0)
+shared float dw_part[2][4];
+void main() {
+    const uint K = 512u;
+    const uint H = arg_u32(5);
+    const uint row_bytes = arg_u32(6);
+    const uint i = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint half_ = tid / 128u;
+    const uint q = tid % 128u;
+    const uint s = q / 16u, t = q % 16u;
+    const uint r = gl_WorkGroupID.x * 2u + half_;
+    const uint rr = min(r, H - 1u);
+    const uint slot = i * 8u + s;
+    const uint e = U32(arg(2)).v[slot];
+    const uint64_t row = arg(0) + (uint64_t(e) * H + rr) * row_bytes;
+    float w[32];
+#ifdef KERNEL_qwen36_moe_down_wide_q4_k
+    glm53_decode_q4_k(row, t, w);
+#else
+    glm53_decode_q8_0(row, t, w);
+#endif
+    const float d = glm53_task_dot(w, arg(1) + 4u * (uint64_t(slot) * K + t * GLM53_TASK));
+    const float sum = subgroupAdd(d);
+    if (gl_SubgroupInvocationID == 0u) dw_part[half_][gl_SubgroupID % 4u] = sum;
+    barrier();
+    if (q == 0u && r < H) {
+        F32(arg(3)).v[i * H + r] = (dw_part[half_][0] + dw_part[half_][1]) + (dw_part[half_][2] + dw_part[half_][3]);
+    }
+}
+#endif

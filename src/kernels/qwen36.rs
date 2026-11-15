@@ -408,7 +408,9 @@ pub fn shared_gate(
 
 /// Routed experts' down projection summed over each row's `used` slots
 /// (`glm53::moe_down` without `add`) for rows of 256 or 512 values: all
-/// lanes at work.
+/// lanes at work. The model's 8 slots of rows of 512 take the wide kernel
+/// (`wide`; a thread a slot and task, the sum regrouped), others the one
+/// whose lanes walk the slots.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_down(
     ctx: &MetalContext,
@@ -421,6 +423,25 @@ pub fn moe_down(
     m: usize,
     used: usize,
 ) -> Result<()> {
+    let wide = used == 8 && down.cols == 512;
+    moe_down_with(ctx, pass, down, hidden, mid, sel, out, m, used, wide)
+}
+
+/// [`moe_down`] through the wide kernel (`wide`: 8 slots of rows of 512)
+/// or the lane-walk one.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_down_with(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    down: &QWeight,
+    hidden: usize,
+    mid: &Tensor,
+    sel: &Tensor,
+    out: &Tensor,
+    m: usize,
+    used: usize,
+    wide: bool,
+) -> Result<()> {
     check(&[(mid, DType::F32), (out, DType::F32), (sel, DType::U32)])?;
     ensure!(down.cols == 256 || down.cols == 512, "down rows of {}", down.cols);
     ensure!(down.rows.is_multiple_of(hidden), "down rows {} of {hidden}", down.rows);
@@ -428,13 +449,30 @@ pub fn moe_down(
         out.numel() >= m * hidden && mid.numel() >= m * used * down.cols,
         "down shapes"
     );
-    let name = match down.ty {
-        GgmlType::Q4K => "qwen36_moe_down_q4_k",
-        GgmlType::Q8_0 => "qwen36_moe_down_q8_0",
-        t => anyhow::bail!("no Qwen3.6 expert down kernel for {t:?}"),
+    ensure!(
+        !wide || (used == 8 && down.cols == 512),
+        "the wide down kernel takes 8 slots of 512"
+    );
+    let name = match (down.ty, wide) {
+        (GgmlType::Q4K, true) => "qwen36_moe_down_wide_q4_k",
+        (GgmlType::Q8_0, true) => "qwen36_moe_down_wide_q8_0",
+        (GgmlType::Q4K, false) => "qwen36_moe_down_q4_k",
+        (GgmlType::Q8_0, false) => "qwen36_moe_down_q8_0",
+        (t, _) => anyhow::bail!("no Qwen3.6 expert down kernel for {t:?}"),
     };
-    let rows_per_tg = 8 * 32 / (down.cols / 32);
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    if wide {
+        return pass.dispatch_at(
+            &pipeline,
+            &[down.t.binding(), mid.binding(), sel.binding(), out.binding()],
+            &[&u32_bytes(down.cols), &u32_bytes(hidden), &u32_bytes(down.row_bytes)],
+            Grid::Threadgroups {
+                groups: (hidden.div_ceil(2), m, 1),
+                threadgroup: (256, 1, 1),
+            },
+        );
+    }
+    let rows_per_tg = 8 * 32 / (down.cols / 32);
     pass.dispatch_at(
         &pipeline,
         &[down.t.binding(), mid.binding(), sel.binding(), out.binding()],
