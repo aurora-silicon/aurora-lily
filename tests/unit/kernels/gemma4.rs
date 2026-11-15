@@ -727,7 +727,8 @@ fn moe_grouped_matches_a_bf16_reference() {
     }
 }
 
-/// Per-dispatch time of the decode GEMVs at Gemma 4's shapes (one row):
+/// Per-dispatch time of the decode GEMVs at Gemma 4's shapes (one row, or
+/// `LILY_GEMV_M` rows):
 /// attention and dense FFN projections as the model groups them, the tied
 /// LM head and the dense down, best of eight passes of 128 dispatches (16
 /// of the head) over weight copies in turn (so the cache does not hold
@@ -738,6 +739,7 @@ fn gemv_timing() {
     use crate::kernels::glm53::gemv_sets;
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(71);
+    let m: usize = std::env::var("LILY_GEMV_M").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     let shapes: [(&str, GgmlType, usize, &[usize]); 7] = [
         ("local q/k/v Q5_K", GgmlType::Q5K, 2816, &[4096, 2048, 2048]),
         ("local o Q5_K", GgmlType::Q5K, 4096, &[2816]),
@@ -760,8 +762,8 @@ fn gemv_timing() {
                     .collect()
             })
             .collect();
-        let x = tensor(&ctx, &f32s(&mut rng, cols, -1.0, 1.0));
-        let ys: Vec<Tensor> = rows.iter().map(|&r| zeros(&ctx, r)).collect();
+        let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
+        let ys: Vec<Tensor> = rows.iter().map(|&r| zeros(&ctx, m * r)).collect();
         let repeat = if total > 100_000 { 16 } else { 128 };
         let mut best = f64::MAX;
         for pass_no in 0..9 {
@@ -769,7 +771,7 @@ fn gemv_timing() {
             for r in 0..repeat {
                 let sets: Vec<(&QWeight, &Tensor)> =
                     ws[r % copies].iter().zip(&ys).collect();
-                gemv_sets(&ctx, &pass, &sets, &x, 1).unwrap();
+                gemv_sets(&ctx, &pass, &sets, &x, m).unwrap();
             }
             let t = std::time::Instant::now();
             pass.commit_wait().unwrap();
