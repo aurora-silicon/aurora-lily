@@ -1048,3 +1048,31 @@ fn hc_read_and_experts_rows_equal_one_row_calls() {
         }
     }
 }
+
+/// The narrow embedding gather: ids below `low` read their rows, ids from
+/// `spec` on read the rows after them, an id between (or past the table)
+/// reads zeros.
+#[test]
+fn narrow_embedding_reads_its_rows_and_zeros_between() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(85);
+    let (h, low, spec, vocab) = (64usize, 10usize, 30usize, 36usize);
+    let n = low + (vocab - spec);
+    let raw = random_blocks(&mut rng, GgmlType::Bf16, n * h);
+    let table = QWeight::from_bytes(&ctx, &raw, GgmlType::Bf16, h, n).unwrap();
+    let cw = decode(GgmlType::Bf16, &raw);
+    let ids: Vec<u32> = vec![0, 9, 10, 29, 30, 35, 36, 5];
+    let tids = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[ids.len()], DType::U32).unwrap();
+    let out = Tensor::zeros(&ctx, &[ids.len() * h], DType::BF16).unwrap();
+    run(&ctx, |p| embed_narrow_bf16(&ctx, p, &table, low, spec, &tids, &out, ids.len()).unwrap());
+    let got = out.to_f32().unwrap();
+    for (r, &id) in ids.iter().enumerate() {
+        let id = id as usize;
+        let row = if id < low { Some(id) } else if id >= spec && id < vocab { Some(low + id - spec) } else { None };
+        let want: Vec<f32> = match row {
+            Some(k) => cw[k * h..(k + 1) * h].to_vec(),
+            None => vec![0.0; h],
+        };
+        assert_eq!(got[r * h..(r + 1) * h], want[..], "id {id}");
+    }
+}

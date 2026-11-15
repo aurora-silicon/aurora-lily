@@ -6,6 +6,7 @@
 
 pub mod cache_replay;
 pub mod config;
+pub mod embed;
 pub mod expert_cache;
 pub mod expert_prefetch;
 pub mod expert_replay;

@@ -193,6 +193,10 @@ impl MtpWeights {
 pub struct ModelWeights {
     /// `[vocab, h]` token table.
     pub embed_tokens: LinearWeights,
+    /// The full table read from the file when `embed_tokens` holds only the
+    /// draft head's narrow rows (`super::embed`): the trunk's rows are
+    /// staged from it.
+    pub embed_paged: Option<std::sync::Arc<super::embed::PagedEmbed>>,
     /// Untied LM head.
     pub lm_head: LinearWeights,
     /// The model-level read that collapses the streams before the LM head.
@@ -1059,6 +1063,7 @@ pub fn load(
         .collect();
     Ok(ModelWeights {
         embed_tokens,
+        embed_paged: None,
         lm_head,
         final_mixer,
         layers,

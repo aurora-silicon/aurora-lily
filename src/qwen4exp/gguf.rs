@@ -53,6 +53,7 @@ pub const ARCH: &str = "qwen4exp";
 
 /// The n-gram table, which is never mapped.
 const NGRAM_TABLE: &str = "per_layer_token_embd.weight";
+const EMBED: &str = "token_embd.weight";
 
 /// Tensors read and rearranged into owned buffers instead of mapped.
 const COPIED: &[&str] = &[
@@ -522,6 +523,7 @@ impl Mapped {
         g: &Gguf,
         path: &Path,
         first_unused: usize,
+        skip_embed: bool,
     ) -> Result<Self> {
         let unused = |name: &str| {
             name.strip_prefix("blk.")
@@ -531,6 +533,7 @@ impl Mapped {
         };
         let skip = |t: &TensorInfo| {
             t.name == NGRAM_TABLE
+                || (skip_embed && t.name == EMBED)
                 || COPIED.iter().any(|c| t.name.ends_with(c))
                 || unused(&t.name)
         };
@@ -1092,7 +1095,13 @@ pub fn load(
         Some(p) => Some(ngram_table(&ngram_table_dir(ngram_checkpoint)?, p)?),
         None => None,
     };
-    let mapped = Mapped::map(ctx, &g, path, first_unused)?;
+    // Under a memory limit the token embedding is read from the file
+    // (`super::embed`) and only the draft head's narrow rows stay resident;
+    // `LILY_EMBED_PAGED=0` maps it whole.
+    let paged = memory_limit.is_some()
+        && config.vocab_size == super::spec::QWEN38_VOCAB
+        && std::env::var("LILY_EMBED_PAGED").map_or(true, |v| v != "0");
+    let mapped = Mapped::map(ctx, &g, path, first_unused, paged)?;
     let l = Load { ctx, g: &g, m: &mapped, cfg: config };
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for (il, kind) in config.layer_types.iter().enumerate() {
@@ -1106,19 +1115,44 @@ pub fn load(
         (Some(_), true) => Some(Box::new(l.mtp(config.num_hidden_layers)?)),
         _ => None,
     };
-    let embed_tokens = mapped.lin(&["token_embd.weight"])?;
+    let h = config.hidden_size;
+    let (embed_tokens, embed_paged) = if paged {
+        let t = g.require(EMBED)?;
+        ensure!(
+            t.ty == GgmlType::Bf16 && t.rows() == config.vocab_size && t.row_len() == h,
+            "token_embd is {:?} {} x {}",
+            t.ty,
+            t.rows(),
+            t.row_len()
+        );
+        let table = super::embed::PagedEmbed::open(path, t.offset, t.rows(), h)?;
+        let (low, spec) = (super::spec::DRAFT_LOW_ROWS, super::spec::DRAFT_SPECIAL_FROM);
+        let mut rows = table.read_rows(0, low)?;
+        rows.extend(table.read_rows(spec, config.vocab_size - spec)?);
+        let n = low + config.vocab_size - spec;
+        let narrow = QWeight::new(
+            Tensor::from_bytes(ctx, &rows, &[rows.len()], DType::I8)?,
+            GgmlType::Bf16,
+            h,
+            n,
+        )?;
+        (
+            LinearWeights::Gguf(GgufLinear { parts: vec![narrow] }),
+            Some(std::sync::Arc::new(table)),
+        )
+    } else {
+        let e = mapped.lin(&[EMBED])?;
+        e.expect_features(config.vocab_size, config.hidden_size, "token_embd")?;
+        (e, None)
+    };
     let lm_head = mapped.lin(&["output.weight"])?;
-    embed_tokens.expect_features(
-        config.vocab_size,
-        config.hidden_size,
-        "token_embd",
-    )?;
     lm_head.expect_features(config.vocab_size, config.hidden_size, "output")?;
     let final_mixer = l.hc("", "output_hc", false)?;
     drop(mapped);
     let buffers = recording.finish();
     Ok(ModelWeights {
         embed_tokens,
+        embed_paged,
         lm_head,
         final_mixer,
         layers,

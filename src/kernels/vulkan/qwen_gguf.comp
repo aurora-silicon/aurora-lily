@@ -291,6 +291,24 @@ void main() {
 // keeps a bad one inside the buffer). Buffers: 0 table, 1 ids (u32), 2 out.
 // Params: 3 H, 4 rows of the table.
 // ---------------------------------------------------------------------------
+// qg_embed_narrow_bf16: out[r] from a table that holds only ids below LOW
+// (rows 0..LOW) and ids from SPEC on (rows LOW..): the draft head's
+// resident rows when the full table is paged from the file. An id between
+// them reads as zeros. Grid (H, m). Buffers: 0 table, 1 ids, 2 out.
+// Params: 3 H, 4 LOW, 5 SPEC, 6 rows of the table.
+#ifdef KERNEL_qg_embed_narrow_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint H = arg_u32(3), low = arg_u32(4), spec = arg_u32(5), rows = arg_u32(6);
+    const uint i = gl_GlobalInvocationID.x;
+    const uint r = gl_GlobalInvocationID.y;
+    const uint id = U32(arg(1)).v[r];
+    const bool held = id < low || (id >= spec && low + (id - spec) < rows);
+    const uint row = id < low ? id : low + (id - spec);
+    U16(arg(2)).v[r * H + i] = held ? U16(arg(0) + 2u * (uint64_t(row) * H)).v[i] : uint16_t(0u);
+}
+#endif
+
 #ifdef KERNEL_qg_embed_bf16
 void main() {
     if (!LILY_THREAD_IN_GRID) return;

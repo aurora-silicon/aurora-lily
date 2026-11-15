@@ -78,9 +78,9 @@ static DRAFT_GPU_END: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None
 /// greedy output is unchanged; under a sampler, speculative sampling still
 /// draws from the trunk's distribution, but with other proposals a given
 /// seed may draw other tokens.
-const DRAFT_LOW_ROWS: usize = 98_304;
-const DRAFT_SPECIAL_FROM: usize = 248_044;
-const QWEN38_VOCAB: usize = 248_320;
+pub(super) const DRAFT_LOW_ROWS: usize = 98_304;
+pub(super) const DRAFT_SPECIAL_FROM: usize = 248_044;
+pub(super) const QWEN38_VOCAB: usize = 248_320;
 /// Positions after a fed token outside the narrow head during which drafts
 /// take the whole LM head: text in another script keeps drafting at full
 /// acceptance.

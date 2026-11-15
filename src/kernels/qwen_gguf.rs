@@ -222,6 +222,36 @@ pub fn embed_bf16(
     )
 }
 
+/// [`embed_bf16`] from a table of only the ids below `low` (its first
+/// `low` rows) and from `spec` on (the rest): an id between them reads as
+/// zeros. The draft head's rows when the full table is paged.
+#[allow(clippy::too_many_arguments)]
+pub fn embed_narrow_bf16(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    table: &QWeight,
+    low: usize,
+    spec: usize,
+    ids: &Tensor,
+    out: &Tensor,
+    m: usize,
+) -> Result<()> {
+    ensure!(table.ty == GgmlType::Bf16, "embedding of {:?}", table.ty);
+    ensure!(low <= table.rows && low <= spec, "narrow table of {} rows", table.rows);
+    ensure!(ids.dtype() == DType::U32 && ids.numel() >= m, "embedding ids");
+    ensure!(
+        out.dtype() == DType::BF16 && out.numel() >= m * table.cols,
+        "embedding output"
+    );
+    let pipeline = ctx.pipeline("qg_embed_narrow_bf16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[table.t.binding(), ids.binding(), out.binding()],
+        &[&u32_bytes(table.cols), &u32_bytes(low), &u32_bytes(spec), &u32_bytes(table.rows)],
+        Grid::Threads { grid: (table.cols, m, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 /// Routed experts' gate and up with the SwiGLU: `act[i * used + s] =
 /// silu(gate_e x[i]) * up_e x[i]` (both rounded to bfloat16 first, the
 /// product too) for the `used` experts `sel[i]` of each of the `m` rows;
