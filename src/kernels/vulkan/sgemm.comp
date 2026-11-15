@@ -48,6 +48,16 @@
 #endif
 
 #ifdef SG_TYPE
+#if defined(KERNEL_sgemm_iq4_nl) || defined(KERNEL_sgemm_moe_iq4_nl)
+// IQ4_NL's value of code c: its 16 values as signed bytes, 4 a word (the
+// table of glm53_iq4nl_value, in fewer operations).
+float sg_iq4nl(uint c) {
+    const uint lo = c < 4u ? 0xBFAD9881u : 0xF6EADDCFu;
+    const uint hi = c < 12u ? 0x26190D01u : 0x71594535u;
+    return float(bitfieldExtract(int(c < 8u ? lo : hi), int(8u * (c & 3u)), 8));
+}
+#endif
+
 // Weights k .. k + 8 (k a multiple of 8) of `row`, as glm53_decode gives
 // them: Gemma's prompt-run types directly (as gemma4_gemm.comp and
 // glm53_gemm.comp decode them), the others as 8 of glm53_decode's 32.
@@ -83,8 +93,8 @@ void sg_decode8(uint64_t row, uint k, out float w[8]) {
     const uint j = k & 31u, at = j & 15u, shift = j < 16u ? 0u : 4u;
     [[unroll]] for (uint i = 0u; i < 4u; i++) {
         const uint pair = uint(U16(b + 2u + at).v[i]);
-        w[2u * i] = d * glm53_iq4nl_value((pair >> shift) & 0xfu);
-        w[2u * i + 1u] = d * glm53_iq4nl_value((pair >> (8u + shift)) & 0xfu);
+        w[2u * i] = d * sg_iq4nl((pair >> shift) & 0xfu);
+        w[2u * i + 1u] = d * sg_iq4nl((pair >> (8u + shift)) & 0xfu);
     }
 #elif defined(KERNEL_sgemm_q5_k) || defined(KERNEL_sgemm_moe_q5_k)
     // Values k .. k + 8 of their 32-value sub-block j: nibbles of bytes
