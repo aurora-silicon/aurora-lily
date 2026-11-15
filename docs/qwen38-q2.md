@@ -38,13 +38,24 @@ The loader undoes the converter's layout choices with exact moves (llama.cpp's
 ```sh
 ./target/release/lily --model ~/models/Qwen3.8-Flash-Next-Q2/Qwen3.8-Flash-Next-Q2.gguf \
   --ngram-checkpoint ~/models/Qwen3.8-Flash-Next-lily-q4-xl \
-  --max-seq 32768 --memory-limit-gb 48
+  --max-seq 32768 --memory-limit-gb 44.7
 ```
 
-Memory (the server's line, 32K context, q8 K/V): 43.4 GB allocated without the
-draft head (`--mtp-drafts 0`), 45.3 GB with it; `--memory-limit-gb 48` (GiB) leaves
-a 6.3 GB session cache. The n-gram table's background preload is skipped where the
-page cache cannot hold it beside the GPU's allocation.
+Memory: `--memory-limit-gb` (GiB) is the footprint the server keeps to. The load
+measures the weights and a scratch with its full prefill chunk (allocated from the
+start), fits the longest context whose session (the server's checkpoints, growth to
+full capacity, the speculative lookahead) fits the rest, and the server caps
+`--max-seq` there, keeps its session cache under the rest and refuses longer
+prompts. Where a 4096-row prefill chunk leaves less than 32K tokens the chunk halves
+(about 5% slower prefill at 2048). With the draft head, q8 K/V:
+
+| `--memory-limit-gb` | context | prefill chunk | allocated | session cache |
+|---|---:|---:|---:|---:|
+| 48 (51.5 GB) | 172 024 | 4096 | 47.3 GB | 4.2 GB |
+| 44.7 (48.0 GB) | 40 952 | 2048 | 46.3 GB | 1.7 GB |
+
+The n-gram table's background preload is skipped where the page cache cannot hold
+it beside the GPU's allocation.
 
 ## Quality and speed (M5 Max, 2026-11-14)
 

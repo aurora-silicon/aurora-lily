@@ -297,8 +297,9 @@ above.
 
 A Qwen3.8-Flash-Next GGUF (ds4's Q2, [qwen38-q2.md](qwen38-q2.md)) pages its
 n-gram table from a lily checkpoint of the model, `--ngram-checkpoint <dir>`
-(`LILY_NGRAM_TABLE` when not given). Its `--memory-limit-gb` caps the session cache
-beside what the load allocated. The n-gram table's background preload
+(`LILY_NGRAM_TABLE` when not given). Under `--memory-limit-gb` it fits its context
+to the limit (weights, a full-chunk scratch and one session with its checkpoints),
+which caps `--max-seq`, and the session cache takes what is left. The n-gram table's background preload
 (`--ngram-preload`, on by default) is skipped where the machine's memory, less what
 the GPU allocated, cannot hold the table and a 12 GB reserve; `--ngram-lock`
 preloads regardless.
