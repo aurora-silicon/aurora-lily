@@ -282,7 +282,8 @@ pub fn attn_partial_len(rows: usize, heads: usize, d: usize, chunks: usize) -> u
 /// Attention of `m` rows at positions `pos0..` (queries `q`, normed and
 /// rotated) over the caches, scale 1, into `heads` (`[m][heads][d]`):
 /// split over key chunks and merged for a few rows, flash attention on the
-/// matrix units for a prompt run (`m > small_rows`).
+/// matrix units for a prompt run (`m > small_rows`; without matrix units a
+/// subgroup a row, walking its keys in f32).
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &MetalContext,
@@ -310,13 +311,30 @@ pub fn attention(
     }
     if m > small_rows {
         // On the matrix units (gemma4_attn.comp): sixteen rows of a KV
-        // head's query heads a threadgroup.
-        let pipeline = ctx.pipeline(
-            a.name(["gemma4_attn_mu_256", "gemma4_attn_mu_512"])?,
-            SOURCE,
-            MslVersion::V3_1,
-        )?;
+        // head's query heads a threadgroup. Without them
+        // (gemma4_attn_prefill): a subgroup a row and two heads of one KV
+        // head, eight rows a threadgroup; the same buffers and params.
+        let mu = ctx.matrix_units();
         let group = a.heads / a.kv_heads;
+        let (names, grid) = if mu {
+            (
+                ["gemma4_attn_mu_256", "gemma4_attn_mu_512"],
+                Grid::Threadgroups {
+                    groups: ((m * group).div_ceil(16), a.kv_heads, 1),
+                    threadgroup: (128, 1, 1),
+                },
+            )
+        } else {
+            ensure!(group.is_multiple_of(2), "{group} query heads a KV head");
+            (
+                ["gemma4_attn_prefill_256", "gemma4_attn_prefill_512"],
+                Grid::Threadgroups {
+                    groups: (m.div_ceil(8), a.heads / 2, 1),
+                    threadgroup: (256, 1, 1),
+                },
+            )
+        };
+        let pipeline = ctx.pipeline(a.name(names)?, SOURCE, MslVersion::V3_1)?;
         return pass.dispatch_at(
             &pipeline,
             &[
@@ -335,10 +353,7 @@ pub fn attention(
                 &u32_bytes(m),
                 &u32_bytes(a.k_rot),
             ],
-            Grid::Threadgroups {
-                groups: ((m * group).div_ceil(16), a.kv_heads, 1),
-                threadgroup: (128, 1, 1),
-            },
+            grid,
         );
     }
     let common = [
