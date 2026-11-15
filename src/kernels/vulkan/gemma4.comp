@@ -530,7 +530,11 @@ void main() {
 #endif
 
 #ifdef KERNEL_gemma4_moe_down_iq4_nl
-// ggml's kvalues_iq4nl as packed int8 (code c is byte c).
+// A code byte's two values (low nibble, high nibble) of ggml's
+// kvalues_iq4nl as floats: one 8-byte load for two weights, where a
+// lookup in a register-packed table took a select chain, shifts and a
+// convert for each (1015 instructions, 219 registers; 2026-11-15).
+shared vec2 g4_kv2[256];
 const uvec4 G4_KV = uvec4(0xbfad9881u, 0xf6eaddcfu, 0x26190d01u, 0x71594535u);
 float g4_kv(uint c) {
     return float(int(G4_KV[c >> 2u] << (24u - 8u * (c & 3u))) >> 24);
@@ -540,10 +544,11 @@ float g4_kv(uint c) {
 float g4_iq4nl_dot(in uint wd[9], uint blk, in vec4 xv[8]) {
     const uint base = 18u * blk;
     const float d = glm53_h2f(PB(base) | (PB(base + 1u) << 8u));
+    vec2 v[16];
+    [[unroll]] for (uint j = 0u; j < 16u; j++) v[j] = g4_kv2[PB(base + 2u + j)];
     float s = 0.0;
     [[unroll]] for (uint j = 0u; j < 16u; j++) {
-        const uint q = PB(base + 2u + j);
-        s += g4_kv(q & 0xfu) * xv[j >> 2u][j & 3u] + g4_kv(q >> 4u) * xv[4u + (j >> 2u)][j & 3u];
+        s += v[j].x * xv[j >> 2u][j & 3u] + v[j].y * xv[4u + (j >> 2u)][j & 3u];
     }
     return d * s;
 }
@@ -553,6 +558,11 @@ void main() {
     const uint H = arg_u32(6);
     const uint row_bytes = arg_u32(7);
     const uint used = arg_u32(8);
+    {
+        const uint c = gl_LocalInvocationIndex;
+        g4_kv2[c] = vec2(g4_kv(c & 0xfu), g4_kv(c >> 4u));
+    }
+    barrier();
     const uint i = gl_WorkGroupID.y;
     const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
     if (r >= H) return;
