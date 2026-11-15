@@ -626,6 +626,7 @@ pub fn rmsnorm(
     for t in [x, w, out] {
         check(&[(t, DType::F32)])?;
     }
+    ensure!(w.numel() >= hidden, "rmsnorm weight shorter than {hidden}");
     ensure!(
         x.numel() >= m * hidden && out.numel() >= m * hidden,
         "rmsnorm of {m} rows"
