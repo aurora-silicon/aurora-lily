@@ -510,3 +510,44 @@ fn moe_timing() {
         eprintln!("{line}");
     }
 }
+
+/// The grouped experts of a prompt run against the per-row kernels: the
+/// same sums with both operands rounded to bfloat.
+#[test]
+fn moe_grouped_matches_the_row_kernels() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(21);
+    let (hid, ff, ne, used, m) = (512, 128, 12, 8, 37);
+    for (gt, dt) in
+        [(GgmlType::Iq2Xxs, GgmlType::Iq4Nl), (GgmlType::Q5K, GgmlType::Q8_0)]
+    {
+        let gu_raw = random_blocks(&mut rng, gt, ne * 2 * ff * hid);
+        let dn_raw = random_blocks(&mut rng, dt, ne * hid * ff);
+        let gu = QWeight::from_bytes(&ctx, &gu_raw, gt, hid, ne * 2 * ff).unwrap();
+        let dn = QWeight::from_bytes(&ctx, &dn_raw, dt, ff, ne * hid).unwrap();
+        // Small activations keep the bfloat rounding's share small.
+        let x = f32s(&mut rng, m * hid, -0.1, 0.1);
+        let sel: Vec<u32> =
+            (0..m * used).map(|i| ((i * 7 + i / used) % ne) as u32).collect();
+        let wts = f32s(&mut rng, m * used, 0.05, 0.2);
+        let (tx, ts, tw) = (tensor(&ctx, &x), u32s(&ctx, &sel), tensor(&ctx, &wts));
+        let mid = zeros(&ctx, m * used * ff);
+        let rows = zeros(&ctx, m * hid);
+        let grouped = zeros(&ctx, m * hid);
+        let sc = MoeGroupScratch::new(&ctx, m, used, ne, ff, hid).unwrap();
+        run(&ctx, |p| {
+            moe_gate_up(&ctx, p, &gu, ff, &tx, &ts, &mid, m, used).unwrap();
+            p.memory_barrier().unwrap();
+            moe_down(&ctx, p, &dn, hid, &mid, &ts, &tw, &rows, m, used).unwrap();
+            p.memory_barrier().unwrap();
+            moe_grouped(
+                &ctx, p, &gu, &dn, ff, &tx, &ts, &tw, &grouped, &sc, m, used, ne,
+            )
+            .unwrap();
+        });
+        let (a, b) = (grouped.to_f32().unwrap(), rows.to_f32().unwrap());
+        let scale = b.iter().fold(0f32, |s, v| s.max(v.abs()));
+        let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        assert!(worst <= 0.02 * scale, "{gt:?}/{dt:?}: worst {worst} of {scale}");
+    }
+}

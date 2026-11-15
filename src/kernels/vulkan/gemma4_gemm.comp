@@ -1,0 +1,223 @@
+#version 460
+// Gemma 4's routed experts over a prompt run, grouped by expert on the
+// matrix units (src/kernels/gemma4.rs `moe_grouped`): the expert GEMM of
+// glm53_gemm.comp (Qwen's grouped layout, quant_grouped.glsl) with a
+// weight decode for each of Gemma's expert block types, the GeGLU of the
+// fused gate/up output, and the routed sum. The pairs and tiles come from
+// glm53_moe_group, the bfloat input from glm53_to_bf16.
+#if defined(KERNEL_gemma4_gemm_moe_iq2_s) || defined(KERNEL_gemma4_gemm_moe_q5_k) || \
+    defined(KERNEL_gemma4_gemm_moe_iq4_nl)
+#define GLM53_EXT_TYPES
+#endif
+#include "common.glsl"
+#include "glm53_quant.glsl"
+#include "matmul.glsl"
+
+uint g4_bf16_bits(float f) {
+    const uint u = floatBitsToUint(f);
+    return (u + 0x7fffu + ((u >> 16u) & 1u)) >> 16u;
+}
+
+// ---------------------------------------------------------------------------
+// Y[pairs[k]] = W_e . X[pairs[k] >> x_shift] for the tiles of the run (tile
+// y = tiles[y] = (expert e, first, count)): X bfloat rows of K, W the
+// expert stack (expert e's N rows from row e N), Y f32 rows of N. A
+// threadgroup of four subgroups computes 64 rows x 64 columns, a subgroup
+// 16 rows; every thread decodes 8 weights of 4 weight rows a 64-deep K
+// step into the tile in the lanes' order, two tiles in turn. Weights are
+// rounded to bfloat (to nearest, ties away), the sums f32.
+// Grid (N / 64, max tiles), 128 threads. K a multiple of 64.
+// Buffers: 0 X (bfloat), 1 W, 2 Y f32, 3 pairs u32, 4 tiles u32 [3 a tile],
+// 5 tile count. Params: 6 N, 7 K, 8 row_bytes, 9 x_shift.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_gemma4_gemm_moe_iq2_xxs) || defined(KERNEL_gemma4_gemm_moe_iq2_s) || \
+    defined(KERNEL_gemma4_gemm_moe_q5_k) || defined(KERNEL_gemma4_gemm_moe_iq4_nl) || \
+    defined(KERNEL_gemma4_gemm_moe_q8_0)
+#define GM_STEP 64u
+#define GM_SUB 16u
+shared uvec4 gm_tile[2u * GM_STEP * 8u];
+
+uint gm_pair(uint lo, uint hi) { return (lo >> 16u) | (hi & 0xffff0000u); }
+uint gm_round_w(float f) { return floatBitsToUint(f) + 0x8000u; }
+
+#define GM_STORE_TILE(at, w)                                                                  \
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {                                               \
+        gm_tile[(at) + 16u * i] = uvec4(                                                      \
+            gm_pair(gm_round_w(w[0][2u * i]), gm_round_w(w[1][2u * i])),                      \
+            gm_pair(gm_round_w(w[2][2u * i]), gm_round_w(w[3][2u * i])),                      \
+            gm_pair(gm_round_w(w[0][2u * i + 1u]), gm_round_w(w[1][2u * i + 1u])),            \
+            gm_pair(gm_round_w(w[2][2u * i + 1u]), gm_round_w(w[3][2u * i + 1u])));           \
+    }
+
+// Weights k .. k + 8 (k a multiple of 8) of `row`, as glm53_decode gives
+// them.
+void gm_decode8(uint64_t row, uint k, out float w[8]) {
+#if defined(KERNEL_gemma4_gemm_moe_iq2_xxs)
+    const uint t = k >> 5u, l = (k >> 3u) & 3u;
+    const uint bw = (t >> 3u) * 33u;
+    const uint qw = bw + 1u + 4u * (t & 7u);
+    const float d = glm53_h2f(uint(U16(row).v[bw]));
+    const uint aux0 = uint(U16(row).v[qw]) | (uint(U16(row).v[qw + 1u]) << 16u);
+    const uint aux1 = uint(U16(row).v[qw + 2u]) | (uint(U16(row).v[qw + 3u]) << 16u);
+    const float scale = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
+    const uvec4 g = glm53_iq2xxs_grid_h[(aux0 >> (8u * l)) & 0xffu]
+                  ^ glm53_iq2xxs_signs_h[(aux1 >> (7u * l)) & 127u];
+    [[unroll]] for (uint p = 0u; p < 4u; p++) {
+        const vec2 v = unpackHalf2x16(g[p]);
+        w[p] = scale * v.x;
+        w[p + 4u] = scale * v.y;
+    }
+#elif defined(KERNEL_gemma4_gemm_moe_q8_0)
+    const uint64_t b = row + uint64_t(k >> 5u) * 34u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(U16(b + 2u).v[((k & 31u) >> 1u) + i]);
+        w[2u * i] = d * float(int(pair << 24) >> 24);
+        w[2u * i + 1u] = d * float(int(pair << 16) >> 24);
+    }
+#elif defined(KERNEL_gemma4_gemm_moe_iq4_nl)
+    // Values j .. j + 8 of a block: the low nibbles of bytes j.. (j < 16)
+    // or the high nibbles of bytes j - 16.. .
+    const uint64_t b = row + uint64_t(k >> 5u) * 18u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint j = k & 31u, at = j & 15u, shift = j < 16u ? 0u : 4u;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(U16(b + 2u + at).v[i]);
+        w[2u * i] = d * glm53_iq4nl_value((pair >> shift) & 0xfu);
+        w[2u * i + 1u] = d * glm53_iq4nl_value((pair >> (8u + shift)) & 0xfu);
+    }
+#else
+    // Q5_K, IQ2_S: eight values of glm53_decode's 32.
+    float t[32];
+#ifdef KERNEL_gemma4_gemm_moe_q5_k
+    glm53_decode(GLM53_Q5_K, row, k >> 5u, t);
+#else
+    glm53_decode(GLM53_IQ2_S, row, k >> 5u, t);
+#endif
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        if ((k & 24u) == 8u * q) {
+            [[unroll]] for (uint i = 0u; i < 8u; i++) w[i] = t[8u * q + i];
+        }
+    }
+#endif
+}
+
+void main() {
+    if (gl_WorkGroupID.y >= U32(arg(5)).v[0]) return;
+    const uint N = arg_u32(6);
+    const uint K = arg_u32(7);
+    const uint row_bytes = arg_u32(8);
+    const uint x_shift = arg_u32(9);
+    const uint expert = U32(arg(4)).v[3u * gl_WorkGroupID.y];
+    const uint first = U32(arg(4)).v[3u * gl_WorkGroupID.y + 1u];
+    const uint rows = U32(arg(4)).v[3u * gl_WorkGroupID.y + 2u];
+    const uint tid = gl_LocalInvocationIndex;
+    const uint sg = gl_SubgroupID;
+    const uint quad = tid & 15u, k8 = tid >> 4u;
+    const uint n0 = gl_WorkGroupID.x * 64u;
+    const uint64_t W = arg(1) + (uint64_t(expert) * N + n0) * row_bytes;
+    uint64_t wr[4];
+    [[unroll]] for (uint r = 0u; r < 4u; r++) wr[r] = W + uint64_t(min(4u * quad + r, N - 1u - n0)) * row_bytes;
+    const uint row0 = GM_SUB * sg;
+    const bool working = row0 < rows;
+    const uint lane_row = mat_lane_row(), a_half = mat_a_half(), odd16 = 16u * mat_a_odd();
+    const uint words = K / 8u;
+    uint a_at[GM_SUB / 8u];
+    [[unroll]] for (uint h = 0u; h < GM_SUB / 8u; h++) {
+        const uint r = row0 + 16u * (h >> 1u) + lane_row + (h & 1u);
+        a_at[h] = (U32(arg(3)).v[first + min(r, rows - 1u)] >> x_shift) * words;
+    }
+    U32x4 xa = U32x4(arg(0));
+    const uint lane_at = lane_row * 8u + mat_lane_col() / 4u;
+    MatC acc[GM_SUB / 16u][4];
+    [[unroll]] for (uint i = 0u; i < GM_SUB / 16u; i++) {
+        [[unroll]] for (uint c = 0u; c < 4u; c++) acc[i][c] = MatC(0.0);
+    }
+    for (uint k0 = 0u; k0 < K; k0 += GM_STEP) {
+        const uint tile_at = ((k0 / GM_STEP) & 1u) * (GM_STEP * 8u);
+        {
+            float w[4][8];
+            [[unroll]] for (uint r = 0u; r < 4u; r++) gm_decode8(wr[r], k0 + 8u * k8, w[r]);
+            GM_STORE_TILE(tile_at + 64u * k8 + quad, w)
+        }
+        barrier();
+        if (working) {
+            [[unroll]] for (uint kk = 0u; kk < GM_STEP; kk += 16u) {
+                const uint at = (k0 + kk) / 8u + a_half;
+                const uint b_at = tile_at + lane_at + kk * 8u;
+                uvec4 v[GM_SUB / 8u];
+                [[unroll]] for (uint h = 0u; h < GM_SUB / 8u; h++) v[h] = xa.v[a_at[h] + at];
+                const uvec4 b0 = gm_tile[b_at], b1 = gm_tile[b_at + 4u];
+                const uvec4 b2 = gm_tile[b_at + 8u], b3 = gm_tile[b_at + 12u];
+                [[unroll]] for (uint i = 0u; i < GM_SUB / 16u; i++) {
+                    MatA ma;
+                    MatB mb;
+                    MAT_A_OF_ROWS(ma, v[2u * i], v[2u * i + 1u], odd16)
+                    MAT_OF_WORDS(mb, b0)
+                    acc[i][0] = coopMatMulAdd(ma, mb, acc[i][0]);
+                    MAT_OF_WORDS(mb, b1)
+                    acc[i][1] = coopMatMulAdd(ma, mb, acc[i][1]);
+                    MAT_OF_WORDS(mb, b2)
+                    acc[i][2] = coopMatMulAdd(ma, mb, acc[i][2]);
+                    MAT_OF_WORDS(mb, b3)
+                    acc[i][3] = coopMatMulAdd(ma, mb, acc[i][3]);
+                }
+            }
+        }
+    }
+    if (!working) return;
+    const uint col = n0 + mat_lane_col();
+    [[unroll]] for (uint i = 0u; i < GM_SUB / 16u; i++)
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {
+        const uint r = row0 + 16u * i + lane_row + h;
+        if (r < rows) {
+            const uint64_t y = arg(2) + 4u * uint64_t(U32(arg(3)).v[first + r]) * N;
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                F32x4(y).v[(col + 16u * c) / 4u] =
+                    vec4(acc[i][c][4u * h], acc[i][c][4u * h + 1u], acc[i][c][4u * h + 2u], acc[i][c][4u * h + 3u]);
+            }
+        }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The GeGLU of the fused gate/up output, weighted, as the down GEMM's
+// bfloat operand: mid[p][j] = w[p] * gelu(y[p][j]) * y[p][F + j].
+// Grid::Threads (F, pairs). Buffers: 0 y [pairs][2 F], 1 weights [pairs],
+// 2 mid (bfloat [pairs][F]). Params: 3 F.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_gemma4_moe_geglu
+float g4_tanh(float x) {
+    const float t = exp(-2.0 * abs(x));
+    const float r = (1.0 - t) / (1.0 + t);
+    return x < 0.0 ? -r : r;
+}
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint F = arg_u32(3);
+    const uint j = gl_GlobalInvocationID.x, p = gl_GlobalInvocationID.y;
+    const uint64_t y = arg(0) + 8u * uint64_t(p) * F;
+    const float g = F32(y).v[j], u = F32(y).v[F + j];
+    const float gelu = 0.5 * g * (1.0 + g4_tanh(0.79788456080286535587989211986876 * g * (1.0 + 0.044715 * g * g)));
+    const float v = F32(arg(1)).v[p] * (gelu * u);
+    BF16(arg(2) + 2u * (uint64_t(p) * F + j)).v[0] = uintBitsToBFloat16EXT(uint16_t(g4_bf16_bits(v)));
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// out[i][r] = sum over the row's slots of down[i * used + s][r].
+// Grid::Threads (H, rows). Buffers: 0 down [pairs][H], 1 out. Params: 2 H,
+// 3 used.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_gemma4_moe_combine
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint H = arg_u32(2);
+    const uint used = arg_u32(3);
+    const uint r = gl_GlobalInvocationID.x, i = gl_GlobalInvocationID.y;
+    float acc = 0.0;
+    for (uint s = 0u; s < used; s++) acc += F32(arg(0) + 4u * (uint64_t(i * used + s) * H)).v[r];
+    F32(arg(1) + 4u * (uint64_t(i) * H)).v[r] = acc;
+}
+#endif

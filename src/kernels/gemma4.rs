@@ -439,6 +439,148 @@ pub fn moe_down(
     )
 }
 
+/// Scratch of [`moe_grouped`] for runs of up to `pairs` routed pairs.
+pub struct MoeGroupScratch {
+    pairs: Tensor,
+    tiles: Tensor,
+    tile_count: Tensor,
+    /// The run's expert input as bfloat.
+    xb: Tensor,
+    /// f32 `[pairs][2 ff]`: the fused gate/up GEMM's output.
+    gate_up: Tensor,
+    /// bfloat `[pairs][ff]`: the down GEMM's operand.
+    mid: Tensor,
+    /// f32 `[pairs][hidden]`.
+    down: Tensor,
+}
+
+impl MoeGroupScratch {
+    pub fn new(
+        ctx: &MetalContext,
+        rows: usize,
+        used: usize,
+        experts: usize,
+        ff: usize,
+        hidden: usize,
+    ) -> Result<Self> {
+        let pairs = rows * used;
+        let max_tiles = pairs.div_ceil(64) + experts;
+        Ok(Self {
+            pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
+            tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
+            tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
+            xb: Tensor::zeros(ctx, &[rows * hidden], DType::BF16)?,
+            gate_up: Tensor::zeros(ctx, &[pairs * 2 * ff], DType::F32)?,
+            mid: Tensor::zeros(ctx, &[pairs * ff], DType::BF16)?,
+            down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
+        })
+    }
+}
+
+/// The routed experts of a run of `m` rows grouped by expert, on the
+/// matrix units (operands rounded to bfloat): `out[i] = sum_s w[i][s]
+/// down_e(gelu(g) * u)`, `[g; u] = gate_up_e x[i]` (each expert's `ff`
+/// gate rows, then its `ff` up rows).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate_up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+) -> Result<()> {
+    check_f32(&[x, weights, out])?;
+    let hidden = gate_up.cols;
+    let pairs = m * used;
+    ensure!(
+        sc.pairs.numel() >= pairs && sc.xb.numel() >= m * hidden,
+        "grouped MoE scratch"
+    );
+    ensure!(used.is_power_of_two(), "experts used {used}");
+    ensure!(
+        hidden.is_multiple_of(64)
+            && ff.is_multiple_of(64)
+            && down.cols == ff
+            && down.rows == experts * hidden,
+        "grouped experts of {ff} x {hidden}"
+    );
+    let group = ctx.pipeline("glm53_moe_group", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &group,
+        &[
+            sel.binding(),
+            sc.pairs.binding(),
+            sc.tiles.binding(),
+            sc.tile_count.binding(),
+        ],
+        &[&u32_bytes(pairs), &u32_bytes(experts), &u32_bytes(64)],
+        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
+    )?;
+    crate::kernels::glm53::to_bf16(ctx, pass, x, &sc.xb, m * hidden)?;
+    pass.memory_barrier()?;
+    let max_tiles = pairs.div_ceil(64) + experts;
+    let gemm =
+        |w: &QWeight, x: &Tensor, y: &Tensor, n: usize, x_shift: usize| -> Result<()> {
+            let name = match w.ty {
+                GgmlType::Iq2Xxs => "gemma4_gemm_moe_iq2_xxs",
+                GgmlType::Iq2S => "gemma4_gemm_moe_iq2_s",
+                GgmlType::Q5K => "gemma4_gemm_moe_q5_k",
+                GgmlType::Iq4Nl => "gemma4_gemm_moe_iq4_nl",
+                GgmlType::Q8_0 => "gemma4_gemm_moe_q8_0",
+                other => anyhow::bail!("no grouped Gemma expert GEMM over {other:?}"),
+            };
+            let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+            pass.dispatch_at(
+                &pipeline,
+                &[
+                    x.binding(),
+                    w.t.binding(),
+                    y.binding(),
+                    sc.pairs.binding(),
+                    sc.tiles.binding(),
+                    sc.tile_count.binding(),
+                ],
+                &[
+                    &u32_bytes(n),
+                    &u32_bytes(w.cols),
+                    &u32_bytes(w.row_bytes),
+                    &u32_bytes(x_shift),
+                ],
+                Grid::Threadgroups {
+                    groups: (n.div_ceil(64), max_tiles, 1),
+                    threadgroup: (128, 1, 1),
+                },
+            )
+        };
+    gemm(gate_up, &sc.xb, &sc.gate_up, 2 * ff, used.trailing_zeros() as usize)?;
+    pass.memory_barrier()?;
+    let geglu = ctx.pipeline("gemma4_moe_geglu", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &geglu,
+        &[sc.gate_up.binding(), weights.binding(), sc.mid.binding()],
+        &[&u32_bytes(ff)],
+        Grid::Threads { grid: (ff, pairs, 1), threadgroup: (64, 1, 1) },
+    )?;
+    pass.memory_barrier()?;
+    gemm(down, &sc.mid, &sc.down, hidden, 0)?;
+    pass.memory_barrier()?;
+    let combine = ctx.pipeline("gemma4_moe_combine", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &combine,
+        &[sc.down.binding(), out.binding()],
+        &[&u32_bytes(hidden), &u32_bytes(used)],
+        Grid::Threads { grid: (hidden, m, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 /// Threads of a row kernel: four values a thread.
 fn row_threads(n: usize) -> Result<usize> {
     ensure!(n.is_multiple_of(4) && n <= 4096, "row of {n} values");

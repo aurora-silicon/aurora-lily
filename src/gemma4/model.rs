@@ -279,6 +279,7 @@ pub struct Scratch {
     sel: Tensor,
     rw: Tensor,
     emid: Tensor,
+    moe_group: g4::MoeGroupScratch,
     partial: Tensor,
     /// The partials' capacity in key chunks.
     chunks: usize,
@@ -327,7 +328,15 @@ impl Scratch {
             rlogits: f(m * cfg.n_expert)?,
             sel: Tensor::zeros(ctx, &[m * cfg.n_expert_used], DType::U32)?,
             rw: f(m * cfg.n_expert_used)?,
-            emid: f(m * cfg.n_expert_used * cfg.ff_expert)?,
+            emid: f(MAX_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
+            moe_group: g4::MoeGroupScratch::new(
+                ctx,
+                m,
+                cfg.n_expert_used,
+                cfg.n_expert,
+                cfg.ff_expert,
+                h,
+            )?,
             partial: f(partial)?,
             chunks,
             logits,
@@ -621,30 +630,49 @@ impl Gemma4Model {
         )?;
         pass.memory_barrier()?;
         self.proj(ctx, pass, &[(&l.down, &sc.m1)], &sc.mid, m)?;
-        g4::moe_gate_up(
-            ctx,
-            pass,
-            &l.gate_up_exps,
-            cfg.ff_expert,
-            &sc.n2,
-            &sc.sel,
-            &sc.emid,
-            m,
-            cfg.n_expert_used,
-        )?;
-        pass.memory_barrier()?;
-        g4::moe_down(
-            ctx,
-            pass,
-            &l.down_exps,
-            h,
-            &sc.emid,
-            &sc.sel,
-            &sc.rw,
-            &sc.m2,
-            m,
-            cfg.n_expert_used,
-        )?;
+        if m > MAX_ROWS {
+            // A prompt run: grouped by expert on the matrix units.
+            g4::moe_grouped(
+                ctx,
+                pass,
+                &l.gate_up_exps,
+                &l.down_exps,
+                cfg.ff_expert,
+                &sc.n2,
+                &sc.sel,
+                &sc.rw,
+                &sc.m2,
+                &sc.moe_group,
+                m,
+                cfg.n_expert_used,
+                cfg.n_expert,
+            )?;
+        } else {
+            g4::moe_gate_up(
+                ctx,
+                pass,
+                &l.gate_up_exps,
+                cfg.ff_expert,
+                &sc.n2,
+                &sc.sel,
+                &sc.emid,
+                m,
+                cfg.n_expert_used,
+            )?;
+            pass.memory_barrier()?;
+            g4::moe_down(
+                ctx,
+                pass,
+                &l.down_exps,
+                h,
+                &sc.emid,
+                &sc.sel,
+                &sc.rw,
+                &sc.m2,
+                m,
+                cfg.n_expert_used,
+            )?;
+        }
         pass.memory_barrier()?;
         // The FFN's end, with the next layer's input norm (or the head's).
         let next = self.layers.get(il + 1).map_or(&self.output_norm, |n| &n.attn_norm);
