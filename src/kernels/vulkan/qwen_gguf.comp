@@ -37,8 +37,14 @@ float qg_dot32(in float w[32], in vec4 xv[8]) {
 // 2^(e - 128) (ggml_e8m0_to_fp32_half: kvalues are twice the E2M1 values).
 #define QG_MXFP4 39u
 
-const float qg_mxfp4_values[16] = float[16](
-    0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0);
+// kvalues_mxfp4 as signed bytes, four to a word (little-endian): a word
+// select and a byte extract, where a constant array became a select tree of
+// 32-bit float constants.
+float qg_mxfp4_value(uint c) {
+    const uint w = c < 8u ? (c < 4u ? 0x03020100u : 0x0C080604u)
+                          : (c < 12u ? 0xFDFEFF00u : 0xF4F8FAFCu);
+    return float(bitfieldExtract(int(w), int(8u * (c & 3u)), 8));
+}
 
 void qg_decode_mxfp4(uint64_t row, uint t, out float w[32]) {
     const uint64_t b = row + uint64_t(t) * 17u;
@@ -52,8 +58,8 @@ void qg_decode_mxfp4(uint64_t row, uint t, out float w[32]) {
     [[unroll]] for (uint j = 0u; j < 16u; j++) {
         const uint q = uint(U8(b + 1u).v[j]);
         // precise: d * d2 folded first would be the subnormal again.
-        precise float lo = qg_mxfp4_values[q & 15u] * d;
-        precise float hi = qg_mxfp4_values[q >> 4u] * d;
+        precise float lo = qg_mxfp4_value(q & 15u) * d;
+        precise float hi = qg_mxfp4_value(q >> 4u) * d;
         lo = lo * d2;
         hi = hi * d2;
         w[j] = lo;
