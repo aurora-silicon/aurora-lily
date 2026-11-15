@@ -248,6 +248,7 @@ fn routed_experts_match_cpu_with_padded_down_rows() {
     for (gty, dty, d_cols) in [
         (GgmlType::Iq2Xxs, GgmlType::Q2K, 768usize),
         (GgmlType::Q4K, GgmlType::Mxfp4, 640),
+        (GgmlType::Q4K, GgmlType::Q8_0, 640),
     ] {
         let raw_g = random_blocks(&mut rng, gty, experts * ff * h);
         let raw_u = random_blocks(&mut rng, gty, experts * ff * h);
@@ -262,7 +263,9 @@ fn routed_experts_match_cpu_with_padded_down_rows() {
         let wd = QWeight::from_bytes(&ctx, &raw_d, dty, d_cols, experts * h).unwrap();
         let (cg, cu, cd) =
             (decode(gty, &raw_g), decode(gty, &raw_u), decode(dty, &raw_d));
-        for (m, used) in [(1usize, 4usize), (3, 4), (2, 5)] {
+        // Up to four rows take the packed down kernel (every row's slots in
+        // one subgroup), five the one-row-a-threadgroup one.
+        for (m, used) in [(1usize, 4usize), (3, 4), (2, 5), (4, 3), (5, 2)] {
             let (x, tx) = bf16_input(&ctx, &mut rng, m * h);
             let sel: Vec<u32> =
                 (0..m * used).map(|_| rng.gen_range(0..experts as u32)).collect();
@@ -304,8 +307,29 @@ fn routed_experts_match_cpu_with_padded_down_rows() {
                     with_shared.then_some((so.as_slice(), sg.as_slice())),
                     (m, used, ff, h),
                 );
-                assert_close(&act.to_f32().unwrap(), &eact, 2e-3, 1.6e-2);
-                assert_close(&out.to_f32().unwrap(), &eout, 2e-3, 1.6e-2);
+                let gact = act.to_f32().unwrap();
+                assert_close(&gact, &eact, 2e-3, 1.6e-2);
+                // Each slot's dot is rounded to bfloat at its own magnitude,
+                // which can be far above the combined output's: the GPU's f32
+                // dot and the CPU's f64 one may round to neighbours there.
+                // Per output, one bfloat ulp of every scaled slot term on top.
+                let gout = out.to_f32().unwrap();
+                for i in 0..m {
+                    for r in 0..h {
+                        let mut slack = 0f32;
+                        for s in 0..used {
+                            let slot = i * used + s;
+                            let row = (sel[slot] as usize * h + r) * d_cols;
+                            let v = dot(&cd[row..row + ff], &gact[slot * ff..(slot + 1) * ff]);
+                            slack += scores[slot] * v.abs() / 128.0;
+                        }
+                        let (g, e) = (gout[i * h + r], eout[i * h + r]);
+                        assert!(
+                            (g - e).abs() <= 2e-3 + 1.6e-2 * e.abs() + slack,
+                            "{gty:?}/{dty:?} m {m} used {used} out[{i}][{r}]: {g} vs {e} (slack {slack})"
+                        );
+                    }
+                }
             }
         }
     }
