@@ -191,35 +191,6 @@ void g4_load_q(uint64_t Q, uint lane, out vec4 q[2][G4_V4]) {
             q[h][j] = F32x4(Q + 4u * (uint64_t(h) * G4_D + G4_PER * lane)).v[j];
 }
 
-// A lane's slice of a cache row (at `at`) as floats.
-void g4_load_row(uint64_t at, uint lane, out vec4 r[G4_V4]) {
-    [[unroll]] for (uint j = 0u; j < G4_V4 / 2u; j++) {
-        const uvec4 w = U32x4(at).v[j];
-        r[2u * j] = vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
-        r[2u * j + 1u] = vec4(unpackHalf2x16(w.z), unpackHalf2x16(w.w));
-    }
-}
-
-// One key for both heads: scores from the K slice, then the online-softmax
-// update with the V slice.
-#define G4_KEY(krow, vrow)                                                    \
-    {                                                                         \
-        vec4 kr[G4_V4];                                                       \
-        g4_load_row(krow, lane, kr);                                          \
-        vec4 vr[G4_V4];                                                       \
-        g4_load_row(vrow, lane, vr);                                          \
-        [[unroll]] for (uint h = 0u; h < 2u; h++) {                           \
-            float dot = 0.0;                                                  \
-            [[unroll]] for (uint j = 0u; j < G4_V4; j++) dot += dot4(q[h][j], kr[j]); \
-            const float s = subgroupAdd(dot);                                 \
-            const float mn = max(mx[h], s);                                   \
-            const float a = exp(mx[h] - mn), e = exp(s - mn);                 \
-            sum[h] = sum[h] * a + e;                                          \
-            [[unroll]] for (uint j = 0u; j < G4_V4; j++) acc[h][j] = acc[h][j] * a + e * vr[j]; \
-            mx[h] = mn;                                                       \
-        }                                                                     \
-    }
-
 float dot4(vec4 a, vec4 b) { return (a.x * b.x + a.y * b.y) + (a.z * b.z + a.w * b.w); }
 #endif
 
@@ -261,20 +232,71 @@ void main() {
         [[unroll]] for (uint h = 0u; h < 2u; h++)
             [[unroll]] for (uint j = 0u; j < G4_V4; j++) q[h][j] *= F32x4(arg(4) + 4u * e0).v[j];
     }
-    const uint64_t k_base = turned ? arg(1) + 2u * (uint64_t(kv) * 2u * k_rot + (e0 < G4_D / 2u ? e0 : k_rot + e0 - G4_D / 2u))
-                                   : arg(2) + 2u * (uint64_t(kv) * G4_D + e0);
-    const uint64_t k_row = turned ? 2u * uint64_t(kvh) * 2u * k_rot : 2u * uint64_t(kvh) * G4_D;
-    const uint64_t v_base = arg(2) + 2u * (uint64_t(kv) * G4_D + e0);
-    const uint64_t v_row = 2u * uint64_t(kvh) * G4_D;
+    // 32-bit indices of 16-byte vectors from loop-invariant bases.
+    U32x4 kbuf = U32x4(turned ? arg(1) + 2u * uint64_t(kv) * 2u * k_rot : arg(2) + 2u * uint64_t(kv) * G4_D);
+    U32x4 vbuf = U32x4(arg(2) + 2u * uint64_t(kv) * G4_D);
+    const uint k_lane = (turned ? (e0 < G4_D / 2u ? e0 : k_rot + e0 - G4_D / 2u) : e0) / 8u;
+    const uint k_row = (turned ? kvh * 2u * k_rot : kvh * G4_D) / 8u;
+    const uint v_lane = e0 / 8u, v_row = kvh * G4_D / 8u;
     float mx[2] = float[2](-1.0 / 0.0, -1.0 / 0.0), sum[2] = float[2](0.0, 0.0);
     vec4 acc[2][G4_V4];
     [[unroll]] for (uint h = 0u; h < 2u; h++)
         [[unroll]] for (uint j = 0u; j < G4_V4; j++) acc[h][j] = vec4(0.0);
     const uint first = lo + 256u * c + 32u * sg;
     const uint last = min(first + 32u, pos + 1u);
-    [[dont_unroll]] for (uint key = first; key < last; key++) {
-        const uint64_t s = uint64_t(key % ring);
-        G4_KEY(k_base + s * k_row, v_base + s * v_row)
+    // G4_U keys a step, their loads first, and one rescale of the running
+    // sums a step; the slot walks the ring without a division; keys past
+    // `last` read the last one and weigh nothing (attention_decode_timing,
+    // a sliding-window layer 34.5 -> 24.3 us, 2026-11-15; four keys at a
+    // 512-wide head take too many registers).
+#ifdef KERNEL_gemma4_attn_decode_256
+#define G4_U 4u
+#else
+#define G4_U 2u
+#endif
+    uint slot = first % ring;
+    [[dont_unroll]] for (uint key = first; key < last; key += G4_U) {
+        vec4 kr[G4_U][G4_V4], vr[G4_U][G4_V4];
+        [[unroll]] for (uint u = 0u; u < G4_U; u++) {
+            uint su = slot + min(u, last - 1u - key);
+            su -= su >= ring ? ring : 0u;
+            [[unroll]] for (uint j = 0u; j < G4_V4 / 2u; j++) {
+                const uvec4 w = kbuf.v[su * k_row + k_lane + j];
+                kr[u][2u * j] = vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+                kr[u][2u * j + 1u] = vec4(unpackHalf2x16(w.z), unpackHalf2x16(w.w));
+            }
+            [[unroll]] for (uint j = 0u; j < G4_V4 / 2u; j++) {
+                const uvec4 w = vbuf.v[su * v_row + v_lane + j];
+                vr[u][2u * j] = vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+                vr[u][2u * j + 1u] = vec4(unpackHalf2x16(w.z), unpackHalf2x16(w.w));
+            }
+        }
+        [[unroll]] for (uint h = 0u; h < 2u; h++) {
+            float sc[G4_U];
+            float mn = mx[h];
+            [[unroll]] for (uint u = 0u; u < G4_U; u++) {
+                float dot = 0.0;
+                [[unroll]] for (uint j = 0u; j < G4_V4; j++) dot += dot4(q[h][j], kr[u][j]);
+                const float sd = subgroupAdd(dot);
+                sc[u] = key + u < last ? sd : -1.0 / 0.0;
+                mn = max(mn, sc[u]);
+            }
+            const float a = exp(mx[h] - mn);
+            sum[h] = sum[h] * a;
+            float e[G4_U];
+            [[unroll]] for (uint u = 0u; u < G4_U; u++) {
+                e[u] = exp(sc[u] - mn);
+                sum[h] += e[u];
+            }
+            [[unroll]] for (uint j = 0u; j < G4_V4; j++) {
+                vec4 t = acc[h][j] * a;
+                [[unroll]] for (uint u = 0u; u < G4_U; u++) t += e[u] * vr[u][j];
+                acc[h][j] = t;
+            }
+            mx[h] = mn;
+        }
+        slot += G4_U;
+        slot -= slot >= ring ? ring : 0u;
     }
     [[unroll]] for (uint h = 0u; h < 2u; h++) {
         if (lane == 0u) {
