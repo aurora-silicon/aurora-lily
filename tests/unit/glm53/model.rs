@@ -320,6 +320,49 @@ fn weight_inventory_lists_the_draft_head_once() {
     assert_eq!(weight_inventory(&mapped, Some(&inside)).len(), 3);
 }
 
+/// Known Q4_0 bytes for hand-made Q8_0 blocks: the first of two
+/// equal-magnitude extrema sets the scale's sign (both orders), values
+/// half a step from a rounding boundary round up, a -128 code, a zero
+/// scale (the scale then -0.0, as llama.cpp's max / -8 gives), a negative
+/// Q8_0 scale.
+#[test]
+fn q8_0_to_q4_0_known_blocks() {
+    // (Q8_0 scale bits, (index, code) pairs (others 0), Q4_0 scale bits,
+    // (index, nibble) pairs (others 8)).
+    #[allow(clippy::type_complexity)]
+    let cases: &[(u16, &[(usize, i8)], u16, &[(usize, u8)])] = &[
+        // x = 0.5 q: -8 first, then 8; d = 1.
+        (0x3800, &[(0, -16), (1, 1), (2, -1), (3, 3), (4, 16)], 0x3c00,
+            &[(0, 0), (1, 9), (2, 8), (3, 10), (4, 15)]),
+        // 8 first, then -8; d = -1.
+        (0x3800, &[(0, 16), (1, 1), (2, -1), (3, 3), (4, -16)], 0xbc00,
+            &[(0, 0), (1, 8), (2, 9), (3, 7), (4, 15)]),
+        // x = q / 128: -128 sets d = 0.125; 127 clamps; 64 -> 12.
+        (0x2000, &[(0, -128), (1, 127), (17, 64)], 0x3000,
+            &[(0, 0), (1, 15), (17, 12)]),
+        // A zero scale: every value 0.
+        (0x0000, &[(0, 100), (5, -7)], 0x8000, &[]),
+        // A negative Q8_0 scale: x = -0.5 q.
+        (0xb800, &[(0, 16), (1, -1)], 0x3c00, &[(0, 0), (1, 9)]),
+    ];
+    for (n, &(d8, codes, d4, nibbles)) in cases.iter().enumerate() {
+        let mut blk = [0u8; 34];
+        blk[..2].copy_from_slice(&d8.to_le_bytes());
+        for &(i, q) in codes {
+            blk[2 + i] = q as u8;
+        }
+        let mut want = [0x88u8; 18];
+        want[..2].copy_from_slice(&d4.to_le_bytes());
+        for &(i, q) in nibbles {
+            let byte = &mut want[2 + i % 16];
+            *byte = if i < 16 { (*byte & 0xf0) | q } else { (*byte & 0x0f) | (q << 4) };
+        }
+        let mut got = [0u8; 18];
+        q8_0_to_q4_0(&blk, &mut got);
+        assert_eq!(got, want, "case {n}");
+    }
+}
+
 /// Every staging path the engine uses fits the scratch it writes, at every
 /// row count it is called with: a verify pass (1 or 2 rows, up to
 /// MAX_ROWS), a decode step, a prefill run up to PREFILL_ROWS, the MTP
