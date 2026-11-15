@@ -1713,7 +1713,7 @@ impl Glm53Model {
                         self.bf16_input(ctx, pass, sc, &sc.fmid, cfg.ff_expert, m)?;
                     self.proj(ctx, pass, &[(sh_down, &sc.ffn_out)], &sc.fmid, xb, m)?;
                     pass.memory_barrier()?;
-                    k::moe_grouped(
+                    k::moe_grouped_dot(
                         ctx,
                         pass,
                         gate,

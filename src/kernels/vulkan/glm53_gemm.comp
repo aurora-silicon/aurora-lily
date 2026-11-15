@@ -88,6 +88,9 @@ uint glm53_bf16_bits(float f) {
 #ifndef GM_SUB
 #define GM_SUB 16u
 #endif
+#ifndef GM_DOT_ROWS
+#define GM_DOT_ROWS 4u
+#endif
 
 // Gemma 4's block types (glm53_gemm_q4_0, _q5_k, _q6_k, _iq4_nl, _iq2_s):
 // the dense GEMM with gd_decode8 taking 8 values of glm53_decode's 32-value
@@ -485,6 +488,8 @@ void main() {
 // SwiGLU of each pair (weights f32 at buffer 7) to Y as bfloat, the down
 // GEMM's operand; its params are 8 N, 9 K, 10 row_bytes, 11 x_shift,
 // 12 limit.
+// The last param (10, or 13 for the fused gate/up) is the most rows a tile
+// takes the register path with (at most GM_DOT_ROWS; 0: none).
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
     defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q4_k) || \
@@ -492,8 +497,10 @@ void main() {
 #ifdef KERNEL_glm53_gemm_moe_gate_up_iq2_xxs
 #define GM_GATE_UP 1
 #define GM_P 8u
+#define GM_DOT_ARG 13u
 #else
 #define GM_P 6u
+#define GM_DOT_ARG 10u
 #endif
 
 // Weights k .. k + 8 (k a multiple of 8) of `row`.
@@ -595,6 +602,35 @@ void main() {
     const uint64_t W = arg(1) + (uint64_t(expert) * N + n0) * row_bytes;
     [[unroll]] for (uint r = 0u; r < 4u; r++) wr[r] = W + uint64_t(min(4u * quad + r, N - 1u - n0)) * row_bytes;
 #endif
+    // An expert of at most GM_DOT_ROWS rows (a short prompt's experts: one
+    // to four rows each) skips the shared tile and the matrix units
+    // (glm53_moe_dot.glsl, a variant per row count); the products are the
+    // f32 weights' (the tile path rounds them to bfloat first).
+    // Only an expert's one tile: the pairs of an expert with more than a
+    // tile of them are split in an arbitrary order (glm53_moe_group), so the
+    // rows of a small last tile would vary from run to run.
+    const bool alone =
+        gl_WorkGroupID.y == 0u || U32(arg(4)).v[3u * (gl_WorkGroupID.y - 1u)] != expert;
+    if (alone && rows <= arg_u32(GM_DOT_ARG)) {
+        if (rows == 1u) {
+#define GM_DR 1u
+#include "glm53_moe_dot.glsl"
+#undef GM_DR
+        } else if (rows == 2u) {
+#define GM_DR 2u
+#include "glm53_moe_dot.glsl"
+#undef GM_DR
+        } else if (rows == 3u) {
+#define GM_DR 3u
+#include "glm53_moe_dot.glsl"
+#undef GM_DR
+        } else {
+#define GM_DR 4u
+#include "glm53_moe_dot.glsl"
+#undef GM_DR
+        }
+        return;
+    }
     // The subgroup's rows, and its lanes' rows of X, two per 16 (a row
     // past the tile's reads the tile's last and is not stored).
     const uint row0 = GM_SUB * sg;

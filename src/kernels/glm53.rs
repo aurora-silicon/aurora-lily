@@ -609,7 +609,7 @@ pub fn moe_grouped(
     let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
     moe_grouped_with(
         ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true, tiles,
+        experts, limit, true, tiles, 0,
     )
 }
 
@@ -646,7 +646,46 @@ pub fn moe_grouped_tiles(
 ) -> Result<()> {
     moe_grouped_with(
         ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true, tiles,
+        experts, limit, true, tiles, 0,
+    )
+}
+
+/// Most rows an expert's tile computes off the matrix units in
+/// [`moe_grouped_dot`] (the kernels' GM_DOT_ROWS).
+pub const MOE_DOT_ROWS: usize = 4;
+
+/// [`moe_grouped`] where an expert with at most [`MOE_DOT_ROWS`] rows is
+/// computed by register dot products of its decoded f32 weights and the
+/// rows' bfloat values instead of a tile on the matrix units: a short
+/// prompt's experts have one or two rows each, and their tiles cost almost
+/// as much as full ones. moe_grouped_timing (2026-11-15), a layer: 24-token
+/// density 2.46 -> 1.56 ms, 64-token 2.77 -> 1.93, from 256 unchanged; a
+/// cap of 8 rows lost at 256 (3.43 -> 4.68). The values are the same
+/// products up to the weights' bfloat rounding, summed in another order.
+/// GLM 5.3's prefill.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_dot(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    hidden: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+    limit: f32,
+) -> Result<()> {
+    let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
+    moe_grouped_with(
+        ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
+        experts, limit, true, tiles, MOE_DOT_ROWS,
     )
 }
 
@@ -673,7 +712,9 @@ fn moe_grouped_with(
     limit: f32,
     fuse_gate_up: bool,
     tiles: MoeTiles,
+    dot_rows: usize,
 ) -> Result<()> {
+    ensure!(dot_rows <= MOE_DOT_ROWS, "register path for {dot_rows} rows");
     let tile_rows = if tiles == MoeTiles::R64 { 64 } else { 128 };
     let r128 = tiles == MoeTiles::R128;
     let pairs = m * used;
@@ -735,6 +776,7 @@ fn moe_grouped_with(
                     &u32_bytes(w.cols),
                     &u32_bytes(w.row_bytes),
                     &u32_bytes(x_shift),
+                    &u32_bytes(dot_rows),
                 ],
                 Grid::Threadgroups {
                     groups: (n.div_ceil(64), max_tiles, 1),
@@ -782,6 +824,7 @@ fn moe_grouped_with(
                 &u32_bytes(gate.row_bytes),
                 &u32_bytes(shift),
                 &f32_bytes(limit),
+                &u32_bytes(dot_rows),
             ],
             Grid::Threadgroups {
                 groups: (ff / 32, max_tiles, 1),
