@@ -174,7 +174,7 @@ fn log_softmax(row: &[f32]) -> Vec<f32> {
 }
 
 fn score(
-    path: &PathBuf,
+    path: &std::path::Path,
     cases: &PathBuf,
     base: Option<&std::path::Path>,
     dump: Option<&std::path::Path>,
@@ -282,7 +282,7 @@ fn score(
     Ok(())
 }
 
-fn generate(path: &PathBuf, tokens: &[u32], n: usize) -> Result<()> {
+fn generate(path: &std::path::Path, tokens: &[u32], n: usize) -> Result<()> {
     ensure!(!tokens.is_empty(), "no tokens");
     let ctx = MetalContext::new()?;
     let model = Gemma4Model::load(&ctx, path)?;
@@ -311,7 +311,7 @@ fn generate(path: &PathBuf, tokens: &[u32], n: usize) -> Result<()> {
     Ok(())
 }
 
-fn chat(path: &PathBuf, prompt: &str, n: usize, think: bool) -> Result<()> {
+fn chat(path: &std::path::Path, prompt: &str, n: usize, think: bool) -> Result<()> {
     use lily::tokenizer::{ChatRender, Tokenizer};
     let tok = Tokenizer::from_gguf(path)?;
     let messages = [serde_json::json!({"role": "user", "content": prompt})];
@@ -347,7 +347,12 @@ fn chat(path: &PathBuf, prompt: &str, n: usize, think: bool) -> Result<()> {
     Ok(())
 }
 
-fn state_check(path: &PathBuf, cases: &PathBuf, n: usize, steps: usize) -> Result<()> {
+fn state_check(
+    path: &std::path::Path,
+    cases: &PathBuf,
+    n: usize,
+    steps: usize,
+) -> Result<()> {
     use lily::engine::DecodeStateApi;
     let text = std::fs::read_to_string(cases)?;
     let line = text.lines().find(|l| !l.starts_with('#')).context("no case")?;
@@ -397,7 +402,7 @@ fn state_check(path: &PathBuf, cases: &PathBuf, n: usize, steps: usize) -> Resul
     Ok(())
 }
 
-fn mem(path: &PathBuf, tokens: usize, checkpoints: usize) -> Result<()> {
+fn mem(path: &std::path::Path, tokens: usize, checkpoints: usize) -> Result<()> {
     use lily::engine::DecodeStateApi;
     let ctx = MetalContext::new()?;
     let base = ctx.current_allocated();
@@ -450,7 +455,7 @@ fn profile_report(steps: usize) {
 }
 
 fn bench(
-    path: &PathBuf,
+    path: &std::path::Path,
     text: &PathBuf,
     prompt_len: usize,
     n: usize,
@@ -506,7 +511,7 @@ fn bench(
 }
 
 fn spec(
-    path: &PathBuf,
+    path: &std::path::Path,
     question: &str,
     n: usize,
     drafts: usize,

@@ -31,12 +31,6 @@ fn host_copy(src: &Tensor, dst: &Tensor, bytes: usize) {
     }
 }
 
-fn clone_tensor(ctx: &MetalContext, t: &Tensor) -> Result<Tensor> {
-    let c = Tensor::zeros(ctx, t.shape(), t.dtype())?;
-    host_copy(t, &c, t.byte_len());
-    Ok(c)
-}
-
 /// Copies `bytes` from `src` at byte `from` to `dst` at byte `to` through
 /// host memory (both shared-storage, the GPU idle on them).
 fn host_copy_at(src: &Tensor, from: usize, dst: &Tensor, to: usize, bytes: usize) {
@@ -208,6 +202,8 @@ impl ScratchApi for Scratch {
         &self.next_token
     }
 
+    // The step's last row's logits, which is what the trait means.
+    #[allow(clippy::misnamed_getters)]
     fn logits(&self) -> &Tensor {
         &self.logits_last
     }
