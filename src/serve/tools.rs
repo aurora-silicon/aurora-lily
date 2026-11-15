@@ -206,11 +206,21 @@ pub fn parse_tool_call(block: &str, tools: &[ToolSchema]) -> Result<ParsedToolCa
 /// Gemma 4's string quote in tool calls.
 const GEMMA_QUOTE: &str = "<|\"|>";
 
+/// Nesting depth of objects and arrays a Gemma call may have.
+const GEMMA_MAX_DEPTH: usize = 32;
+
 /// One value of Gemma's call syntax (the chat template's `format_argument`
 /// with unquoted keys): a `<|"|>`-quoted string, `{key:value,...}`,
-/// `[value,...]`, or a bare word (number, `true`, `false`, `null`; anything
-/// else is kept as a string). Returns the value and the rest.
-fn gemma_value(s: &str) -> Result<(Value, &str)> {
+/// `[value,...]`, or a bare word (number, `true`, `false`, `null`; any
+/// other word is kept as a string). Returns the value and the rest, which
+/// is shorter: every value consumes input. A missing value, an unterminated
+/// string or structure, a closer of the other kind, a missing separator and
+/// nesting past [`GEMMA_MAX_DEPTH`] are errors.
+fn gemma_value(s: &str, depth: usize) -> Result<(Value, &str)> {
+    anyhow::ensure!(
+        depth <= GEMMA_MAX_DEPTH,
+        "Gemma call nested past {GEMMA_MAX_DEPTH}"
+    );
     let s = s.trim_start();
     if let Some(rest) = s.strip_prefix(GEMMA_QUOTE) {
         let end = rest.find(GEMMA_QUOTE).context("unterminated Gemma string")?;
@@ -220,24 +230,23 @@ fn gemma_value(s: &str) -> Result<(Value, &str)> {
         ));
     }
     if let Some(rest) = s.strip_prefix('{') {
-        let (map, rest) = gemma_object(rest)?;
+        let (map, rest) = gemma_object(rest, depth + 1)?;
         return Ok((Value::Object(map), rest));
     }
-    if let Some(mut rest) = s.strip_prefix('[') {
-        let mut items = Vec::new();
-        loop {
-            rest = rest.trim_start();
-            if let Some(r) = rest.strip_prefix(']') {
-                return Ok((Value::Array(items), r));
-            }
-            let (v, r) = gemma_value(rest)?;
-            items.push(v);
-            rest = r.trim_start();
-            rest = rest.strip_prefix(',').unwrap_or(rest);
-        }
+    if let Some(rest) = s.strip_prefix('[') {
+        let (items, rest) = gemma_array(rest, depth + 1)?;
+        return Ok((Value::Array(items), rest));
     }
-    let end = s.find([',', '}', ']']).unwrap_or(s.len());
-    let word = s[..end].trim();
+    let end = s
+        .find(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | ':' | '{' | '}' | '[' | ']')
+        })
+        .unwrap_or(s.len());
+    let word = &s[..end];
+    anyhow::ensure!(
+        !word.is_empty() && !word.contains(GEMMA_QUOTE),
+        "a Gemma value is missing"
+    );
     let v = match word {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
@@ -249,25 +258,62 @@ fn gemma_value(s: &str) -> Result<(Value, &str)> {
     Ok((v, &s[end..]))
 }
 
-/// The pairs of an object after its `{`, up to and including its `}`.
-fn gemma_object(mut s: &str) -> Result<(Map<String, Value>, &str)> {
-    let mut map = Map::new();
+/// The items of an array after its `[`, up to and including its `]`.
+fn gemma_array(s: &str, depth: usize) -> Result<(Vec<Value>, &str)> {
+    let mut items = Vec::new();
+    let mut s = s.trim_start();
+    if let Some(r) = s.strip_prefix(']') {
+        return Ok((items, r));
+    }
     loop {
-        s = s.trim_start();
-        if let Some(r) = s.strip_prefix('}') {
+        let (v, r) = gemma_value(s, depth)?;
+        items.push(v);
+        let r = r.trim_start();
+        if let Some(r) = r.strip_prefix(']') {
+            return Ok((items, r));
+        }
+        s = r.strip_prefix(',').context("a Gemma array lacks a , or its ]")?;
+    }
+}
+
+/// The pairs of an object after its `{`, up to and including its `}`.
+fn gemma_object(s: &str, depth: usize) -> Result<(Map<String, Value>, &str)> {
+    anyhow::ensure!(
+        depth <= GEMMA_MAX_DEPTH,
+        "Gemma call nested past {GEMMA_MAX_DEPTH}"
+    );
+    let mut map = Map::new();
+    let mut s = s.trim_start();
+    if let Some(r) = s.strip_prefix('}') {
+        return Ok((map, r));
+    }
+    loop {
+        // The key: quoted, or a run of characters up to its `:`.
+        let (key, r) = match s.strip_prefix(GEMMA_QUOTE) {
+            Some(r) => {
+                let end = r.find(GEMMA_QUOTE).context("unterminated Gemma key")?;
+                (&r[..end], &r[end + GEMMA_QUOTE.len()..])
+            }
+            None => {
+                let end = s.find([':', ',', '{', '}', '[', ']']).unwrap_or(s.len());
+                (s[..end].trim(), &s[end..])
+            }
+        };
+        anyhow::ensure!(!key.is_empty(), "a Gemma object key is missing");
+        let r = r
+            .trim_start()
+            .strip_prefix(':')
+            .context("a Gemma object key lacks its :")?;
+        let (v, r) = gemma_value(r, depth)?;
+        map.insert(key.to_string(), v);
+        let r = r.trim_start();
+        if let Some(r) = r.strip_prefix('}') {
             return Ok((map, r));
         }
-        let colon = s.find(':').context("Gemma object key without a value")?;
-        let key = s[..colon].trim();
-        let key = key
-            .strip_prefix(GEMMA_QUOTE)
-            .and_then(|k| k.strip_suffix(GEMMA_QUOTE))
-            .unwrap_or(key);
-        let (v, r) = gemma_value(&s[colon + 1..])?;
-        map.insert(key.to_string(), v);
-        s = r.trim_start();
-        s = s.strip_prefix(',').unwrap_or(s);
-        anyhow::ensure!(!s.is_empty(), "unterminated Gemma object");
+        s = r
+            .strip_prefix(',')
+            .context("a Gemma object lacks a , or its }")?
+            .trim_start();
     }
 }
 
@@ -289,7 +335,7 @@ pub fn parse_gemma_tool_call(
     if name.is_empty() || !name.chars().all(is_name_char) {
         bail!("Gemma tool call has no function name");
     }
-    let (mut arguments, tail) = gemma_object(&rest[brace + 1..])?;
+    let (mut arguments, tail) = gemma_object(&rest[brace + 1..], 1)?;
     if !tail.trim().is_empty() {
         bail!("text after a Gemma tool call");
     }

@@ -274,4 +274,54 @@ fn parses_gemma_calls() {
     assert_eq!(call.arguments, "{}");
     assert!(parse_gemma_tool_call("I will call it", &schemas()).is_err());
     assert!(parse_gemma_tool_call("call:read_file{path:", &schemas()).is_err());
+    // Whitespace around the separators, a quoted key, nesting at the limit.
+    let call = parse_gemma_tool_call(
+        &format!("call:f{{ a : [ 1 , 2 ] , {q}b c{q} : {q}x{q} }}"),
+        &schemas(),
+    )
+    .expect("spaced");
+    assert_eq!(call.arguments, r#"{"a":[1,2],"b c":"x"}"#);
+    let deep = format!("call:f{{x:{}1{}}}", "[".repeat(30), "]".repeat(30));
+    parse_gemma_tool_call(&deep, &schemas()).expect("30 levels");
+}
+
+/// Malformed Gemma calls are errors, returned promptly (a parse that made
+/// no progress used to loop forever): truncated or mismatched arrays and
+/// objects, missing values, keys or separators, unterminated strings, and
+/// nesting past the limit.
+#[test]
+fn malformed_gemma_calls_are_errors_promptly() {
+    let q = "<|\"|>";
+    let deep = format!("call:f{{x:{}1{}}}", "[".repeat(100_000), "]".repeat(100_000));
+    let cases = [
+        "call:f{x:[1}".to_string(),
+        "call:f{x:[".to_string(),
+        "call:f{x:[1,".to_string(),
+        "call:f{x:[1 2]}".to_string(),
+        "call:f{x:[,]}".to_string(),
+        "call:f{x:{a:1]}".to_string(),
+        "call:f{x:}".to_string(),
+        "call:f{x:,y:1}".to_string(),
+        "call:f{x:1 y:2}".to_string(),
+        "call:f{x:1,}".to_string(),
+        "call:f{:1}".to_string(),
+        "call:f{x 1}".to_string(),
+        "call:f{x:1".to_string(),
+        format!("call:f{{x:{q}open}}"),
+        format!("call:f{{{q}key:1}}"),
+        "call:f{x:[1]]}".to_string(),
+        deep,
+    ];
+    for case in cases {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = case.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(parse_gemma_tool_call(&input, &[]).map(|c| c.arguments));
+        });
+        let shown: String = case.chars().take(40).collect();
+        match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => assert!(result.is_err(), "{shown}: {result:?}"),
+            Err(_) => panic!("{shown}: no answer within a second"),
+        }
+    }
 }
