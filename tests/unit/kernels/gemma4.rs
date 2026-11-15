@@ -34,8 +34,12 @@ fn run(ctx: &MetalContext, f: impl FnOnce(&ComputePass<'_>)) {
     pass.commit_wait().expect("commit");
 }
 
-/// Random blocks with small scales (Q8_0, IQ4_NL, Q5_K, IQ2_XXS).
+/// Random blocks with small scales (Q8_0, IQ4_NL, Q4_K, Q5_K, Q6_K,
+/// IQ2_XXS, IQ2_S; F32 values in -0.1..0.1).
 fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
+    if ty == GgmlType::F32 {
+        return (0..values).flat_map(|_| rng.gen_range(-0.1f32..0.1).to_le_bytes()).collect();
+    }
     let nb = values / ty.block_values();
     let bb = ty.block_bytes();
     let mut b: Vec<u8> = (0..nb * bb).map(|_| rng.r#gen()).collect();
@@ -44,10 +48,11 @@ fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
     };
     for blk in b.chunks_exact_mut(bb) {
         match ty {
-            GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Iq2Xxs => {
+            GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Iq2Xxs | GgmlType::Iq2S => {
                 put(blk, 0, rng.gen_range(0.001..0.01))
             }
-            GgmlType::Q5K => {
+            GgmlType::Q6K => put(blk, 208, rng.gen_range(0.001..0.01)),
+            GgmlType::Q4K | GgmlType::Q5K => {
                 put(blk, 0, rng.gen_range(0.001..0.01));
                 put(blk, 2, rng.gen_range(0.001..0.01));
             }
@@ -523,6 +528,115 @@ fn moe_timing() {
     }
 }
 
+/// Without matrix units (an M4) a prompt run's GEMMs are sgemm.comp's, f32
+/// throughout: the dense GEMM over the block types of Gemma's files and the
+/// grouped experts against f32 CPU sums, at shapes with partial tiles in
+/// both directions. Each output within 2^-14 of the magnitudes it sums
+/// (the summation order). On a device with matrix units these paths are
+/// not taken and the test returns.
+#[test]
+fn gemms_without_matrix_units_match_cpu() {
+    let ctx = ctx();
+    if ctx.matrix_units() {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(31);
+    let tol = 2f32.powi(-14);
+    for (ty, cols, rows, m) in [
+        (GgmlType::Q8_0, 2112usize, 200usize, 70usize),
+        (GgmlType::Q5K, 2816, 130, 129),
+        (GgmlType::Q6K, 2816, 72, 64),
+        (GgmlType::Q4K, 512, 64, 5),
+        (GgmlType::F32, 2816, 128, 256),
+        (GgmlType::Iq4Nl, 704, 96, 65),
+        (GgmlType::Iq2Xxs, 512, 66, 33),
+        (GgmlType::Iq2S, 512, 64, 100),
+    ] {
+        let raw = random_blocks(&mut rng, ty, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+        let wf = decode(ty, &raw);
+        let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+        let tx = tensor(&ctx, &x);
+        let y = zeros(&ctx, m * rows);
+        run(&ctx, |p| crate::kernels::glm53::gemm(&ctx, p, &w, &tx, &y, m).unwrap());
+        let got = y.to_f32().unwrap();
+        for i in 0..m {
+            let xi = &x[i * cols..(i + 1) * cols];
+            for n in 0..rows {
+                let wn = &wf[n * cols..(n + 1) * cols];
+                let want = dot(wn, xi);
+                let bound: f32 = wn.iter().zip(xi).map(|(a, b)| (a * b).abs()).sum();
+                let err = (got[i * rows + n] - want).abs();
+                assert!(
+                    err <= bound * tol + 1e-6,
+                    "{ty:?} row {i} col {n}: {} vs {want}",
+                    got[i * rows + n]
+                );
+            }
+        }
+    }
+    let (hid, ff, ne, used, m) = (512, 128, 12, 8, 140);
+    for (gt, dt) in [
+        (GgmlType::Iq2Xxs, GgmlType::Iq4Nl),
+        (GgmlType::Iq2S, GgmlType::Iq4Nl),
+        (GgmlType::Q5K, GgmlType::Q8_0),
+    ] {
+        let gu_raw = random_blocks(&mut rng, gt, ne * 2 * ff * hid);
+        let dn_raw = random_blocks(&mut rng, dt, ne * hid * ff);
+        let gu = QWeight::from_bytes(&ctx, &gu_raw, gt, hid, ne * 2 * ff).unwrap();
+        let dn = QWeight::from_bytes(&ctx, &dn_raw, dt, ff, ne * hid).unwrap();
+        let (guw, dnw) = (decode(gt, &gu_raw), decode(dt, &dn_raw));
+        let x = f32s(&mut rng, m * hid, -1.0, 1.0);
+        let sel: Vec<u32> =
+            (0..m * used).map(|i| ((i * 7 + i / used) % ne) as u32).collect();
+        let wts = f32s(&mut rng, m * used, 0.05, 0.2);
+        let (tx, ts, tw) = (tensor(&ctx, &x), u32s(&ctx, &sel), tensor(&ctx, &wts));
+        let grouped = zeros(&ctx, m * hid);
+        let sc = MoeGroupScratch::new(&ctx, m, used, ne, ff, hid).unwrap();
+        run(&ctx, |p| {
+            moe_grouped(
+                &ctx, p, &gu, &dn, ff, &tx, &ts, &tw, &grouped, &sc, m, used, ne,
+            )
+            .unwrap()
+        });
+        let got = grouped.to_f32().unwrap();
+        for i in 0..m {
+            let xi = &x[i * hid..(i + 1) * hid];
+            let (mut want, mut bound) = (vec![0f32; hid], vec![0f32; hid]);
+            for s in 0..used {
+                let e = sel[i * used + s] as usize;
+                let w = &guw[e * 2 * ff * hid..(e + 1) * 2 * ff * hid];
+                // The GeGLU's inputs to within their own sums' order: the
+                // bound carries the gate and up magnitudes.
+                let v: Vec<(f32, f32)> = (0..ff)
+                    .map(|j| {
+                        let (gw, uw) = (&w[j * hid..(j + 1) * hid], &w[(ff + j) * hid..][..hid]);
+                        let g = dot(gw, xi);
+                        let u = dot(uw, xi);
+                        let mag = |r: &[f32]| r.iter().zip(xi).map(|(a, b)| (a * b).abs()).sum::<f32>();
+                        let wt = wts[i * used + s];
+                        (wt * (gelu(g) * u), wt * (mag(gw) + g.abs()) * (mag(uw) + u.abs()))
+                    })
+                    .collect();
+                for r in 0..hid {
+                    let d = &dnw[(e * hid + r) * ff..(e * hid + r + 1) * ff];
+                    want[r] += d.iter().zip(&v).map(|(a, b)| a * b.0).sum::<f32>();
+                    bound[r] += d.iter().zip(&v).map(|(a, b)| (a * b.0).abs() + a.abs() * b.1).sum::<f32>();
+                }
+            }
+            for r in 0..hid {
+                let err = (got[i * hid + r] - want[r]).abs();
+                assert!(
+                    err <= bound[r] * tol + 1e-6,
+                    "{gt:?}/{dt:?} row {i} col {r}: {} vs {}",
+                    got[i * hid + r],
+                    want[r]
+                );
+            }
+        }
+    }
+}
+
 /// The grouped experts of a prompt run against a CPU reference that rounds
 /// as the kernels do: weights to bfloat to nearest with ties away from zero,
 /// the input and the weighted GeGLU output to nearest even, f32 sums. Each
@@ -533,6 +647,11 @@ fn moe_timing() {
 #[test]
 fn moe_grouped_matches_a_bf16_reference() {
     let ctx = ctx();
+    // Without matrix units the operands stay f32
+    // (gemms_without_matrix_units_match_cpu).
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(21);
     let (hid, ff, ne, used, m) = (512, 128, 12, 8, 140);
     let bfw = |v: f32| f32::from_bits((v.to_bits() + 0x8000) & 0xffff_0000);
