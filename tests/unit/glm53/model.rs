@@ -150,6 +150,92 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
     }
 }
 
+/// Two sessions taking turns through one scratch's KDA alternates (A
+/// rejects, B rejects, A rejects; each verify finished before the other
+/// session runs): a verify's writes to the alternates never change the idle
+/// session or a saved snapshot; snapshot, restore and fork after several
+/// swaps; state sizes unchanged by swaps; one session reset and dropped
+/// while the other lives on. A "verify" here writes the alternates as the
+/// verify pass's first row would, a "reject" is `take_kda_snapshots`.
+#[test]
+fn sessions_share_the_scratch_alternates_safely() {
+    use crate::engine::DecodeStateApi;
+    let ctx = MetalContext::new().expect("context");
+    let cfg = Config::glm53_flash();
+    let mut sc = Scratch::new(&ctx, &cfg).expect("scratch");
+    fn kda(st: &Glm53State) -> Vec<&Tensor> {
+        st.layers
+            .iter()
+            .flat_map(|l| match l {
+                LayerState::Kda { conv, s } => vec![conv, s],
+                LayerState::Dsa { .. } => vec![],
+            })
+            .collect()
+    }
+    fn alternates(sc: &Scratch) -> Vec<&Tensor> {
+        sc.kda_alt.iter().flatten().flat_map(|(c, s)| [c, s]).collect()
+    }
+    let word = |k: u32, t: usize, i: usize| {
+        0x3f80_0000 ^ ((k << 26) | ((t as u32) << 18) | (i as u32 & 0x3ffff))
+    };
+    let fill = |ts: &[&Tensor], k: u32| {
+        for (t, x) in ts.iter().enumerate() {
+            let v: Vec<f32> = (0..x.numel()).map(|i| f32::from_bits(word(k, t, i))).collect();
+            x.write_bytes(bytemuck::cast_slice(&v)).unwrap();
+        }
+    };
+    let check = |ts: &[&Tensor], k: u32, what: &str| {
+        for (t, x) in ts.iter().enumerate() {
+            for (i, g) in x.to_f32().unwrap().iter().enumerate() {
+                assert_eq!(g.to_bits(), word(k, t, i), "{what}: tensor {t} value {i}");
+            }
+        }
+    };
+    let mut a = Glm53State::new(&ctx, &cfg, 64).unwrap();
+    let mut b = Glm53State::new(&ctx, &cfg, 64).unwrap();
+    fill(&kda(&a), 1);
+    fill(&kda(&b), 2);
+    let (bytes_a, bytes_b) = (a.bytes(), b.bytes());
+    let snap_a = a.snapshot(&ctx).unwrap();
+    // A: verify, reject.
+    fill(&alternates(&sc), 3);
+    a.take_kda_snapshots(&mut sc);
+    check(&kda(&a), 3, "A after its reject");
+    check(&kda(&b), 2, "B idle");
+    // B: verify (into A's former tensors), reject.
+    fill(&alternates(&sc), 4);
+    check(&kda(&a), 3, "A idle through B's verify");
+    b.take_kda_snapshots(&mut sc);
+    check(&kda(&b), 4, "B after its reject");
+    // A again: verify (into B's former tensors), reject.
+    fill(&alternates(&sc), 5);
+    check(&kda(&b), 4, "B idle through A's verify");
+    a.take_kda_snapshots(&mut sc);
+    check(&kda(&a), 5, "A after its second reject");
+    assert_eq!((a.bytes(), b.bytes()), (bytes_a, bytes_b), "state sizes");
+    // The snapshot taken before the swaps still holds A's first values.
+    let mut c = Glm53State::new(&ctx, &cfg, 64).unwrap();
+    c.restore(&ctx, &snap_a).unwrap();
+    check(&kda(&c), 1, "snapshot from before the swaps");
+    // Snapshot, mutate, restore and fork after the swaps.
+    let snap = a.snapshot(&ctx).unwrap();
+    fill(&kda(&a), 6);
+    a.restore(&ctx, &snap).unwrap();
+    check(&kda(&a), 5, "restored after swaps");
+    c.restore(&ctx, &snap).unwrap();
+    check(&kda(&c), 5, "forked after swaps");
+    // B reset and dropped; A and the scratch carry on.
+    b.reset();
+    assert!(kda(&b).iter().all(|t| t.to_f32().unwrap().iter().all(|v| v.to_bits() == 0)));
+    check(&kda(&a), 5, "A through B's reset");
+    drop(b);
+    fill(&alternates(&sc), 7);
+    check(&kda(&a), 5, "A through a verify after B's drop");
+    a.take_kda_snapshots(&mut sc);
+    check(&kda(&a), 7, "A after a reject with B gone");
+    check(&kda(&c), 5, "the fork untouched");
+}
+
 /// The MTP draft head's requantization: a Q8_0 block as Q4_0 reads back
 /// (the GGUF reader's Q4_0) within half a Q4_0 step of the Q8_0 values (a
 /// whole step for values the format clamps); an all-zero block stays zero.
