@@ -86,14 +86,27 @@ void gm_decode8(uint64_t row, uint k, out float w[8]) {
         w[2u * i] = d * glm53_iq4nl_value((pair >> shift) & 0xfu);
         w[2u * i + 1u] = d * glm53_iq4nl_value((pair >> (8u + shift)) & 0xfu);
     }
+#elif defined(KERNEL_gemma4_gemm_moe_q5_k)
+    // Values k .. k + 8 of their 32-value sub-block j: nibbles of bytes
+    // 32 (j / 2) + l .., high bit j of bytes l .. (l = k % 32), as
+    // glm53_gemm_q5_k decodes them.
+    const uint64_t b = row + uint64_t(k >> 8u) * 176u;
+    const uint j = (k >> 5u) & 7u, l = k & 31u;
+    uint sc, mn;
+    glm53_k4_scale_min(b, j, sc, mn);
+    const uint dd = U32(b).v[0];
+    const float scale = glm53_h2f(dd & 0xffffu) * float(sc);
+    const float minv = glm53_h2f(dd >> 16u) * float(mn);
+    const uvec2 q = U32x2(b + 48u + (j >> 1u) * 32u + l).v[0] >> ((j & 1u) * 4u);
+    const uvec2 h = U32x2(b + 16u + l).v[0] >> j;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        const uint c = ((q[i >> 2u] >> (8u * (i & 3u))) & 0xfu) | (((h[i >> 2u] >> (8u * (i & 3u))) & 1u) << 4u);
+        w[i] = scale * float(c) - minv;
+    }
 #else
-    // Q5_K, IQ2_S: eight values of glm53_decode's 32.
+    // IQ2_S: eight values of glm53_decode's 32.
     float t[32];
-#ifdef KERNEL_gemma4_gemm_moe_q5_k
-    glm53_decode(GLM53_Q5_K, row, k >> 5u, t);
-#else
     glm53_decode(GLM53_IQ2_S, row, k >> 5u, t);
-#endif
     [[unroll]] for (uint q = 0u; q < 4u; q++) {
         if ((k & 24u) == 8u * q) {
             [[unroll]] for (uint i = 0u; i < 8u; i++) w[i] = t[8u * q + i];
