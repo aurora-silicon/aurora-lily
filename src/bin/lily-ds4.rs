@@ -485,11 +485,13 @@ fn bench(
             (h ^ u64::from(t)).wrapping_mul(0x100000001b3)
         });
         println!(
-            "run {run}: prompt {} prefill {pf:.2} s ({:.1} tok/s), decode {n} in {dt:.2} s ({:.2} tok/s, median {:.2} ms/step), digest {digest:016x}",
+            "run {run}: prompt {} prefill {pf:.2} s ({:.1} tok/s), decode {n} in {dt:.2} s ({:.2} tok/s, median {:.2} ms/step, p10 {:.2}, min {:.2}), digest {digest:016x}",
             prompt.len(),
             prompt.len() as f64 / pf,
             n as f64 / dt,
-            steps[steps.len() / 2]
+            steps[steps.len() / 2],
+            steps[steps.len() / 10],
+            steps[0]
         );
     }
     Ok(())
