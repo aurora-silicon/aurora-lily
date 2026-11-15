@@ -978,6 +978,35 @@ fn noncausal_block_attention_matches_cpu() {
                 1e-4,
             );
         }
+        // DSpark's call: the query norm and RoPE at each row's own position
+        // and the inverse RoPE folded in (attend_fused_raw), against the
+        // three steps; the block's common endpoint and the truncated ring
+        // (lo) as above.
+        let c = Config::deepseek4_flash();
+        let (plain, _) = tables(&c, 0, pos0 + m);
+        let tt = tensor(&ctx, &plain);
+        let (qa, qb) = (tensor(&ctx, &q), tensor(&ctx, &q));
+        let (sep, fused) = (
+            zeros(&ctx, m * heads * 512, DType::F32),
+            zeros(&ctx, m * heads * 512, DType::F32),
+        );
+        run(&ctx, |p| {
+            head_norm_rope(&ctx, p, &qa, &tt, pos0, m, heads, 512, 64, 1e-6, HeadOp::NormRope)
+                .unwrap();
+            p.memory_barrier().unwrap();
+            attend(&ctx, p, &qa, &trun, &tring, CompRows::None, &tsinks, &sep, m, heads, pos0, raw)
+                .unwrap();
+            p.memory_barrier().unwrap();
+            head_norm_rope(&ctx, p, &sep, &tt, pos0, m, heads, 512, 64, 0.0, HeadOp::InverseRope)
+                .unwrap();
+            let fuse = PromptFuse { table: &tt, t0: pos0, eps: 1e-6 };
+            attend_fused_raw(
+                &ctx, p, &qb, &trun, &tring, CompRows::None, &tsinks, &fused, m, heads, pos0,
+                raw, fuse,
+            )
+            .unwrap();
+        });
+        assert_close(&fused.to_f32().unwrap(), &sep.to_f32().unwrap(), 2e-6, 1e-4);
     }
 }
 

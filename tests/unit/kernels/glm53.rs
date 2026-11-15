@@ -2395,6 +2395,45 @@ fn gemm_bx_batched_matches_gemm_with() {
     assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
 }
 
+/// DeepSeek V4's grouped output projection as it runs (a dispatch a group
+/// over offset views of the weights, input and output) gives the batched
+/// grid's results bit for bit: eight groups, 300 rows (a partial 256-row
+/// tile), the last group's last row at the tensors' ends.
+#[test]
+fn gemm_bx_split_groups_match_batched() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(83);
+    let (groups, per, cols, m) = (8, 128, 256, 300);
+    let raw = random_blocks(&mut rng, GgmlType::Q8_0, groups * per * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, groups * per).unwrap();
+    let x = tensor(&ctx, &f32s(&mut rng, m * groups * cols, -1.0, 1.0));
+    let xb = Tensor::zeros(&ctx, &[m * groups * cols], DType::BF16).unwrap();
+    let (y, ys) = (zeros(&ctx, m * groups * per), zeros(&ctx, m * groups * per));
+    let l = GemmLayout {
+        ldx: groups * cols,
+        ldy: groups * per,
+        batches: groups,
+        x_batch: cols,
+        w_batch: per,
+        y_batch: per,
+    };
+    let one = GemmLayout { batches: 1, x_batch: 0, w_batch: 0, y_batch: 0, ..l };
+    run(&ctx, |p| {
+        to_bf16(&ctx, p, &x, &xb, m * groups * cols).unwrap();
+        p.memory_barrier().unwrap();
+        gemm_bx_with(&ctx, p, &w, &xb, &y, m, per, l).unwrap();
+        for g in 0..groups {
+            let t = w.t.view(g * per * w.row_bytes, &[per * w.row_bytes]).unwrap();
+            let wg = QWeight::new(t, GgmlType::Q8_0, cols, per).unwrap();
+            let xv = xb.view(g * cols, &[xb.numel() - g * cols]).unwrap();
+            let yv = ys.view(g * per, &[ys.numel() - g * per]).unwrap();
+            gemm_bx_with(&ctx, p, &wg, &xv, &yv, m, per, one).unwrap();
+        }
+    });
+    let (a, b) = (y.to_f32().unwrap(), ys.to_f32().unwrap());
+    assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+}
+
 #[test]
 fn gemm_batched_matches_grouped_gemv() {
     // attn_k_b's shape for 4 heads, 70 rows: per head a 512 x 256 block.
