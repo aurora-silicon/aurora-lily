@@ -228,6 +228,9 @@ fn attention_prefill_matches_cpu() {
     attention_case(256, 8, 40, 100, 50, false);
     attention_case(512, 2, 0, 70, 37, true);
     attention_case(256, 8, 1024, 0, 20, false);
+    // Whole prompt runs: a ring that wraps, a global layer deep in its cache.
+    attention_case(256, 8, 1024, 1100, 256, false);
+    attention_case(512, 2, 0, 500, 200, true);
 }
 
 #[test]

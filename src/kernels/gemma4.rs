@@ -250,8 +250,8 @@ pub fn attn_partial_len(rows: usize, heads: usize, d: usize, chunks: usize) -> u
 
 /// Attention of `m` rows at positions `pos0..` (queries `q`, normed and
 /// rotated) over the caches, scale 1, into `heads` (`[m][heads][d]`):
-/// split over key chunks and merged for a few rows, one pass over the keys
-/// per row for a prompt run (`m > small_rows`).
+/// split over key chunks and merged for a few rows, flash attention on the
+/// matrix units for a prompt run (`m > small_rows`).
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &MetalContext,
@@ -276,6 +276,32 @@ pub fn attention(
     } else {
         ensure!(a.ring >= pos0 + m, "cache of {} for position {}", a.ring, pos0 + m);
     }
+    if m > small_rows {
+        // On the matrix units (gemma4_attn.comp): sixteen rows of a KV
+        // head's query heads a threadgroup.
+        let pipeline = ctx.pipeline(
+            a.name(["gemma4_attn_mu_256", "gemma4_attn_mu_512"])?,
+            SOURCE,
+            MslVersion::V3_1,
+        )?;
+        let group = a.heads / a.kv_heads;
+        return pass.dispatch_at(
+            &pipeline,
+            &[q.binding(), a.k_cache.binding(), a.v_cache.binding(), heads.binding()],
+            &[
+                &u32_bytes(a.heads),
+                &u32_bytes(a.kv_heads),
+                &u32_bytes(pos0),
+                &u32_bytes(a.ring),
+                &u32_bytes(a.window),
+                &u32_bytes(m),
+            ],
+            Grid::Threadgroups {
+                groups: ((m * group).div_ceil(16), a.kv_heads, 1),
+                threadgroup: (128, 1, 1),
+            },
+        );
+    }
     let common = [
         u32_bytes(d),
         u32_bytes(a.heads),
@@ -284,25 +310,6 @@ pub fn attention(
         u32_bytes(a.ring),
         u32_bytes(a.window),
     ];
-    if m > small_rows {
-        let pipeline = ctx.pipeline(
-            a.name(["gemma4_attn_prefill_256", "gemma4_attn_prefill_512"])?,
-            SOURCE,
-            MslVersion::V3_1,
-        )?;
-        let mb = u32_bytes(m);
-        let params: Vec<&[u8]> =
-            common.iter().map(|b| b.as_slice()).chain([mb.as_slice()]).collect();
-        return pass.dispatch_at(
-            &pipeline,
-            &[q.binding(), a.k_cache.binding(), a.v_cache.binding(), heads.binding()],
-            &params,
-            Grid::Threadgroups {
-                groups: (m.div_ceil(8), a.heads / 2, 1),
-                threadgroup: (256, 1, 1),
-            },
-        );
-    }
     let chunks = attn_chunks(a, pos0, m);
     ensure!(
         partial.numel() >= attn_partial_len(m, a.heads, d, chunks),
