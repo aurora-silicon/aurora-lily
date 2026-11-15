@@ -363,6 +363,26 @@ const COOPERATIVE_MATRIX2_FEATURES: vk::StructureType =
     vk::StructureType::from_raw(1000593000);
 const COOPERATIVE_MATRIX2_EXTENSION: &CStr = c"VK_NV_cooperative_matrix2";
 
+/// The SPIR-V capabilities a device without matrix units cannot run:
+/// BFloat16TypeKHR, BFloat16DotProductKHR, BFloat16CooperativeMatrixKHR,
+/// CooperativeMatrixKHR.
+const NEEDS_MATRIX_UNITS: [u32; 4] = [5116, 5117, 5118, 6022];
+
+/// The capabilities a SPIR-V module declares: its `OpCapability`
+/// instructions, which follow the 5-word header.
+fn spirv_capabilities(words: &[u32]) -> impl Iterator<Item = u32> + '_ {
+    let mut at = 5;
+    std::iter::from_fn(move || {
+        let (&first, &cap) = (words.get(at)?, words.get(at + 1)?);
+        let count = (first >> 16) as usize;
+        // OpCapability (17), two words; it precedes every other instruction.
+        (first & 0xffff == 17 && count == 2).then(|| {
+            at += 2;
+            cap
+        })
+    })
+}
+
 /// The device and what lives as long as it: shared by the context, its
 /// buffers and its two threads, destroyed with the last of them.
 struct Dev {
@@ -742,6 +762,17 @@ impl Dev {
         };
         let words = ash::util::read_spv(&mut std::io::Cursor::new(&bytes))
             .with_context(|| format!("SPIR-V of {name}"))?;
+        // Without matrix units the context enables neither bfloat nor the
+        // cooperative matrices: a module declaring them is invalid there,
+        // and Mesa's compiler fails on it or crashes the process.
+        if !self.matrix_units
+            && let Some(cap) =
+                spirv_capabilities(&words).find(|c| NEEDS_MATRIX_UNITS.contains(c))
+        {
+            bail!(
+                "kernel '{name}' needs matrix units (SPIR-V capability {cap}), which this GPU lacks"
+            );
+        }
         // SAFETY: `words` is a SPIR-V module.
         let module = unsafe {
             self.device.create_shader_module(
