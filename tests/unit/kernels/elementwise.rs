@@ -1216,6 +1216,38 @@ fn shared_stride_probe() {
     }
 }
 
+/// More GEMM inner-loop shapes (`pb_*`, tests/vulkan/peak_test.comp): a
+/// lane's 1 w vec4 against 8 or 12 activation values a k step, as shared
+/// vec4 loads or as subgroup broadcasts. FMA TFLOPS. Run with `--ignored
+/// --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn shared_shape_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    for (name, rows) in [("pb_lds8", 8usize), ("pb_lds12", 12), ("pb_bc8", 8), ("pb_bc12", 12)] {
+        let kernel = ctx.pipeline(name, "", MslVersion::V3_1).expect("kernel");
+        let (groups, rounds) = (1024usize, 256usize);
+        let mut best = f64::INFINITY;
+        for _ in 0..6 {
+            let pass = ctx.begin().expect("pass");
+            pass.dispatch_at(
+                &kernel,
+                &[out.binding()],
+                &[&u32_bytes(rounds)],
+                Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
+            )
+            .expect("dispatch");
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            best = best.min(t.gpu_end_secs - t.gpu_start_secs);
+        }
+        let fmas = (groups * 256 * rounds * 8 * rows * 4) as f64;
+        eprintln!("{name:<9} {:.3} TFLOPS of FMAs", 2.0 * fmas / best / 1e12);
+    }
+}
+
 /// Whether what a thread holds in registers changes what its instructions
 /// cost (`lv_fat<N>`: the Q8 unpack-and-dot loop with N more registers live
 /// across it), by threadgroup size: nanoseconds per unpacked word.

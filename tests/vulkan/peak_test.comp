@@ -149,3 +149,50 @@ void main() {
     if (s == 1234.5) U32(arg(0)).v[tid] = 1u;
 }
 #endif
+
+// More inner-loop shapes (shared_shape_probe): per k step a lane reads 1 w
+// vec4 of its own and PB_X activation values for PB_X x 4 FMAs, as vec4
+// loads the subgroup shares (pb_lds*) or as subgroup broadcasts of values
+// the lanes hold in registers (pb_bc*, one vec4 a lane loaded per round).
+#if defined(KERNEL_pb_lds8) || defined(KERNEL_pb_lds12) || defined(KERNEL_pb_bc8) || \
+    defined(KERNEL_pb_bc12)
+#if defined(KERNEL_pb_lds8) || defined(KERNEL_pb_bc8)
+#define PB_X 8
+#else
+#define PB_X 12
+#endif
+#if defined(KERNEL_pb_bc8) || defined(KERNEL_pb_bc12)
+#define PB_BC
+#endif
+shared vec4 pb_s[4096];
+void main() {
+    const uint rounds = arg_u32(1), tid = gl_LocalInvocationIndex;
+    const uint lane = tid & 31u, sg = tid >> 5u;
+    for (uint i = tid; i < 4096u; i += 256u) pb_s[i] = vec4(float(i) * 1e-4);
+    barrier();
+    vec4 acc[PB_X];
+    [[unroll]] for (uint i = 0u; i < PB_X; i++) acc[i] = vec4(0.0);
+    for (uint r = 0u; r < rounds; r++) {
+        const uint base = (r & 3u) * 8u;
+#ifdef PB_BC
+        // Lane l holds activation (row l % PB_X... ) values for the round.
+        const vec4 mine = pb_s[2048u + 64u * sg + base + lane];
+#endif
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            const vec4 w = pb_s[lane * 9u + base + k];
+#ifdef PB_BC
+            [[unroll]] for (uint i = 0u; i < PB_X; i++)
+                acc[i] = fma(vec4(subgroupBroadcast(mine[k & 3u], (k >> 2u) * PB_X + i)), w, acc[i]);
+#else
+            [[unroll]] for (uint g = 0u; g < PB_X / 4; g++) {
+                const vec4 xv = pb_s[2048u + 64u * sg + (PB_X / 4) * (base + k) + g];
+                [[unroll]] for (uint i = 0u; i < 4u; i++) acc[4u * g + i] = fma(vec4(xv[i]), w, acc[4u * g + i]);
+            }
+#endif
+        }
+    }
+    float s = 0.0;
+    [[unroll]] for (uint i = 0u; i < PB_X; i++) s += acc[i].x + acc[i].w;
+    if (s == 1234.5) U32(arg(0)).v[tid] = 1u;
+}
+#endif
