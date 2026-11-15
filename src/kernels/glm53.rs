@@ -534,6 +534,31 @@ impl MoeGroupScratch {
             down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
         })
     }
+
+    /// For runs of up to `rows` rows of `used` pairs whose IQ2_XXS gate and
+    /// up take the fused GEMM (DeepSeek V4's): no separate gate and up
+    /// outputs, the bfloat input `rows` rows long.
+    pub fn fused(
+        ctx: &MetalContext,
+        rows: usize,
+        used: usize,
+        experts: usize,
+        ff: usize,
+        hidden: usize,
+    ) -> Result<Self> {
+        let pairs = rows * used;
+        let max_tiles = pairs.div_ceil(64) + experts;
+        Ok(Self {
+            pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
+            tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
+            tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
+            xb: Tensor::zeros(ctx, &[rows * hidden], DType::BF16)?,
+            g: Tensor::zeros(ctx, &[1], DType::F32)?,
+            u: Tensor::zeros(ctx, &[1], DType::F32)?,
+            mid: Tensor::zeros(ctx, &[pairs * ff], DType::BF16)?,
+            down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
+        })
+    }
 }
 
 /// Routed experts over a run of `m` rows grouped by expert (prefill): each
@@ -743,6 +768,10 @@ fn moe_grouped_with(
             },
         )?;
     } else {
+        ensure!(
+            sc.g.numel() >= pairs * ff && sc.u.numel() >= pairs * ff,
+            "grouped MoE scratch without separate gate and up outputs"
+        );
         gemm_moe(gate, &sc.xb, &sc.g, ff, shift)?;
         gemm_moe(up, &sc.xb, &sc.u, ff, shift)?;
         pass.memory_barrier()?;

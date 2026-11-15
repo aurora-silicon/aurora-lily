@@ -477,7 +477,8 @@ impl Scratch {
         Ok(Self {
             tokens: u(m)?,
             h: f(m * cfg.hc_dim())?,
-            flat: f(m * cfg.hc_dim())?,
+            // The head's and DSpark's collapse input: at most EXACT_ROWS rows.
+            flat: f(EXACT_ROWS * cfg.hc_dim())?,
             hc_partial: f(m * k::hc_mix_groups(cfg.hidden) * 25)?,
             split: f(m * cfg.hc_mix())?,
             xn: f(m * cfg.hidden)?,
@@ -504,9 +505,10 @@ impl Scratch {
             rsel: u(m * cfg.n_expert_used)?,
             rw: f(m * cfg.n_expert_used)?,
             moe_mid: f(EXACT_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
-            moe_group: k::MoeGroupScratch::new(
+            moe_group: k::MoeGroupScratch::fused(
                 ctx,
-                m * cfg.n_expert_used,
+                m,
+                cfg.n_expert_used,
                 cfg.n_expert,
                 cfg.ff_expert,
                 cfg.hidden,
