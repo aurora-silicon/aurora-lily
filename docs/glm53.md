@@ -31,13 +31,18 @@ template are read from it).
 
 - `--cache-bytes 9G`: the session cache's floor for models with bf16 caches is
   8.6 GB; GLM's sessions are small (about 13 KB a token of context plus
-  0.3 GB of recurrent state), so this is a cap, not an allocation.
+  0.15 GB of recurrent state), so this is a cap, not an allocation. The KDA
+  states a verify pass keeps for a rejected draft are one shared set in the
+  scratch (another 0.15 GB), not every session's.
 - `--pin-weights off`: pinning would lock all 96.5 GB of weights in memory.
 - `--mtp-drafts 1`: speculative decoding with the model's own MTP block, one
-  draft a step. A draft is proposed only when its probability under the MTP
-  head (softmax at temperature 1 over the whole vocabulary, before the
-  request's penalties or truncation) is at least 0.3; otherwise the step is
-  an ordinary one-row step. This is an empirical scheduling heuristic for
+  draft a step. The draft's output head is a Q4_0 copy of the Q8_0 head,
+  requantized at load (about 0.36 GB more, only with speculation and a
+  Q8_0 head); the verify pass keeps the Q8_0 head and the sampling rule. A
+  draft is proposed only when its probability under that approximate head
+  (softmax at temperature 1 over the whole vocabulary, before the request's
+  penalties or truncation) is at least 0.3; otherwise the step is an
+  ordinary one-row step. This is an empirical scheduling heuristic for
   greedy decoding on the M5 Max (a two-row verify pass costs about 37 ms
   against 28 for one row, so a draft pays above about 30% acceptance;
   greedy drafts below 0.3 were accepted about a quarter of the time), not a
@@ -52,8 +57,10 @@ ends; a per-layer prefill pass processing 1 024 rows is one, and without
 Mesa's compute kick (aurora-silicon/mesa #260) the desktop's work can wait
 past the kernel driver's timeout. Run GLM on a Mesa with the kick.
 
-Memory: the 96.5 GB of weights in the page cache, about 1.5 GB of scratch
-for prefill runs of 1 024 rows, and the sessions.
+Memory: the 96.5 GB of weights in the page cache, the scratch for prefill
+runs (with the shared 0.15 GB of verify alternates), the 0.36 GB Q4_0 draft
+head when speculating, and the sessions. GLM does not plan its memory to
+`--memory-limit-gb`.
 
 ## What runs
 
