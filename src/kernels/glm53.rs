@@ -856,6 +856,59 @@ pub fn moe_gate_up(
 /// `add` when given: `out[i] = sum_s down_{sel[i][s]} mid[i * used + s]
 /// (+ add[i])`; `out` may be `add`.
 #[allow(clippy::too_many_arguments)]
+/// [`moe_gate_up`] for IQ2_XXS experts over `xh`, the activations as f16
+/// in the dot's pairing (DeepSeek V4's `x_f16_iq2`): half the activation
+/// bytes a task.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gate_up_xh(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    ff: usize,
+    xh: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    mid: &Tensor,
+    m: usize,
+    used: usize,
+    limit: f32,
+) -> Result<()> {
+    check_f32(&[weights, mid])?;
+    ensure!(xh.dtype() == DType::F16, "f16 expert activations");
+    ensure!(
+        gate.ty == GgmlType::Iq2Xxs && up.ty == gate.ty && gate.cols == up.cols && gate.rows == up.rows,
+        "f16-activation gate/up of {:?} experts",
+        gate.ty
+    );
+    ensure!(gate.rows.is_multiple_of(ff) && gate.cols.is_multiple_of(32), "expert shape");
+    ensure!(sel.dtype() == DType::U32 && sel.numel() >= m * used, "selection");
+    ensure!(xh.numel() >= m * gate.cols && mid.numel() >= m * used * ff, "expert buffers");
+    let pipeline = ctx.pipeline("glm53_moe_gate_up_iq2_xxs_xh", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            gate.t.binding(),
+            up.t.binding(),
+            xh.binding(),
+            sel.binding(),
+            weights.binding(),
+            mid.binding(),
+        ],
+        &[
+            &u32_bytes(gate.cols),
+            &u32_bytes(ff),
+            &u32_bytes(gate.row_bytes),
+            &u32_bytes(used),
+            &f32_bytes(limit),
+        ],
+        Grid::Threadgroups {
+            groups: (ff.div_ceil(8), m * used, 1),
+            threadgroup: (256, 1, 1),
+        },
+    )
+}
+
 pub fn moe_down(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,

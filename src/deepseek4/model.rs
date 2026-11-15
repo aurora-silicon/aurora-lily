@@ -423,6 +423,9 @@ pub struct Scratch {
     headsb: Tensor,
     lowb: Tensor,
     fmidb: Tensor,
+    /// Decode, verify and draft rows: the routed experts' input as f16
+    /// (`x_f16_iq2`, `moe_gate_up_xh`).
+    xh: Tensor,
 }
 
 /// A verify pass's per-layer rows (see [`Scratch::verify`]).
@@ -533,6 +536,7 @@ impl Scratch {
             headsb: b(m * cfg.q_dim())?,
             lowb: b(m * cfg.o_groups * cfg.o_lora)?,
             fmidb: b(m * cfg.ff_expert)?,
+            xh: Tensor::zeros(ctx, &[EXACT_ROWS * cfg.hidden], DType::F16)?,
         })
     }
 
@@ -1326,6 +1330,12 @@ impl Ds4Model {
         let lim = cfg.swiglu_limit;
         let used = cfg.n_expert_used;
         let xb = self.bf16_copy(ctx, pass, &sc.xn, &sc.xb, m, cfg.hidden)?;
+        // Decode-sized runs: the routed gate/up read their input as f16 (half
+        // the activation bytes; the kernel is bound by those loads).
+        let xh = m <= EXACT_ROWS && l.gate.ty == crate::gguf::GgmlType::Iq2Xxs;
+        if xh {
+            d::x_f16_iq2(ctx, pass, &sc.xn, &sc.xh, m, cfg.hidden)?;
+        }
         self.proj_b(ctx, pass, &[(&l.router, &sc.rlogits)], &sc.xn, xb, m)?;
         self.proj_b(
             ctx,
@@ -1382,20 +1392,37 @@ impl Ds4Model {
             )?;
             return pass.memory_barrier();
         }
-        k::moe_gate_up(
-            ctx,
-            pass,
-            &l.gate,
-            &l.up,
-            cfg.ff_expert,
-            &sc.xn,
-            &sc.rsel,
-            &sc.rw,
-            &sc.moe_mid,
-            m,
-            used,
-            lim,
-        )?;
+        if xh {
+            k::moe_gate_up_xh(
+                ctx,
+                pass,
+                &l.gate,
+                &l.up,
+                cfg.ff_expert,
+                &sc.xh,
+                &sc.rsel,
+                &sc.rw,
+                &sc.moe_mid,
+                m,
+                used,
+                lim,
+            )?;
+        } else {
+            k::moe_gate_up(
+                ctx,
+                pass,
+                &l.gate,
+                &l.up,
+                cfg.ff_expert,
+                &sc.xn,
+                &sc.rsel,
+                &sc.rw,
+                &sc.moe_mid,
+                m,
+                used,
+                lim,
+            )?;
+        }
         self.proj(ctx, pass, &[(&l.sh_down, &sc.ffn_out)], &sc.fmid, m)?;
         pass.memory_barrier()?;
         k::moe_down(

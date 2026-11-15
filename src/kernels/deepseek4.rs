@@ -47,6 +47,29 @@ pub fn rope_table(rope: &Rope, lo: usize, n: usize) -> Vec<f32> {
     t
 }
 
+/// `out` (F16) = the `m` rows of `k` values of `x` as f16 in the IQ2_XXS
+/// dot's pairing (of each 8 values, word p holds values p and p + 4): the
+/// input of `glm53::moe_gate_up_xh`.
+pub fn x_f16_iq2(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    out: &Tensor,
+    m: usize,
+    k: usize,
+) -> Result<()> {
+    check(&[x], DType::F32)?;
+    check(&[out], DType::F16)?;
+    ensure!(k.is_multiple_of(8) && x.numel() >= m * k && out.numel() >= m * k, "f16 activations");
+    let pipeline = ctx.pipeline("ds4_x_f16_iq2", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[x.binding(), out.binding()],
+        &[&u32_bytes(k)],
+        Grid::Threads { grid: (k / 8, m, 1), threadgroup: (64, 1, 1) },
+    )
+}
+
 /// Embeds `m` tokens (U32) from the F16 table into four streams each.
 pub fn embed(
     ctx: &MetalContext,

@@ -94,6 +94,25 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
+// Activations as f16 in the IQ2 dot's pairing (glm53_moe_gate_up_iq2_xxs_xh):
+// of each 8 values, word p holds values p and p + 4. Grid (K / 8, m).
+// Buffers: 0 x f32 [m][K], 1 out f16 [m][K]. Params: 2 K.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_x_f16_iq2
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint K = arg_u32(2);
+    const uint j = gl_GlobalInvocationID.x;
+    const uint i = gl_GlobalInvocationID.y;
+    if (8u * j >= K) return;
+    const uint at = i * (K / 8u) + j;
+    const vec4 a = F32x4(arg(0)).v[2u * at], b = F32x4(arg(0)).v[2u * at + 1u];
+    U32x4(arg(1)).v[at] = uvec4(packHalf2x16(vec2(a.x, b.x)), packHalf2x16(vec2(a.y, b.y)),
+                                packHalf2x16(vec2(a.z, b.z)), packHalf2x16(vec2(a.w, b.w)));
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Per-head RMSNorm without weight (when do_norm) then RoPE of the head's
 // last n_rot dims, in place, for heads of up to 512 values: the queries
 // (norm + rope), the attention output (inverse rope), the indexer queries

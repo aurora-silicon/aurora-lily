@@ -203,6 +203,43 @@ fn gemv_grouped_matches_cpu() {
     }
 }
 
+/// The routed gate/up over f16 activations (decode rows of DeepSeek V4)
+/// against the f32-activation kernel: six rows of six slots, within f16's
+/// rounding of the activations.
+#[test]
+fn moe_xh_matches_f32_kernel() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(81);
+    let (experts, hidden, ff, used, m) = (12, 512, 256, 6, 6);
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+    let sel: Vec<u32> = (0..m * used).map(|s| ((s * 7 + s / used) % experts) as u32).collect();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+    let (mid, mid_h) = (zeros(&ctx, m * used * ff), zeros(&ctx, m * used * ff));
+    let xh = Tensor::zeros(&ctx, &[m * hidden], DType::F16).unwrap();
+    run(&ctx, |p| {
+        moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid, m, used, 10.0).unwrap();
+        crate::kernels::deepseek4::x_f16_iq2(&ctx, p, &x, &xh, m, hidden).unwrap();
+        p.memory_barrier().unwrap();
+        moe_gate_up_xh(&ctx, p, &gw, &uw, ff, &xh, &tsel, &tw, &mid_h, m, used, 10.0)
+            .unwrap();
+    });
+    let (a, b) = (mid_h.to_f32().unwrap(), mid.to_f32().unwrap());
+    let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
+    for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+        // f16 activations: a half-ulp (2^-12) per product, with cancellation.
+        assert!((x - y).abs() <= 5e-3 * scale + 1e-3 * y.abs(), "mid {k}: {x} vs {y}");
+    }
+}
+
 #[test]
 fn moe_gate_up_and_down_match_cpu() {
     let ctx = ctx();
@@ -1966,27 +2003,32 @@ fn moe_timing() {
     let tw = tensor(&ctx, &vec![0.3f32; used]);
     let mid = zeros(&ctx, used * ff);
     let out = zeros(&ctx, hidden);
-    for (label, part) in [("gate_up", 0), ("down", 1)] {
+    let xh = Tensor::zeros(&ctx, &[hidden], DType::F16).unwrap();
+    run(&ctx, |p| crate::kernels::deepseek4::x_f16_iq2(&ctx, p, &x, &xh, 1, hidden).unwrap());
+    for (label, part) in [("gate_up", 0), ("down", 1), ("gate_up f16 x", 2)] {
         let mut best = f64::MAX;
         for _ in 0..5 {
             let pass = ctx.begin().unwrap();
             for r in 0..repeat {
                 let (g, u, d) = &layers[r % 4];
-                if part == 0 {
-                    moe_gate_up(
+                match part {
+                    0 => moe_gate_up(
                         &ctx, &pass, g, u, ff, &x, &tsel, &tw, &mid, 1, used, 10.0,
                     )
-                    .unwrap();
-                } else {
-                    moe_down(&ctx, &pass, d, hidden, &mid, &tsel, None, &out, 1, used)
-                        .unwrap();
+                    .unwrap(),
+                    1 => moe_down(&ctx, &pass, d, hidden, &mid, &tsel, None, &out, 1, used)
+                        .unwrap(),
+                    _ => moe_gate_up_xh(
+                        &ctx, &pass, g, u, ff, &xh, &tsel, &tw, &mid, 1, used, 10.0,
+                    )
+                    .unwrap(),
                 }
             }
             let t = std::time::Instant::now();
             pass.commit_wait().unwrap();
             best = best.min(t.elapsed().as_secs_f64());
         }
-        let bytes = if part == 0 { 2 * used * ff * 1056 } else { used * hidden * 672 };
+        let bytes = if part % 2 == 0 { 2 * used * ff * 1056 } else { used * hidden * 672 };
         let per = best / repeat as f64;
         println!(
             "moe {label:24} {:8.1} us  {:6.1} GB/s",
