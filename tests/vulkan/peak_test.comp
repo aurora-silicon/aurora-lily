@@ -126,21 +126,22 @@ void main() {
 // Threadgroup-memory loads by lane stride: per k step 2 broadcast vec4 of x
 // and 1 vec4 of w at lane * stride (vec4 units, param 2), 32 FMAs.
 #ifdef KERNEL_pl_stride
-shared vec4 pl_t[4096];
+// 2048 vec4s, the M4's 32 KB of threadgroup memory: w below 1024, x above.
+shared vec4 pl_t[2048];
 void main() {
     const uint rounds = arg_u32(1), stride = arg_u32(2), tid = gl_LocalInvocationIndex;
     const uint lane = tid & 31u, sg = tid >> 5u;
-    for (uint i = tid; i < 4096u; i += 256u) pl_t[i] = vec4(float(i) * 1e-4);
+    for (uint i = tid; i < 2048u; i += 256u) pl_t[i] = vec4(float(i) * 1e-4);
     barrier();
     vec4 acc[8];
     [[unroll]] for (uint i = 0u; i < 8u; i++) acc[i] = vec4(0.0);
-    const uint wl = (lane * stride) & 2047u;
+    const uint wl = lane * stride;
     for (uint r = 0u; r < rounds; r++) {
         const uint base = (r & 3u) * 8u;
         [[unroll]] for (uint k = 0u; k < 8u; k++) {
-            const vec4 w = pl_t[wl + base + k];
+            const vec4 w = pl_t[(wl + base + k) & 1023u];
             [[unroll]] for (uint g = 0u; g < 2u; g++) {
-                const vec4 xv = pl_t[2048u + 64u * sg + 2u * (base + k) + g];
+                const vec4 xv = pl_t[1024u + 64u * sg + 2u * (base + k) + g];
                 [[unroll]] for (uint i = 0u; i < 4u; i++) acc[4u * g + i] = fma(vec4(xv[i]), w, acc[4u * g + i]);
             }
         }
@@ -165,11 +166,12 @@ void main() {
 #if defined(KERNEL_pb_bc8) || defined(KERNEL_pb_bc12)
 #define PB_BC
 #endif
-shared vec4 pb_s[4096];
+// 2048 vec4s, the M4's 32 KB of threadgroup memory: w below 1024, x above.
+shared vec4 pb_s[2048];
 void main() {
     const uint rounds = arg_u32(1), tid = gl_LocalInvocationIndex;
     const uint lane = tid & 31u, sg = tid >> 5u;
-    for (uint i = tid; i < 4096u; i += 256u) pb_s[i] = vec4(float(i) * 1e-4);
+    for (uint i = tid; i < 2048u; i += 256u) pb_s[i] = vec4(float(i) * 1e-4);
     barrier();
     vec4 acc[PB_X];
     [[unroll]] for (uint i = 0u; i < PB_X; i++) acc[i] = vec4(0.0);
@@ -177,7 +179,7 @@ void main() {
         const uint base = (r & 3u) * 8u;
 #ifdef PB_BC
         // Lane l holds activation (row l % PB_X... ) values for the round.
-        const vec4 mine = pb_s[2048u + 64u * sg + base + lane];
+        const vec4 mine = pb_s[1024u + 64u * sg + base + lane];
 #endif
         [[unroll]] for (uint k = 0u; k < 8u; k++) {
             const vec4 w = pb_s[lane * 9u + base + k];
@@ -186,7 +188,7 @@ void main() {
                 acc[i] = fma(vec4(subgroupBroadcast(mine[k & 3u], (k >> 2u) * PB_X + i)), w, acc[i]);
 #else
             [[unroll]] for (uint g = 0u; g < PB_X / 4; g++) {
-                const vec4 xv = pb_s[2048u + 64u * sg + (PB_X / 4) * (base + k) + g];
+                const vec4 xv = pb_s[1024u + 64u * sg + (PB_X / 4) * (base + k) + g];
                 [[unroll]] for (uint i = 0u; i < 4u; i++) acc[4u * g + i] = fma(vec4(xv[i]), w, acc[4u * g + i]);
             }
 #endif
