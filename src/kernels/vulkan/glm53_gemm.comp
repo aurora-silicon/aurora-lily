@@ -147,6 +147,24 @@ uint gm_round_w(float f) { return floatBitsToUint(f) + 0x8000u; }
 // Weights k .. k + 8 (k a multiple of 8) of `row`, as glm53_decode gives
 // them.
 void gd_decode8(uint64_t row, uint k, out float w[8]) {
+#ifdef KERNEL_glm53_gemm_q5_k
+    // Q5_K values k .. k + 8 of their 32-value sub-block j: nibbles of
+    // bytes 32 (j / 2) + l .., high bit j of bytes l .. (l = k % 32).
+    const uint64_t b = row + uint64_t(k >> 8u) * 176u;
+    const uint j = (k >> 5u) & 7u, l = k & 31u;
+    uint sc, mn;
+    glm53_k4_scale_min(b, j, sc, mn);
+    const uint dd = U32(b).v[0];
+    const float scale = glm53_h2f(dd & 0xffffu) * float(sc);
+    const float minv = glm53_h2f(dd >> 16u) * float(mn);
+    const uvec2 q = U32x2(b + 48u + (j >> 1u) * 32u + l).v[0] >> ((j & 1u) * 4u);
+    const uvec2 h = U32x2(b + 16u + l).v[0] >> j;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        const uint c = ((q[i >> 2u] >> (8u * (i & 3u))) & 0xfu) | (((h[i >> 2u] >> (8u * (i & 3u))) & 1u) << 4u);
+        w[i] = scale * float(c) - minv;
+    }
+    return;
+#endif
 #ifdef GEMM_GENERIC
     float t[32];
     glm53_decode(GEMM_TYPE, row, k >> 5u, t);
