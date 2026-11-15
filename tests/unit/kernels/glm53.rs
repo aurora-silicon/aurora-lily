@@ -177,29 +177,33 @@ fn gemv_matches_cpu_for_every_type_and_row_count() {
 
 #[test]
 fn gemv_grouped_matches_cpu() {
-    // attn_k_b's shape: 64 heads x 512 rows of 256, input per head.
+    // attn_k_b's shape: 64 heads x 512 rows of 256, input per head; Q5_K
+    // at all 64 heads is past the two-rows-a-subgroup threshold (32768
+    // rows), which grouped inputs must not take.
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(54);
-    let (heads, per, cols) = (8, 512, 256);
-    let raw = random_blocks(&mut rng, GgmlType::Q8_0, heads * per * cols);
-    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, heads * per).unwrap();
-    let cpu = mat(GgmlType::Q8_0, &raw, heads * per, cols);
-    for m in [1, 3] {
-        let x = f32s(&mut rng, m * heads * cols, -1.0, 1.0);
-        let tx = tensor(&ctx, &x);
-        let out = zeros(&ctx, m * heads * per);
-        let layout = GemvLayout {
-            x_group: per,
-            x_row_stride: heads * cols,
-            y_row_stride: heads * per,
-        };
-        run(&ctx, |p| gemv_with(&ctx, p, &w, &tx, &out, m, layout).unwrap());
-        let expected: Vec<f32> = (0..m)
-            .flat_map(|i| {
-                cpu.mv_grouped(&x[i * heads * cols..(i + 1) * heads * cols], per)
-            })
-            .collect();
-        assert_close(&out.to_f32().unwrap(), &expected, 1e-4, 1e-4);
+    let (per, cols) = (512, 256);
+    for (ty, heads) in [(GgmlType::Q8_0, 8), (GgmlType::Q5K, 64)] {
+        let raw = random_blocks(&mut rng, ty, heads * per * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, cols, heads * per).unwrap();
+        let cpu = mat(ty, &raw, heads * per, cols);
+        for m in [1, 3] {
+            let x = f32s(&mut rng, m * heads * cols, -1.0, 1.0);
+            let tx = tensor(&ctx, &x);
+            let out = zeros(&ctx, m * heads * per);
+            let layout = GemvLayout {
+                x_group: per,
+                x_row_stride: heads * cols,
+                y_row_stride: heads * per,
+            };
+            run(&ctx, |p| gemv_with(&ctx, p, &w, &tx, &out, m, layout).unwrap());
+            let expected: Vec<f32> = (0..m)
+                .flat_map(|i| {
+                    cpu.mv_grouped(&x[i * heads * cols..(i + 1) * heads * cols], per)
+                })
+                .collect();
+            assert_close(&out.to_f32().unwrap(), &expected, 1e-4, 1e-4);
+        }
     }
 }
 

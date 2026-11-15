@@ -236,8 +236,9 @@ fn gemv_dispatch(
     );
     let per_sg = 32 / tasks.min(32);
     let max_rows = sets.iter().map(|(w, _)| w.rows).max().unwrap_or(0);
-    let r = gemv_rows_per_subgroup(w0.ty, m, max_rows);
-    ensure!(r == 1 || l.x_group >= max_rows, "GEMV of two rows a subgroup with grouped inputs");
+    // Two rows a subgroup share one input row, so grouped inputs (GLM's
+    // per-head attn_k_b) take one.
+    let r = if l.x_group >= max_rows { gemv_rows_per_subgroup(w0.ty, m, max_rows) } else { 1 };
     let rows_per_tg = 8 * per_sg * r;
     let mut groups = 0;
     for &(w, y) in sets {
