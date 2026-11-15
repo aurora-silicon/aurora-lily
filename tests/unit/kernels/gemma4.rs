@@ -103,8 +103,11 @@ fn attention_case(
     let ff: Vec<f32> = (0..d / 2).map(|i| if i < d / 8 { 1.0 } else { 1e30 }).collect();
     let q = f32s(&mut rng, total * heads * d, -1.0, 1.0);
     let k = f32s(&mut rng, total * kw, -1.0, 1.0);
-    let v = f32s(&mut rng, total * kw, -1.0, 1.0);
-    let kc = Tensor::zeros(&ctx, &[ring * kw], DType::F16).unwrap();
+    // A global layer's V is its K projection (attention_k_eq_v), and its K
+    // cache keeps only the turning pairs (d / 8 of them here).
+    let v = if global { k.clone() } else { f32s(&mut rng, total * kw, -1.0, 1.0) };
+    let k_rot = if global { d / 8 } else { d / 2 };
+    let kc = Tensor::zeros(&ctx, &[ring * kvh * 2 * k_rot], DType::F16).unwrap();
     let vc = Tensor::zeros(&ctx, &[ring * kw], DType::F16).unwrap();
     let (tqn, tkn, tff) = (tensor(&ctx, &qn), tensor(&ctx, &kn), tensor(&ctx, &ff));
     let a = AttnShape {
@@ -115,6 +118,8 @@ fn attention_case(
         window,
         k_cache: &kc,
         v_cache: &vc,
+        k_rot,
+        k_norm: &tkn,
     };
     let chunks = attn_chunks(&a, pos0, m).max(1);
     let partial = zeros(&ctx, attn_partial_len(m, heads, d, chunks));
@@ -737,5 +742,71 @@ fn gemm_bx_q5_k_q6_k_match_gemm() {
             a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
             "{ty:?} {rows} x {cols}, {m} rows"
         );
+    }
+}
+
+/// Decode attention (one row) at a sliding-window layer's shape (256-wide
+/// heads, 8 KV heads, window 1024) and a global one's (512, 2 KV heads)
+/// at 1K and 4K positions: best of five passes of 128 layers (two cache
+/// copies alternating).
+#[test]
+#[ignore = "timing only"]
+fn attention_decode_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(74);
+    for (label, d, kvh, window, pos) in [
+        ("local 1K", 256, 8, 1024, 1000),
+        ("local 4K", 256, 8, 1024, 4000),
+        ("global 1K", 512, 2, 0, 1000),
+        ("global 4K", 512, 2, 0, 4000),
+        ("global 16K", 512, 2, 0, 16000),
+        ("global 16K full K", 512, 2, 0, 16001),
+    ] {
+        let heads = 16;
+        let ring = if window > 0 { window + 256 } else { pos + 8 };
+        let caches: Vec<(Tensor, Tensor)> = (0..2)
+            .map(|_| {
+                let k: Vec<f32> = f32s(&mut rng, ring * kvh * d, -0.1, 0.1);
+                let v: Vec<f32> = f32s(&mut rng, ring * kvh * d, -1.0, 1.0);
+                let h = |x: &[f32]| {
+                    let o = Tensor::zeros(&ctx, &[x.len()], DType::F16).unwrap();
+                    let b: Vec<u8> =
+                        x.iter().flat_map(|v| f16::from_f32(*v).to_bits().to_le_bytes()).collect();
+                    o.write_bytes(&b).unwrap();
+                    o
+                };
+                (h(&k), h(&v))
+            })
+            .collect();
+        let q = tensor(&ctx, &f32s(&mut rng, heads * d, -1.0, 1.0));
+        let kn = tensor(&ctx, &f32s(&mut rng, d, 0.5, 1.5));
+        let out = zeros(&ctx, heads * d);
+        let chunks = (pos + 1).min(if window > 0 { window } else { usize::MAX }).div_ceil(ATTN_CHUNK);
+        let partial = zeros(&ctx, attn_partial_len(1, heads, d, chunks));
+        let repeat = 128;
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin_concurrent().unwrap();
+            for r in 0..repeat {
+                let (kc, vc) = &caches[r % 2];
+                let a = AttnShape {
+                    head_dim: d,
+                    heads,
+                    kv_heads: kvh,
+                    ring,
+                    window,
+                    k_cache: kc,
+                    v_cache: vc,
+                    k_rot: if window > 0 || pos == 16001 { d / 2 } else { d / 8 },
+                    k_norm: &kn,
+                };
+                attention(&ctx, &pass, &a, &q, &partial, &out, pos, 1, 4).unwrap();
+                pass.memory_barrier().unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("attn decode {label:10} {:7.1} us", best / repeat as f64 * 1e6);
     }
 }

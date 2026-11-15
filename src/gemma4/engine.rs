@@ -128,8 +128,8 @@ impl DecodeStateApi for Gemma4State {
             if l.swa {
                 continue;
             }
-            let per_tok = l.k.numel() / l.slots;
             let grow = |t: &Tensor| -> Result<Tensor> {
+                let per_tok = t.numel() / l.slots;
                 let n = Tensor::zeros(ctx, &[capacity * per_tok], DType::F16)?;
                 host_copy(t, &n, self.pos * per_tok * 2);
                 Ok(n)
@@ -201,9 +201,8 @@ impl DecodeStateApi for Gemma4State {
             if src.swa {
                 continue;
             }
-            let per_tok = src.k.numel() / src.slots;
-            host_copy(&src.k, &dst.k, tokens * per_tok * 2);
-            host_copy(&src.v, &dst.v, tokens * per_tok * 2);
+            host_copy(&src.k, &dst.k, tokens * (src.k.numel() / src.slots) * 2);
+            host_copy(&src.v, &dst.v, tokens * (src.v.numel() / src.slots) * 2);
         }
         Ok(())
     }
@@ -541,7 +540,7 @@ impl LanguageModel for Gemma4Model {
     fn bytes_per_token(&self) -> usize {
         (0..self.cfg.n_layer)
             .filter(|&il| !self.cfg.swa[il])
-            .map(|il| 4 * self.cfg.kv_width(il))
+            .map(|il| 2 * (self.cfg.k_cache_width(il) + self.cfg.kv_width(il)))
             .sum()
     }
 
@@ -552,7 +551,7 @@ impl LanguageModel for Gemma4Model {
         Some(
             (0..self.cfg.n_layer)
                 .filter(|&il| self.cfg.swa[il])
-                .map(|il| 4 * slots * self.cfg.kv_width(il))
+                .map(|il| 2 * slots * (self.cfg.k_cache_width(il) + self.cfg.kv_width(il)))
                 .sum(),
         )
     }

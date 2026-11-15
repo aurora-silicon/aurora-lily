@@ -27,10 +27,13 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 // ---------------------------------------------------------------------------
+// The K cache keeps a head's first k_rot RoPE pairs' keys ([ring][kvh]
+// [2 k_rot], gemma4.comp qkv); a 64-value step past them takes its keys
+// from the V cache with the query times k_norm.
 // Grid (ceil(m G / 16), kvh), 128 threads.
 // Buffers: 0 q f32 [m][H][D] (normed and rotated), 1 K cache, 2 V cache
-// (f16 [ring][kvh][D]), 3 heads f32 [m][H][D].
-// Params: 4 H, 5 kvh, 6 pos0, 7 ring, 8 window (0: none), 9 m.
+// (f16 [ring][kvh][D]), 3 heads f32 [m][H][D], 4 k_norm [D].
+// Params: 5 H, 6 kvh, 7 pos0, 8 ring, 9 window (0: none), 10 m, 11 k_rot.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_gemma4_attn_mu_256) || defined(KERNEL_gemma4_attn_mu_512)
 #ifdef KERNEL_gemma4_attn_mu_256
@@ -61,12 +64,13 @@ shared f16vec4 p_tile[BQ * BK / 4u];
 shared float row_max[BQ], row_sum[BQ], row_alpha[BQ];
 
 void main() {
-    const uint H = arg_u32(4);
-    const uint kvh = arg_u32(5);
-    const uint pos0 = arg_u32(6);
-    const uint ring = arg_u32(7);
-    const uint window = arg_u32(8);
-    const uint m = arg_u32(9);
+    const uint H = arg_u32(5);
+    const uint kvh = arg_u32(6);
+    const uint pos0 = arg_u32(7);
+    const uint ring = arg_u32(8);
+    const uint window = arg_u32(9);
+    const uint m = arg_u32(10);
+    const uint k_rot = arg_u32(11);
     const uint G = H / kvh;
     const uint kv = gl_WorkGroupID.y;
     const uint P0 = gl_WorkGroupID.x * BQ;
@@ -84,14 +88,18 @@ void main() {
         const uint r0 = (l & 6u) | ((l >> 1u) & 8u);
         const uint half_ = l & 1u, odd = (l >> 3u) & 1u;
         const uint d0 = 64u * g + 32u * half_ + 2u * t + odd;
+        // A step past the K cache's pairs scores V with the query times k_norm.
+        const bool turned = ((64u * g) & (AD / 2u - 1u)) < k_rot;
+        F32 kn = F32(arg(4));
+        vec4 f = turned ? vec4(1.0) : vec4(kn.v[d0], kn.v[d0 + 8u], kn.v[d0 + 16u], kn.v[d0 + 24u]);
         uint w[4];
         [[unroll]] for (uint h = 0u; h < 2u; h++) {
             const uint P = min(P0 + r0 + h, rows - 1u);
             const uint row = P / G, head = kv * G + P % G;
             const uint64_t Q = arg(0) + 4u * ((uint64_t(row) * H + head) * AD);
             F32 q = F32(Q);
-            w[2u * h] = packHalf2x16(vec2(q.v[d0], q.v[d0 + 8u]));
-            w[2u * h + 1u] = packHalf2x16(vec2(q.v[d0 + 16u], q.v[d0 + 24u]));
+            w[2u * h] = packHalf2x16(vec2(q.v[d0], q.v[d0 + 8u]) * f.xy);
+            w[2u * h + 1u] = packHalf2x16(vec2(q.v[d0 + 16u], q.v[d0 + 24u]) * f.zw);
         }
         q_tile[idx] = uvec4(w[0], w[1], w[2], w[3]);
     }
@@ -109,8 +117,10 @@ void main() {
 
     const uint lane_row = mat_lane_row(), lane_col = mat_lane_col();
     const uint p_at = lane_row * 4u + 2u * mat_a_half() + mat_a_odd();
-    U32x4 kc = U32x4(arg(1) + 2u * uint64_t(kv) * AD);
+    U32x4 kc = U32x4(arg(1) + 2u * uint64_t(kv) * 2u * k_rot);
+    U32x4 vk = U32x4(arg(2) + 2u * uint64_t(kv) * AD);
     U32x2 vc = U32x2(arg(2) + 2u * uint64_t(kv) * AD);
+    const uint kstride = kvh * 2u * k_rot;
 
     MatCf acc[NB];
     [[unroll]] for (uint i = 0u; i < NB; i++) acc[i] = MatCf(0.0);
@@ -130,17 +140,24 @@ void main() {
         // S = Q K^T for key blocks 2 sg, 2 sg + 1.
         const uint kb = k0 + 32u * sg;
         if (kb < k_end) {
-            uint ka[8];
+            uint slots[8];
             [[unroll]] for (uint j = 0u; j < 8u; j++) {
                 const uint off = 32u * sg + 16u * (j >> 2u) + lane_col + (j & 3u);
                 uint slot = slot0 + min(off, k_end - 1u - k0);
                 slot -= slot >= ring ? ring : 0u;
-                ka[j] = slot * (rstride / 8u) + (lane_row >> 1u);
+                slots[j] = slot;
             }
             MatCf s0 = MatCf(0.0), s1 = MatCf(0.0);
             [[unroll]] for (uint g = 0u; g < AD / 64u; g++) {
+                // Step g's keys: the K cache's (value r of a row) or V's.
+                const uint e = 64u * g;
+                const bool turned = (e & (AD / 2u - 1u)) < k_rot;
+                const uint r = e < AD / 2u ? e : k_rot + e - AD / 2u;
+                U32x4 src = turned ? kc : vk;
+                const uint row8 = turned ? kstride / 8u : rstride / 8u;
+                const uint at = (turned ? r : e) / 8u + (lane_row >> 1u);
                 uvec4 kw[8];
-                [[unroll]] for (uint j = 0u; j < 8u; j++) kw[j] = kc.v[ka[j] + 8u * g];
+                [[unroll]] for (uint j = 0u; j < 8u; j++) kw[j] = src.v[slots[j] * row8 + at];
                 uvec4 qw[4];
                 [[unroll]] for (uint t = 0u; t < 4u; t++) qw[t] = q_tile[32u * (4u * g + t) + lane];
                 [[unroll]] for (uint t = 0u; t < 4u; t++) {

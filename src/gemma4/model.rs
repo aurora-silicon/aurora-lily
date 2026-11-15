@@ -204,6 +204,12 @@ impl Gemma4Model {
         &self.embed
     }
 
+    /// Layer `il`'s K norm weight (attention reads the keys its K cache
+    /// leaves out as V times it).
+    pub(crate) fn k_norm(&self, il: usize) -> &Tensor {
+        &self.layers[il].k_norm
+    }
+
     /// The layer whose caches the draft model's sliding-window (or global)
     /// layers read: the target's last of that kind (llama.cpp's
     /// `n_layer - 2` and `n_layer - 1` for Gemma 4).
@@ -239,7 +245,7 @@ pub fn session_bytes(cfg: &Config, capacity: usize, checkpoints: usize) -> u64 {
     let per_row = |swa: bool| -> usize {
         (0..cfg.n_layer)
             .filter(|&il| cfg.swa[il] == swa)
-            .map(|il| 4 * cfg.kv_width(il))
+            .map(|il| 2 * (cfg.k_cache_width(il) + cfg.kv_width(il)))
             .sum()
     };
     // Each snapshot also keeps the draft model's input (4 B a hidden value).
@@ -255,13 +261,14 @@ pub fn session_bytes(cfg: &Config, capacity: usize, checkpoints: usize) -> u64 {
 pub fn session_peak(cfg: &Config, capacity: usize, checkpoints: usize) -> u64 {
     let widest = (0..cfg.n_layer)
         .filter(|&il| !cfg.swa[il])
-        .map(|il| cfg.kv_width(il))
+        .map(|il| cfg.k_cache_width(il) + cfg.kv_width(il))
         .max()
         .unwrap_or(0);
-    session_bytes(cfg, capacity, checkpoints) + (4 * widest * capacity) as u64
+    session_bytes(cfg, capacity, checkpoints) + (2 * widest * capacity) as u64
 }
 
-/// One layer's K and V caches, f16 `[slots][kv heads][head dim]`.
+/// One layer's K and V caches, f16 `[slots][kv heads][head dim]` (K: the
+/// layer's `Config::k_rot` pairs a head).
 pub struct LayerCache {
     pub k: Tensor,
     pub v: Tensor,
@@ -303,10 +310,9 @@ impl Gemma4State {
             .map(|il| -> Result<LayerCache> {
                 let swa = cfg.swa[il];
                 let slots = if swa { ring_slots(cfg) } else { capacity };
-                let n = slots * cfg.kv_width(il);
                 Ok(LayerCache {
-                    k: Tensor::zeros(ctx, &[n], DType::F16)?,
-                    v: Tensor::zeros(ctx, &[n], DType::F16)?,
+                    k: Tensor::zeros(ctx, &[slots * cfg.k_cache_width(il)], DType::F16)?,
+                    v: Tensor::zeros(ctx, &[slots * cfg.kv_width(il)], DType::F16)?,
                     slots,
                     swa,
                 })
@@ -678,6 +684,8 @@ impl Gemma4Model {
             window: if c.swa { cfg.window } else { 0 },
             k_cache: &c.k,
             v_cache: &c.v,
+            k_rot: cfg.k_rot[il],
+            k_norm: &l.k_norm,
         };
         g4::qkv(
             ctx,

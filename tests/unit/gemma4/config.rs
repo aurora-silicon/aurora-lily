@@ -211,3 +211,17 @@ fn semantics_the_graph_lacks_are_refused() {
         assert!(Config::from_metadata(&with(k, v), VOCAB).is_ok(), "{k}");
     }
 }
+
+/// The published files' global layers keep 64 of 256 RoPE pairs in their
+/// K caches (V is their K projection, the pairs from 64 on do not turn);
+/// the sliding-window layers whole heads.
+#[test]
+#[ignore = "reads the Gemma 4 GGUF in LILY_GEMMA4_GGUF"]
+fn the_published_file_narrows_the_global_k_caches() {
+    let Some(path) = std::env::var_os("LILY_GEMMA4_GGUF") else { return };
+    let g = crate::gguf::Gguf::open(std::path::Path::new(&path)).unwrap();
+    let c = Config::from_gguf(&g).unwrap();
+    for il in 0..c.n_layer {
+        assert_eq!(c.k_rot[il], if c.swa[il] { 128 } else { 64 }, "layer {il}");
+    }
+}

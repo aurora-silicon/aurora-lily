@@ -45,6 +45,11 @@ pub struct Config {
     pub context_length: usize,
     pub bos: u32,
     pub eos: u32,
+    /// Per layer: the RoPE pairs whose keys the K cache keeps (all of a
+    /// head's, d / 2, but in a global layer whose V is its K projection
+    /// and whose higher pairs do not turn: there K's other values are V's
+    /// times k_norm, which attention takes from the V cache).
+    pub k_rot: Vec<usize>,
 }
 
 /// A metadata reader over `meta` for the keys of architecture `arch`:
@@ -164,7 +169,10 @@ impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let embd = g.require("token_embd.weight")?;
         ensure!(embd.dims.len() == 2, "token_embd.weight is not a matrix");
-        Self::from_metadata(&g.metadata, embd.dims[1])
+        let mut c = Self::from_metadata(&g.metadata, embd.dims[1])?;
+        c.k_rot = k_rot_pairs(g, &c)?;
+        c.validate()?;
+        Ok(c)
     }
 
     /// The shape from a GGUF's metadata and the embedding's row count (the
@@ -205,7 +213,7 @@ impl Config {
         m.refuse_float("expert_weights_scale", &[0.0, 1.0])?;
         // LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX.
         m.refuse_int("expert_gating_func", 1)?;
-        let c = Self {
+        let mut c = Self {
             n_layer,
             hidden: m.u("embedding_length", MAX_HIDDEN)?,
             vocab: vocab as usize,
@@ -230,7 +238,9 @@ impl Config {
             context_length: m.u("context_length", 1 << 30)?,
             bos: token_id(meta, "bos_token_id")?,
             eos: token_id(meta, "eos_token_id")?,
+            k_rot: Vec::new(),
         };
+        c.k_rot = (0..n_layer).map(|il| c.head_dim_of(il) / 2).collect();
         ensure!(
             m.u("attention.value_length", 1 << 12)? == c.head_dim
                 && m.u("attention.value_length_swa", 1 << 12)? == c.head_dim_swa,
@@ -272,6 +282,8 @@ impl Config {
             context_length: 262144,
             bos: 2,
             eos: 106,
+            // Whole heads: from_gguf narrows it from the tensors.
+            k_rot: (0..30).map(|il| if il % 6 != 5 { 128 } else { 256 }).collect(),
         }
     }
 
@@ -280,7 +292,8 @@ impl Config {
         ensure!(
             (1..=MAX_LAYERS).contains(&self.n_layer)
                 && self.swa.len() == self.n_layer
-                && self.n_head_kv.len() == self.n_layer,
+                && self.n_head_kv.len() == self.n_layer
+                && self.k_rot.len() == self.n_layer,
             "{} layers, {} sliding-window flags, {} KV head counts",
             self.n_layer,
             self.swa.len(),
@@ -398,6 +411,12 @@ impl Config {
         self.n_head_kv[il] * self.head_dim_of(il)
     }
 
+    /// The K cache's values a position of layer `il` (its turning pairs'
+    /// keys, [`Config::k_rot`]).
+    pub fn k_cache_width(&self, il: usize) -> usize {
+        self.n_head_kv[il] * 2 * self.k_rot[il]
+    }
+
     /// The widest query projection.
     pub fn max_q_width(&self) -> usize {
         (0..self.n_layer).map(|il| self.q_width(il)).max().unwrap_or(0)
@@ -407,6 +426,30 @@ impl Config {
     pub fn max_kv_width(&self) -> usize {
         (0..self.n_layer).map(|il| self.kv_width(il)).max().unwrap_or(0)
     }
+}
+
+/// [`Config::k_rot`] of each layer of the model in `g`: in a global layer
+/// without its own V projection (V = rmsnorm(k), K = rope(V k_norm)) whose
+/// rope_freqs leave every pair from some R on unturned (a factor above
+/// 1e20, as the qkv kernel takes it) with R a multiple of 64 (the prompt
+/// attention's 64-value steps), R; else d / 2 (the whole head).
+fn k_rot_pairs(g: &Gguf, c: &Config) -> Result<Vec<usize>> {
+    let ff = match g.tensor("rope_freqs.weight") {
+        Some(t) if t.ty == crate::gguf::GgmlType::F32 && t.row_len() == c.head_dim / 2 && t.rows() == 1 => {
+            Some(g.read_rows_f32(t, 0..1)?)
+        }
+        _ => None,
+    };
+    Ok((0..c.n_layer)
+        .map(|il| {
+            let half = c.head_dim_of(il) / 2;
+            let k_eq_v = g.tensor(&format!("blk.{il}.attn_v.weight")).is_none();
+            let Some(ff) = ff.as_ref().filter(|_| k_eq_v && !c.swa[il]) else { return half };
+            let r = ff.iter().position(|&f| !(f < 1e20)).unwrap_or(half);
+            let rest_still = ff[r..].iter().all(|&f| !(f < 1e20));
+            if rest_still && r.is_multiple_of(64) && r < half { r } else { half }
+        })
+        .collect())
 }
 
 #[cfg(test)]

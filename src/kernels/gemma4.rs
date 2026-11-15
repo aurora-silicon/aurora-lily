@@ -74,6 +74,35 @@ pub struct AttnShape<'t> {
     pub window: usize,
     pub k_cache: &'t Tensor,
     pub v_cache: &'t Tensor,
+    /// RoPE pairs whose keys the K cache keeps (`head_dim / 2`: all; fewer:
+    /// the others are V times `k_norm`, `gemma4::config::Config::k_rot`).
+    pub k_rot: usize,
+    /// The layer's K norm weight (f32 [head_dim]).
+    pub k_norm: &'t Tensor,
+}
+
+impl AttnShape<'_> {
+    /// Checks k_rot and the caches' sizes for `slots` slots.
+    fn check_caches(&self) -> Result<()> {
+        let d = self.head_dim;
+        ensure!(
+            self.k_rot > 0
+                && self.k_rot <= d / 2
+                && (self.k_rot == d / 2 || self.k_rot.is_multiple_of(64)),
+            "K cache of {} pairs of a {d}-wide head",
+            self.k_rot
+        );
+        ensure!(
+            self.k_cache.numel() >= self.ring * self.kv_heads * 2 * self.k_rot
+                && self.v_cache.numel() >= self.ring * self.kv_heads * d,
+            "caches of {} and {} for {} slots",
+            self.k_cache.numel(),
+            self.v_cache.numel(),
+            self.ring
+        );
+        ensure!(self.k_norm.dtype() == DType::F32 && self.k_norm.numel() >= d, "k_norm");
+        Ok(())
+    }
 }
 
 impl AttnShape<'_> {
@@ -124,11 +153,7 @@ pub fn qkv(
         a.k_cache.dtype() == DType::F16 && a.v_cache.dtype() == DType::F16,
         "f16 caches"
     );
-    ensure!(
-        a.k_cache.numel() >= a.ring * a.kv_heads * d,
-        "cache of {}",
-        a.k_cache.numel()
-    );
+    a.check_caches()?;
     ensure!(
         q.numel() >= m * a.heads * d && q_out.numel() >= m * a.heads * d,
         "queries"
@@ -173,6 +198,7 @@ pub fn qkv(
             &f32_bytes(eps),
             &u32_bytes(kv_stride),
             &u32_bytes(v_offset),
+            &u32_bytes(a.k_rot),
         ],
         Grid::Threadgroups {
             groups: (slots.div_ceil(8), m, 1),
@@ -265,6 +291,7 @@ pub fn attention(
     small_rows: usize,
 ) -> Result<()> {
     check_f32(&[q, partial, heads])?;
+    a.check_caches()?;
     let d = a.head_dim;
     ensure!(
         q.numel() >= m * a.heads * d && heads.numel() >= m * a.heads * d,
@@ -287,7 +314,13 @@ pub fn attention(
         let group = a.heads / a.kv_heads;
         return pass.dispatch_at(
             &pipeline,
-            &[q.binding(), a.k_cache.binding(), a.v_cache.binding(), heads.binding()],
+            &[
+                q.binding(),
+                a.k_cache.binding(),
+                a.v_cache.binding(),
+                heads.binding(),
+                a.k_norm.binding(),
+            ],
             &[
                 &u32_bytes(a.heads),
                 &u32_bytes(a.kv_heads),
@@ -295,6 +328,7 @@ pub fn attention(
                 &u32_bytes(a.ring),
                 &u32_bytes(a.window),
                 &u32_bytes(m),
+                &u32_bytes(a.k_rot),
             ],
             Grid::Threadgroups {
                 groups: ((m * group).div_ceil(16), a.kv_heads, 1),
@@ -321,12 +355,21 @@ pub fn attention(
         SOURCE,
         MslVersion::V3_1,
     )?;
-    let cb = u32_bytes(chunks);
-    let params: Vec<&[u8]> =
-        common.iter().map(|b| b.as_slice()).chain([cb.as_slice()]).collect();
+    let (cb, kr) = (u32_bytes(chunks), u32_bytes(a.k_rot));
+    let params: Vec<&[u8]> = common
+        .iter()
+        .map(|b| b.as_slice())
+        .chain([cb.as_slice(), kr.as_slice()])
+        .collect();
     pass.dispatch_at(
         &pipeline,
-        &[q.binding(), a.k_cache.binding(), a.v_cache.binding(), partial.binding()],
+        &[
+            q.binding(),
+            a.k_cache.binding(),
+            a.v_cache.binding(),
+            partial.binding(),
+            a.k_norm.binding(),
+        ],
         &params,
         Grid::Threadgroups {
             groups: (chunks, a.heads / 2, m),

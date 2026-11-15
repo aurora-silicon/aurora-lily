@@ -39,6 +39,7 @@ fn small() -> Config {
     c.n_layer = 2;
     c.swa = vec![true, false];
     c.n_head_kv = vec![8, 2];
+    c.k_rot = vec![128, 64];
     c.window = 64;
     c
 }
@@ -79,7 +80,7 @@ fn session_bytes_are_what_a_session_allocates() {
     let used = (ctx.current_allocated() - before) as u64;
     assert_eq!(used, session_bytes(&cfg, cap, checkpoints));
     assert_eq!(st.bytes() as u64, session_bytes(&cfg, cap, 0));
-    let widest = 4 * cfg.kv_width(1) * cap;
+    let widest = 2 * (cfg.k_cache_width(1) + cfg.kv_width(1)) * cap;
     assert_eq!(session_peak(&cfg, cap, checkpoints), used + widest as u64);
     drop(snaps);
 }

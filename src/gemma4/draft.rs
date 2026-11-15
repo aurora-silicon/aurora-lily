@@ -412,6 +412,8 @@ impl Gemma4Draft {
             window: 0,
             k_cache: &c.k,
             v_cache: &c.v,
+            k_rot: tc.k_rot[tl],
+            k_norm: target.k_norm(tl),
         };
         g4::qkv_queries(
             ctx,
@@ -436,6 +438,8 @@ impl Gemma4Draft {
             window: if c.swa { tc.window - 1 } else { 0 },
             k_cache: &c.k,
             v_cache: &c.v,
+            k_rot: tc.k_rot[tl],
+            k_norm: target.k_norm(tl),
         };
         g4::attention(
             ctx,

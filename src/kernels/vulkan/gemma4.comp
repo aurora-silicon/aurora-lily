@@ -67,11 +67,15 @@ void main() {
 // base^(-2 i / d) / ff[i]; a factor above 1e20 (Gemma's unrotated pairs,
 // 1e30) leaves the pair as it is, which is what the tiny angle gives.
 // Grid (ceil(slots / 8), m), 256 threads.
+// The K cache keeps the keys of a head's first k_rot pairs (values
+// [0, k_rot) and [d / 2, d / 2 + k_rot), in that order: [ring][kvh][2 k_rot]);
+// the others are V times k_norm (Config::k_rot), which attention reads
+// from the V cache.
 // Buffers: 0 q_raw [m][H d], 1 k_raw [m][kvh d] (row stride k_stride),
 // 2 v_raw (same layout, may be k_raw), 3 q_norm [d], 4 k_norm [d],
 // 5 q_out [m][H d], 6 K cache, 7 V cache, 8 freq factors [d / 2].
 // Params: 9 d, 10 H, 11 kvh, 12 pos0, 13 ring, 14 base, 15 has_ff, 16 eps,
-// 17 k_stride, 18 v_offset (elements of a row before the V part).
+// 17 k_stride, 18 v_offset (elements of a row before the V part), 19 k_rot.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_gemma4_qkv_256) || defined(KERNEL_gemma4_qkv_512)
 #ifdef KERNEL_gemma4_qkv_256
@@ -148,9 +152,16 @@ void main() {
     if (kind == 0u) {
         const uint64_t O = arg(5) + 4u * (uint64_t(i) * H * d + head * d);
         [[unroll]] for (uint j = 0u; j < 16u; j++) if (j < per) F32(O).v[lane + 32u * j] = v[j];
+    } else if (kind == 1u) {
+        const uint k_rot = arg_u32(19);
+        const uint64_t C = arg(6) + 2u * ((uint64_t(p % ring) * kvh + head) * (2u * k_rot));
+        [[unroll]] for (uint j = 0u; j < 16u; j++) {
+            const uint e = lane + 32u * j;
+            const uint at = e < d / 2u ? e : k_rot + e - d / 2u;
+            if (j < per && (e & (d / 2u - 1u)) < k_rot) F16(C).v[at] = float16_t(v[j]);
+        }
     } else {
-        const uint64_t C = (kind == 1u ? arg(6) : arg(7))
-                         + 2u * ((uint64_t(p % ring) * kvh + head) * d);
+        const uint64_t C = arg(7) + 2u * ((uint64_t(p % ring) * kvh + head) * d);
         [[unroll]] for (uint j = 0u; j < 16u; j++) {
             if (j < per) F16(C).v[lane + 32u * j] = float16_t(v[j]);
         }
@@ -180,10 +191,10 @@ void g4_load_q(uint64_t Q, uint lane, out vec4 q[2][G4_V4]) {
             q[h][j] = F32x4(Q + 4u * (uint64_t(h) * G4_D + G4_PER * lane)).v[j];
 }
 
-// A cache row's lane slice as floats.
-void g4_load_row(uint64_t row, uint lane, out vec4 r[G4_V4]) {
+// A lane's slice of a cache row (at `at`) as floats.
+void g4_load_row(uint64_t at, uint lane, out vec4 r[G4_V4]) {
     [[unroll]] for (uint j = 0u; j < G4_V4 / 2u; j++) {
-        const uvec4 w = U32x4(row + 2u * G4_PER * lane).v[j];
+        const uvec4 w = U32x4(at).v[j];
         r[2u * j] = vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
         r[2u * j + 1u] = vec4(unpackHalf2x16(w.z), unpackHalf2x16(w.w));
     }
@@ -218,21 +229,24 @@ float dot4(vec4 a, vec4 b) { return (a.x * b.x + a.y * b.y) + (a.z * b.z + a.w *
 // of 256 keys: threadgroup (c, y, i) takes keys lo + 256 c .. for heads
 // 2 y, 2 y + 1, subgroup s 32 of them in turn, the eight subgroups merged;
 // writes each head's chunk (max, sum, weighted values[d]) for
-// gemma4_attn_combine. Grid (chunks, H / 2, m), 256 threads.
+// gemma4_attn_combine. A lane whose values are past the K cache's turning
+// pairs (qkv) takes its keys from the V row with its query times k_norm.
+// Grid (chunks, H / 2, m), 256 threads.
 // Buffers: 0 q [m][H][d], 1 K cache, 2 V cache, 3 partial
-// [m][H][chunks][d + 2]. Params: 4 d, 5 H, 6 kvh, 7 pos0, 8 ring,
-// 9 window (0: none), 10 chunks.
+// [m][H][chunks][d + 2], 4 k_norm [d]. Params: 5 d, 6 H, 7 kvh, 8 pos0,
+// 9 ring, 10 window (0: none), 11 chunks, 12 k_rot.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_gemma4_attn_decode_256) || defined(KERNEL_gemma4_attn_decode_512)
 shared float g4_m[8], g4_l[8];
 shared vec4 g4_acc[8][G4_D / 4u];
 void main() {
-    const uint H = arg_u32(5);
-    const uint kvh = arg_u32(6);
-    const uint pos0 = arg_u32(7);
-    const uint ring = arg_u32(8);
-    const uint window = arg_u32(9);
-    const uint chunks = arg_u32(10);
+    const uint H = arg_u32(6);
+    const uint kvh = arg_u32(7);
+    const uint pos0 = arg_u32(8);
+    const uint ring = arg_u32(9);
+    const uint window = arg_u32(10);
+    const uint chunks = arg_u32(11);
+    const uint k_rot = arg_u32(12);
     const uint c = gl_WorkGroupID.x, h0 = 2u * gl_WorkGroupID.y, i = gl_WorkGroupID.z;
     const uint kv = h0 / (H / kvh);
     const uint lane = gl_SubgroupInvocationID, sg = gl_SubgroupID;
@@ -240,6 +254,18 @@ void main() {
     const uint lo = (window != 0u && pos + 1u > window) ? pos + 1u - window : 0u;
     vec4 q[2][G4_V4];
     g4_load_q(arg(0) + 4u * ((uint64_t(i) * H + h0) * G4_D), lane, q);
+    // The lane's values and where its keys are.
+    const uint e0 = G4_PER * lane;
+    const bool turned = (e0 & (G4_D / 2u - 1u)) < k_rot;
+    if (!turned) {
+        [[unroll]] for (uint h = 0u; h < 2u; h++)
+            [[unroll]] for (uint j = 0u; j < G4_V4; j++) q[h][j] *= F32x4(arg(4) + 4u * e0).v[j];
+    }
+    const uint64_t k_base = turned ? arg(1) + 2u * (uint64_t(kv) * 2u * k_rot + (e0 < G4_D / 2u ? e0 : k_rot + e0 - G4_D / 2u))
+                                   : arg(2) + 2u * (uint64_t(kv) * G4_D + e0);
+    const uint64_t k_row = turned ? 2u * uint64_t(kvh) * 2u * k_rot : 2u * uint64_t(kvh) * G4_D;
+    const uint64_t v_base = arg(2) + 2u * (uint64_t(kv) * G4_D + e0);
+    const uint64_t v_row = 2u * uint64_t(kvh) * G4_D;
     float mx[2] = float[2](-1.0 / 0.0, -1.0 / 0.0), sum[2] = float[2](0.0, 0.0);
     vec4 acc[2][G4_V4];
     [[unroll]] for (uint h = 0u; h < 2u; h++)
@@ -247,8 +273,8 @@ void main() {
     const uint first = lo + 256u * c + 32u * sg;
     const uint last = min(first + 32u, pos + 1u);
     [[dont_unroll]] for (uint key = first; key < last; key++) {
-        const uint64_t off = 2u * ((uint64_t(key % ring) * kvh + kv) * G4_D);
-        G4_KEY(arg(1) + off, arg(2) + off)
+        const uint64_t s = uint64_t(key % ring);
+        G4_KEY(k_base + s * k_row, v_base + s * v_row)
     }
     [[unroll]] for (uint h = 0u; h < 2u; h++) {
         if (lane == 0u) {
