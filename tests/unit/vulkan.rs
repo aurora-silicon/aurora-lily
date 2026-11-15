@@ -91,3 +91,42 @@ fn command_pools_are_reused() {
     assert!(pools <= 2, "{pools} command pools for one pass at a time");
     assert_eq!(dst.to_u32().expect("read"), vec![5; 16]);
 }
+
+/// The capability scan reads the `OpCapability` run after the header and
+/// stops at the first other instruction or a truncated one.
+#[test]
+fn spirv_capabilities_reads_the_leading_capabilities() {
+    let header = [0x0723_0203, 0x0001_0600, 0, 100, 0];
+    let cap = |c: u32| [(2 << 16) | 17, c];
+    // OpExtension "ab" (10, 2 words), then a capability past it.
+    let module: Vec<u32> = header
+        .iter()
+        .copied()
+        .chain(cap(1))
+        .chain(cap(5116))
+        .chain([(2 << 16) | 10, 0x6261])
+        .chain(cap(6022))
+        .collect();
+    assert_eq!(spirv_capabilities(&module).collect::<Vec<_>>(), vec![1, 5116]);
+    assert_eq!(spirv_capabilities(&module[..8]).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(spirv_capabilities(&header).count(), 0);
+}
+
+/// Without matrix units a bfloat or cooperative-matrix kernel is refused
+/// with an error (Mesa would fail compiling it or crash), and every other
+/// kernel still builds.
+#[test]
+fn matrix_unit_kernels_are_refused_without_matrix_units() {
+    let ctx = MetalContext::new().expect("context");
+    for &(name, bytes) in KERNELS {
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(bytes)).expect("spv");
+        let needs = spirv_capabilities(&words).any(|c| NEEDS_MATRIX_UNITS.contains(&c));
+        let module = ctx.dev.module(name);
+        if needs && !ctx.matrix_units() {
+            let err = module.expect_err(name).to_string();
+            assert!(err.contains("needs matrix units"), "{name}: {err}");
+        } else {
+            module.unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        }
+    }
+}

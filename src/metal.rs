@@ -456,6 +456,20 @@ impl MetalContext {
             .unwrap_or(0)
     }
 
+    /// Whether the device has matrix units (on Vulkan VK_KHR_cooperative_matrix
+    /// with bfloat): always on Metal, whose kernels keep their matrix path
+    /// (MPP emulates the tensor ops where the GPU has no units).
+    pub fn matrix_units(&self) -> bool {
+        true
+    }
+
+    /// Whether the GPU is an Apple G16 (an M4) whose decode GEMVs take the
+    /// Vulkan G16 kernels (`gemv_g16.comp`): never on Metal, which keeps its
+    /// own kernels.
+    pub fn g16(&self) -> bool {
+        false
+    }
+
     /// Metal's advice on how much this process may keep resident on the GPU
     /// (the wired limit in practice), in bytes.
     pub fn recommended_working_set(&self) -> usize {

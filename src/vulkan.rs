@@ -363,6 +363,26 @@ const COOPERATIVE_MATRIX2_FEATURES: vk::StructureType =
     vk::StructureType::from_raw(1000593000);
 const COOPERATIVE_MATRIX2_EXTENSION: &CStr = c"VK_NV_cooperative_matrix2";
 
+/// The SPIR-V capabilities a device without matrix units cannot run:
+/// BFloat16TypeKHR, BFloat16DotProductKHR, BFloat16CooperativeMatrixKHR,
+/// CooperativeMatrixKHR.
+const NEEDS_MATRIX_UNITS: [u32; 4] = [5116, 5117, 5118, 6022];
+
+/// The capabilities a SPIR-V module declares: its `OpCapability`
+/// instructions, which follow the 5-word header.
+fn spirv_capabilities(words: &[u32]) -> impl Iterator<Item = u32> + '_ {
+    let mut at = 5;
+    std::iter::from_fn(move || {
+        let (&first, &cap) = (words.get(at)?, words.get(at + 1)?);
+        let count = (first >> 16) as usize;
+        // OpCapability (17), two words; it precedes every other instruction.
+        (first & 0xffff == 17 && count == 2).then(|| {
+            at += 2;
+            cap
+        })
+    })
+}
+
 /// The device and what lives as long as it: shared by the context, its
 /// buffers and its two threads, destroyed with the last of them.
 struct Dev {
@@ -387,10 +407,17 @@ struct Dev {
     /// VK_EXT_pageable_device_local_memory, when the device has it: memory
     /// priority 1.0 keeps a buffer's memory resident.
     priority: Option<ash::ext::pageable_device_local_memory::Device>,
+    /// Whether VK_KHR_cooperative_matrix and VK_KHR_shader_bfloat16 are
+    /// enabled: the matrix-unit kernels (GEMMs, `_mu` kernels) need both.
+    /// Without them (an M4) only the kernels without matrix operations run.
+    matrix_units: bool,
     /// Whether VK_NV_cooperative_matrix2's conversions, reductions and
     /// per-element operations are enabled (the operations on a matrix in
     /// registers that the `_cm2` kernels use).
     cooperative_matrix_register_ops: bool,
+    /// Whether the GPU is an Apple G16 (the M4's, "Apple M4 (G16G B0)"):
+    /// its decode GEMVs take the G16 kernels (`gemv_g16.comp`).
+    g16: bool,
     /// VK_KHR_calibrated_timestamps, enabled for the trace ([`trace`]).
     calibrated: Option<ash::khr::calibrated_timestamps::Device>,
 }
@@ -455,11 +482,11 @@ impl Dev {
             let has = |name: &CStr| {
                 extensions.iter().any(|e| e.extension_name_as_c_str() == Ok(name))
             };
-            ensure!(
-                has(COOPERATIVE_MATRIX_EXTENSION) && has(BFLOAT16_EXTENSION),
-                "lily needs VK_KHR_cooperative_matrix and VK_KHR_shader_bfloat16 \
-                 (Honeykrisp on an M5 with ASAHI_M5_COOPERATIVE_MATRIX=1)"
-            );
+            // Matrix units: VK_KHR_cooperative_matrix and bfloat (Honeykrisp
+            // on an M5 with ASAHI_M5_COOPERATIVE_MATRIX=1). Without them the
+            // models that have a path without matrix operations still run.
+            let matrix_units =
+                has(COOPERATIVE_MATRIX_EXTENSION) && has(BFLOAT16_EXTENSION);
             let queue_family = instance
                 .get_physical_device_queue_family_properties(physical)
                 .iter()
@@ -490,7 +517,7 @@ impl Dev {
             // VK_NV_cooperative_matrix2, when the device has it: chained
             // between bfloat and the memory priorities while queried, and
             // kept there (enabled as queried) when it offers any feature.
-            let has_cooperative2 = has(COOPERATIVE_MATRIX2_EXTENSION);
+            let has_cooperative2 = matrix_units && has(COOPERATIVE_MATRIX2_EXTENSION);
             let mut cooperative2 = CooperativeMatrix2Features {
                 s_type: COOPERATIVE_MATRIX2_FEATURES,
                 p_next: bfloat.p_next,
@@ -510,11 +537,19 @@ impl Dev {
             let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
             let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
+            // Without matrix units neither `cooperative` nor `bfloat` is in
+            // the chain; the optional structures linked after bfloat are
+            // linked after v11 (the chain's last) instead.
+            if !matrix_units {
+                v11.p_next = std::mem::replace(&mut bfloat.p_next, std::ptr::null_mut());
+            }
             let mut features = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut v11)
                 .push_next(&mut v12)
-                .push_next(&mut v13)
-                .push_next(&mut cooperative);
+                .push_next(&mut v13);
+            if matrix_units {
+                features = features.push_next(&mut cooperative);
+            }
             instance.get_physical_device_features2(physical, &mut features);
             let core = features.features;
             ensure!(
@@ -544,6 +579,9 @@ impl Dev {
             // v12.
             // Raw place accesses only, so the header reads do not narrow the
             // pointers to the header's size.
+            let prioritize = can_prioritize
+                && priority.memory_priority == vk::TRUE
+                && pageable.pageable_device_local_memory == vk::TRUE;
             let mut found = false;
             unsafe {
                 let mut next = features.p_next.cast::<vk::BaseOutStructure>();
@@ -554,13 +592,21 @@ impl Dev {
                         (*v12).buffer_device_address_multi_device = vk::FALSE;
                         found = true;
                     }
+                    // Without matrix units the memory priorities end the
+                    // chain after v11: unlinked here when not enabled.
+                    let after = (*next).p_next;
+                    if !matrix_units
+                        && !prioritize
+                        && !after.is_null()
+                        && (*after).s_type
+                            == vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT
+                    {
+                        (*next).p_next = std::ptr::null_mut();
+                    }
                     next = (*next).p_next;
                 }
             }
             ensure!(found, "the Vulkan 1.2 features are not in the device feature chain");
-            let prioritize = can_prioritize
-                && priority.memory_priority == vk::TRUE
-                && pageable.pageable_device_local_memory == vk::TRUE;
             let enable_cooperative2 = has_cooperative2
                 && [
                     cooperative2.workgroup_scope,
@@ -591,7 +637,11 @@ impl Dev {
             let queues = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&[1.0])];
-            let mut names = vec![COOPERATIVE_MATRIX_EXTENSION.as_ptr(), BFLOAT16_EXTENSION.as_ptr()];
+            let mut names = Vec::new();
+            if matrix_units {
+                names.push(COOPERATIVE_MATRIX_EXTENSION.as_ptr());
+                names.push(BFLOAT16_EXTENSION.as_ptr());
+            }
             if prioritize {
                 names.push(ash::ext::memory_priority::NAME.as_ptr());
                 names.push(ash::ext::pageable_device_local_memory::NAME.as_ptr());
@@ -654,6 +704,11 @@ impl Dev {
             };
             let priority = prioritize
                 .then(|| ash::ext::pageable_device_local_memory::Device::new(&instance, &device));
+            let g16 = instance
+                .get_physical_device_properties(physical)
+                .device_name_as_c_str()
+                .is_ok_and(|name| name.to_bytes().windows(4).any(|w| w == b"(G16"))
+                && std::env::var_os("LILY_G16_KERNELS").is_none_or(|v| v != "0");
             let calibrated = calibrate
                 .then(|| ash::khr::calibrated_timestamps::Device::new(&instance, &device));
 
@@ -674,7 +729,9 @@ impl Dev {
                 allocations: AtomicUsize::new(0),
                 host_import,
                 priority,
+                matrix_units,
                 cooperative_matrix_register_ops,
+                g16,
                 calibrated,
             }))
         }
@@ -705,6 +762,17 @@ impl Dev {
         };
         let words = ash::util::read_spv(&mut std::io::Cursor::new(&bytes))
             .with_context(|| format!("SPIR-V of {name}"))?;
+        // Without matrix units the context enables neither bfloat nor the
+        // cooperative matrices: a module declaring them is invalid there,
+        // and Mesa's compiler fails on it or crashes the process.
+        if !self.matrix_units
+            && let Some(cap) =
+                spirv_capabilities(&words).find(|c| NEEDS_MATRIX_UNITS.contains(c))
+        {
+            bail!(
+                "kernel '{name}' needs matrix units (SPIR-V capability {cap}), which this GPU lacks"
+            );
+        }
         // SAFETY: `words` is a SPIR-V module.
         let module = unsafe {
             self.device.create_shader_module(
@@ -1915,12 +1983,24 @@ impl MetalContext {
         self.dev.priority.is_some()
     }
 
+    /// Whether the device has matrix units (VK_KHR_cooperative_matrix with
+    /// bfloat): without them a kernel with matrix operations cannot run.
+    pub fn matrix_units(&self) -> bool {
+        self.dev.matrix_units
+    }
+
     /// Whether the device offers, and the context enabled, the cooperative
     /// matrix operations on a matrix in registers of VK_NV_cooperative_matrix2
     /// (conversions between uses, reductions, per-element operations): the
     /// `_cm2` kernels need all three.
     pub fn cooperative_matrix_register_ops(&self) -> bool {
         self.dev.cooperative_matrix_register_ops
+    }
+
+    /// Whether the GPU is an Apple G16 (an M4): the decode GEMVs of some
+    /// types take kernels tuned for it (`LILY_G16_KERNELS=0` turns them off).
+    pub fn g16(&self) -> bool {
+        self.dev.g16
     }
 
     /// Whether kernel `name` was built into the crate (one that needs a

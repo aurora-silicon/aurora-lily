@@ -1,0 +1,201 @@
+#version 460
+// ALU peak probes (tests/unit/kernels/elementwise.rs `fma_peak_probe`): a
+// thread runs `rounds` rounds of 32 FMAs on independent chains, f32 or f16;
+// pk_fma_f16w twice the chains (64 FMAs a round). Buffers: 0 out (u32, kept
+// observable), 1 rounds.
+#include "common.glsl"
+
+#if defined(KERNEL_pk_fma_f32) || defined(KERNEL_pk_fma_f16) || defined(KERNEL_pk_fma_f16w)
+#ifdef KERNEL_pk_fma_f32
+#define PK_T vec4
+#define PK_S float
+#define PK_N 8u
+#elif defined(KERNEL_pk_fma_f16)
+#define PK_T f16vec4
+#define PK_S float16_t
+#define PK_N 8u
+#else
+#define PK_T f16vec4
+#define PK_S float16_t
+#define PK_N 16u
+#endif
+void main() {
+    const uint rounds = arg_u32(1), tid = gl_LocalInvocationIndex;
+    const PK_T m = PK_T(PK_S(0.999)), c = PK_T(PK_S(float(tid) * 1e-6));
+    PK_T acc[PK_N];
+    [[unroll]] for (uint i = 0u; i < PK_N; i++) acc[i] = PK_T(PK_S(float(i) * 0.01));
+    for (uint r = 0u; r < rounds; r++) {
+        [[unroll]] for (uint i = 0u; i < PK_N; i++) acc[i] = fma(acc[i], m, c);
+    }
+    PK_T s = acc[0];
+    [[unroll]] for (uint i = 1u; i < PK_N; i++) s += acc[i];
+    if (float(s.x + s.y + s.z + s.w) == 1234.5) U32(arg(0)).v[tid] = 1u;
+}
+#endif
+
+// Threadgroup-memory probes: the GEMM inner loop's shape. A round is 8
+// k steps; each k step loads PL_X vec4 of x and PL_W vec4 of w from shared
+// memory and does the outer product, PL_X 4 x PL_W 4 FMAs. x at an address
+// the whole subgroup shares (a broadcast) or, with PL_XD, one a lane; w one
+// a lane (lane-contiguous vec4s).
+#if defined(KERNEL_pl_x1w2) || defined(KERNEL_pl_x2w2) || defined(KERNEL_pl_x1w2d) || \
+    defined(KERNEL_pl_x0w2) || defined(KERNEL_pl_x1w0) || defined(KERNEL_pl_x2w2d) || \
+    defined(KERNEL_pl_x4w1)
+#if defined(KERNEL_pl_x1w2)
+#define PL_X 1
+#define PL_W 2
+#elif defined(KERNEL_pl_x2w2)
+#define PL_X 2
+#define PL_W 2
+#elif defined(KERNEL_pl_x1w2d)
+#define PL_X 1
+#define PL_W 2
+#define PL_XD
+#elif defined(KERNEL_pl_x2w2d)
+#define PL_X 2
+#define PL_W 2
+#define PL_XD
+#elif defined(KERNEL_pl_x4w1)
+#define PL_X 4
+#define PL_W 1
+#elif defined(KERNEL_pl_x0w2)
+// w loads only: 2 vec4 a k step, 8 FMAs on them.
+#define PL_X 0
+#define PL_W 2
+#else
+// x loads only: 1 broadcast vec4 a k step, 8 FMAs.
+#define PL_X 1
+#define PL_W 0
+#endif
+// 2048 vec4s fill the M4's 32 KB of threadgroup memory; the x reads wrap.
+shared vec4 pl_s[2048];
+void main() {
+    const uint rounds = arg_u32(1), tid = gl_LocalInvocationIndex, lane = tid & 31u;
+    const uint sg = tid >> 5u;
+    for (uint i = tid; i < 2048u; i += 256u) pl_s[i] = vec4(float(i) * 1e-4);
+    barrier();
+#if PL_X == 0 || PL_W == 0
+    vec4 acc[2];
+    acc[0] = acc[1] = vec4(0.0);
+#else
+    vec4 acc[PL_X * 4][PL_W];
+    [[unroll]] for (uint i = 0u; i < PL_X * 4; i++)
+        [[unroll]] for (uint j = 0u; j < PL_W; j++) acc[i][j] = vec4(0.0);
+#endif
+    for (uint r = 0u; r < rounds; r++) {
+        const uint base = (r & 7u) * 128u;
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+#if PL_X > 0
+            vec4 x[PL_X > 0 ? PL_X : 1];
+            [[unroll]] for (uint i = 0u; i < PL_X; i++) {
+#ifdef PL_XD
+                x[i] = pl_s[(1024u + base + k * 16u + 4u * (lane & 7u) + i) & 2047u];
+#else
+                x[i] = pl_s[(1024u + base + k * 16u + 2u * sg + i) & 2047u];
+#endif
+            }
+#endif
+#if PL_W > 0
+            vec4 w[PL_W > 0 ? PL_W : 1];
+            [[unroll]] for (uint j = 0u; j < PL_W; j++) w[j] = pl_s[base + k * 64u + 32u * j + lane];
+#endif
+#if PL_X == 0
+            acc[0] = fma(w[0], w[1], acc[0]);
+            acc[1] = fma(w[1], w[0], acc[1]);
+#elif PL_W == 0
+            acc[0] = fma(x[0], x[0], acc[0]);
+            acc[1] = fma(x[0], acc[0], acc[1]);
+#else
+            [[unroll]] for (uint i = 0u; i < PL_X * 4; i++)
+                [[unroll]] for (uint j = 0u; j < PL_W; j++)
+                    acc[i][j] = fma(vec4(x[i >> 2u][i & 3u]), w[j], acc[i][j]);
+#endif
+        }
+    }
+    float s = 0.0;
+#if PL_X == 0 || PL_W == 0
+    s = acc[0].x + acc[1].y;
+#else
+    [[unroll]] for (uint i = 0u; i < PL_X * 4; i++)
+        [[unroll]] for (uint j = 0u; j < PL_W; j++) s += acc[i][j].x + acc[i][j].w;
+#endif
+    if (s == 1234.5) U32(arg(0)).v[tid] = 1u;
+}
+#endif
+
+// Threadgroup-memory loads by lane stride: per k step 2 broadcast vec4 of x
+// and 1 vec4 of w at lane * stride (vec4 units, param 2), 32 FMAs.
+#ifdef KERNEL_pl_stride
+// 2048 vec4s, the M4's 32 KB of threadgroup memory: w below 1024, x above.
+shared vec4 pl_t[2048];
+void main() {
+    const uint rounds = arg_u32(1), stride = arg_u32(2), tid = gl_LocalInvocationIndex;
+    const uint lane = tid & 31u, sg = tid >> 5u;
+    for (uint i = tid; i < 2048u; i += 256u) pl_t[i] = vec4(float(i) * 1e-4);
+    barrier();
+    vec4 acc[8];
+    [[unroll]] for (uint i = 0u; i < 8u; i++) acc[i] = vec4(0.0);
+    const uint wl = lane * stride;
+    for (uint r = 0u; r < rounds; r++) {
+        const uint base = (r & 3u) * 8u;
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            const vec4 w = pl_t[(wl + base + k) & 1023u];
+            [[unroll]] for (uint g = 0u; g < 2u; g++) {
+                const vec4 xv = pl_t[1024u + 64u * sg + 2u * (base + k) + g];
+                [[unroll]] for (uint i = 0u; i < 4u; i++) acc[4u * g + i] = fma(vec4(xv[i]), w, acc[4u * g + i]);
+            }
+        }
+    }
+    float s = 0.0;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) s += acc[i].x + acc[i].w;
+    if (s == 1234.5) U32(arg(0)).v[tid] = 1u;
+}
+#endif
+
+// More inner-loop shapes (shared_shape_probe): per k step a lane reads 1 w
+// vec4 of its own and PB_X activation values for PB_X x 4 FMAs, as vec4
+// loads the subgroup shares (pb_lds*) or as subgroup broadcasts of values
+// the lanes hold in registers (pb_bc*, one vec4 a lane loaded per round).
+#if defined(KERNEL_pb_lds8) || defined(KERNEL_pb_lds12) || defined(KERNEL_pb_bc8) || \
+    defined(KERNEL_pb_bc12)
+#if defined(KERNEL_pb_lds8) || defined(KERNEL_pb_bc8)
+#define PB_X 8
+#else
+#define PB_X 12
+#endif
+#if defined(KERNEL_pb_bc8) || defined(KERNEL_pb_bc12)
+#define PB_BC
+#endif
+// 2048 vec4s, the M4's 32 KB of threadgroup memory: w below 1024, x above.
+shared vec4 pb_s[2048];
+void main() {
+    const uint rounds = arg_u32(1), tid = gl_LocalInvocationIndex;
+    const uint lane = tid & 31u, sg = tid >> 5u;
+    for (uint i = tid; i < 2048u; i += 256u) pb_s[i] = vec4(float(i) * 1e-4);
+    barrier();
+    vec4 acc[PB_X];
+    [[unroll]] for (uint i = 0u; i < PB_X; i++) acc[i] = vec4(0.0);
+    for (uint r = 0u; r < rounds; r++) {
+        const uint base = (r & 3u) * 8u;
+#ifdef PB_BC
+        // Lane l holds activation (row l % PB_X... ) values for the round.
+        const vec4 mine = pb_s[1024u + 64u * sg + base + lane];
+#endif
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            const vec4 w = pb_s[lane * 9u + base + k];
+#ifdef PB_BC
+            [[unroll]] for (uint i = 0u; i < PB_X; i++)
+                acc[i] = fma(vec4(subgroupBroadcast(mine[k & 3u], (k >> 2u) * PB_X + i)), w, acc[i]);
+#else
+            [[unroll]] for (uint g = 0u; g < PB_X / 4; g++) {
+                const vec4 xv = pb_s[1024u + 64u * sg + (PB_X / 4) * (base + k) + g];
+                [[unroll]] for (uint i = 0u; i < 4u; i++) acc[4u * g + i] = fma(vec4(xv[i]), w, acc[4u * g + i]);
+            }
+#endif
+        }
+    }
+    float s = 0.0;
+    [[unroll]] for (uint i = 0u; i < PB_X; i++) s += acc[i].x + acc[i].w;
+    if (s == 1234.5) U32(arg(0)).v[tid] = 1u;
+}
+#endif

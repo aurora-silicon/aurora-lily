@@ -134,6 +134,40 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
     Ok(NAMES[t][m - 1])
 }
 
+/// On a G16 GPU (an M4), the `gemv_g16.comp` kernel of a type, row count,
+/// width and activation layout, and the rows a subgroup of it takes; `None`
+/// keeps the glm53_gemv kernel.
+fn g16_gemv_name(
+    ctx: &MetalContext,
+    ty: GgmlType,
+    cols: usize,
+    m: usize,
+    x_group: usize,
+    x_row_stride: usize,
+) -> Option<(&'static str, usize)> {
+    if !ctx.g16() {
+        return None;
+    }
+    let (names, rows) = match ty {
+        GgmlType::Q5K if cols.is_multiple_of(256) => (
+            [
+                "g16_gemv_q5_k_m1",
+                "g16_gemv_q5_k_m2",
+                "g16_gemv_q5_k_m3",
+                "g16_gemv_q5_k_m4",
+            ],
+            if m == 1 { 4 } else { 2 },
+        ),
+        _ => return None,
+    };
+    // Every row count's kernel or none: a verify pass's rows must sum as
+    // plain decode's row does. The kernel steps between activation rows in
+    // vec4s (x_row_stride / 4): a layout of another stride takes glm53_gemv,
+    // at m = 1 too.
+    (m <= names.len() && x_group.is_multiple_of(4) && x_row_stride.is_multiple_of(4))
+        .then(|| (names[m - 1], rows))
+}
+
 fn moe_name(gate_up: bool, ty: GgmlType) -> Result<&'static str> {
     Ok(match (gate_up, ty) {
         (true, GgmlType::Iq2Xxs) => "glm53_moe_gate_up_iq2_xxs",
@@ -234,11 +268,19 @@ fn gemv_dispatch(
         "GEMV row of {} values",
         w0.cols
     );
-    let per_sg = 32 / tasks.min(32);
     let max_rows = sets.iter().map(|(w, _)| w.rows).max().unwrap_or(0);
+    let g16 = g16_gemv_name(ctx, w0.ty, w0.cols, m, l.x_group, l.x_row_stride);
     // Two rows a subgroup share one input row, so grouped inputs (GLM's
-    // per-head attn_k_b) take one.
-    let r = if l.x_group >= max_rows { gemv_rows_per_subgroup(w0.ty, m, max_rows) } else { 1 };
+    // per-head attn_k_b) take one; the G16 kernels set their own rows.
+    let r = if g16.is_none() && l.x_group >= max_rows {
+        gemv_rows_per_subgroup(w0.ty, m, max_rows)
+    } else {
+        1
+    };
+    let per_sg = match g16 {
+        Some((_, rows)) => rows,
+        None => 32 / tasks.min(32),
+    };
     let rows_per_tg = 8 * per_sg * r;
     let mut groups = 0;
     for &(w, y) in sets {
@@ -265,7 +307,11 @@ fn gemv_dispatch(
         bindings.push(sets.get(s).map_or(x.binding(), |(_, y)| y.binding()));
     }
     let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
-    let name = if r == 2 { "glm53_gemv_q5_k_m1_r2" } else { gemv_name(w0.ty, m)? };
+    let name = match g16 {
+        Some((name, _)) => name,
+        None if r == 2 => "glm53_gemv_q5_k_m1_r2",
+        None => gemv_name(w0.ty, m)?,
+    };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -345,7 +391,28 @@ pub fn gemm_with(
     l: GemmLayout,
 ) -> Result<()> {
     check_f32(&[x])?;
-    gemm_any(ctx, pass, w, x, y, m, n, l, gemm_name(w.ty)?, 64, 128)
+    if !ctx.matrix_units() {
+        return gemm_any(ctx, pass, w, x, y, m, n, l, sgemm_name(w.ty)?, (64, 128), 256);
+    }
+    gemm_any(ctx, pass, w, x, y, m, n, l, gemm_name(w.ty)?, (64, 64), 128)
+}
+
+/// The GEMM without matrix units (`sgemm.comp`: f32 operands, tiles of 64
+/// activation rows x 128 weight rows, 256 threads, K in 32-deep steps).
+fn sgemm_name(ty: GgmlType) -> Result<&'static str> {
+    Ok(match ty {
+        GgmlType::Q8_0 => "sgemm_q8_0",
+        GgmlType::Q4_0 => "sgemm_q4_0",
+        GgmlType::Q4K => "sgemm_q4_k",
+        GgmlType::Q5K => "sgemm_q5_k",
+        GgmlType::Q6K => "sgemm_q6_k",
+        GgmlType::Iq4Nl => "sgemm_iq4_nl",
+        GgmlType::Iq2S => "sgemm_iq2_s",
+        GgmlType::Iq2Xxs => "sgemm_iq2_xxs",
+        GgmlType::F16 => "sgemm_f16",
+        GgmlType::F32 => "sgemm_f32",
+        other => anyhow::bail!("no GEMM without matrix units over {other:?}"),
+    })
 }
 
 /// [`gemm`] over `xb`, the input's rows as bfloat ([`to_bf16`]'s rounding:
@@ -408,7 +475,7 @@ pub fn gemm_bx_with(
         (GgmlType::Q6K, _) => ("glm53_gemm_q6_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
         (other, _) => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
     };
-    gemm_any(ctx, pass, w, xb, y, m, n, l, name, rows, threads)
+    gemm_any(ctx, pass, w, xb, y, m, n, l, name, (rows, 64), threads)
 }
 
 /// Rows of X a threadgroup of the bfloat-input GEMM takes (the kernel's
@@ -464,7 +531,7 @@ fn gemm_any(
     n: usize,
     l: GemmLayout,
     name: &'static str,
-    tile_rows: usize,
+    (tile_rows, tile_cols): (usize, usize),
     threads: usize,
 ) -> Result<()> {
     check_f32(&[y])?;
@@ -504,7 +571,7 @@ fn gemm_any(
             &u32_bytes(l.y_batch),
         ],
         Grid::Threadgroups {
-            groups: (n.div_ceil(64), m.div_ceil(tile_rows), l.batches),
+            groups: (n.div_ceil(tile_cols), m.div_ceil(tile_rows), l.batches),
             threadgroup: (threads, 1, 1),
         },
     )

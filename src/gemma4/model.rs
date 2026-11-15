@@ -353,7 +353,8 @@ pub struct Scratch {
     pub tokens: Tensor,
     pub x: Tensor,
     h: Tensor,
-    /// BF16: a prompt run's projection input (the bfloat-input GEMMs').
+    /// BF16: a prompt run's projection input (the bfloat-input GEMMs';
+    /// matrix units only).
     xb: Tensor,
     q: Tensor,
     kv: Tensor,
@@ -426,7 +427,11 @@ impl Scratch {
             h: hb.clone(),
             xb: Tensor::zeros(
                 ctx,
-                &[m * cfg.max_q_width().max(cfg.ff).max(h)],
+                &[if ctx.matrix_units() {
+                    m * cfg.max_q_width().max(cfg.ff).max(h)
+                } else {
+                    2
+                }],
                 DType::BF16,
             )?,
             q: pool.view(0, &[m * qw])?,
@@ -533,7 +538,8 @@ impl Gemma4Model {
             // rounds X in every column tile): UD-IQ2_M's 4K prompt
             // 2115 -> 2378 tok/s, 2026-11-15.
             let cols = sets[0].0.cols;
-            let bx = sets.iter().all(|(w, _)| w.cols == cols && k::gemm_bx_takes(w));
+            let bx = ctx.matrix_units()
+                && sets.iter().all(|(w, _)| w.cols == cols && k::gemm_bx_takes(w));
             if bx {
                 k::to_bf16(ctx, pass, x, &sc.xb, m * cols)?;
                 pass.memory_barrier()?;

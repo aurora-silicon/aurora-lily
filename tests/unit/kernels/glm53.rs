@@ -88,7 +88,9 @@ fn gemv_and_gemm_match_cpu_for_gemma4_types() {
                     (0..m).flat_map(|i| cpu.mv(&x[i * cols..(i + 1) * cols])).collect();
                 assert_close(&y.to_f32().unwrap(), &expected, 1e-4, 1e-4);
             }
-            if cols.is_multiple_of(64) {
+            // Without matrix units the GEMM is sgemm.comp's, f32 throughout
+            // (kernels::gemma4 gemms_without_matrix_units_match_cpu).
+            if cols.is_multiple_of(64) && ctx.matrix_units() {
                 // The GEMM rounds both operands to bfloat: so does the
                 // reference.
                 let m = 37;
@@ -978,6 +980,10 @@ fn kda_prefill_long_runs_match_cpu() {
 
 #[test]
 fn dsa_store_and_attend_match_cpu() {
+    // The prompt-run DSA kernels use matrix units.
+    if !ctx().matrix_units() {
+        return;
+    }
     // 42 cached rows then 3 rows of queries (SIMT kernels); 25 then a run
     // of 20 (matrix units); runs from row 0 in partial tiles of the
     // padded widths 8 and 16.
@@ -990,6 +996,10 @@ fn dsa_store_and_attend_match_cpu() {
 /// through f32 on the matrix route): finite, and as the CPU computes.
 #[test]
 fn dsa_attend_large_queries_stay_finite() {
+    // The prompt-run DSA kernels use matrix units.
+    if !ctx().matrix_units() {
+        return;
+    }
     for m in [3, 20] {
         dsa_causal_case(45, m, 64, true);
     }
@@ -1050,6 +1060,10 @@ fn dsa_attend_refuses_unpadded_prompt_widths() {
 #[test]
 fn dsa_scores_mu_block_boundaries() {
     let ctx = ctx();
+    // The prompt-run DSA kernels use matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(81);
     let n = 6000usize;
     let s = 192usize;
@@ -1173,6 +1187,10 @@ fn dsa_scores_mu_block_boundaries() {
 #[test]
 fn dsa_scores_at_and_past_f16_range() {
     let ctx = ctx();
+    // The prompt-run DSA kernels use matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(78);
     let (n, m) = (200usize, 6usize);
     let s = n;
@@ -1346,6 +1364,10 @@ fn dsa_causal_case(n: usize, m: usize, s: usize, big: bool) {
 /// lists with unused slots, against the CPU.
 #[test]
 fn dsa_attend_selected_matches_cpu() {
+    // The prompt-run DSA kernels use matrix units.
+    if !ctx().matrix_units() {
+        return;
+    }
     // Decode rows (SIMT kernels, the slots in chunks) and a prompt run
     // (matrix units); a short selection and a full one (its last chunk full).
     for (m, count) in [(2, 344), (6, 344), (2, 2056), (6, 2056)] {
@@ -2256,6 +2278,10 @@ fn gemm_matches_cpu() {
         (GgmlType::F32, 4096, 288, 33),
         (GgmlType::Q8_0, 128, 8192, 64),
     ] {
+        // The f32 GEMM without matrix units has no bf16 weights.
+        if matches!(ty, GgmlType::Bf16) && !ctx.matrix_units() {
+            continue;
+        }
         let raw = random_blocks(&mut rng, ty, rows * cols);
         let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
         let cpu = mat(ty, &raw, rows, cols);
@@ -2323,6 +2349,10 @@ fn gemm_k_widths() {
 #[test]
 fn gemm_bx_matches_gemm() {
     let ctx = ctx();
+    // The bfloat GEMMs run on matrix units only.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(78);
     // Rows within one 256-row tile, around its edge (255, 256, 257) and
     // across several (513, 1 024); widths with partial 64-column tiles.
@@ -2378,6 +2408,10 @@ fn gemm_bx_matches_gemm() {
 #[test]
 fn gemm_bx_batched_matches_gemm_with() {
     let ctx = ctx();
+    // The bfloat-input GEMM uses matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(79);
     let (heads, per, cols, m) = (4, 128, 256, 300);
     let raw = random_blocks(&mut rng, GgmlType::Q8_0, heads * per * cols);
@@ -2411,6 +2445,10 @@ fn gemm_bx_batched_matches_gemm_with() {
 #[test]
 fn gemm_bx_split_groups_match_batched() {
     let ctx = ctx();
+    // The bfloat-input GEMM uses matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(83);
     let (groups, per, cols, m) = (8, 128, 256, 300);
     let raw = random_blocks(&mut rng, GgmlType::Q8_0, groups * per * cols);
@@ -2488,6 +2526,10 @@ fn moe_grouped_six_slots_matches_per_pair_kernels() {
 
 fn moe_grouped_case(used: usize) {
     let ctx = ctx();
+    // The bfloat GEMMs run on matrix units only.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(71);
     let (experts, hidden, ff, m) = (12, 512, 256, 70);
     let g_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
@@ -2553,6 +2595,10 @@ fn moe_grouped_case(used: usize) {
 #[test]
 fn moe_grouped_dot_matches_per_pair_kernels() {
     let ctx = ctx();
+    // The bfloat tiles use matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(80);
     let (experts, hidden, ff) = (40, 512, 256);
     let g_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
@@ -2655,6 +2701,10 @@ fn moe_grouped_dot_matches_per_pair_kernels() {
 #[test]
 fn moe_grouped_dot_route_boundaries() {
     let ctx = ctx();
+    // The tile route uses matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(81);
     let (hidden, ff, used, m) = (512usize, 256usize, 8usize, 140usize);
     // Experts 0-4: 1..5 rows; 5-8: 65..68; 9-12: 129..132; then fillers.
@@ -3039,6 +3089,10 @@ fn gemm_timing() {
 #[test]
 fn moe_grouped_fused_matches_separate() {
     let ctx = ctx();
+    // The bfloat GEMMs run on matrix units only.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(74);
     let (experts, hidden, ff, used, m) = (12, 1024, 512, 8, 60);
     let mk = |rng: &mut StdRng, ty, cols, rows| {
@@ -3101,6 +3155,10 @@ fn deepseek4_q2_k_gate_up_scratch() {
     assert!(separate_gate_up([GgmlType::Iq2Xxs, GgmlType::Q2K]));
     assert!(!separate_gate_up([GgmlType::Iq2Xxs, GgmlType::Iq2Xxs]));
     let ctx = ctx();
+    // The grouped experts use matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(82);
     let (experts, hidden, ff, used, m) = (12, 512, 256, 6, 40);
     let mk = |rng: &mut StdRng, cols, rows| {
@@ -3150,6 +3208,10 @@ fn deepseek4_q2_k_gate_up_scratch() {
 #[test]
 fn moe_grouped_q2_k_gate_up_matches_per_pair_kernels() {
     let ctx = ctx();
+    // The bfloat GEMMs run on matrix units only.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(76);
     let (experts, hidden, ff, used, m) = (12, 512, 256, 8, 70);
     let g_raw = random_blocks(&mut rng, GgmlType::Q2K, experts * ff * hidden);
@@ -3330,6 +3392,130 @@ fn moe_rows_timing() {
             line += &format!("  {name} {:6.1} us", best / repeat as f64 * 1e6);
         }
         println!("{line}");
+    }
+}
+
+/// A GEMV's rows of m = 2..4 are bit-identical to the same activations'
+/// one-row GEMV (a verify pass's rows to plain decode's), at Gemma's widths.
+#[test]
+fn gemv_rows_match_one_row_exactly() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(45);
+    for ty in [GgmlType::Q5K, GgmlType::Q8_0, GgmlType::Iq4Nl] {
+        for (cols, rows) in [(2816usize, 72usize), (4096, 40)] {
+            let raw = random_blocks(&mut rng, ty, rows * cols);
+            let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+            let x = f32s(&mut rng, GEMV_MAX_ROWS * cols, -1.0, 1.0);
+            let tx = tensor(&ctx, &x);
+            let mut one = Vec::new();
+            for i in 0..GEMV_MAX_ROWS {
+                let xi = tensor(&ctx, &x[i * cols..(i + 1) * cols]);
+                let y = zeros(&ctx, rows);
+                run(&ctx, |p| gemv(&ctx, p, &w, &xi, &y, 1).unwrap());
+                one.extend(y.to_f32().unwrap());
+            }
+            for m in 2..=GEMV_MAX_ROWS {
+                let y = zeros(&ctx, m * rows);
+                run(&ctx, |p| gemv(&ctx, p, &w, &tx, &y, m).unwrap());
+                let got = y.to_f32().unwrap();
+                for (n, (a, b)) in got.iter().zip(&one[..m * rows]).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{ty:?} {cols} m={m} at {n}");
+                }
+            }
+        }
+    }
+}
+
+/// Q5_K GEMVs at the edges of the G16 kernel's routing (gemv_g16.comp on a
+/// G16 GPU, an M4: a subgroup 4 output rows at m = 1, else 2): sets of 37
+/// and 41 rows and per-head inputs of 4 rows (a subgroup's last rows past
+/// the output), and activation rows a stride apart that is not a multiple
+/// of 4 (glm53_gemv then). Every row count against the CPU, the outputs'
+/// gaps and tails unwritten.
+#[test]
+fn gemv_g16_edges_match_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(46);
+    let (ty, cols) = (GgmlType::Q5K, 512usize);
+    // Outputs start as (and must keep, past what is written) this value.
+    const UNWRITTEN: f32 = 1234.5;
+    const TAIL: usize = 64;
+    let mut weight = |rows: usize| {
+        let raw = random_blocks(&mut rng, ty, rows * cols);
+        (
+            QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap(),
+            mat(ty, &raw, rows, cols),
+        )
+    };
+    let sets = [weight(37), weight(41), weight(44)];
+    let head = weight(37);
+    let strided = weight(40);
+    let out = |n: usize| tensor(&ctx, &vec![UNWRITTEN; n + TAIL]);
+    let g16 = |m: usize, l: &GemvLayout| {
+        g16_gemv_name(&ctx, ty, cols, m, l.x_group, l.x_row_stride)
+    };
+    for m in 1..=GEMV_MAX_ROWS {
+        // gemv_sets: one input row for all three sets (x_group 44).
+        let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+        let tx = tensor(&ctx, &x);
+        let ys: Vec<Tensor> = sets.iter().map(|(w, _)| out(m * w.rows)).collect();
+        let pairs: Vec<(&QWeight, &Tensor)> =
+            sets.iter().map(|(w, _)| w).zip(&ys).collect();
+        run(&ctx, |p| gemv_sets(&ctx, p, &pairs, &tx, m).unwrap());
+        for ((w, cpu), y) in sets.iter().zip(&ys) {
+            let mut want: Vec<f32> =
+                (0..m).flat_map(|i| cpu.mv(&x[i * cols..(i + 1) * cols])).collect();
+            want.resize(m * w.rows + TAIL, UNWRITTEN);
+            assert_close(&y.to_f32().unwrap(), &want, 1e-4, 1e-4);
+        }
+
+        // Per-head inputs: rows 4 n .. 4 n + 4 read input vector n of their
+        // activation row, outputs 40 apart (rows 37 .. 40 of each unwritten).
+        let (w, cpu) = &head;
+        let l = GemvLayout { x_group: 4, x_row_stride: 10 * cols, y_row_stride: 40 };
+        let x = f32s(&mut rng, m * 10 * cols, -1.0, 1.0);
+        let y = out((m - 1) * 40 + w.rows);
+        run(&ctx, |p| gemv_with(&ctx, p, w, &tensor(&ctx, &x), &y, m, l).unwrap());
+        let mut want = vec![UNWRITTEN; (m - 1) * 40 + w.rows + TAIL];
+        for i in 0..m {
+            let yi = cpu.mv_grouped(&x[i * 10 * cols..(i + 1) * 10 * cols], 4);
+            want[i * 40..i * 40 + w.rows].copy_from_slice(&yi);
+        }
+        assert_close(&y.to_f32().unwrap(), &want, 1e-4, 1e-4);
+
+        // Activation rows cols + 1 and cols + 6 apart take glm53_gemv,
+        // cols + 4 apart the G16 kernel.
+        let (w, cpu) = &strided;
+        for stride in [cols + 1, cols + 4, cols + 6] {
+            let l =
+                GemvLayout { x_group: w.rows, x_row_stride: stride, y_row_stride: 0 };
+            let x = f32s(&mut rng, (m - 1) * stride + cols, -1.0, 1.0);
+            let y = out(m * w.rows);
+            run(&ctx, |p| gemv_with(&ctx, p, w, &tensor(&ctx, &x), &y, m, l).unwrap());
+            let mut want: Vec<f32> = (0..m)
+                .flat_map(|i| cpu.mv(&x[i * stride..i * stride + cols]))
+                .collect();
+            want.resize(m * w.rows + TAIL, UNWRITTEN);
+            assert_close(&y.to_f32().unwrap(), &want, 1e-4, 1e-4);
+        }
+    }
+    // The side of the G16 routing each case is on, asserted after the
+    // outputs so that a wrong routing shows first as wrong outputs.
+    for m in 1..=GEMV_MAX_ROWS {
+        for (x_group, x_row_stride, takes) in [
+            (44, cols, true),
+            (4, 10 * cols, true),
+            (40, cols + 1, false),
+            (40, cols + 4, true),
+            (40, cols + 6, false),
+        ] {
+            let l = GemvLayout { x_group, x_row_stride, y_row_stride: 0 };
+            assert_eq!(
+                g16(m, &l).is_some(),
+                ctx.g16() && takes,
+                "x_group {x_group} stride {x_row_stride} at m={m}"
+            );
+        }
     }
 }
 

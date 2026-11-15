@@ -23,6 +23,10 @@ use crate::cpu_ref;
 #[test]
 fn elementwise_ops_match_cpu() {
     let ctx = MetalContext::new().expect("metal context");
+    // bfloat arithmetic kernels: a device without matrix units has no bfloat.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(3);
     let n = 1000;
     let a: Vec<f32> = (0..n).map(|_| rng.gen_range(-2.0f32..2.0)).collect();
@@ -204,6 +208,10 @@ fn memory_bandwidth_probe() {
 #[test]
 fn silu_mul_rows_matches_split_silu_mul_bitwise() {
     let ctx = MetalContext::new().expect("metal context");
+    // bfloat arithmetic kernels: a device without matrix units has no bfloat.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(97);
     for (m, n) in [(1usize, 640usize), (3, 640), (8, 96), (16, 1280)] {
         let gu: Vec<f32> =
@@ -261,6 +269,10 @@ fn gelu_erf(x: f32) -> f32 {
 #[test]
 fn gelu_forms_match_cpu() {
     let ctx = MetalContext::new().expect("metal context");
+    // bfloat arithmetic kernels: a device without matrix units has no bfloat.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(7);
     let n = 1500;
     let x: Vec<f32> = (0..n).map(|_| rng.gen_range(-5.0f32..5.0)).collect();
@@ -1100,6 +1112,161 @@ fn instruction_cost_probe() {
                 (ns - per_round[0]) / 8.0
             );
         }
+    }
+}
+
+/// The GPU's FMA peak (`pk_fma_*`, tests/vulkan/peak_test.comp): f32 and
+/// f16 FMAs on independent chains, 2 FLOPs each, by dispatch size. Run with
+/// `--ignored --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn fma_peak_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    for (name, per_round) in
+        [("pk_fma_f32", 32usize), ("pk_fma_f16", 32), ("pk_fma_f16w", 64)]
+    {
+        let kernel = ctx.pipeline(name, "", MslVersion::V3_1).expect("kernel");
+        for groups in [64usize, 256, 1024] {
+            let rounds = 2048usize;
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let pass = ctx.begin().expect("pass");
+                pass.dispatch_at(
+                    &kernel,
+                    &[out.binding()],
+                    &[&u32_bytes(rounds)],
+                    Grid::Threadgroups {
+                        groups: (groups, 1, 1),
+                        threadgroup: (256, 1, 1),
+                    },
+                )
+                .expect("dispatch");
+                let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                let t = done.timing().expect("timing");
+                best = best.min(t.gpu_end_secs - t.gpu_start_secs);
+            }
+            let flops = 2.0 * (groups * 256 * rounds * per_round) as f64;
+            eprintln!(
+                "{name:<12} {groups:>5} groups of 256: {:.3} TFLOPS ({:.2} ms)",
+                flops / best / 1e12,
+                best * 1e3
+            );
+        }
+    }
+}
+
+/// Threadgroup-memory loads in the shape of a GEMM's inner loop (`pl_*`,
+/// tests/vulkan/peak_test.comp): per k step x vec4s (broadcast, or one a
+/// lane with `d`) and w vec4s (one a lane) and their outer product. FMA
+/// TFLOPS and ns per k step a subgroup. Run with `--ignored --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn shared_load_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    for (name, fmas) in [
+        ("pl_x1w2", 32usize),
+        ("pl_x2w2", 64),
+        ("pl_x4w1", 64),
+        ("pl_x1w2d", 32),
+        ("pl_x2w2d", 64),
+        ("pl_x0w2", 8),
+        ("pl_x1w0", 8),
+    ] {
+        let kernel = ctx.pipeline(name, "", MslVersion::V3_1).expect("kernel");
+        let (groups, rounds) = (1024usize, 256usize);
+        let mut best = f64::INFINITY;
+        for _ in 0..6 {
+            let pass = ctx.begin().expect("pass");
+            pass.dispatch_at(
+                &kernel,
+                &[out.binding()],
+                &[&u32_bytes(rounds)],
+                Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
+            )
+            .expect("dispatch");
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            best = best.min(t.gpu_end_secs - t.gpu_start_secs);
+        }
+        let steps = (groups * 256 * rounds * 8) as f64;
+        eprintln!(
+            "{name:<10} {:.3} TFLOPS of FMAs, {:.3} ns a k step a lane-thread ({:.2} ms)",
+            2.0 * steps * fmas as f64 / best / 1e12,
+            best / steps * 1e9,
+            best * 1e3
+        );
+    }
+}
+
+/// Threadgroup-memory vec4 loads by lane stride (`pl_stride`,
+/// tests/vulkan/peak_test.comp): 2 broadcast x vec4 and 1 w vec4 at lane x
+/// stride a k step, 32 FMAs. Run with `--ignored --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn shared_stride_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    let kernel = ctx.pipeline("pl_stride", "", MslVersion::V3_1).expect("kernel");
+    for stride in [0usize, 1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33] {
+        let (groups, rounds) = (1024usize, 256usize);
+        let mut best = f64::INFINITY;
+        for _ in 0..6 {
+            let pass = ctx.begin().expect("pass");
+            pass.dispatch_at(
+                &kernel,
+                &[out.binding()],
+                &[&u32_bytes(rounds), &u32_bytes(stride)],
+                Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
+            )
+            .expect("dispatch");
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            best = best.min(t.gpu_end_secs - t.gpu_start_secs);
+        }
+        let steps = (groups * 256 * rounds * 8) as f64;
+        eprintln!(
+            "stride {stride:>2}: {:.3} TFLOPS of FMAs",
+            2.0 * steps * 32.0 / best / 1e12
+        );
+    }
+}
+
+/// More GEMM inner-loop shapes (`pb_*`, tests/vulkan/peak_test.comp): a
+/// lane's 1 w vec4 against 8 or 12 activation values a k step, as shared
+/// vec4 loads or as subgroup broadcasts. FMA TFLOPS. Run with `--ignored
+/// --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn shared_shape_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    for (name, rows) in
+        [("pb_lds8", 8usize), ("pb_lds12", 12), ("pb_bc8", 8), ("pb_bc12", 12)]
+    {
+        let kernel = ctx.pipeline(name, "", MslVersion::V3_1).expect("kernel");
+        let (groups, rounds) = (1024usize, 256usize);
+        let mut best = f64::INFINITY;
+        for _ in 0..6 {
+            let pass = ctx.begin().expect("pass");
+            pass.dispatch_at(
+                &kernel,
+                &[out.binding()],
+                &[&u32_bytes(rounds)],
+                Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
+            )
+            .expect("dispatch");
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            best = best.min(t.gpu_end_secs - t.gpu_start_secs);
+        }
+        let fmas = (groups * 256 * rounds * 8 * rows * 4) as f64;
+        eprintln!("{name:<9} {:.3} TFLOPS of FMAs", 2.0 * fmas / best / 1e12);
     }
 }
 

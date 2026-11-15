@@ -34,8 +34,14 @@ fn run(ctx: &MetalContext, f: impl FnOnce(&ComputePass<'_>)) {
     pass.commit_wait().expect("commit");
 }
 
-/// Random blocks with small scales (Q8_0, IQ4_NL, Q5_K, IQ2_XXS).
+/// Random blocks with small scales (Q8_0, IQ4_NL, Q4_K, Q5_K, Q6_K,
+/// IQ2_XXS, IQ2_S; F32 values in -0.1..0.1).
 fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
+    if ty == GgmlType::F32 {
+        return (0..values)
+            .flat_map(|_| rng.gen_range(-0.1f32..0.1).to_le_bytes())
+            .collect();
+    }
     let nb = values / ty.block_values();
     let bb = ty.block_bytes();
     let mut b: Vec<u8> = (0..nb * bb).map(|_| rng.r#gen()).collect();
@@ -47,7 +53,8 @@ fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
             GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Iq2Xxs | GgmlType::Iq2S => {
                 put(blk, 0, rng.gen_range(0.001..0.01))
             }
-            GgmlType::Q5K => {
+            GgmlType::Q6K => put(blk, 208, rng.gen_range(0.001..0.01)),
+            GgmlType::Q4K | GgmlType::Q5K => {
                 put(blk, 0, rng.gen_range(0.001..0.01));
                 put(blk, 2, rng.gen_range(0.001..0.01));
             }
@@ -473,7 +480,8 @@ fn embed_geglu_softcap_match_cpu() {
 
 /// Per-dispatch time of the routed-expert kernels at Gemma 4's shapes
 /// (hidden 2816, expert FF 704, top 8): one layer's gate/up and down, the
-/// dispatches of a serial pass over four layers' weights in turn.
+/// dispatches of a serial pass over four layers' weights in turn, best of
+/// eight passes after one that wakes the GPU's clocks.
 #[test]
 #[ignore = "timing only"]
 fn moe_timing() {
@@ -509,7 +517,7 @@ fn moe_timing() {
         let mut line = format!("moe {gt:?}/{dt:?}:");
         for part in 0..2 {
             let mut best = f64::MAX;
-            for _ in 0..5 {
+            for pass_no in 0..9 {
                 let pass = ctx.begin().unwrap();
                 for r in 0..repeat {
                     let (gu, dn) = &layers[r % 4];
@@ -525,7 +533,9 @@ fn moe_timing() {
                 }
                 let t = std::time::Instant::now();
                 pass.commit_wait().unwrap();
-                best = best.min(t.elapsed().as_secs_f64());
+                if pass_no > 0 {
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
             }
             line += &format!(
                 " {} {:.1} us",
@@ -534,6 +544,272 @@ fn moe_timing() {
             );
         }
         eprintln!("{line}");
+    }
+}
+
+/// Without matrix units (an M4) a prompt run's GEMMs are sgemm.comp's, f32
+/// throughout: the dense GEMM over the block types of Gemma's files and the
+/// grouped experts against f32 CPU sums, at shapes with partial tiles in
+/// both directions. Each output within 2^-14 of the magnitudes it sums
+/// (the summation order). On a device with matrix units these paths are
+/// not taken and the test returns.
+#[test]
+fn gemms_without_matrix_units_match_cpu() {
+    let ctx = ctx();
+    if ctx.matrix_units() {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(31);
+    let tol = 2f32.powi(-14);
+    for (ty, cols, rows, m) in [
+        (GgmlType::Q8_0, 2112usize, 200usize, 70usize),
+        (GgmlType::Q5K, 2816, 130, 129),
+        (GgmlType::Q6K, 2816, 72, 64),
+        (GgmlType::Q4K, 512, 64, 5),
+        (GgmlType::F32, 2816, 128, 256),
+        (GgmlType::Iq4Nl, 704, 96, 65),
+        (GgmlType::Iq2Xxs, 512, 66, 33),
+        (GgmlType::Iq2S, 512, 64, 100),
+    ] {
+        let raw = random_blocks(&mut rng, ty, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+        let wf = decode(ty, &raw);
+        let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+        let tx = tensor(&ctx, &x);
+        let y = zeros(&ctx, m * rows);
+        run(&ctx, |p| crate::kernels::glm53::gemm(&ctx, p, &w, &tx, &y, m).unwrap());
+        let got = y.to_f32().unwrap();
+        for i in 0..m {
+            let xi = &x[i * cols..(i + 1) * cols];
+            for n in 0..rows {
+                let wn = &wf[n * cols..(n + 1) * cols];
+                let want = dot(wn, xi);
+                let bound: f32 = wn.iter().zip(xi).map(|(a, b)| (a * b).abs()).sum();
+                let err = (got[i * rows + n] - want).abs();
+                assert!(
+                    err <= bound * tol + 1e-6,
+                    "{ty:?} row {i} col {n}: {} vs {want}",
+                    got[i * rows + n]
+                );
+            }
+        }
+    }
+    let (hid, ff, ne, used, m) = (512, 128, 12, 8, 140);
+    let sel: Vec<u32> =
+        (0..m * used).map(|i| ((i * 7 + i / used) % ne) as u32).collect();
+    for (gt, dt) in [
+        (GgmlType::Iq2Xxs, GgmlType::Iq4Nl),
+        (GgmlType::Iq2S, GgmlType::Iq4Nl),
+        (GgmlType::Q5K, GgmlType::Q8_0),
+    ] {
+        grouped_f32_matches_cpu(&ctx, &mut rng, gt, dt, (hid, ff, ne, used, m), &sel);
+    }
+}
+
+/// [`moe_grouped`] without matrix units over random `gt` gate/up and `dt`
+/// down weights of `ne` experts (hidden `hid`, FF `ff`), `m` rows routed
+/// to `sel` (`used` a row), against f32 CPU sums: each output within 2^-14
+/// of the magnitudes it sums.
+fn grouped_f32_matches_cpu(
+    ctx: &MetalContext,
+    rng: &mut StdRng,
+    gt: GgmlType,
+    dt: GgmlType,
+    (hid, ff, ne, used, m): (usize, usize, usize, usize, usize),
+    sel: &[u32],
+) {
+    let tol = 2f32.powi(-14);
+    let gu_raw = random_blocks(rng, gt, ne * 2 * ff * hid);
+    let dn_raw = random_blocks(rng, dt, ne * hid * ff);
+    let gu = QWeight::from_bytes(ctx, &gu_raw, gt, hid, ne * 2 * ff).unwrap();
+    let dn = QWeight::from_bytes(ctx, &dn_raw, dt, ff, ne * hid).unwrap();
+    let (guw, dnw) = (decode(gt, &gu_raw), decode(dt, &dn_raw));
+    let x = f32s(rng, m * hid, -1.0, 1.0);
+    let wts = f32s(rng, m * used, 0.05, 0.2);
+    let (tx, ts, tw) = (tensor(ctx, &x), u32s(ctx, sel), tensor(ctx, &wts));
+    let grouped = zeros(ctx, m * hid);
+    let sc = MoeGroupScratch::new(ctx, m, used, ne, ff, hid).unwrap();
+    run(ctx, |p| {
+        moe_grouped(ctx, p, &gu, &dn, ff, &tx, &ts, &tw, &grouped, &sc, m, used, ne)
+            .unwrap()
+    });
+    let got = grouped.to_f32().unwrap();
+    for i in 0..m {
+        let xi = &x[i * hid..(i + 1) * hid];
+        let (mut want, mut bound) = (vec![0f32; hid], vec![0f32; hid]);
+        for s in 0..used {
+            let e = sel[i * used + s] as usize;
+            let w = &guw[e * 2 * ff * hid..(e + 1) * 2 * ff * hid];
+            // The GeGLU's inputs to within their own sums' order: the
+            // bound carries the gate and up magnitudes.
+            let v: Vec<(f32, f32)> = (0..ff)
+                .map(|j| {
+                    let (gw, uw) =
+                        (&w[j * hid..(j + 1) * hid], &w[(ff + j) * hid..][..hid]);
+                    let g = dot(gw, xi);
+                    let u = dot(uw, xi);
+                    let mag = |r: &[f32]| {
+                        r.iter().zip(xi).map(|(a, b)| (a * b).abs()).sum::<f32>()
+                    };
+                    let wt = wts[i * used + s];
+                    (wt * (gelu(g) * u), wt * (mag(gw) + g.abs()) * (mag(uw) + u.abs()))
+                })
+                .collect();
+            for r in 0..hid {
+                let d = &dnw[(e * hid + r) * ff..(e * hid + r + 1) * ff];
+                want[r] += d.iter().zip(&v).map(|(a, b)| a * b.0).sum::<f32>();
+                bound[r] += d
+                    .iter()
+                    .zip(&v)
+                    .map(|(a, b)| (a * b.0).abs() + a.abs() * b.1)
+                    .sum::<f32>();
+            }
+        }
+        for r in 0..hid {
+            let err = (got[i * hid + r] - want[r]).abs();
+            assert!(
+                err <= bound[r] * tol + 1e-6,
+                "{gt:?}/{dt:?} row {i} col {r}: {} vs {}",
+                got[i * hid + r],
+                want[r]
+            );
+        }
+    }
+}
+
+/// Without matrix units a grouped-expert tile of up to 32 pairs is 32 rows
+/// x 256 weight rows and a larger one 64 x 128 (sgemm.comp): experts of
+/// exactly 32, 33, 64 and 65 pairs (65: a full tile and one of one pair),
+/// at gate/up widths (2 x 192) and hidden sizes (320) that end inside a
+/// tile, against f32 CPU sums.
+#[test]
+fn moe_grouped_tile_shapes_without_matrix_units_match_cpu() {
+    let ctx = ctx();
+    if ctx.matrix_units() {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(32);
+    let (ff, ne, used, m) = (192, 12, 8, 70);
+    // Row i: experts 0 .. 3 while i < 32, 33, 64, 65, the rest of its
+    // slots from experts 4 .. 11.
+    let firsts = [32, 33, 64, 65];
+    let mut sel = Vec::with_capacity(m * used);
+    for i in 0..m {
+        let row: Vec<u32> =
+            (0..4).filter(|&e| i < firsts[e]).map(|e| e as u32).collect();
+        let rest = (0..used - row.len()).map(|j| (4 + (i + j) % 8) as u32);
+        sel.extend(row.iter().copied().chain(rest));
+    }
+    for (e, &n) in firsts.iter().enumerate() {
+        assert_eq!(sel.iter().filter(|&&s| s as usize == e).count(), n);
+    }
+    for (gt, dt, hid) in [
+        (GgmlType::Iq2Xxs, GgmlType::Iq4Nl, 512),
+        (GgmlType::Q8_0, GgmlType::Q8_0, 320),
+    ] {
+        grouped_f32_matches_cpu(&ctx, &mut rng, gt, dt, (hid, ff, ne, used, m), &sel);
+    }
+}
+
+/// The routed experts' decode kernels at output sizes that end inside a
+/// subgroup's rows (on a G16 GPU, an M4, IQ2_XXS gate/up takes 4 rows a
+/// subgroup, g16_moe_gate_up_iq2_xxs): expert FF 37, 41 and 42, every row
+/// count, against the CPU and nothing written past the output.
+#[test]
+fn moe_gate_up_partial_rows_match_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(33);
+    let (ty, hid, ne, used) = (GgmlType::Iq2Xxs, 256, 10, 8);
+    const UNWRITTEN: f32 = 1234.5;
+    for ff in [37usize, 41, 42] {
+        let raw = random_blocks(&mut rng, ty, ne * 2 * ff * hid);
+        let gu = QWeight::from_bytes(&ctx, &raw, ty, hid, ne * 2 * ff).unwrap();
+        let guw = decode(ty, &raw);
+        for m in 1..=4 {
+            let x = f32s(&mut rng, m * hid, -1.0, 1.0);
+            let sel: Vec<u32> = (0..m * used)
+                .map(|k| ((3 * (k / used) + k % used) % ne) as u32)
+                .collect();
+            let mid = tensor(&ctx, &vec![UNWRITTEN; m * used * ff + 64]);
+            run(&ctx, |p| {
+                moe_gate_up(
+                    &ctx,
+                    p,
+                    &gu,
+                    ff,
+                    &tensor(&ctx, &x),
+                    &u32s(&ctx, &sel),
+                    &mid,
+                    m,
+                    used,
+                )
+                .unwrap()
+            });
+            let mut want = vec![UNWRITTEN; m * used * ff + 64];
+            for (k, &e) in sel.iter().enumerate() {
+                let (e, xi) = (e as usize, &x[k / used * hid..][..hid]);
+                for r in 0..ff {
+                    let g = dot(&guw[(e * 2 * ff + r) * hid..][..hid], xi);
+                    let u = dot(&guw[(e * 2 * ff + ff + r) * hid..][..hid], xi);
+                    want[k * ff + r] = gelu(g) * u;
+                }
+            }
+            assert_close(&mid.to_f32().unwrap(), &want, 1e-4, 1e-4);
+        }
+    }
+}
+
+/// [`moe_gate_up_partial_rows_match_cpu`]'s down: IQ4_NL (on a G16 GPU 2
+/// rows a subgroup, g16_moe_down_iq4_nl) at hidden sizes 37 and 41.
+#[test]
+fn moe_down_partial_rows_match_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(34);
+    let (ty, ff, ne, used) = (GgmlType::Iq4Nl, 128, 10, 8);
+    const UNWRITTEN: f32 = 1234.5;
+    for hid in [37usize, 41] {
+        let raw = random_blocks(&mut rng, ty, ne * hid * ff);
+        let dn = QWeight::from_bytes(&ctx, &raw, ty, ff, ne * hid).unwrap();
+        let dnw = decode(ty, &raw);
+        for m in 1..=4 {
+            let mid = f32s(&mut rng, m * used * ff, -1.0, 1.0);
+            let sel: Vec<u32> = (0..m * used)
+                .map(|k| ((3 * (k / used) + k % used) % ne) as u32)
+                .collect();
+            let wts = f32s(&mut rng, m * used, 0.1, 0.5);
+            let out = tensor(&ctx, &vec![UNWRITTEN; m * hid + 64]);
+            run(&ctx, |p| {
+                moe_down(
+                    &ctx,
+                    p,
+                    &dn,
+                    hid,
+                    &tensor(&ctx, &mid),
+                    &u32s(&ctx, &sel),
+                    &tensor(&ctx, &wts),
+                    &out,
+                    m,
+                    used,
+                )
+                .unwrap()
+            });
+            let mut want = vec![UNWRITTEN; m * hid + 64];
+            for i in 0..m {
+                for r in 0..hid {
+                    want[i * hid + r] = (0..used)
+                        .map(|s| {
+                            let (k, e) = (i * used + s, sel[i * used + s] as usize);
+                            wts[k]
+                                * dot(
+                                    &dnw[(e * hid + r) * ff..][..ff],
+                                    &mid[k * ff..][..ff],
+                                )
+                        })
+                        .sum();
+                }
+            }
+            assert_close(&out.to_f32().unwrap(), &want, 1e-4, 1e-4);
+        }
     }
 }
 
@@ -547,6 +823,11 @@ fn moe_timing() {
 #[test]
 fn moe_grouped_matches_a_bf16_reference() {
     let ctx = ctx();
+    // Without matrix units the operands stay f32
+    // (gemms_without_matrix_units_match_cpu).
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(21);
     let (hid, ff, ne, used, m) = (512, 128, 12, 8, 140);
     let bfw = |v: f32| f32::from_bits((v.to_bits() + 0x8000) & 0xffff_0000);
@@ -619,6 +900,197 @@ fn moe_grouped_matches_a_bf16_reference() {
         eprintln!(
             "{gt:?}/{dt:?}: worst error {worst:.3} of the bound, mean {:.2e} of the inputs' magnitude",
             mean / (m * hid) as f64
+        );
+    }
+}
+
+/// Each kernel's least GPU time in one pass among the profiled passes
+/// since the last call.
+fn best_kernel_secs() -> std::collections::BTreeMap<&'static str, f64> {
+    let mut best = std::collections::BTreeMap::new();
+    for p in crate::metal::profile::take() {
+        let mut by: std::collections::BTreeMap<&'static str, f64> = Default::default();
+        for k in &p.kernels {
+            *by.entry(k.name).or_default() += k.gpu_secs;
+        }
+        for (k, s) in by {
+            let e = best.entry(k).or_insert(f64::MAX);
+            *e = s.min(*e);
+        }
+    }
+    best
+}
+
+/// Prompt-run GEMM speed at Gemma 4 26B-A4B's shapes for a run of
+/// `LILY_PROBE_M` rows (default 1024): the dense projections and the grouped
+/// experts (routing skewed over 128 experts), best of 8 per kernel from the
+/// per-kernel profile, ms and TFLOPS. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn prefill_gemm_probe() {
+    let ctx = MetalContext::new_with_profile(true).expect("metal context");
+    // The GPU's clock varies (a fanless Mac's heat, and it rises only under
+    // steady load): before each case one pass of 24 FMA peak kernels (~0.3
+    // s) brings it up, and the kernel's rate after it is the yardstick.
+    #[cfg(target_os = "linux")]
+    let clock = |when: &str| {
+        let fma = ctx.pipeline("pk_fma_f32", "", MslVersion::V3_1).expect("fma");
+        let out = zeros(&ctx, 1024);
+        let grid =
+            Grid::Threadgroups { groups: (1024, 1, 1), threadgroup: (256, 1, 1) };
+        let rounds = u32_bytes(2048);
+        run(&ctx, |p| {
+            for _ in 0..24 {
+                p.dispatch_at(&fma, &[out.binding()], &[&rounds], grid).unwrap();
+            }
+        });
+        crate::metal::profile::take();
+        for _ in 0..4 {
+            run(&ctx, |p| {
+                p.dispatch_at(&fma, &[out.binding()], &[&rounds], grid).unwrap()
+            });
+        }
+        let s = best_kernel_secs()["pk_fma_f32"];
+        let flops = 2.0 * (1024.0 * 256.0 * 2048.0 * 32.0);
+        eprintln!("clock {when}: f32 FMA {:.3} TFLOPS", flops / s / 1e12);
+    };
+    let mut rng = StdRng::seed_from_u64(5);
+    let m =
+        std::env::var("LILY_PROBE_M").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+    for (ty, n, k) in [
+        (GgmlType::Q5K, 4096usize, 2816usize),
+        (GgmlType::Q5K, 2816, 4096),
+        (GgmlType::Q8_0, 2816, 2112),
+    ] {
+        let raw = random_blocks(&mut rng, ty, n * k);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, k, n).unwrap();
+        let x = tensor(&ctx, &f32s(&mut rng, m * k, -1.0, 1.0));
+        let y = zeros(&ctx, m * n);
+        #[cfg(target_os = "linux")]
+        clock("before");
+        for _ in 0..8 {
+            run(&ctx, |p| crate::kernels::glm53::gemm(&ctx, p, &w, &x, &y, m).unwrap());
+        }
+        for (name, s) in best_kernel_secs() {
+            let flops = 2.0 * (m * n * k) as f64;
+            eprintln!(
+                "{ty:?} {m}x{n}x{k}: {name} {:.3} ms {:.3} TFLOPS",
+                s * 1e3,
+                flops / s / 1e12
+            );
+        }
+    }
+    let (hid, ff, ne, used) = (2816usize, 704usize, 128usize, 8usize);
+    // Expert e drawn with weight 1 / (e + 8): the busiest expert several
+    // times the quietest, as a prompt's routing is uneven.
+    let pw: Vec<f64> = (0..ne).map(|e| 1.0 / (e as f64 + 8.0)).collect();
+    let total: f64 = pw.iter().sum();
+    let mut sel = Vec::with_capacity(m * used);
+    for _ in 0..m {
+        let mut row: Vec<u32> = Vec::new();
+        while row.len() < used {
+            let mut t = rng.gen_range(0.0..total);
+            let mut e = 0;
+            while t >= pw[e] {
+                t -= pw[e];
+                e += 1;
+            }
+            if !row.contains(&(e as u32)) {
+                row.push(e as u32);
+            }
+        }
+        sel.extend(row);
+    }
+    let gu_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, ne * 2 * ff * hid);
+    let gu =
+        QWeight::from_bytes(&ctx, &gu_raw, GgmlType::Iq2Xxs, hid, ne * 2 * ff).unwrap();
+    drop(gu_raw);
+    let dn_raw = random_blocks(&mut rng, GgmlType::Iq4Nl, ne * hid * ff);
+    let dn = QWeight::from_bytes(&ctx, &dn_raw, GgmlType::Iq4Nl, ff, ne * hid).unwrap();
+    drop(dn_raw);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hid, -1.0, 1.0));
+    let ts = u32s(&ctx, &sel);
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.05, 0.2));
+    let out = zeros(&ctx, m * hid);
+    let sc = MoeGroupScratch::new(&ctx, m, used, ne, ff, hid).unwrap();
+    #[cfg(target_os = "linux")]
+    clock("before");
+    for _ in 0..8 {
+        run(&ctx, |p| {
+            moe_grouped(&ctx, p, &gu, &dn, ff, &x, &ts, &tw, &out, &sc, m, used, ne)
+                .unwrap()
+        });
+    }
+    let gemms = best_kernel_secs().into_iter().filter(|(n, _)| n.contains("gemm"));
+    for (name, s) in gemms {
+        // Gate/up: 2 ff x hid a pair; down: hid x ff.
+        let macs = if name.contains("iq2") { 2 * ff * hid } else { hid * ff };
+        let flops = 2.0 * (m * used * macs) as f64;
+        eprintln!("grouped {name} {:.3} ms {:.3} TFLOPS", s * 1e3, flops / s / 1e12);
+    }
+    #[cfg(target_os = "linux")]
+    clock("after");
+}
+
+/// Per-dispatch time of the decode GEMVs at Gemma 4's shapes (one row, or
+/// `LILY_GEMV_M` rows):
+/// attention and dense FFN projections as the model groups them, the tied
+/// LM head and the dense down, best of eight passes of 128 dispatches (16
+/// of the head) over weight copies in turn (so the cache does not hold
+/// them), after a pass that wakes the GPU's clocks.
+#[test]
+#[ignore = "timing only"]
+fn gemv_rows_timing() {
+    use crate::kernels::glm53::gemv_sets;
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(71);
+    let m: usize =
+        std::env::var("LILY_GEMV_M").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let shapes: [(&str, GgmlType, usize, &[usize]); 7] = [
+        ("local q/k/v Q5_K", GgmlType::Q5K, 2816, &[4096, 2048, 2048]),
+        ("local o Q5_K", GgmlType::Q5K, 4096, &[2816]),
+        ("gate/up Q5_K", GgmlType::Q5K, 2816, &[2112, 2112]),
+        ("global q/k Q5_K", GgmlType::Q5K, 2816, &[8192, 1024]),
+        ("global o Q5_K", GgmlType::Q5K, 8192, &[2816]),
+        ("head Q5_K", GgmlType::Q5K, 2816, &[262144]),
+        ("down Q8_0", GgmlType::Q8_0, 2112, &[2816]),
+    ];
+    for (label, ty, cols, rows) in shapes {
+        let total: usize = rows.iter().sum();
+        let copies = if total > 100_000 { 1 } else { 4 };
+        let ws: Vec<Vec<QWeight>> = (0..copies)
+            .map(|_| {
+                rows.iter()
+                    .map(|&r| {
+                        let raw = random_blocks(&mut rng, ty, r * cols);
+                        QWeight::from_bytes(&ctx, &raw, ty, cols, r).unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+        let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
+        let ys: Vec<Tensor> = rows.iter().map(|&r| zeros(&ctx, m * r)).collect();
+        let repeat = if total > 100_000 { 16 } else { 128 };
+        let mut best = f64::MAX;
+        for pass_no in 0..9 {
+            let pass = ctx.begin().unwrap();
+            for r in 0..repeat {
+                let sets: Vec<(&QWeight, &Tensor)> =
+                    ws[r % copies].iter().zip(&ys).collect();
+                gemv_sets(&ctx, &pass, &sets, &x, m).unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            if pass_no > 0 {
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+        }
+        let bytes: usize = ws[0].iter().map(|w| w.row_bytes * w.rows).sum();
+        let per = best / repeat as f64;
+        eprintln!(
+            "gemv {label:20} {total:6}x{cols:<5} {:8.1} us {:6.1} GB/s",
+            per * 1e6,
+            bytes as f64 / per / 1e9
         );
     }
 }
@@ -714,6 +1186,10 @@ fn gemv_wide_q5_k_matches_cpu() {
 fn gemm_bx_q5_k_q6_k_match_gemm() {
     use crate::kernels::glm53::{gemm, gemm_bx, to_bf16};
     let ctx = ctx();
+    // The bfloat-input GEMM uses matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(73);
     for (ty, cols, rows, m) in [
         (GgmlType::Q5K, 512usize, 72usize, 65usize),
@@ -742,6 +1218,42 @@ fn gemm_bx_q5_k_q6_k_match_gemm() {
             a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
             "{ty:?} {rows} x {cols}, {m} rows"
         );
+    }
+}
+
+/// The device's read bandwidth (tests/vulkan/g16_probe_test.comp) over a
+/// 512 MB buffer at several grid sizes: the ceiling the GEMVs aim at.
+#[test]
+#[ignore = "timing only"]
+fn read_bandwidth_probe() {
+    let ctx = ctx();
+    let bytes = 512usize << 20;
+    let src = Tensor::zeros(&ctx, &[bytes / 4], DType::F32).unwrap();
+    let out = zeros(&ctx, 1);
+    let pipeline = ctx.pipeline("g16_read_bw", SOURCE, MslVersion::V3_1).unwrap();
+    for groups in [64usize, 128, 256, 512, 1024, 2048, 4096] {
+        let mut best = f64::MAX;
+        for pass_no in 0..6 {
+            let pass = ctx.begin().unwrap();
+            for _ in 0..4 {
+                pass.dispatch_at(
+                    &pipeline,
+                    &[src.binding(), out.binding()],
+                    &[&u32_bytes(bytes / 16)],
+                    Grid::Threadgroups {
+                        groups: (groups, 1, 1),
+                        threadgroup: (256, 1, 1),
+                    },
+                )
+                .unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            if pass_no > 0 {
+                best = best.min(t.elapsed().as_secs_f64() / 4.0);
+            }
+        }
+        eprintln!("read {groups:5} groups: {:7.1} GB/s", bytes as f64 / best / 1e9);
     }
 }
 

@@ -1,0 +1,200 @@
+#version 460
+// GEMMs over GGUF weights without matrix units (an M4's GPU): the prompt
+// runs' projections (src/kernels/glm53.rs `gemm_with` when the device has
+// no VK_KHR_cooperative_matrix) and Gemma 4's routed experts grouped by
+// expert (src/kernels/gemma4.rs `moe_grouped`). f32 operands and sums: the
+// weights as glm53_decode gives them, the activations as stored.
+//
+// A threadgroup of 256 computes a tile of Y (sgemm_tile.glsl), a thread 8
+// activation rows x 4 weight rows: 64 x 128, or 32 x 256 for an expert's
+// pairs that fit 32 rows. Every output is one f32 FMA chain over k in
+// order, whatever the tile.
+#if defined(KERNEL_sgemm_q4_0) || defined(KERNEL_sgemm_q5_k) || defined(KERNEL_sgemm_q6_k) || \
+    defined(KERNEL_sgemm_iq4_nl) || defined(KERNEL_sgemm_iq2_s) || \
+    defined(KERNEL_sgemm_moe_iq2_s) || defined(KERNEL_sgemm_moe_q5_k) || \
+    defined(KERNEL_sgemm_moe_iq4_nl)
+#define GLM53_EXT_TYPES
+#endif
+#include "common.glsl"
+#include "glm53_quant.glsl"
+
+#if defined(KERNEL_sgemm_q8_0) || defined(KERNEL_sgemm_moe_q8_0)
+#define SG_TYPE GLM53_Q8_0
+#elif defined(KERNEL_sgemm_q4_0)
+#define SG_TYPE GLM53_Q4_0
+#elif defined(KERNEL_sgemm_q4_k)
+#define SG_TYPE GLM53_Q4_K
+#elif defined(KERNEL_sgemm_q5_k) || defined(KERNEL_sgemm_moe_q5_k)
+#define SG_TYPE GLM53_Q5_K
+#elif defined(KERNEL_sgemm_q6_k)
+#define SG_TYPE GLM53_Q6_K
+#elif defined(KERNEL_sgemm_iq4_nl) || defined(KERNEL_sgemm_moe_iq4_nl)
+#define SG_TYPE GLM53_IQ4_NL
+#elif defined(KERNEL_sgemm_iq2_s) || defined(KERNEL_sgemm_moe_iq2_s)
+#define SG_TYPE GLM53_IQ2_S
+#elif defined(KERNEL_sgemm_iq2_xxs) || defined(KERNEL_sgemm_moe_iq2_xxs)
+#define SG_TYPE GLM53_IQ2_XXS
+#elif defined(KERNEL_sgemm_f16)
+#define SG_TYPE GLM53_F16
+#elif defined(KERNEL_sgemm_f32)
+#define SG_TYPE GLM53_F32
+#endif
+
+#if defined(KERNEL_sgemm_moe_iq2_xxs) || defined(KERNEL_sgemm_moe_iq2_s) || \
+    defined(KERNEL_sgemm_moe_q5_k) || defined(KERNEL_sgemm_moe_iq4_nl) || \
+    defined(KERNEL_sgemm_moe_q8_0)
+#define SG_MOE
+#endif
+
+#ifdef SG_TYPE
+#if defined(KERNEL_sgemm_iq4_nl) || defined(KERNEL_sgemm_moe_iq4_nl)
+// IQ4_NL's value of code c: its 16 values as signed bytes, 4 a word (the
+// table of glm53_iq4nl_value, in fewer operations).
+float sg_iq4nl(uint c) {
+    const uint lo = c < 4u ? 0xBFAD9881u : 0xF6EADDCFu;
+    const uint hi = c < 12u ? 0x26190D01u : 0x71594535u;
+    return float(bitfieldExtract(int(c < 8u ? lo : hi), int(8u * (c & 3u)), 8));
+}
+#endif
+
+// Weights k .. k + 8 (k a multiple of 8) of `row`, as glm53_decode gives
+// them: Gemma's prompt-run types directly (as gemma4_gemm.comp and
+// glm53_gemm.comp decode them), the others as 8 of glm53_decode's 32.
+void sg_decode8(uint64_t row, uint k, out float w[8]) {
+#if defined(KERNEL_sgemm_iq2_xxs) || defined(KERNEL_sgemm_moe_iq2_xxs)
+    const uint t = k >> 5u, l = (k >> 3u) & 3u;
+    const uint bw = (t >> 3u) * 33u;
+    const uint qw = bw + 1u + 4u * (t & 7u);
+    const float d = glm53_h2f(uint(U16(row).v[bw]));
+    const uint aux0 = uint(U16(row).v[qw]) | (uint(U16(row).v[qw + 1u]) << 16u);
+    const uint aux1 = uint(U16(row).v[qw + 2u]) | (uint(U16(row).v[qw + 3u]) << 16u);
+    const float scale = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
+    const uvec4 g = glm53_iq2xxs_grid_h[(aux0 >> (8u * l)) & 0xffu]
+                  ^ glm53_iq2xxs_signs_h[(aux1 >> (7u * l)) & 127u];
+    [[unroll]] for (uint p = 0u; p < 4u; p++) {
+        const vec2 v = unpackHalf2x16(g[p]);
+        w[p] = scale * v.x;
+        w[p + 4u] = scale * v.y;
+    }
+#elif defined(KERNEL_sgemm_q8_0) || defined(KERNEL_sgemm_moe_q8_0)
+    const uint64_t b = row + uint64_t(k >> 5u) * 34u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(U16(b + 2u).v[((k & 31u) >> 1u) + i]);
+        w[2u * i] = d * float(int(pair << 24) >> 24);
+        w[2u * i + 1u] = d * float(int(pair << 16) >> 24);
+    }
+#elif defined(KERNEL_sgemm_iq4_nl) || defined(KERNEL_sgemm_moe_iq4_nl)
+    // Values j .. j + 8 of a block: the low nibbles of bytes j.. (j < 16)
+    // or the high nibbles of bytes j - 16.. .
+    const uint64_t b = row + uint64_t(k >> 5u) * 18u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint j = k & 31u, at = j & 15u, shift = j < 16u ? 0u : 4u;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(U16(b + 2u + at).v[i]);
+        w[2u * i] = d * sg_iq4nl((pair >> shift) & 0xfu);
+        w[2u * i + 1u] = d * sg_iq4nl((pair >> (8u + shift)) & 0xfu);
+    }
+#elif defined(KERNEL_sgemm_q5_k) || defined(KERNEL_sgemm_moe_q5_k)
+    // Values k .. k + 8 of their 32-value sub-block j: nibbles of bytes
+    // 32 (j / 2) + l .., high bit j of bytes l .. (l = k % 32).
+    const uint64_t b = row + uint64_t(k >> 8u) * 176u;
+    const uint j = (k >> 5u) & 7u, l = k & 31u;
+    uint sc, mn;
+    glm53_k4_scale_min(b, j, sc, mn);
+    const uint dd = U32(b).v[0];
+    const float scale = glm53_h2f(dd & 0xffffu) * float(sc);
+    const float minv = glm53_h2f(dd >> 16u) * float(mn);
+    const uvec2 q = U32x2(b + 48u + (j >> 1u) * 32u + l).v[0] >> ((j & 1u) * 4u);
+    const uvec2 h = U32x2(b + 16u + l).v[0] >> j;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        const uint c = ((q[i >> 2u] >> (8u * (i & 3u))) & 0xfu) | (((h[i >> 2u] >> (8u * (i & 3u))) & 1u) << 4u);
+        w[i] = scale * float(c) - minv;
+    }
+#else
+    float t[32];
+    glm53_decode(SG_TYPE, row, k >> 5u, t);
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        if ((k & 24u) == 8u * q) {
+            [[unroll]] for (uint i = 0u; i < 8u; i++) w[i] = t[8u * q + i];
+        }
+    }
+#endif
+}
+
+// The tile kernel (sgemm_tile.glsl), instantiated per tile shape below.
+// Threadgroup memory: the decoded weights of a K step (4096).
+shared vec4 sg_w[1024];
+
+// Y's tile: rows i < rows of the activations at x_row(i) (f32 elements
+// from X), of Y at y_row(i), weight rows n0 + j from W + j row_bytes.
+#ifdef SG_MOE
+// Grid (N / 128, max tiles), tile y = tiles[y] = (expert e, first, count):
+// the pairs pairs[first ..] of expert e; activation row pairs[..] >>
+// x_shift of K values, Y row pairs[..] of N.
+// Buffers: 0 X f32, 1 W (the expert stack, expert e's N rows from row
+// e N), 2 Y f32, 3 pairs u32, 4 tiles u32 [3 a tile], 5 tile count.
+// Params: 6 N, 7 K, 8 row_bytes, 9 x_shift.
+#define SG_N arg_u32(6)
+#define SG_KK arg_u32(7)
+#define SG_ROW_BYTES arg_u32(8)
+uint sg_first, sg_shift;
+uint64_t sg_x_row(uint i) { return uint64_t(U32(arg(3)).v[sg_first + i] >> sg_shift) * SG_KK; }
+uint64_t sg_y_row(uint i) { return uint64_t(U32(arg(3)).v[sg_first + i]) * SG_N; }
+#else
+// Y[b][m][n] = W[b][n] . X[b][m] for m < M, n < N: grid (N / 128, M / 64,
+// batches). Buffers: 0 X f32, 1 W, 2 Y f32. Params: 3 M, 4 N, 5 K,
+// 6 row_bytes, 7 ldx, 8 ldy, 9 x_batch, 10 w_batch, 11 y_batch (elements,
+// weight rows).
+#define SG_N arg_u32(4)
+#define SG_KK arg_u32(5)
+#define SG_ROW_BYTES arg_u32(6)
+uint sg_m0;
+uint64_t sg_x_row(uint i) {
+    return uint64_t(gl_WorkGroupID.z) * arg_u32(9) + uint64_t(sg_m0 + i) * arg_u32(7);
+}
+uint64_t sg_y_row(uint i) {
+    return uint64_t(gl_WorkGroupID.z) * arg_u32(11) + uint64_t(sg_m0 + i) * arg_u32(8);
+}
+#endif
+
+// 64 activation rows x 128 weight rows, K steps of 32.
+#define SGT_NAME sg_tile_64
+#define SGT_TR 64u
+#define SGT_TW 128u
+#define SGT_KS 32u
+#include "sgemm_tile.glsl"
+#ifdef SG_MOE
+// An expert tile of at most 32 pairs: 32 rows x 256 weight rows, K steps of
+// 16, so that every subgroup computes (on 64-row tiles half would idle).
+#define SGT_NAME sg_tile_32
+#define SGT_TR 32u
+#define SGT_TW 256u
+#define SGT_KS 16u
+#include "sgemm_tile.glsl"
+#endif
+
+void main() {
+    const uint N = SG_N, K = SG_KK, row_bytes = SG_ROW_BYTES;
+    const uint n0 = gl_WorkGroupID.x * 128u;
+#ifdef SG_MOE
+    if (gl_WorkGroupID.y >= U32(arg(5)).v[0]) return;
+    const uint expert = U32(arg(4)).v[3u * gl_WorkGroupID.y];
+    sg_first = U32(arg(4)).v[3u * gl_WorkGroupID.y + 1u];
+    const uint rows = U32(arg(4)).v[3u * gl_WorkGroupID.y + 2u];
+    sg_shift = arg_u32(9);
+    const uint64_t W = arg(1) + (uint64_t(expert) * N + n0) * row_bytes;
+    if (rows > 32u) {
+        sg_tile_64(n0, rows, W, N, K, row_bytes);
+    } else if ((gl_WorkGroupID.x & 1u) == 0u) {
+        // Weight rows n0 .. n0 + 256: the odd column of the grid idles.
+        sg_tile_32(n0, rows, W, N, K, row_bytes);
+    }
+#else
+    sg_m0 = gl_WorkGroupID.y * 64u;
+    const uint rows = min(arg_u32(3) - sg_m0, 64u);
+    const uint64_t W = arg(1) + (uint64_t(gl_WorkGroupID.z) * arg_u32(10) + n0) * row_bytes;
+    sg_tile_64(n0, rows, W, N, K, row_bytes);
+#endif
+}
+#endif
