@@ -119,20 +119,35 @@ pub fn find_beside(
     Ok(found.into_iter().next())
 }
 
-impl Gemma4Draft {
-    /// Maps the draft model at `path` for `target`.
-    pub fn load(
-        ctx: &MetalContext,
-        path: &Path,
+/// The draft model's shape from its metadata (`gemma4-assistant.*`),
+/// checked against its target's and against what lily's graph runs: the
+/// target's head widths and window, whole-head RoPE, values as wide as the
+/// keys, no RoPE or attention scaling, and a target layer of each
+/// attention kind it reads.
+#[derive(Clone, Debug)]
+pub struct DraftConfig {
+    pub n_layer: usize,
+    pub hidden: usize,
+    pub ff: usize,
+    pub heads: usize,
+    /// Per layer: sliding-window attention (else global).
+    pub swa: Vec<bool>,
+    pub head_dim: usize,
+    pub head_dim_swa: usize,
+    pub eps: f32,
+    pub rope_base: f32,
+    pub rope_base_swa: f32,
+}
+
+impl DraftConfig {
+    pub fn from_metadata(
+        meta: &std::collections::BTreeMap<String, crate::gguf::Value>,
         target: &TargetConfig,
     ) -> Result<Self> {
-        let gguf = Gguf::open(path)?;
-        ensure!(
-            gguf.architecture()? == ARCH,
-            "{} is not a {ARCH} GGUF",
-            path.display()
-        );
-        let m = super::config::Meta { meta: &gguf.metadata, arch: ARCH };
+        let arch =
+            meta.get("general.architecture").and_then(crate::gguf::Value::as_str);
+        ensure!(arch == Some(ARCH), "GGUF architecture {arch:?}, expected {ARCH:?}");
+        let m = super::config::Meta { meta, arch: ARCH };
         let n_layer = m.u("block_count", 64)?;
         let hidden = m.u("embedding_length", super::config::MAX_HIDDEN)?;
         let ff = m.u("feed_forward_length", 1 << 16)?;
@@ -142,7 +157,11 @@ impl Gemma4Draft {
             hidden >= 256 && hidden.is_multiple_of(256),
             "draft embedding_length {hidden} (lily takes multiples of 256)"
         );
-        ensure!(ff > 0 && ff.is_multiple_of(32), "draft feed_forward_length {ff}");
+        // Its down projection's input in 64-value steps, as the target's.
+        ensure!(
+            ff > 0 && ff.is_multiple_of(64),
+            "draft feed_forward_length {ff} (lily takes multiples of 64)"
+        );
         ensure!(
             m.u("embedding_length_out", super::config::MAX_HIDDEN)? == target.hidden,
             "draft model for another target"
@@ -157,13 +176,21 @@ impl Gemma4Draft {
             target.n_head
         );
         let swa = m.bools("attention.sliding_window_pattern", n_layer)?;
-        let (dh, dh_swa) = (
-            m.u("attention.key_length", 1 << 12)?,
-            m.u("attention.key_length_swa", 1 << 12)?,
-        );
+        let w = |k: &str| m.u(k, 1 << 12);
+        let (dh, dh_swa) = (w("attention.key_length")?, w("attention.key_length_swa")?);
         ensure!(
             dh == target.head_dim && dh_swa == target.head_dim_swa,
             "draft head widths {dh}/{dh_swa} differ from the target's"
+        );
+        ensure!(
+            w("attention.value_length")? == dh
+                && w("attention.value_length_swa")? == dh_swa,
+            "draft key and value widths differ (it reads the target's values)"
+        );
+        ensure!(
+            w("rope.dimension_count")? == dh
+                && m.u_or("rope.dimension_count_swa", 1 << 12, dh_swa)? == dh_swa,
+            "draft partial RoPE dimension counts (lily rotates whole heads)"
         );
         ensure!(
             m.u("attention.sliding_window", 1 << 20)? == target.window,
@@ -174,11 +201,53 @@ impl Gemma4Draft {
         }
         m.refuse_float("rope.scaling.factor", &[0.0, 1.0])?;
         m.refuse_float("attention.scale", &[0.0, 1.0])?;
+        for kind in [true, false] {
+            ensure!(
+                !swa.contains(&kind) || target.swa.contains(&kind),
+                "the draft model reads a {} layer the target lacks",
+                if kind { "sliding-window" } else { "global" }
+            );
+        }
         let eps = m.f("attention.layer_norm_rms_epsilon")?;
         let (rope_base, rope_base_swa) =
             (m.f("rope.freq_base")?, m.f("rope.freq_base_swa")?);
         ensure!(eps > 0.0 && eps < 1.0, "draft rms epsilon {eps}");
         ensure!(rope_base > 1.0 && rope_base_swa > 1.0, "draft RoPE bases");
+        Ok(Self {
+            n_layer,
+            hidden,
+            ff,
+            heads,
+            swa,
+            head_dim: dh,
+            head_dim_swa: dh_swa,
+            eps,
+            rope_base,
+            rope_base_swa,
+        })
+    }
+}
+
+impl Gemma4Draft {
+    /// Maps the draft model at `path` for `target`.
+    pub fn load(
+        ctx: &MetalContext,
+        path: &Path,
+        target: &TargetConfig,
+    ) -> Result<Self> {
+        let gguf = Gguf::open(path)?;
+        let DraftConfig {
+            n_layer,
+            hidden,
+            ff,
+            heads,
+            swa,
+            head_dim: dh,
+            head_dim_swa: dh_swa,
+            eps,
+            rope_base,
+            rope_base_swa,
+        } = DraftConfig::from_metadata(&gguf.metadata, target)?;
         super::schema::validate_gguf(
             &super::schema::draft(target, hidden, ff, &swa),
             &gguf,
@@ -331,7 +400,7 @@ impl Gemma4Draft {
         pass.memory_barrier()?;
         // The target layer whose caches this layer reads: its last
         // sliding-window layer or its last global one.
-        let tl = target.shared_kv_layer(l.swa);
+        let tl = target.shared_kv_layer(l.swa)?;
         let c = &st.layers[tl];
         let tc = &target.cfg;
         // Queries only (no K/V slots), rotated to p.
@@ -432,3 +501,7 @@ impl Gemma4Draft {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/gemma4/draft.rs"]
+mod tests;

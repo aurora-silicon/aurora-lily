@@ -207,8 +207,11 @@ impl Gemma4Model {
     /// The layer whose caches the draft model's sliding-window (or global)
     /// layers read: the target's last of that kind (llama.cpp's
     /// `n_layer - 2` and `n_layer - 1` for Gemma 4).
-    pub(crate) fn shared_kv_layer(&self, swa: bool) -> usize {
-        (0..self.cfg.n_layer).rev().find(|&il| self.cfg.swa[il] == swa).unwrap_or(0)
+    pub(crate) fn shared_kv_layer(&self, swa: bool) -> Result<usize> {
+        (0..self.cfg.n_layer)
+            .rev()
+            .find(|&il| self.cfg.swa[il] == swa)
+            .context("the target has no layer of the kind the draft model reads")
     }
 
     pub fn new_state(
