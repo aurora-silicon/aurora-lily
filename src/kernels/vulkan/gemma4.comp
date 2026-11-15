@@ -6,8 +6,7 @@
 // factors, softmax gating, GeGLU with the tanh GELU, final logit softcap).
 #if defined(KERNEL_gemma4_embed_q5_k) || defined(KERNEL_gemma4_embed_q6_k) || \
     defined(KERNEL_gemma4_moe_gate_up_q5_k) || defined(KERNEL_gemma4_moe_gate_up_q6_k) || \
-    defined(KERNEL_gemma4_moe_gate_up_iq2_s) || defined(KERNEL_gemma4_moe_down_iq4_nl) || \
-    defined(KERNEL_gemma4_moe_down_q4_0)
+    defined(KERNEL_gemma4_moe_gate_up_iq2_s)
 #define GLM53_EXT_TYPES
 #endif
 #include "common.glsl"
@@ -446,6 +445,41 @@ void main() {
 #else
 #define MOE_TYPE GLM53_Q4_K
 #endif
+// Q5_K task t of `row` against xv (sum sx): a sub-block's scale and min
+// multiply its sum of code times x and its sum of x; the block's header
+// and scales are one 16-byte load, its high bits and nibbles two each
+// (176-byte blocks are 16-byte aligned in Gemma's 2816-wide rows).
+float g4_q5k_dot(uint64_t row, uint t, in vec4 xv[8], float sx) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 176u;
+    const uint j = t & 7u;
+    const uvec4 hd = U32x4(b).v[0];
+    const uvec3 sw = hd.yzw;
+    #define K5_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
+    uint sc, mn;
+    if (j < 4u) {
+        sc = K5_BYTE(j) & 63u;
+        mn = K5_BYTE(j + 4u) & 63u;
+    } else {
+        sc = (K5_BYTE(j + 4u) & 0xfu) | ((K5_BYTE(j - 4u) >> 6u) << 4u);
+        mn = (K5_BYTE(j + 4u) >> 4u) | ((K5_BYTE(j) >> 6u) << 4u);
+    }
+    #undef K5_BYTE
+    const uint shift = (j & 1u) * 4u;
+    const uvec4 qa = U32x4(b + 48u + (j >> 1u) * 32u).v[0];
+    const uvec4 qb = U32x4(b + 64u + (j >> 1u) * 32u).v[0];
+    const uvec4 ha = U32x4(b + 16u).v[0];
+    const uvec4 hb = U32x4(b + 32u).v[0];
+    float s = 0.0;
+    [[unroll]] for (uint c = 0u; c < 8u; c++) {
+        const uint word = (c < 4u ? qa[c] : qb[c - 4u]) >> shift;
+        const uint hw = (c < 4u ? ha[c] : hb[c - 4u]) >> j;
+        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+            s += float(((word >> (8u * k)) & 0xfu) | (((hw >> (8u * k)) & 1u) << 4u)) * xv[c][k];
+        }
+    }
+    return glm53_h2f(hd.x & 0xffffu) * float(sc) * s - glm53_h2f(hd.x >> 16u) * float(mn) * sx;
+}
+
 void main() {
     const uint K = arg_u32(4);
     const uint F = arg_u32(5);
@@ -462,7 +496,14 @@ void main() {
     const uint tasks = K / GLM53_TASK;
     float ag = 0.0, au = 0.0;
     for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
-#ifdef KERNEL_gemma4_moe_gate_up_iq2_xxs
+#if defined(KERNEL_gemma4_moe_gate_up_q5_k)
+        vec4 xv[8];
+        [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(X).v[8u * t + q];
+        float sx = 0.0;
+        [[unroll]] for (uint q = 0u; q < 8u; q++) sx += (xv[q].x + xv[q].y) + (xv[q].z + xv[q].w);
+        ag += g4_q5k_dot(gate, t, xv, sx);
+        au += g4_q5k_dot(up, t, xv, sx);
+#elif defined(KERNEL_gemma4_moe_gate_up_iq2_xxs)
         vec4 xv[8];
         [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(X).v[8u * t + q];
         ag += glm53_dot_iq2_xxs(gate, t, xv);
@@ -484,20 +525,18 @@ void main() {
 // ---------------------------------------------------------------------------
 // Routed experts, down and the weighted sum: out[i][r] = sum_s w[i][s] *
 // down_{sel[i][s]}[r] . mid[i * used + s]. Down rows are F values (Gemma:
-// 704 = 22 tasks): a subgroup an output row, its lanes over the (slot,
-// task) pairs. Grid (ceil(H / 8), m), 256 threads.
+// 704). A subgroup an output row. Grid (ceil(H / 8), m), 256 threads.
 // Buffers: 0 down experts, 1 mid, 2 sel, 3 weights, 4 out [m][H].
-// Params: 5 F, 6 H, 7 row_bytes, 8 used.
+// Params: 5 F, 6 H, 7 row_bytes, 8 used (<= 32).
+// Q8_0: the lanes take the (slot, block) tasks. IQ4_NL: the lanes take
+// (slot, block pair) tasks of 64 values, a pair (36 bytes, 4-byte aligned:
+// row and pair bytes are multiples of 4) read as nine words and its codes
+// looked up in a register-packed table; one row a subgroup beat two and
+// four sharing the activations (moe_timing, 2026-11-14: IQ4_NL 71.9 us
+// with 2-byte loads and a select tree, 48.1 now; 77.1 at two rows, 87.0
+// at four; Q8_0 39.3 as below, 43.5 in the pair form).
 // ---------------------------------------------------------------------------
-#if defined(KERNEL_gemma4_moe_down_q8_0) || defined(KERNEL_gemma4_moe_down_iq4_nl) || \
-    defined(KERNEL_gemma4_moe_down_q4_0)
-#if defined(KERNEL_gemma4_moe_down_q8_0)
-#define MOE_TYPE GLM53_Q8_0
-#elif defined(KERNEL_gemma4_moe_down_iq4_nl)
-#define MOE_TYPE GLM53_IQ4_NL
-#else
-#define MOE_TYPE GLM53_Q4_0
-#endif
+#ifdef KERNEL_gemma4_moe_down_q8_0
 void main() {
     const uint F = arg_u32(5);
     const uint H = arg_u32(6);
@@ -514,11 +553,68 @@ void main() {
         const uint e = U32(arg(2)).v[slot];
         const uint64_t row = arg(0) + (uint64_t(e) * H + r) * row_bytes;
         float w[32];
-        glm53_decode(MOE_TYPE, row, t, w);
+        glm53_decode(GLM53_Q8_0, row, t, w);
         acc += F32(arg(3)).v[slot] * glm53_task_dot(w, arg(1) + 4u * (uint64_t(slot) * F + t * GLM53_TASK));
     }
     acc = subgroupAdd(acc);
     if (gl_SubgroupInvocationID == 0u) F32(arg(4)).v[i * H + r] = acc;
+}
+#endif
+
+#ifdef KERNEL_gemma4_moe_down_iq4_nl
+// ggml's kvalues_iq4nl as packed int8 (code c is byte c).
+const uvec4 G4_KV = uvec4(0xbfad9881u, 0xf6eaddcfu, 0x26190d01u, 0x71594535u);
+float g4_kv(uint c) {
+    return float(int(G4_KV[c >> 2u] << (24u - 8u * (c & 3u))) >> 24);
+}
+// Byte j (0..35) of the pair's words.
+#define PB(j) ((wd[(j) >> 2u] >> (8u * ((j) & 3u))) & 0xffu)
+float g4_iq4nl_dot(in uint wd[9], uint blk, in vec4 xv[8]) {
+    const uint base = 18u * blk;
+    const float d = glm53_h2f(PB(base) | (PB(base + 1u) << 8u));
+    float s = 0.0;
+    [[unroll]] for (uint j = 0u; j < 16u; j++) {
+        const uint q = PB(base + 2u + j);
+        s += g4_kv(q & 0xfu) * xv[j >> 2u][j & 3u] + g4_kv(q >> 4u) * xv[4u + (j >> 2u)][j & 3u];
+    }
+    return d * s;
+}
+#undef PB
+void main() {
+    const uint F = arg_u32(5);
+    const uint H = arg_u32(6);
+    const uint row_bytes = arg_u32(7);
+    const uint used = arg_u32(8);
+    const uint i = gl_WorkGroupID.y;
+    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    if (r >= H) return;
+    const uint lane = gl_SubgroupInvocationID;
+    // Lane s < used holds slot s's expert and weight.
+    const uint my_e = lane < used ? U32(arg(2)).v[i * used + lane] : 0u;
+    const float my_w = lane < used ? F32(arg(3)).v[i * used + lane] : 0.0;
+    const uint pairs = F / 64u;
+    float acc = 0.0;
+    // Task u = lane, lane + 32, ..: slot s = u / pairs, pair p = u % pairs.
+    uint s = lane / pairs, p = lane - (lane / pairs) * pairs;
+    [[dont_unroll]] for (uint u = lane; u < used * pairs; u += 32u) {
+        const uint e = subgroupShuffle(my_e, s);
+        const float we = subgroupShuffle(my_w, s);
+        const uint64_t X = arg(1) + 4u * (uint64_t(i * used + s) * F + 64u * p);
+        vec4 xa[8], xb[8];
+        [[unroll]] for (uint q = 0u; q < 8u; q++) xa[q] = F32x4(X).v[q];
+        [[unroll]] for (uint q = 0u; q < 8u; q++) xb[q] = F32x4(X + 128u).v[q];
+        const uint64_t W = arg(0) + (uint64_t(e) * H + r) * row_bytes + 36u * p;
+        uint wd[9];
+        [[unroll]] for (uint w = 0u; w < 9u; w++) wd[w] = U32(W).v[w];
+        acc += we * (g4_iq4nl_dot(wd, 0u, xa) + g4_iq4nl_dot(wd, 1u, xb));
+        p += 32u;
+        while (p >= pairs) {
+            p -= pairs;
+            s += 1u;
+        }
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0u) F32(arg(4)).v[i * H + r] = acc;
 }
 #endif
 

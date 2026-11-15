@@ -406,9 +406,16 @@ pub fn moe_down(
     let name = match down.ty {
         GgmlType::Q8_0 => "gemma4_moe_down_q8_0",
         GgmlType::Iq4Nl => "gemma4_moe_down_iq4_nl",
-        GgmlType::Q4_0 => "gemma4_moe_down_q4_0",
         other => anyhow::bail!("no Gemma expert down over {other:?}"),
     };
+    // IQ4_NL tasks are pairs of 32-value blocks read as 4-byte words.
+    ensure!(
+        (down.ty != GgmlType::Iq4Nl
+            || down.cols.is_multiple_of(64) && down.row_bytes.is_multiple_of(4))
+            && used <= 32,
+        "expert down rows of {} values, {used} used",
+        down.cols
+    );
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
