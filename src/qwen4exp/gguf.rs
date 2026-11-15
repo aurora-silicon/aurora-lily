@@ -1126,20 +1126,24 @@ pub fn load(
             t.row_len()
         );
         let table = super::embed::PagedEmbed::open(path, t.offset, t.rows(), h)?;
-        let (low, spec) = (super::spec::DRAFT_LOW_ROWS, super::spec::DRAFT_SPECIAL_FROM);
-        let mut rows = table.read_rows(0, low)?;
-        rows.extend(table.read_rows(spec, config.vocab_size - spec)?);
-        let n = low + config.vocab_size - spec;
-        let narrow = QWeight::new(
-            Tensor::from_bytes(ctx, &rows, &[rows.len()], DType::I8)?,
-            GgmlType::Bf16,
-            h,
-            n,
-        )?;
-        (
-            LinearWeights::Gguf(GgufLinear { parts: vec![narrow] }),
-            Some(std::sync::Arc::new(table)),
-        )
+        // The draft head's resident rows (its narrow LM head's ids), only
+        // when it is loaded: nothing else reads them. Without it
+        // `embed_tokens` holds no rows at all.
+        let parts = if loads_mtp {
+            let (low, spec) = (super::spec::DRAFT_LOW_ROWS, super::spec::DRAFT_SPECIAL_FROM);
+            let mut rows = table.read_rows(0, low)?;
+            rows.extend(table.read_rows(spec, config.vocab_size - spec)?);
+            let n = low + config.vocab_size - spec;
+            vec![QWeight::new(
+                Tensor::from_bytes(ctx, &rows, &[rows.len()], DType::I8)?,
+                GgmlType::Bf16,
+                h,
+                n,
+            )?]
+        } else {
+            Vec::new()
+        };
+        (LinearWeights::Gguf(GgufLinear { parts }), Some(std::sync::Arc::new(table)))
     } else {
         let e = mapped.lin(&[EMBED])?;
         e.expect_features(config.vocab_size, config.hidden_size, "token_embd")?;
