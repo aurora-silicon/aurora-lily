@@ -1183,6 +1183,10 @@ fn gemv_wide_q5_k_matches_cpu() {
 fn gemm_bx_q5_k_q6_k_match_gemm() {
     use crate::kernels::glm53::{gemm, gemm_bx, to_bf16};
     let ctx = ctx();
+    // The bfloat-input GEMM uses matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(73);
     for (ty, cols, rows, m) in [
         (GgmlType::Q5K, 512usize, 72usize, 65usize),

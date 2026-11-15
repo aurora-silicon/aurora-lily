@@ -2408,6 +2408,10 @@ fn gemm_bx_matches_gemm() {
 #[test]
 fn gemm_bx_batched_matches_gemm_with() {
     let ctx = ctx();
+    // The bfloat-input GEMM uses matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(79);
     let (heads, per, cols, m) = (4, 128, 256, 300);
     let raw = random_blocks(&mut rng, GgmlType::Q8_0, heads * per * cols);
@@ -2441,6 +2445,10 @@ fn gemm_bx_batched_matches_gemm_with() {
 #[test]
 fn gemm_bx_split_groups_match_batched() {
     let ctx = ctx();
+    // The bfloat-input GEMM uses matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(83);
     let (groups, per, cols, m) = (8, 128, 256, 300);
     let raw = random_blocks(&mut rng, GgmlType::Q8_0, groups * per * cols);
@@ -2587,6 +2595,10 @@ fn moe_grouped_case(used: usize) {
 #[test]
 fn moe_grouped_dot_matches_per_pair_kernels() {
     let ctx = ctx();
+    // The bfloat tiles use matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(80);
     let (experts, hidden, ff) = (40, 512, 256);
     let g_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
@@ -2689,6 +2701,10 @@ fn moe_grouped_dot_matches_per_pair_kernels() {
 #[test]
 fn moe_grouped_dot_route_boundaries() {
     let ctx = ctx();
+    // The tile route uses matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(81);
     let (hidden, ff, used, m) = (512usize, 256usize, 8usize, 140usize);
     // Experts 0-4: 1..5 rows; 5-8: 65..68; 9-12: 129..132; then fillers.
@@ -3139,6 +3155,10 @@ fn deepseek4_q2_k_gate_up_scratch() {
     assert!(separate_gate_up([GgmlType::Iq2Xxs, GgmlType::Q2K]));
     assert!(!separate_gate_up([GgmlType::Iq2Xxs, GgmlType::Iq2Xxs]));
     let ctx = ctx();
+    // The grouped experts use matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(82);
     let (experts, hidden, ff, used, m) = (12, 512, 256, 6, 40);
     let mk = |rng: &mut StdRng, cols, rows| {
