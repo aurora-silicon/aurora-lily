@@ -405,39 +405,45 @@ impl Scratch {
             chunks,
         );
         let logits = f(MAX_ROWS * cfg.vocab)?;
-        // One pool for the attention's q, qo and heads and the grouped
-        // experts' f32 outputs: the experts run after the attention output
-        // projection has read heads, and the next layer's q waits for the
-        // experts (each ~0.1 MB a run row).
-        let qw = cfg.max_q_width();
+        // One pool for the attention's q, qo, heads and raw K/V and the
+        // grouped experts' f32 outputs: the experts run after the attention
+        // output projection has read heads, and the next layer's q waits
+        // for the experts (each ~0.1 MB a run row).
+        let (qw, kvw) = (cfg.max_q_width(), cfg.max_kv_width());
         let moe = g4::MoeGroupScratch::pool_len(m, cfg.n_expert_used, cfg.ff_expert, h);
-        let pool = f((3 * m * qw).max(moe))?;
+        let pool = f((3 * m * qw + 2 * m * kvw).max(moe))?;
+        // Within a layer: h (its input) is dead from the projections to
+        // the FFN's end, so it holds the attention output; n1 and t are
+        // dead after the dense gate/up and the router read them, so they
+        // hold the dense MLP's and the experts' outputs; GeGLU writes its
+        // gate in place.
+        let (hb, n1, t, g) = (f(m * h)?, f(m * h)?, f(m * h)?, f(m * cfg.ff)?);
         Ok(Self {
             rows: m,
             logits_last: logits.view(0, &[cfg.vocab])?,
             tokens: Tensor::zeros(ctx, &[m], DType::U32)?,
             x: f(m * h)?,
-            h: f(m * h)?,
+            h: hb.clone(),
             xb: Tensor::zeros(
                 ctx,
                 &[m * cfg.max_q_width().max(cfg.ff).max(h)],
                 DType::BF16,
             )?,
             q: pool.view(0, &[m * qw])?,
-            kv: f(m * cfg.max_kv_width())?,
-            vraw: f(m * cfg.max_kv_width())?,
+            kv: pool.view(3 * m * qw, &[m * kvw])?,
+            vraw: pool.view(3 * m * qw + m * kvw, &[m * kvw])?,
             qo: pool.view(m * qw, &[m * qw])?,
             heads: pool.view(2 * m * qw, &[m * qw])?,
-            attn: f(m * h)?,
+            attn: hb,
             r: f(m * h)?,
-            n1: f(m * h)?,
             n2: f(m * h)?,
-            t: f(m * h)?,
-            g: f(m * cfg.ff)?,
             u: f(m * cfg.ff)?,
-            mid: f(m * cfg.ff)?,
-            m1: f(m * h)?,
-            m2: f(m * h)?,
+            mid: g.clone(),
+            g,
+            m1: t.clone(),
+            m2: n1.clone(),
+            n1,
+            t,
             rlogits: f(m * cfg.n_expert)?,
             sel: Tensor::zeros(ctx, &[m * cfg.n_expert_used], DType::U32)?,
             rw: f(m * cfg.n_expert_used)?,
