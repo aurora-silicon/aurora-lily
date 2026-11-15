@@ -851,21 +851,37 @@ void main() {
     const float we = F32(arg(4)).v[slot];
     const uint64_t off = (uint64_t(e) * F + min(r, F - 1u)) * row_bytes;
     const uint64_t X = arg(2) + 4u * uint64_t(i) * K;
-    // The row's half (sg & 1): one task a lane.
+    // The row's half (sg & 1): one task a lane, its x loaded once for the
+    // gate and the up row (7.39 -> 7.35 ms a decode step, 2026-11-15).
     const uint t = (sg & 1u) * 32u + lane;
+    vec4 xv[8];
+    [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(X + 128u * t + 16u * q).v[0];
     float w[32];
 #ifdef KERNEL_qwen36_moe_gate_up_q4_k_k2048
     qwen36_decode_q4_k(arg(0) + off, t, w);
 #else
     glm53_decode_q8_0(arg(0) + off, t, w);
 #endif
-    const float ag = subgroupAdd(glm53_task_dot(w, X + 128u * t));
+    // The dots written out here: the compiler then contracts them otherwise
+    // than glm53_task_dot (the sums round differently, the same at any m);
+    // through a shared function it emitted main's code (no gain).
+    float dg = 0.0;
+    [[unroll]] for (uint q = 0u; q < 8u; q++) {
+        const vec4 v = xv[q];
+        dg += w[4u * q] * v.x + w[4u * q + 1u] * v.y + w[4u * q + 2u] * v.z + w[4u * q + 3u] * v.w;
+    }
+    const float ag = subgroupAdd(dg);
 #ifdef KERNEL_qwen36_moe_gate_up_q4_k_k2048
     qwen36_decode_q4_k(arg(1) + off, t, w);
 #else
     glm53_decode_q8_0(arg(1) + off, t, w);
 #endif
-    const float au = subgroupAdd(glm53_task_dot(w, X + 128u * t));
+    float du = 0.0;
+    [[unroll]] for (uint q = 0u; q < 8u; q++) {
+        const vec4 v = xv[q];
+        du += w[4u * q] * v.x + w[4u * q + 1u] * v.y + w[4u * q + 2u] * v.z + w[4u * q + 3u] * v.w;
+    }
+    const float au = subgroupAdd(du);
     if (lane == 0u) {
         gu_gate[sg] = ag;
         gu_up[sg] = au;
