@@ -205,6 +205,7 @@ fn gdn_matches_cpu_with_snapshot() {
             &p,
             &st,
             Some(&snap),
+            None,
             &qkv_t,
             &a_t,
             &b_t,
@@ -657,6 +658,7 @@ fn gdn_step_matches_gdn_bitwise() {
                         &p,
                         &st,
                         Some(&snap),
+                        None,
                         &qkv,
                         &a,
                         &b,
@@ -1119,4 +1121,129 @@ fn gemv_k2048_rejects_malformed() {
         assert!(gemv_k2048(&ctx, p, &[], &x, 1).is_err());
         assert!(gemv_k2048(&ctx, p, &[(&q8, &y); 5], &x, 1).is_err());
     });
+}
+
+/// The chunked delta rule of a prompt run (chunks of 64 rows on the matrix
+/// units, bf16 operands, a ragged tail token by token) against the CPU
+/// reference and the token-serial scan: outputs and state within bfloat
+/// tolerances of the f64 reference, every value finite, the conv window
+/// the same bits. 128 rows (two whole chunks) and 200 (three and a tail of
+/// 8) over 2 key and 4 value heads; 128 rows of the model's 16 and 32.
+#[test]
+fn gdn_chunked_matches_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(95);
+    let eps = 1e-6;
+    for (hk, h, m) in [(2, 4, 128), (2, 4, 200), (16, 32, 128)] {
+        let ch = (2 * hk + h) * GDN_DIM;
+        let inner = h * GDN_DIM;
+        let qkv = f32s(&mut rng, m * ch, -1.0, 1.0);
+        let alpha = f32s(&mut rng, m * h, -2.0, 2.0);
+        let beta = f32s(&mut rng, m * h, -2.0, 2.0);
+        let z = f32s(&mut rng, m * inner, -2.0, 2.0);
+        let w = f32s(&mut rng, 4 * ch, -0.5, 0.5);
+        let ssm_a = f32s(&mut rng, h, -2.0, -0.1);
+        let dt = f32s(&mut rng, h, -1.0, 1.0);
+        let norm = f32s(&mut rng, GDN_DIM, 0.5, 1.5);
+        let conv0 = f32s(&mut rng, 3 * ch, -1.0, 1.0);
+        let s0 = f32s(&mut rng, h * GDN_DIM * GDN_DIM, -0.1, 0.1);
+        let (mut conv_r, mut s_r) =
+            (conv0.clone(), s0.iter().map(|&x| x as f64).collect::<Vec<_>>());
+        let (o_r, y_r) = gdn_ref(
+            &qkv,
+            &alpha,
+            &beta,
+            &z,
+            &w,
+            &ssm_a,
+            &dt,
+            &norm,
+            &mut conv_r,
+            &mut s_r,
+            m,
+            hk,
+            eps,
+        );
+        let t = |v: &[f32]| tensor(&ctx, v);
+        let (wt, at, dtt, nt) = (t(&w), t(&ssm_a), t(&dt), t(&norm));
+        let p = GdnParams { conv_w: &wt, ssm_a: &at, dt_bias: &dtt, norm: &nt };
+        let (qkv_t, a_t, b_t, z_t) = (t(&qkv), t(&alpha), t(&beta), t(&z));
+        let shapes = gdn_chunk_shapes(m, hk, h);
+        let staging: Vec<_> =
+            shapes.iter().map(|&(n, ty)| zeros(&ctx, n, ty)).collect();
+        let chunk = GdnChunk {
+            qkv: &staging[0],
+            w: &staging[1],
+            u: &staging[2],
+            p: &staging[3],
+            g: &staging[4],
+        };
+        let mut outs = Vec::new();
+        for chunked in [false, true] {
+            let (conv, s) = (t(&conv0), t(&s0));
+            let st = GdnState { conv: &conv, s: &s };
+            let c = zeros(&ctx, m * ch, DType::F32);
+            let o = zeros(&ctx, m * inner, DType::F32);
+            let y = zeros(&ctx, m * inner, DType::F32);
+            run(&ctx, |pass| {
+                gdn(
+                    &ctx,
+                    pass,
+                    &p,
+                    &st,
+                    None,
+                    chunked.then_some(&chunk),
+                    &qkv_t,
+                    &a_t,
+                    &b_t,
+                    &z_t,
+                    &c,
+                    &o,
+                    &y,
+                    m,
+                    hk,
+                    eps as f32,
+                )
+                .unwrap()
+            });
+            outs.push((
+                o.to_f32().unwrap(),
+                y.to_f32().unwrap(),
+                s.to_f32().unwrap(),
+                conv.to_f32().unwrap(),
+            ));
+        }
+        let at = format!("{hk}/{h} heads, {m} rows");
+        let (serial, chunked) = (&outs[0], &outs[1]);
+        for v in [&chunked.0, &chunked.1, &chunked.2] {
+            assert!(v.iter().all(|x| x.is_finite()), "{at}: a non-finite value");
+        }
+        assert_eq!(chunked.3, serial.3, "{at}: conv window");
+        assert_eq!(chunked.3, conv_r, "{at}: conv window against the reference");
+        // Relative (L2) error against the reference over each block of 32
+        // rows: the chunked path's bfloat operands and tiles (~2^-8),
+        // single near-zero outputs aside; the serial scan's for scale.
+        let rel = |a: &[f32], b: &[f64]| {
+            let d: f64 = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y).powi(2)).sum();
+            let n: f64 = b.iter().map(|y| y * y).sum();
+            (d / n).sqrt()
+        };
+        for c0 in (0..m).step_by(32) {
+            let r = c0 * inner..(c0 + 32).min(m) * inner;
+            let (eo, ey) = (
+                rel(&chunked.0[r.clone()], &o_r[r.clone()]),
+                rel(&chunked.1[r.clone()], &y_r[r.clone()]),
+            );
+            assert!(
+                eo < 1e-2 && ey < 1e-2,
+                "{at} rows {c0}..: o error {eo:.2e}, y {ey:.2e}"
+            );
+            assert!(
+                rel(&serial.0[r.clone()], &o_r[r]) < 1e-5,
+                "{at} rows {c0}..: serial o"
+            );
+        }
+        let es = rel(&chunked.2, &s_r);
+        assert!(es < 1e-2, "{at}: state error {es:.2e}");
+    }
 }

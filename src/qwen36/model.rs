@@ -564,6 +564,9 @@ pub struct Scratch {
     pub draws: Tensor,
     /// U32[MAX_ROWS]: tokens a verify pass feeds.
     pub spec_tokens: Tensor,
+    /// The chunked GDN's staging (`qkv`, `w`, `u`, `p`, `g`) for a prompt
+    /// step's rows, when they reach [`k::GDN_CHUNK_MIN_ROWS`].
+    gchunk: Option<[Tensor; 5]>,
 }
 
 impl Scratch {
@@ -582,7 +585,15 @@ impl Scratch {
         let splits = attn::sdpa_split_scratch_splits(attn::MAX_SEQ);
         let widest = [2 * h, inner, hq, cfg.ff_shared].into_iter().max().unwrap_or(h);
         let logits = f(MAX_ROWS * cfg.vocab)?;
+        let gchunk = if r >= k::GDN_CHUNK_MIN_ROWS {
+            let shapes = k::gdn_chunk_shapes(r, cfg.gdn_k_heads, cfg.gdn_v_heads);
+            let t = |i: usize| Tensor::zeros(ctx, &[shapes[i].0], shapes[i].1);
+            Some([t(0)?, t(1)?, t(2)?, t(3)?, t(4)?])
+        } else {
+            None
+        };
         Ok(Self {
+            gchunk,
             logits_last: logits.view(0, &[cfg.vocab])?,
             tokens: u(r)?,
             x: f(r * h)?,
@@ -1136,12 +1147,20 @@ impl Qwen36Model {
                 cfg.rms_eps,
             )?;
         } else {
+            let chunk = sc.gchunk.as_ref().map(|[qkv, w, u, p, g]| k::GdnChunk {
+                qkv,
+                w,
+                u,
+                p,
+                g,
+            });
             k::gdn(
                 ctx,
                 pass,
                 &p,
                 st,
                 snap,
+                chunk.as_ref(),
                 &sc.qkv,
                 &sc.ga,
                 &sc.gb,

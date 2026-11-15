@@ -325,6 +325,31 @@ void main() {
 // loads of the step, and each use of a loaded value is a wait: 1.64 ms a
 // dispatch with coopMatLoad, 2.1 to 2.3 with the wide loads however they
 // were ordered in the source.
+// Qwen3.6's chunked prefill (gdn_chunk_wy3_q36, gdn_chunk_scan_q36; called
+// from kernels/qwen36.rs): the same passes over its layout. Value head h
+// reads key head h % HK (here h / vpk); q, k and v are one bf16 buffer of
+// the mixed rows (q pre-scaled and q, k L2-normed: qwen36_gdn_chunk_prep),
+// so arg(0) and arg(1) are the same rows of (2 HK + H) * DIM; the gates are
+// f32 (alpha and b [M][H], ssm_a = -exp(A_log) and dt_bias [H]); the state
+// is [H][DIM (v column)][DIM (k)], the transpose of this one; o is f32.
+#ifdef KERNEL_gdn_chunk_wy3_q36
+#define KERNEL_gdn_chunk_wy3 1
+#define GDN_Q36 1
+#endif
+#ifdef KERNEL_gdn_chunk_scan_q36
+#define KERNEL_gdn_chunk_scan 1
+#define GDN_Q36 1
+#endif
+#ifdef GDN_Q36
+#define GDN_VHEAD(hk, v) ((hk) + (v) * HK)
+#define GDN_KHEAD(h) ((h) % HK)
+#define GDN_QK_STRIDE ((2 * HK + H) * DIM)
+#else
+#define GDN_VHEAD(hk, v) ((hk) * vpk + (v))
+#define GDN_KHEAD(h) ((h) / vpk)
+#define GDN_QK_STRIDE (2 * HK * DIM)
+#endif
+
 #if defined(KERNEL_gdn_chunk_wy) || defined(KERNEL_gdn_chunk_wy3) || defined(KERNEL_gdn_chunk_scan)
 #include "matmul.glsl"
 
@@ -365,6 +390,23 @@ float gdn_log_decay(float a, float a_log, float dt_bias) {
     float softplus = x > 20.0 ? x : log(1.0 + exp(x));
     return -exp(a_log) * softplus;
 }
+
+// Row r's (at element r of the [M, H] gates) log-decay and beta of value
+// head h.
+#ifdef GDN_Q36
+#define GDN_GATES(lg, bt, r, h)                                                                   \
+    {                                                                                             \
+        float gx = F32(arg(2) + 4 * (r)).v[h] + F32(arg(5)).v[h];                                 \
+        lg = (gx > 20.0 ? gx : log(1.0 + exp(gx))) * F32(arg(4)).v[h];                            \
+        bt = 1.0 / (1.0 + exp(-F32(arg(3) + 4 * (r)).v[h]));                                      \
+    }
+#else
+#define GDN_GATES(lg, bt, r, h)                                                                   \
+    {                                                                                             \
+        lg = gdn_log_decay(float(BF16(arg(2) + 2 * (r)).v[h]), F32(arg(4)).v[h], float(BF16(arg(5)).v[h])); \
+        bt = 1.0 / (1.0 + exp(-float(BF16(arg(3) + 2 * (r)).v[h])));                             \
+    }
+#endif
 
 #ifdef KERNEL_gdn_chunk_wy3
 #define WY_SG 8
@@ -541,7 +583,7 @@ void main() {
     uint hk = threadgroup_position_in_grid.y;
     uint HK = H / vpk;
     uint CW = (2 * HK + H) * DIM;
-    uint qk_stride = 2 * HK * DIM, wu_stride = H * DIM;
+    uint qk_stride = GDN_QK_STRIDE, wu_stride = H * DIM;
     uint64_t q_rows = arg(1) + 2 * (uint64_t(t0) * qk_stride + hk * DIM);
     uint64_t k_rows = q_rows + 2 * (HK * DIM);
     bool wide = ((arg(0) | arg(1)) & 3) == 0, wide_out = ((arg(6) | arg(7)) & 3) == 0;
@@ -558,8 +600,7 @@ void main() {
             float bt = 0.0;
             if (tid < C) {
                 uint64_t r = uint64_t(t0 + tid) * H;
-                lg = gdn_log_decay(float(BF16(arg(2) + 2 * r).v[h]), F32(arg(4)).v[h], float(BF16(arg(5)).v[h]));
-                bt = 1.0 / (1.0 + exp(-float(BF16(arg(3) + 2 * r).v[h])));
+                GDN_GATES(lg, bt, r, h)
             }
             float pre = subgroupInclusiveAdd(lg);
             if (sg == 0 && lane == 31) wy_g_total = pre;
@@ -624,7 +665,7 @@ void main() {
     uint hk = threadgroup_position_in_grid.y;
     uint HK = H / vpk;
     uint CW = (2 * HK + H) * DIM;
-    uint qk_stride = 2 * HK * DIM, wu_stride = H * DIM;
+    uint qk_stride = GDN_QK_STRIDE, wu_stride = H * DIM;
     uint64_t q_rows = arg(1) + 2 * (uint64_t(t0) * qk_stride + hk * DIM);
     uint64_t k_rows = q_rows + 2 * (HK * DIM);
     bool wide = ((arg(0) | arg(1)) & 3) == 0, wide_out = ((arg(6) | arg(7)) & 3) == 0;
@@ -639,9 +680,8 @@ void main() {
         float bt = 0.0;
         if (v < vpk) {
             uint64_t r = uint64_t(t0 + c) * H;
-            uint h = hk * vpk + v;
-            lg = gdn_log_decay(float(BF16(arg(2) + 2 * r).v[h]), F32(arg(4)).v[h], float(BF16(arg(5)).v[h]));
-            bt = 1.0 / (1.0 + exp(-float(BF16(arg(3) + 2 * r).v[h])));
+            uint h = GDN_VHEAD(hk, v);
+            GDN_GATES(lg, bt, r, h)
         }
         float pre = subgroupInclusiveAdd(lg);
         if ((sg & 1u) == 0u && lane == 31 && v < 3) wy_g_total[v] = pre;
@@ -658,7 +698,7 @@ void main() {
         MatC qkp[WY_RB];
         WY_ROWS_PRODUCT(qkp, q_rows)
         for (uint vv = 0; vv < vpk; ++vv) {
-            WY_STORE_P(qkp, vv * C, hk * vpk + vv)
+            WY_STORE_P(qkp, vv * C, GDN_VHEAD(hk, vv))
         }
     }
 
@@ -677,7 +717,7 @@ void main() {
     }
 
     for (uint vv = 0; vv < vpk; ++vv) {
-        uint h = hk * vpk + vv;
+        uint h = GDN_VHEAD(hk, vv);
         if (v == vv) {
             WY_STORE_T(v * C)
         }
@@ -716,15 +756,24 @@ void main() {
     const uint C = GDN_CHUNK, NB = GDN_CHUNK_NB;
     uint M = arg_u32(7), H = arg_u32(8), vpk = arg_u32(9);
     uint h = threadgroup_position_in_grid.y;
-    uint HK = H / vpk, hk = h / vpk;
+    uint HK = H / vpk, hk = GDN_KHEAD(h);
     uint col0 = threadgroup_position_in_grid.x * NB;
     uint row0 = 16 * simdgroup_index_in_threadgroup, srow0 = 32 * simdgroup_index_in_threadgroup;
-    uint qk_stride = 2 * HK * DIM, wu_stride = H * DIM, p_stride = H * C;
+    uint qk_stride = GDN_QK_STRIDE, wu_stride = H * DIM, p_stride = H * C;
 
+#ifdef GDN_Q36
+    // The state's v columns col0.. are rows of DIM k values.
+    F32 st = F32(arg(5) + 4 * (uint64_t(h) * (DIM * DIM) + uint64_t(col0) * DIM));
+#define GDN_STATE_LAYOUT gl_CooperativeMatrixLayoutColumnMajor
+#define GDN_STATE_AT(i) (srow0 + 16 * (i))
+#else
     F32 st = F32(arg(5) + 4 * (uint64_t(h) * (DIM * DIM) + col0));
+#define GDN_STATE_LAYOUT gl_CooperativeMatrixLayoutRowMajor
+#define GDN_STATE_AT(i) ((srow0 + 16 * (i)) * DIM)
+#endif
     MatC S[2];
     for (uint i = 0; i < 2; ++i) {
-        coopMatLoad(S[i], st.v, (srow0 + 16 * i) * DIM, DIM, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(S[i], st.v, GDN_STATE_AT(i), DIM, GDN_STATE_LAYOUT);
         MAT_STORE_BF16(S[i], scan_Sb, (srow0 + 16 * i) * NB, NB)
     }
     barrier();
@@ -782,7 +831,12 @@ void main() {
             for (uint cj = 0; cj < 4; ++cj) acc[4 * rh + cj] *= to_row;
         }
         SCAN_ROW_PRODUCT(acc, arg(3) + 2 * (head_rows * C), p_stride, C, scan_Ut)
+#ifdef GDN_Q36
+        coopMatStore(acc, F32(arg(6) + 4 * (head_rows * DIM)).v, col0, wu_stride,
+                     gl_CooperativeMatrixLayoutRowMajor);
+#else
         MAT_STORE_BF16(acc, BF16(arg(6) + 2 * (head_rows * DIM)).v, col0, wu_stride)
+#endif
         barrier();
 
         // The next chunk reads the updated state.
@@ -790,8 +844,6 @@ void main() {
         barrier();
     }
 
-    for (uint i = 0; i < 2; ++i) {
-        coopMatStore(S[i], st.v, (srow0 + 16 * i) * DIM, DIM, gl_CooperativeMatrixLayoutRowMajor);
-    }
+    for (uint i = 0; i < 2; ++i) coopMatStore(S[i], st.v, GDN_STATE_AT(i), DIM, GDN_STATE_LAYOUT);
 }
 #endif
