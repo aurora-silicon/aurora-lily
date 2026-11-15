@@ -123,11 +123,13 @@ cargo build --release --locked
 ./target/release/lily --model ~/models/Qwen3.8-Flash-Next-lily-q4-xl \
   --bind 127.0.0.1:8000 --max-seq 131072
 
-# Qwen3.8-Flash-Next from ds4's Q2 GGUF, 45 GB on the GPU (the n-gram table
-# is paged from a lily checkpoint of the model; docs/qwen38-q2.md)
+# Qwen3.8-Flash-Next from ds4's Q2 GGUF for a 64 GB machine: 44.8 GB of
+# weights, and everything lily allocates (weights, scratch, one 32K session)
+# within 48.0 GB (44.7 GiB); one request at a time. The n-gram table is paged
+# from a lily checkpoint of the model (docs/qwen38-q2.md)
 ./target/release/lily --model ~/models/Qwen3.8-Flash-Next-Q2/Qwen3.8-Flash-Next-Q2.gguf \
   --ngram-checkpoint ~/models/Qwen3.8-Flash-Next-lily-q4-xl \
-  --bind 127.0.0.1:8000 --max-seq 32768 --memory-limit-gb 48
+  --bind 127.0.0.1:8000 --memory-limit-gb 44.7
 
 # GLM 5.3 Flash (a .gguf path selects the model from its metadata)
 ./target/release/lily --model ~/models/GLM-5.3-Flash-Q2/GLM-5.3-Flash-Q2.gguf \

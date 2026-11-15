@@ -38,21 +38,32 @@ The loader undoes the converter's layout choices with exact moves (llama.cpp's
 ```sh
 ./target/release/lily --model ~/models/Qwen3.8-Flash-Next-Q2/Qwen3.8-Flash-Next-Q2.gguf \
   --ngram-checkpoint ~/models/Qwen3.8-Flash-Next-lily-q4-xl \
-  --max-seq 32768 --memory-limit-gb 44.7
+  --memory-limit-gb 44.7
 ```
 
-Memory: `--memory-limit-gb` (GiB) is the footprint the server keeps to. The load
-measures the weights and a scratch with its full prefill chunk (allocated from the
-start), fits the longest context whose session (the server's checkpoints, growth to
-full capacity, the speculative lookahead) fits the rest, and the server caps
-`--max-seq` there, keeps its session cache under the rest and refuses longer
-prompts. Where a 4096-row prefill chunk leaves less than 32K tokens the chunk halves
-(about 5% slower prefill at 2048). With the draft head, q8 K/V:
+Memory: `--memory-limit-gb` (GiB; 44.7 GiB is 48.0 GB, the 64 GB tier's GPU
+budget) is the footprint the server keeps to. The weights take 44.8 GB of it; the
+rest holds the scratch and one session. The load measures the weights and a scratch
+with its full prefill chunk (allocated from the start) and fits the longest context
+whose session at its largest fits the rest: its caches grown to the context and the
+speculative lookahead, the server's checkpoints, and the one attention layer that
+growth holds twice. The server caps `--max-seq` there and refuses longer prompts.
+Under the limit it serves one request at a time (no batched decoding, whose scratch
+the fit leaves out), and its session cache keeps that largest session free before
+each request allocates: the other sessions go to the disk tier first, and a fork
+that would not fit beside its source rewinds the source instead. Where a 4096-row
+prefill chunk leaves less than 32K tokens the chunk halves (about 5% slower prefill
+at 2048). With the draft head, q8 K/V:
 
-| `--memory-limit-gb` | context | prefill chunk | allocated | session cache |
+| `--memory-limit-gb` | context | prefill chunk | allocated | session cache (kept free) |
 |---|---:|---:|---:|---:|
-| 48 (51.5 GB) | 172 024 | 4096 | 47.3 GB | 4.2 GB |
-| 44.7 (48.0 GB) | 40 952 | 2048 | 46.3 GB | 1.7 GB |
+| 44.7 (48.0 GB) | 32 760 | 2048 | 46.3 GB | 1.7 GB (1.57 GB) |
+| 48 (51.5 GB) | 163 832 | 4096 | 47.3 GB | 4.2 GB (4.16 GB) |
+
+Persisted sessions (the disk tier) are keyed by the file's identity: a hash of its
+header and tensor table, sampled blocks of its tensor data, and the n-gram
+checkpoint's identity. Another quantization or another n-gram table never resumes
+them.
 
 The n-gram table's background preload is skipped where the page cache cannot hold
 it beside the GPU's allocation.
