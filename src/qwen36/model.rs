@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 
 use super::config::Config;
-use crate::gguf::Gguf;
+use crate::gguf::{GgmlType, Gguf};
 use crate::glm53::model::Mapped;
 use crate::kernels::attention::{self as attn, KvCache, KvFormat};
 use crate::kernels::glm53::{self as g, QWeight};
@@ -361,7 +361,18 @@ impl Qwen36Model {
     }
 
     pub fn new_scratch(&self, ctx: &MetalContext) -> Result<Scratch> {
-        Scratch::new(ctx, &self.cfg, self.prefill_rows)
+        Scratch::new(ctx, &self.cfg, self.prefill_rows, self.fused_experts())
+    }
+
+    /// Whether every routed expert stack (the MTP block's too) is Q4_K or
+    /// Q8_0, whose gate, up and SwiGLU take one grouped GEMM
+    /// ([`g::moe_grouped_fused`]): the scratch then holds no separate gate
+    /// and up outputs.
+    fn fused_experts(&self) -> bool {
+        let fusable =
+            |l: &LayerW| matches!(l.ffn.gate.ty, GgmlType::Q4K | GgmlType::Q8_0);
+        self.layers.iter().all(fusable)
+            && self.mtp.as_ref().is_none_or(|m| fusable(&m.layer))
     }
 }
 
@@ -570,7 +581,12 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    pub(crate) fn new(ctx: &MetalContext, cfg: &Config, rows: usize) -> Result<Self> {
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        cfg: &Config,
+        rows: usize,
+        fused_experts: bool,
+    ) -> Result<Self> {
         let r = rows;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let b = |n: usize| Tensor::zeros(ctx, &[n], DType::BF16);
@@ -622,13 +638,11 @@ impl Scratch {
             rw: f(r * used)?,
             moe_mid: f(r * used * cfg.ff_expert)?,
             moe_out: f(r * h)?,
-            moe_group: g::MoeGroupScratch::new(
-                ctx,
-                r * used,
-                cfg.n_expert,
-                cfg.ff_expert,
-                h,
-            )?,
+            moe_group: if fused_experts {
+                g::MoeGroupScratch::fused(ctx, r, used, cfg.n_expert, cfg.ff_expert, h)?
+            } else {
+                g::MoeGroupScratch::new(ctx, r * used, cfg.n_expert, cfg.ff_expert, h)?
+            },
             sfg: f(r * cfg.ff_shared)?,
             sfu: f(r * cfg.ff_shared)?,
             sfm: f(r * cfg.ff_shared)?,

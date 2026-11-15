@@ -1430,10 +1430,12 @@ fn gdn_chunked_long_weak_decay_matches_cpu() {
 }
 
 /// Qwen3.6's grouped experts with gate, up and the SwiGLU in one GEMM
-/// (`glm53::moe_grouped_fused`) against the separate GEMMs and SwiGLU
+/// (`glm53::moe_grouped_fused`, over its own compact scratch whose `mid`
+/// starts as sentinels) against the separate GEMMs and SwiGLU
 /// (`glm53::moe_grouped`): the same bits, mid and out, for Q4_K and Q8_0
-/// experts, with tiles of 64 rows and of 128 (the density decides): experts
-/// with 16, 32, 48, 64, 65, 100 and 129 pairs, small ones, unused ones.
+/// experts, at two densities: 480 pairs over 12 experts (tiles of 64 rows)
+/// and 640 (at least 48 an expert: tiles of 128 rows). Experts with 16 to
+/// 129 pairs (partial tiles, a second tile), small ones, unused ones.
 #[test]
 fn moe_grouped_fused_matches_separate_q4_k_q8_0() {
     use crate::kernels::glm53::{MoeGroupScratch, moe_grouped, moe_grouped_fused};
@@ -1443,54 +1445,75 @@ fn moe_grouped_fused_matches_separate_q4_k_q8_0() {
     }
     let mut rng = StdRng::seed_from_u64(98);
     let (experts, hidden, ff, used) = (12, 2048, 512, 8);
-    let counts = [16usize, 32, 48, 64, 65, 0, 129, 100, 16, 10, 0, 0];
-    let pairs: usize = counts.iter().sum();
-    let m = pairs / used;
-    let mut sel: Vec<u32> = counts
-        .iter()
-        .enumerate()
-        .flat_map(|(e, &c)| std::iter::repeat_n(e as u32, c))
-        .collect();
-    for i in (1..sel.len()).rev() {
-        sel.swap(i, rng.gen_range(0..=i));
-    }
-    let tsel = u32s(&ctx, &sel);
-    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
-    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
-    for ty in [GgmlType::Q4K, GgmlType::Q8_0] {
-        let mk = |rng: &mut StdRng, cols: usize, rows: usize| {
-            QWeight::from_bytes(
-                &ctx,
-                &random_blocks(rng, ty, rows * cols),
-                ty,
-                cols,
-                rows,
-            )
-            .unwrap()
-        };
-        let (gw, uw, dw) = (
-            mk(&mut rng, hidden, experts * ff),
-            mk(&mut rng, hidden, experts * ff),
-            mk(&mut rng, ff, experts * hidden),
-        );
-        // Two scratch sets: the separate route's g and u, the fused route's none.
-        let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
-        let mut got = Vec::new();
-        for fused in [false, true] {
-            let out = zeros(&ctx, m * hidden, DType::F32);
-            run(&ctx, |p| {
-                let f = if fused { moe_grouped_fused } else { moe_grouped };
-                f(
-                    &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m,
-                    used, experts, 0.0,
+    for counts in [
+        [16usize, 32, 48, 64, 65, 0, 129, 100, 16, 10, 0, 0],
+        [16, 64, 65, 0, 129, 100, 16, 10, 0, 96, 128, 16],
+    ] {
+        let pairs: usize = counts.iter().sum();
+        let m = pairs / used;
+        assert_eq!(m * used, pairs);
+        let r128 = pairs >= 48 * experts;
+        let mut sel: Vec<u32> = counts
+            .iter()
+            .enumerate()
+            .flat_map(|(e, &c)| std::iter::repeat_n(e as u32, c))
+            .collect();
+        for i in (1..sel.len()).rev() {
+            sel.swap(i, rng.gen_range(0..=i));
+        }
+        let tsel = u32s(&ctx, &sel);
+        let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+        let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+        for ty in [GgmlType::Q4K, GgmlType::Q8_0] {
+            let mk = |rng: &mut StdRng, cols: usize, rows: usize| {
+                QWeight::from_bytes(
+                    &ctx,
+                    &random_blocks(rng, ty, rows * cols),
+                    ty,
+                    cols,
+                    rows,
                 )
                 .unwrap()
+            };
+            let (gw, uw, dw) = (
+                mk(&mut rng, hidden, experts * ff),
+                mk(&mut rng, hidden, experts * ff),
+                mk(&mut rng, ff, experts * hidden),
+            );
+            let at = format!("{ty:?}, {pairs} pairs (128-row tiles: {r128})");
+            // The separate route's scratch, and the fused route's own compact
+            // one (no gate and up outputs) with its mid set to sentinels.
+            let sep = MoeGroupScratch::new(&ctx, pairs, experts, ff, hidden).unwrap();
+            let fused =
+                MoeGroupScratch::fused(&ctx, m, used, experts, ff, hidden).unwrap();
+            fused.mid.write_bytes(&vec![0x7fu8; fused.mid.byte_len()]).unwrap();
+            let (out_s, out_f) = (
+                zeros(&ctx, m * hidden, DType::F32),
+                zeros(&ctx, m * hidden, DType::F32),
+            );
+            run(&ctx, |p| {
+                moe_grouped(
+                    &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out_s, &sep,
+                    m, used, experts, 0.0,
+                )
+                .unwrap();
+                moe_grouped_fused(
+                    &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out_f, &fused,
+                    m, used, experts, 0.0,
+                )
+                .unwrap();
             });
-            got.push((gs.mid.to_f32().unwrap(), out.to_f32().unwrap()));
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            let (mid_s, mid_f) =
+                (sep.mid.to_f32().unwrap(), fused.mid.to_f32().unwrap());
+            assert_eq!(
+                bits(&mid_s[..pairs * ff]),
+                bits(&mid_f[..pairs * ff]),
+                "{at}: mid"
+            );
+            let (out_s, out_f) = (out_s.to_f32().unwrap(), out_f.to_f32().unwrap());
+            assert_eq!(bits(&out_s), bits(&out_f), "{at}: out");
+            assert!(out_f.iter().all(|v| v.is_finite()), "{at}: a non-finite output");
         }
-        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
-        assert_eq!(bits(&got[0].0), bits(&got[1].0), "{ty:?}: mid");
-        assert_eq!(bits(&got[0].1), bits(&got[1].1), "{ty:?}: out");
-        assert!(got[1].1.iter().all(|v| v.is_finite()), "{ty:?}: a non-finite output");
     }
 }
