@@ -437,13 +437,13 @@ float g4_q5k_dot(uint64_t row, uint t, in vec4 xv[8], float sx) {
     const uvec4 qb = U32x4(b + 64u + (j >> 1u) * 32u).v[0];
     const uvec4 ha = U32x4(b + 16u).v[0];
     const uvec4 hb = U32x4(b + 32u).v[0];
+    // A word's four codes at once (as glm53_q5_k_codes).
     float s = 0.0;
     [[unroll]] for (uint c = 0u; c < 8u; c++) {
         const uint word = (c < 4u ? qa[c] : qb[c - 4u]) >> shift;
         const uint hw = (c < 4u ? ha[c] : hb[c - 4u]) >> j;
-        [[unroll]] for (uint k = 0u; k < 4u; k++) {
-            s += float(((word >> (8u * k)) & 0xfu) | (((hw >> (8u * k)) & 1u) << 4u)) * xv[c][k];
-        }
+        const uint c4 = (word & 0x0f0f0f0fu) | ((hw & 0x01010101u) << 4u);
+        [[unroll]] for (uint k = 0u; k < 4u; k++) s += float((c4 >> (8u * k)) & 0xffu) * xv[c][k];
     }
     return glm53_h2f(hd.x & 0xffffu) * float(sc) * s - glm53_h2f(hd.x >> 16u) * float(mn) * sx;
 }

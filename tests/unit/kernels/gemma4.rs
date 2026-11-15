@@ -473,7 +473,8 @@ fn embed_geglu_softcap_match_cpu() {
 fn moe_timing() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(70);
-    let repeat = 32;
+    // Passes as long as a decode step's (32 dispatches measured 30% apart).
+    let repeat = 256;
     let (experts, hidden, ff, used) = (24, 2816, 704, 8);
     for (gt, dt) in
         [
