@@ -505,7 +505,8 @@ fn fused_hc_read_matches_cpu() {
             e_inj.extend(
                 (0..ni).map(|j| round_bf16(dot(&ci[j * wide..(j + 1) * wide], &xn))),
             );
-            e_down.extend(down);
+            // The down buffer holds the up kernel's input, the activation.
+            e_down.extend(act);
             e_inv.extend(inv_c);
         }
         assert_close(&inv.to_f32().unwrap(), &e_inv, 1e-6, 1e-4);

@@ -601,8 +601,8 @@ void main() {
 // qg_hc_read_down_f16: a threadgroup of G subgroups per weight row (down
 // rows, then inject rows), subgroup g on stream g, 8 values a lane a step.
 // Buffers: 0 hyper bf16 [G*H], 1 norm bf16 [G*H], 2 down F16 [R][G*H], 3
-// inject F16 [NI][G*H], 4 down out bf16 [R], 5 inject out bf16 [NI], 6
-// inv_rms f32 [G]. Params: 7 H, 8 G, 9 R, 10 NI, 11 eps, 12 w_bias, 13 down
+// inject F16 [NI][G*H], 4 the up kernel's input bf16(silu(down / G)) [R],
+// 5 inject out bf16 [NI], 6 inv_rms f32 [G]. Params: 7 H, 8 G, 9 R, 10 NI, 11 eps, 12 w_bias, 13 down
 // row bytes, 14 inject row bytes.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_qg_hc_read_down_f16) || defined(KERNEL_qg_hc_read_down_f16_m2) || \
@@ -668,8 +668,15 @@ void main() {
     if (tid < HC_M) {
         float total = 0.0;
         for (uint s = 0u; s < G; s++) total += qg_part[tid * 8u + s];
-        if (is_inj) BF16(arg(5)).v[tid * NI + r] = bfloat16_t(total);
-        else BF16(arg(4)).v[tid * R + r] = bfloat16_t(total);
+        if (is_inj) {
+            BF16(arg(5)).v[tid * NI + r] = bfloat16_t(total);
+        } else {
+            // The up kernel's input: the scaled SiLU of the bfloat down
+            // value, once here instead of in every up lane that reads it.
+            precise float d = float(bfloat16_t(total)) * (1.0 / float(G));
+            precise float a = d / (1.0 + exp(-d));
+            BF16(arg(4)).v[tid * R + r] = bfloat16_t(a);
+        }
     }
     if (row == 0u && tid < G * HC_M) F32(arg(6)).v[tid] = qg_rms[(tid / G) * 8u + tid % G];
 }
@@ -683,7 +690,6 @@ void main() {
     const uint c = gl_WorkGroupID.x * 8u + gl_SubgroupID;
     const uint lane = gl_SubgroupInvocationID, g = lane >> 3u, sub = lane & 7u;
     if (c >= H) return;
-    const float inv_g = 1.0 / float(G);
     float acc[HC_M];
     [[unroll]] for (uint i = 0u; i < HC_M; i++) acc[i] = 0.0;
     if (g < G) {
@@ -691,11 +697,10 @@ void main() {
         for (uint b = sub; b < R / 8u; b += 8u) {
             const uvec4 wv = ww.v[b];
             [[unroll]] for (uint i = 0u; i < HC_M; i++) {
+                // The down kernel stored the activation bf16(silu(d / G)).
                 const uvec4 dv = U32x4(arg(1) + 2u * uint64_t(i * R)).v[b];
                 [[unroll]] for (uint q = 0u; q < 4u; q++) {
-                    const vec2 d = vec2(uintBitsToFloat(dv[q] << 16u), uintBitsToFloat(dv[q] & 0xffff0000u)) * inv_g;
-                    const vec2 a = vec2(float(bfloat16_t(d.x / (1.0 + exp(-d.x)))),
-                                        float(bfloat16_t(d.y / (1.0 + exp(-d.y)))));
+                    const vec2 a = vec2(uintBitsToFloat(dv[q] << 16u), uintBitsToFloat(dv[q] & 0xffff0000u));
                     const vec2 w = unpackHalf2x16(wv[q]);
                     acc[i] += w.x * a.x + w.y * a.y;
                 }
