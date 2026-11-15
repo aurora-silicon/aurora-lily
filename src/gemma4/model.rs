@@ -115,6 +115,9 @@ pub struct Gemma4Model {
     /// up to MAX_ROWS rows run them over the int8 form of their input, which
     /// the residual's norms write.
     q8x_experts: bool,
+    /// Not a G16 GPU: steps of up to MAX_ROWS rows run a layer's IQ2_XXS
+    /// expert gate/up and IQ4_NL down (UD-IQ2_M) over f16 activations.
+    xh_experts: bool,
     /// The longest context served: the file's, the server's limit, or what
     /// fits the memory limit ([`Gemma4Model::fit_context`]).
     pub context_cap: usize,
@@ -218,6 +221,7 @@ impl Gemma4Model {
             prefill_rows: PREFILL_ROWS,
             q8x,
             q8x_experts,
+            xh_experts: !ctx.g16(),
         })
     }
 
@@ -400,6 +404,10 @@ pub struct Scratch {
     sel: Tensor,
     rw: Tensor,
     emid: Tensor,
+    /// A step's expert input (n2) and mid as f16 (the IQ2_XXS gate/up's
+    /// and the IQ4_NL down's pairings).
+    n2h: Tensor,
+    emid_h: Tensor,
     moe_group: g4::MoeGroupScratch,
     partial: Tensor,
     /// The partials' capacity in key chunks.
@@ -497,6 +505,12 @@ impl Scratch {
             sel: Tensor::zeros(ctx, &[m * cfg.n_expert_used], DType::U32)?,
             rw: f(m * cfg.n_expert_used)?,
             emid: f(MAX_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
+            n2h: Tensor::zeros(ctx, &[MAX_ROWS * h], DType::F16)?,
+            emid_h: Tensor::zeros(
+                ctx,
+                &[MAX_ROWS * cfg.n_expert_used * cfg.ff_expert],
+                DType::F16,
+            )?,
             moe_group: g4::MoeGroupScratch::in_pool(
                 ctx,
                 m,
@@ -794,6 +808,10 @@ impl Gemma4Model {
         // norms).
         let q8 = (self.q8x && m <= MAX_ROWS).then_some((&sc.xq8, &sc.xds));
         let q8e = (self.q8x_experts && m <= MAX_ROWS).then_some((&sc.eq8, &sc.eds));
+        let xh = self.xh_experts
+            && m <= MAX_ROWS
+            && l.gate_up_exps.ty == crate::gguf::GgmlType::Iq2Xxs
+            && l.down_exps.ty == crate::gguf::GgmlType::Iq4Nl;
         let pre = q8.is_some();
         match &l.v {
             Some(v) => self.proj_q8(
@@ -893,6 +911,7 @@ impl Gemma4Model {
             h,
             eps,
             [q8, q8e],
+            xh.then_some(&sc.n2h),
         )?;
         pass.memory_barrier()?;
         self.proj_q8(
@@ -936,6 +955,32 @@ impl Gemma4Model {
                 m,
                 cfg.n_expert_used,
                 cfg.n_expert,
+            )?;
+        } else if xh {
+            g4::moe_gate_up_xh(
+                ctx,
+                pass,
+                &l.gate_up_exps,
+                cfg.ff_expert,
+                &sc.n2h,
+                &sc.sel,
+                &sc.emid,
+                &sc.emid_h,
+                m,
+                cfg.n_expert_used,
+            )?;
+            pass.memory_barrier()?;
+            g4::moe_down_xh(
+                ctx,
+                pass,
+                &l.down_exps,
+                h,
+                &sc.emid_h,
+                &sc.sel,
+                &sc.rw,
+                &sc.m2,
+                m,
+                cfg.n_expert_used,
             )?;
         } else {
             g4::moe_gate_up_q8x(

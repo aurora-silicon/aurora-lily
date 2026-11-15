@@ -518,9 +518,19 @@ fn moe_timing() {
         let codes = Tensor::zeros(&ctx, &[hidden], DType::I8).unwrap();
         let ds = zeros(&ctx, hidden / 16);
         run(&ctx, |p| quant_q8x(&ctx, p, &x, &codes, &ds, 1, hidden).unwrap());
-        let parts = if gt == GgmlType::Q5K { 3 } else { 2 };
+        // IQ2_XXS / IQ4_NL also over f16 activations (parts 3 and 4).
+        let xh = Tensor::zeros(&ctx, &[hidden], DType::F16).unwrap();
+        let mid_h = Tensor::zeros(&ctx, &[used * ff], DType::F16).unwrap();
+        run(&ctx, |p| {
+            crate::kernels::deepseek4::x_f16_iq2(&ctx, p, &x, &xh, 1, hidden).unwrap()
+        });
+        let parts: &[usize] = match gt {
+            GgmlType::Q5K => &[0, 1, 2],
+            GgmlType::Iq2Xxs => &[0, 1, 3, 4],
+            _ => &[0, 1],
+        };
         let mut line = format!("moe {gt:?}/{dt:?}:");
-        for part in 0..parts {
+        for &part in parts {
             let mut best = f64::MAX;
             for pass_no in 0..9 {
                 let pass = ctx.begin().unwrap();
@@ -533,6 +543,16 @@ fn moe_timing() {
                         let q8 = Some((&codes, &ds));
                         moe_gate_up_q8x(
                             &ctx, &pass, gu, ff, &x, &ts, &mid, 1, used, q8,
+                        )
+                        .unwrap();
+                    } else if part == 3 {
+                        moe_gate_up_xh(
+                            &ctx, &pass, gu, ff, &xh, &ts, &mid, &mid_h, 1, used,
+                        )
+                        .unwrap();
+                    } else if part == 4 {
+                        moe_down_xh(
+                            &ctx, &pass, dn, hidden, &mid_h, &ts, &tw, &out, 1, used,
                         )
                         .unwrap();
                     } else {
@@ -550,7 +570,7 @@ fn moe_timing() {
             }
             line += &format!(
                 " {} {:.1} us",
-                ["gate/up", "down", "gate/up int8"][part],
+                ["gate/up", "down", "gate/up int8", "gate/up f16", "down f16"][part],
                 best / repeat as f64 * 1e6
             );
         }
@@ -1518,7 +1538,7 @@ fn int8_gemv_rows_match_one_row() {
     assert!(err < 0.05, "int8 against f32 activations: {err} of rms");
 }
 
-/// The norms' and the attention merge's int8 outputs equal
+/// rmsnorm's, ffn_out's and the attention merge's int8 outputs equal
 /// quant_q8x of their f32 outputs, bit for bit, edge blocks included
 /// (zero, subnormal, NaN, infinities), and the f32 outputs are the plain
 /// kernels'.
@@ -1878,9 +1898,9 @@ fn int8_gemv_sets_match_one_set_and_the_block_layout() {
     }
 }
 
-/// The routed experts' Q5_K gate/up over int8 x: each row equals its
-/// one-row dispatch bit for bit (a verify pass decodes as a plain step),
-/// and gelu(g) u follows the products of the codes with independently
+/// The routed experts' Q5_K gate/up over int8 x, one to four rows at
+/// Gemma's width: each row equals its one-row dispatch bit for bit (a
+/// verify pass decodes as a plain step), and gelu(g) u follows the products
 /// of the codes with independently decoded weights.
 #[test]
 fn moe_gate_up_q8x_matches_int8_products() {
@@ -1959,9 +1979,15 @@ fn moe_gate_up_q8x_matches_int8_products() {
     assert_close(&got, &want, 1e-3, 1e-3);
     }
 }
+
+/// post_attn with every combination of its extra outputs (n1 int8, n2
+/// int8, n2 f16): the residual and all three f32 outputs equal the plain
+/// kernel's bit for bit; each int8 pair equals quant_q8x of its own f32
+/// output, and the f16 output is n2 clamped to +-65504 in the IQ2_XXS
+/// pairing. n1 and n2 take different weights with edge blocks (zero,
 /// subnormal, NaN, overflow, infinite).
 #[test]
-fn post_attn_writes_its_int8_outputs() {
+fn post_attn_writes_its_int8_and_f16_outputs() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(85);
     let (m, n, eps) = (3, 2816, 1e-6);
@@ -2010,8 +2036,21 @@ fn post_attn_writes_its_int8_outputs() {
             quant_q8x(&ctx, p, &op[j], &want[j].0, &want[j].1, m, n).unwrap();
         }
     });
-    for mask in 1..4u32 {
+    // The f16 pairing of the plain n2, clamped.
+    let n2 = op[1].to_f32().unwrap();
+    let mut want_h = vec![0u16; m * n];
+    for g in 0..m * n / 8 {
+        for p in 0..4 {
+            for (half, v) in [n2[8 * g + p], n2[8 * g + p + 4]].into_iter().enumerate()
+            {
+                want_h[8 * g + 2 * p + half] =
+                    f16::from_f32(v.clamp(-65504.0, 65504.0)).to_bits();
+            }
+        }
+    }
+    for mask in 1..8u32 {
         let pairs = [q8(), q8()];
+        let xh = Tensor::zeros(&ctx, &[m * n], DType::F16).unwrap();
         let (rq, oq) = (zeros(&ctx, m * n), [0; 3].map(|_| zeros(&ctx, m * n)));
         let q8s = [0, 1]
             .map(|j| (mask & (1 << j) != 0).then_some((&pairs[j].0, &pairs[j].1)));
@@ -2029,6 +2068,7 @@ fn post_attn_writes_its_int8_outputs() {
                 n,
                 eps,
                 q8s,
+                (mask & 4 != 0).then_some(&xh),
             )
             .unwrap()
         });
@@ -2050,5 +2090,81 @@ fn post_attn_writes_its_int8_outputs() {
                 );
             }
         }
+        if mask & 4 != 0 {
+            let got: Vec<u16> = bytemuck::cast_slice::<u8, u16>(xh.contents()).to_vec();
+            let bad = got.iter().zip(&want_h).position(|(g, w)| {
+                g != w && !(f16::from_bits(*g).is_nan() && f16::from_bits(*w).is_nan())
+            });
+            if let Some(i) = bad {
+                panic!("mask {mask}: f16 n2 [{i}] {:#06x}, want {:#06x}", got[i], want_h[i]);
+            }
+        }
+    }
+}
+
+/// The f16-activation experts: the IQ2_XXS gate/up over f16 x equals the
+/// f32 kernel over x rounded to f16, bit for bit, and its f16 mid is its f32
+/// mid clamped to +-65504 in the IQ4_NL pairing; the IQ4_NL down over that
+/// equals the f32 down over the f16 mid widened, bit for bit. At Gemma's
+/// width, one to four rows.
+#[test]
+fn f16_experts_match_the_f32_kernels_on_f16_values() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(86);
+    let (hid, ff, ne, used) = (2816, 704, 10, 8);
+    let gu_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, ne * 2 * ff * hid);
+    let dn_raw = random_blocks(&mut rng, GgmlType::Iq4Nl, ne * hid * ff);
+    let gu =
+        QWeight::from_bytes(&ctx, &gu_raw, GgmlType::Iq2Xxs, hid, ne * 2 * ff).unwrap();
+    let dn = QWeight::from_bytes(&ctx, &dn_raw, GgmlType::Iq4Nl, ff, ne * hid).unwrap();
+    let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for m in 1..=4 {
+        let xv: Vec<f32> = f32s(&mut rng, m * hid, -1.0, 1.0)
+            .iter()
+            .map(|v| f16::from_f32(*v).to_f32())
+            .collect();
+        let x = tensor(&ctx, &xv);
+        let xh = Tensor::zeros(&ctx, &[m * hid], DType::F16).unwrap();
+        let sel: Vec<u32> =
+            (0..m * used).map(|_| rng.gen_range(0..ne as u32)).collect();
+        let (ts, tw) =
+            (u32s(&ctx, &sel), tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.5)));
+        let (mid, mid32) = (zeros(&ctx, m * used * ff), zeros(&ctx, m * used * ff));
+        let mid_h = Tensor::zeros(&ctx, &[m * used * ff], DType::F16).unwrap();
+        run(&ctx, |p| {
+            crate::kernels::deepseek4::x_f16_iq2(&ctx, p, &x, &xh, m, hid).unwrap();
+            moe_gate_up(&ctx, p, &gu, ff, &x, &ts, &mid32, m, used).unwrap();
+            p.memory_barrier().unwrap();
+            moe_gate_up_xh(&ctx, p, &gu, ff, &xh, &ts, &mid, &mid_h, m, used).unwrap();
+        });
+        let mv = mid.to_f32().unwrap();
+        assert_eq!(bits(&mv), bits(&mid32.to_f32().unwrap()), "m {m}: gate/up");
+        // mid_h: of each 32 values, word j holds values j and j + 16.
+        let got: Vec<u16> = bytemuck::cast_slice::<u8, u16>(mid_h.contents()).to_vec();
+        let mut wide = vec![0f32; m * used * ff];
+        for (b, blk) in mv.chunks(32).enumerate() {
+            for j in 0..16 {
+                for (half, v) in [blk[j], blk[j + 16]].into_iter().enumerate() {
+                    let h = got[32 * b + 2 * j + half];
+                    assert_eq!(
+                        h,
+                        f16::from_f32(v.clamp(-65504.0, 65504.0)).to_bits(),
+                        "m {m}: mid_h"
+                    );
+                    wide[32 * b + j + 16 * half] = f16::from_bits(h).to_f32();
+                }
+            }
+        }
+        let (out, out32) = (zeros(&ctx, m * hid), zeros(&ctx, m * hid));
+        let midw = tensor(&ctx, &wide);
+        run(&ctx, |p| {
+            moe_down(&ctx, p, &dn, hid, &midw, &ts, &tw, &out32, m, used).unwrap();
+            moe_down_xh(&ctx, p, &dn, hid, &mid_h, &ts, &tw, &out, m, used).unwrap();
+        });
+        assert_eq!(
+            bits(&out.to_f32().unwrap()),
+            bits(&out32.to_f32().unwrap()),
+            "m {m}: down"
+        );
     }
 }

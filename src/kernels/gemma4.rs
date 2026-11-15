@@ -631,6 +631,124 @@ pub fn moe_down(
     )
 }
 
+/// [`moe_gate_up`] for IQ2_XXS experts over `xh`, the input as f16 in the
+/// IQ2_XXS dot's pairing (`deepseek4::x_f16_iq2`'s layout), half the
+/// activation bytes a task; it also writes `mid_h`, mid as f16 in
+/// [`moe_down_xh`]'s pairing.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gate_up_xh(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate_up: &QWeight,
+    ff: usize,
+    xh: &Tensor,
+    sel: &Tensor,
+    mid: &Tensor,
+    mid_h: &Tensor,
+    m: usize,
+    used: usize,
+) -> Result<()> {
+    check_f32(&[mid])?;
+    ensure!(
+        xh.dtype() == DType::F16 && mid_h.dtype() == DType::F16,
+        "f16 expert activations"
+    );
+    ensure!(
+        gate_up.ty == GgmlType::Iq2Xxs,
+        "f16-activation gate/up of {:?}",
+        gate_up.ty
+    );
+    ensure!(
+        gate_up.rows.is_multiple_of(2 * ff) && ff.is_multiple_of(32),
+        "gate/up rows {} of {ff}",
+        gate_up.rows
+    );
+    ensure!(sel.dtype() == DType::U32 && sel.numel() >= m * used, "selection");
+    ensure!(
+        mid.numel() >= m * used * ff
+            && mid_h.numel() >= m * used * ff
+            && xh.numel() >= m * gate_up.cols,
+        "expert sizes"
+    );
+    let pipeline =
+        ctx.pipeline("gemma4_moe_gate_up_iq2_xxs_xh", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            gate_up.t.binding(),
+            xh.binding(),
+            sel.binding(),
+            mid.binding(),
+            mid_h.binding(),
+        ],
+        &[
+            &u32_bytes(gate_up.cols),
+            &u32_bytes(ff),
+            &u32_bytes(gate_up.row_bytes),
+            &u32_bytes(used),
+        ],
+        Grid::Threadgroups {
+            groups: (ff.div_ceil(8), m * used, 1),
+            threadgroup: (256, 1, 1),
+        },
+    )
+}
+
+/// [`moe_down`] for IQ4_NL experts over `mid_h`, mid as f16 in the IQ4_NL
+/// dot's pairing (of each 32 values, word j holds values j and j + 16;
+/// [`moe_gate_up_xh`] writes it).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_down_xh(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    down: &QWeight,
+    hidden: usize,
+    mid_h: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    m: usize,
+    used: usize,
+) -> Result<()> {
+    check_f32(&[weights, out])?;
+    ensure!(mid_h.dtype() == DType::F16, "f16 expert activations");
+    ensure!(
+        down.ty == GgmlType::Iq4Nl
+            && down.rows.is_multiple_of(hidden)
+            && down.cols.is_multiple_of(64)
+            && down.row_bytes.is_multiple_of(4)
+            && used <= 32,
+        "f16-activation down of {:?}",
+        down.ty
+    );
+    ensure!(
+        out.numel() >= m * hidden && mid_h.numel() >= m * used * down.cols,
+        "expert sizes"
+    );
+    let pipeline =
+        ctx.pipeline("gemma4_moe_down_iq4_nl_xh", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            down.t.binding(),
+            mid_h.binding(),
+            sel.binding(),
+            weights.binding(),
+            out.binding(),
+        ],
+        &[
+            &u32_bytes(down.cols),
+            &u32_bytes(hidden),
+            &u32_bytes(down.row_bytes),
+            &u32_bytes(used),
+        ],
+        Grid::Threadgroups {
+            groups: (hidden.div_ceil(8), m, 1),
+            threadgroup: (256, 1, 1),
+        },
+    )
+}
+
 /// Scratch of [`moe_grouped`] for runs of up to `pairs` routed pairs.
 pub struct MoeGroupScratch {
     pairs: Tensor,
@@ -846,11 +964,13 @@ pub fn post_attn(
     n: usize,
     eps: f32,
 ) -> Result<()> {
-    post_attn_q8x(ctx, pass, a, w_post, x, r, w, o, m, n, eps, [None, None])
+    post_attn_q8x(ctx, pass, a, w_post, x, r, w, o, m, n, eps, [None, None], None)
 }
 
 /// [`post_attn`], with `q8[0]` also writing `o[0]` (the dense MLP's input)
-/// and `q8[1]` `o[1]` (the routed experts') as [`quant_q8x`] does.
+/// and `q8[1]` `o[1]` (the routed experts') as [`quant_q8x`] does, and
+/// `xh` `o[1]` as f16 in the IQ2_XXS dot's pairing ([`moe_gate_up_xh`]'s
+/// input; values clamped to +-65504).
 #[allow(clippy::too_many_arguments)]
 pub fn post_attn_q8x(
     ctx: &MetalContext,
@@ -865,6 +985,7 @@ pub fn post_attn_q8x(
     n: usize,
     eps: f32,
     q8: [Option<(&Tensor, &Tensor)>; 2],
+    xh: Option<&Tensor>,
 ) -> Result<()> {
     check_f32(&[a, w_post, x, r, w[0], w[1], w[2], o[0], o[1], o[2]])?;
     ensure!(
@@ -884,9 +1005,15 @@ pub fn post_attn_q8x(
         o[1].binding(),
         o[2].binding(),
     ];
-    // Both pairs bound (an unused one as the other), a mask of the
-    // written ones.
-    let Some(any) = q8[0].or(q8[1]) else {
+    // Both pairs and the f16 output bound (an unused one as another
+    // buffer), a mask of the written ones.
+    if let Some(xh) = xh {
+        ensure!(
+            xh.dtype() == DType::F16 && xh.numel() >= m * n && n.is_multiple_of(8),
+            "f16 output of {m} x {n}"
+        );
+    }
+    let Some(any) = q8[0].or(q8[1]).or(xh.map(|t| (t, t))) else {
         let pipeline = ctx.pipeline("gemma4_post_attn", SOURCE, MslVersion::V3_1)?;
         return pass.dispatch_at(
             &pipeline,
@@ -897,11 +1024,18 @@ pub fn post_attn_q8x(
     };
     let mut mask = 0;
     for (j, pair) in q8.iter().enumerate() {
-        if pair.is_some() {
-            mask |= 1 << j;
+        match pair {
+            Some(pair) => {
+                mask |= 1 << j;
+                q8_variant(Some(*pair), m, n, &mut bindings, "", "")?;
+            }
+            None => bindings.extend([any.0.binding(), any.1.binding()]),
         }
-        q8_variant(Some(pair.unwrap_or(any)), m, n, &mut bindings, "", "")?;
     }
+    if xh.is_some() {
+        mask |= 4;
+    }
+    bindings.push(xh.unwrap_or(any.0).binding());
     let pipeline = ctx.pipeline("gemma4_post_attn_q8x", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
