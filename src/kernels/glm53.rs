@@ -992,10 +992,6 @@ pub fn moe_gate_up(
     )
 }
 
-/// Routed experts' down projection summed over each row's slots, plus
-/// `add` when given: `out[i] = sum_s down_{sel[i][s]} mid[i * used + s]
-/// (+ add[i])`; `out` may be `add`.
-#[allow(clippy::too_many_arguments)]
 /// [`moe_gate_up`] for IQ2_XXS experts over `xh`, the activations as f16
 /// in the dot's pairing (DeepSeek V4's `x_f16_iq2`): half the activation
 /// bytes a task.
@@ -1049,6 +1045,10 @@ pub fn moe_gate_up_xh(
     )
 }
 
+/// Routed experts' down projection summed over each row's slots, plus
+/// `add` when given: `out[i] = sum_s down_{sel[i][s]} mid[i * used + s]
+/// (+ add[i])`; `out` may be `add`.
+#[allow(clippy::too_many_arguments)]
 pub fn moe_down(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
