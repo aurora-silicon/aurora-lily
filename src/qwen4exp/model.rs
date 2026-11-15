@@ -2927,7 +2927,11 @@ impl Qwen4ExpModel {
             if stop.is_some_and(|stop| stop()) {
                 return Ok(fed);
             }
+            // The ids, and with a paged embedding the chunk's rows from the
+            // file (on the critical path: counted with the staging).
+            let embed_started = std::time::Instant::now();
             let mut ps = capacity.chunk(chunk)?;
+            let embed_secs = embed_started.elapsed().as_secs_f64();
             ps.ple = capacity
                 .ple
                 .as_ref()
@@ -3003,7 +3007,7 @@ impl Qwen4ExpModel {
             let encode_secs = (encoded_at - started).as_secs_f64();
             crate::stats::record(|c| {
                 c.prefill.chunks += 1;
-                c.prefill.ngram_secs += ngram_secs + ahead_exposed;
+                c.prefill.ngram_secs += ngram_secs + ahead_exposed + embed_secs;
                 c.gather.hidden_secs += ahead_hidden;
                 c.prefill.encode_secs += encode_secs;
                 c.prefill.gpu_secs += gpu_secs;
@@ -3012,13 +3016,14 @@ impl Qwen4ExpModel {
             });
             if profile {
                 eprintln!(
-                    "profile prefill m={}: encode {:.2} ms, gpu {:.2} ms, total {:.2} ms, ngram {:.2} ms exposed, {:.2} ms ahead",
+                    "profile prefill m={}: encode {:.2} ms, gpu {:.2} ms, total {:.2} ms, ngram {:.2} ms exposed, {:.2} ms ahead, ids/embedding {:.2} ms",
                     chunk.len(),
                     encode_secs * 1e3,
                     gpu_secs * 1e3,
                     started.elapsed().as_secs_f64() * 1e3,
                     (ngram_secs + ahead_exposed) * 1e3,
-                    ahead_hidden * 1e3
+                    ahead_hidden * 1e3,
+                    embed_secs * 1e3
                 );
             }
             state.pos += chunk.len();

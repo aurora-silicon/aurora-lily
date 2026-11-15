@@ -178,7 +178,8 @@ pub struct PrefillPhases {
     /// Hashing the n-gram ids and gathering their rows, as far as the GPU
     /// waited for it: the first chunk's staging and whatever of a later
     /// chunk's outlasted the chunk before it (`ngram.prefill` breaks the
-    /// gathers down; its `hidden_ms` is the part that overlapped the GPU).
+    /// gathers down; its `hidden_ms` is the part that overlapped the GPU),
+    /// and a paged token embedding's rows read from the file.
     pub ngram_ms: f64,
     /// Encoding the chunks' passes on the host.
     pub encode_ms: f64,

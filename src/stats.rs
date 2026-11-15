@@ -69,7 +69,10 @@ pub struct Prefill {
     /// Hashing the chunks' n-gram ids and staging their rows, as far as the
     /// GPU waited for it: the first chunk's whole staging, and whatever of a
     /// later chunk's (staged while the GPU ran the chunk before it) outlasted
-    /// that chunk. The overlapped rest is `Gather::hidden_secs`.
+    /// that chunk. The overlapped rest is `Gather::hidden_secs`. Also the
+    /// chunks' token embedding rows read from the file where the table is
+    /// paged (Qwen3.8's Q2 GGUF under a memory limit), which the GPU always
+    /// waits for.
     pub ngram_secs: f64,
     /// Encoding the chunk's pass on the host.
     pub encode_secs: f64,
