@@ -118,12 +118,7 @@ impl DecodeStateApi for Glm53State {
         self.layers
             .iter()
             .map(|l| match l {
-                LayerState::Kda { conv, s, conv_alt, s_alt } => {
-                    conv.byte_len()
-                        + s.byte_len()
-                        + conv_alt.byte_len()
-                        + s_alt.byte_len()
-                }
+                LayerState::Kda { conv, s } => conv.byte_len() + s.byte_len(),
                 LayerState::Dsa { latent, pooled, tail_k, tail_g } => {
                     latent.byte_len()
                         + pooled.byte_len()
@@ -423,7 +418,7 @@ impl LanguageModel for Glm53Model {
         state.pos = pos0 + 1 + accepted;
         if accepted + 1 < rows {
             // Back to the state after row 0.
-            state.take_kda_snapshots();
+            state.take_kda_snapshots(scratch);
         }
         for &token in &draws[accepted + 1..] {
             scratch.sampler().uncount(token);

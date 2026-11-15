@@ -37,15 +37,17 @@ fn a_held_instance_lock_refuses_the_load_before_mapping() {
 /// tensors read zero although they come from memory a dropped state filled;
 /// a snapshot of the recurrent tensors (packed into one allocation) restores
 /// every byte of each to its own tensor, stays independent of the live state,
-/// forks into another state, and follows a swapped KDA pair (the alternate
-/// views current after a rejected draft).
+/// forks into another state, and follows a swapped KDA pair (the scratch's
+/// alternates current after a rejected draft, the former current ones the
+/// scratch's).
 #[test]
 fn recurrent_state_zeroes_and_round_trips_without_the_model() {
     use crate::engine::{DecodeStateApi, SnapshotApi};
     let ctx = MetalContext::new().expect("context");
     let cfg = Config::glm53_flash();
+    let mut sc = Scratch::new(&ctx, &cfg).expect("scratch");
     // Every recurrent tensor (KDA conv and state, DSA incomplete-pool
-    // tails), in the snapshot's order, and the KDA alternates.
+    // tails), in the snapshot's order, and the scratch's KDA alternates.
     fn current(st: &Glm53State) -> Vec<&Tensor> {
         st.layers
             .iter()
@@ -55,14 +57,8 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
             })
             .collect()
     }
-    fn alternates(st: &Glm53State) -> Vec<&Tensor> {
-        st.layers
-            .iter()
-            .flat_map(|l| match l {
-                LayerState::Kda { conv_alt, s_alt, .. } => vec![conv_alt, s_alt],
-                LayerState::Dsa { .. } => vec![],
-            })
-            .collect()
+    fn alternates(sc: &Scratch) -> Vec<&Tensor> {
+        sc.kda_alt.iter().flatten().flat_map(|(c, s)| [c, s]).collect()
     }
     // Tensor t's pattern under seed k: distinct for every tensor and value.
     let fill = |ts: &[&Tensor], k: u32| {
@@ -90,9 +86,7 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
     };
     {
         let st = Glm53State::new(&ctx, &cfg, 64).unwrap();
-        let mut all = current(&st);
-        all.extend(alternates(&st));
-        fill(&all, 1);
+        fill(&current(&st), 1);
     }
     let mut st = Glm53State::new(&ctx, &cfg, 64).unwrap();
     for (il, l) in st.layers.iter().enumerate() {
@@ -108,7 +102,7 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
         }
     }
     fill(&current(&st), 2);
-    fill(&alternates(&st), 3);
+    fill(&alternates(&sc), 3);
     st.pos = 17;
     let snap = st.snapshot(&ctx).unwrap();
     assert_eq!(snap.pos(), 17);
@@ -121,7 +115,7 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
         st.restore(&ctx, &snap).unwrap();
         assert_eq!(st.pos, 17);
         check(&current(&st), 2, "restored");
-        check(&alternates(&st), 3, "alternates untouched");
+        check(&alternates(&sc), 3, "alternates untouched");
     }
     // A fork: another state restored from it.
     let mut other = Glm53State::new(&ctx, &cfg, 64).unwrap();
@@ -129,10 +123,10 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
     check(&current(&other), 2, "forked");
     // A swapped pair: the alternates become current, and a snapshot then
     // holds (and restores into) them.
-    st.take_kda_snapshots();
+    st.take_kda_snapshots(&mut sc);
     let swapped = st.snapshot(&ctx).unwrap();
     let before: Vec<Vec<f32>> =
-        alternates(&st).iter().map(|t| t.to_f32().unwrap()).collect();
+        alternates(&sc).iter().map(|t| t.to_f32().unwrap()).collect();
     fill(&current(&st), 5);
     st.restore(&ctx, &swapped).unwrap();
     // The KDA tensors current now are the former alternates, back to their
@@ -147,7 +141,7 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
         })
         .collect();
     check(&kda_now, 3, "swapped pair restored");
-    for (t, (x, b)) in alternates(&st).iter().zip(&before).enumerate() {
+    for (t, (x, b)) in alternates(&sc).iter().zip(&before).enumerate() {
         let got = x.to_f32().unwrap();
         assert!(
             got.iter().zip(b).all(|(g, w)| g.to_bits() == w.to_bits()),

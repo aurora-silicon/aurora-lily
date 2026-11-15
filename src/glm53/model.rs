@@ -399,13 +399,12 @@ impl Glm53Model {
 
 /// One layer's recurrent state or caches.
 pub enum LayerState {
-    /// `conv_alt`/`s_alt` receive the state after a verify pass's first row,
-    /// which becomes current when its draft is rejected.
+    /// A verify pass writes the state after its first row to the scratch's
+    /// `kda_alt` of the layer, which becomes current when the draft is
+    /// rejected ([`Glm53State::take_kda_snapshots`]).
     Kda {
         conv: Tensor,
         s: Tensor,
-        conv_alt: Tensor,
-        s_alt: Tensor,
     },
     Dsa {
         latent: Tensor,
@@ -438,15 +437,13 @@ impl Glm53State {
     pub fn new(ctx: &MetalContext, cfg: &Config, capacity: usize) -> Result<Self> {
         let capacity = capacity.next_multiple_of(4);
         let p = cfg.kda_projection();
-        // Every KDA layer's conv windows and states, and their alternates,
-        // views of one allocation (about 140 allocations of their own cost
-        // ~10 ms a session), zeroed on the GPU below: the recurrent state
-        // starts at zero (the alternates are written before they are read).
+        // Every KDA layer's conv windows and states, views of one allocation
+        // (about 70 allocations of their own cost ~5 ms a session), zeroed on
+        // the GPU below: the recurrent state starts at zero.
         let conv_len = 3 * (cfg.kda_conv - 1) * p;
         let s_len = cfg.kda_heads * cfg.kda_dim * cfg.kda_dim;
         let n_kda = cfg.kinds.iter().filter(|k| **k == LayerKind::Kda).count();
-        let kda_all =
-            Tensor::uninit(ctx, &[n_kda * 2 * (conv_len + s_len)], DType::F32)?;
+        let kda_all = Tensor::uninit(ctx, &[n_kda * (conv_len + s_len)], DType::F32)?;
         let kda_at = std::cell::Cell::new(0usize);
         let take = |n: usize| -> Result<Tensor> {
             let at = kda_at.get();
@@ -456,12 +453,9 @@ impl Glm53State {
         let layers = (0..cfg.n_layer)
             .map(|il| -> Result<LayerState> {
                 Ok(match cfg.kinds[il] {
-                    LayerKind::Kda => LayerState::Kda {
-                        conv: take(conv_len)?,
-                        s: take(s_len)?,
-                        conv_alt: take(conv_len)?,
-                        s_alt: take(s_len)?,
-                    },
+                    LayerKind::Kda => {
+                        LayerState::Kda { conv: take(conv_len)?, s: take(s_len)? }
+                    }
                     LayerKind::Dsa => LayerState::Dsa {
                         latent: Tensor::zeros(
                             ctx,
@@ -518,10 +512,11 @@ impl Glm53State {
         self.spec = None;
     }
 
-    /// Makes the KDA states saved after a verify pass's first row current.
-    pub(crate) fn take_kda_snapshots(&mut self) {
-        for l in &mut self.layers {
-            if let LayerState::Kda { conv, s, conv_alt, s_alt } = l {
+    /// Makes the KDA states a verify pass saved after its first row (the
+    /// scratch's `kda_alt`) current; the former ones become the scratch's.
+    pub(crate) fn take_kda_snapshots(&mut self, sc: &mut Scratch) {
+        for (l, alt) in self.layers.iter_mut().zip(&mut sc.kda_alt) {
+            if let (LayerState::Kda { conv, s }, Some((conv_alt, s_alt))) = (l, alt) {
                 std::mem::swap(conv, conv_alt);
                 std::mem::swap(s, s_alt);
             }
@@ -594,6 +589,10 @@ pub struct Scratch {
     rsel: Tensor,
     rw: Tensor,
     moe_mid: Tensor,
+    /// Per layer, a KDA layer's (conv, state) alternates a verify pass
+    /// writes (one request at a time decodes: they are the scratch's, not
+    /// every session's), views of one allocation.
+    kda_alt: Vec<Option<(Tensor, Tensor)>>,
     moe_group: k::MoeGroupScratch,
     // Head
     /// The stream mean of the last step's rows (the MTP head's input).
@@ -657,6 +656,27 @@ impl Scratch {
     }
 
     fn new(ctx: &MetalContext, cfg: &Config) -> Result<Self> {
+        let kda_alt = {
+            let p = cfg.kda_projection();
+            let conv_len = 3 * (cfg.kda_conv - 1) * p;
+            let s_len = cfg.kda_heads * cfg.kda_dim * cfg.kda_dim;
+            let n_kda = cfg.kinds.iter().filter(|k| **k == LayerKind::Kda).count();
+            // Written by a verify pass before anything reads them.
+            let all = Tensor::uninit(ctx, &[n_kda * (conv_len + s_len)], DType::F32)?;
+            let mut at = 0;
+            let mut alt = Vec::with_capacity(cfg.n_layer);
+            for il in 0..cfg.n_layer {
+                alt.push(if cfg.kinds[il] == LayerKind::Kda {
+                    let conv = all.view(at, &[conv_len])?;
+                    let s = all.view(at + conv_len, &[s_len])?;
+                    at += conv_len + s_len;
+                    Some((conv, s))
+                } else {
+                    None
+                });
+            }
+            alt
+        };
         let m = PREFILL_ROWS;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let u = |n: usize| Tensor::zeros(ctx, &[n], DType::U32);
@@ -744,6 +764,7 @@ impl Scratch {
             mtp_h1: f(cfg.hidden)?,
             mtp_sel: u(s)?,
             mtp_prob: f(1)?,
+            kda_alt,
         })
     }
 
@@ -1474,7 +1495,7 @@ impl Glm53Model {
     ) -> Result<()> {
         let cfg = &self.cfg;
         match (a, &st.layers[il]) {
-            (AttnW::Kda(w), LayerState::Kda { conv, s, conv_alt, s_alt }) => {
+            (AttnW::Kda(w), LayerState::Kda { conv, s }) => {
                 let xb = self.bf16_input(ctx, pass, sc, &sc.xn, cfg.hidden, m)?;
                 self.proj(ctx, pass, &[(&w.q, &sc.kq), (&w.k, &sc.kk)], &sc.xn, xb, m)?;
                 self.proj(
@@ -1515,11 +1536,13 @@ impl Glm53Model {
                     out_gate: &sc.kog,
                     edges: Some(&sc.kedges),
                 };
-                let snap = snap.map(|row| k::KdaSnapshot {
-                    row,
-                    conv: conv_alt,
-                    state: s_alt,
-                });
+                let snap = match (snap, &sc.kda_alt[il]) {
+                    (Some(row), Some((conv_alt, s_alt))) => {
+                        Some(k::KdaSnapshot { row, conv: conv_alt, state: s_alt })
+                    }
+                    (None, _) => None,
+                    (Some(_), None) => anyhow::bail!("layer {il}: no KDA alternate"),
+                };
                 k::kda(ctx, pass, &p, &x, conv, s, &sc.kout, m, snap)?;
                 pass.memory_barrier()?;
                 let pw = cfg.kda_projection();
