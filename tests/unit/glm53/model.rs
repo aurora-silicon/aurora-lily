@@ -210,6 +210,30 @@ fn q8_0_blocks_requantize_to_q4_0() {
     }
 }
 
+/// The weight inventory (`weight_buffers`): the mapped buffers alone
+/// without a draft head; with one, its buffer once more, not twice, and
+/// not again when it lies in a mapped buffer.
+#[test]
+fn weight_inventory_lists_the_draft_head_once() {
+    let ctx = MetalContext::new().expect("context");
+    let mapped: Vec<Buffer> = (0..3).map(|_| ctx.new_buffer(64).unwrap()).collect();
+    let same = |a: &Buffer, b: &Buffer| std::ptr::eq::<GpuBuffer>(&**a, &**b);
+    let none = weight_inventory(&mapped, None);
+    assert_eq!(none.len(), 3);
+    assert!(none.iter().zip(&mapped).all(|(a, b)| same(a, b)));
+    let head = Tensor::zeros(&ctx, &[16], crate::tensor::DType::F32).unwrap();
+    let with = weight_inventory(&mapped, Some(&head));
+    assert_eq!(with.len(), 4);
+    assert_eq!(with.iter().filter(|b| same(b, &head.shared_buffer())).count(), 1);
+    // A view into a mapped buffer adds nothing.
+    let inside =
+        Tensor::from_buffer(mapped[1].clone(), &[16], crate::tensor::DType::F32)
+            .unwrap()
+            .view(4, &[8])
+            .unwrap();
+    assert_eq!(weight_inventory(&mapped, Some(&inside)).len(), 3);
+}
+
 /// Every staging path the engine uses fits the scratch it writes, at every
 /// row count it is called with: a verify pass (1 or 2 rows, up to
 /// MAX_ROWS), a decode step, a prefill run up to PREFILL_ROWS, the MTP
@@ -331,6 +355,33 @@ fn first_routing_difference_stays_in_the_common_prefix() {
 }
 
 /// Loads the published file for the real-weight tests.
+/// Loads without and with speculation: the weight inventory is the mapped
+/// file's buffers, plus the Q4_0 draft head's buffer exactly once when
+/// speculation is on (the head is Q8_0 in this checkpoint).
+#[test]
+#[ignore = "requires LILY_GLM53_GGUF"]
+fn weight_buffers_include_the_draft_head_only_with_speculation() {
+    use crate::engine::{LanguageModel, LoadOptions};
+    let path = std::env::var("LILY_GLM53_GGUF").expect("LILY_GLM53_GGUF");
+    let ctx = MetalContext::new().expect("context");
+    let load = |drafts: usize| {
+        let options = LoadOptions { mtp_drafts: drafts, ..Default::default() };
+        <Glm53Model as LanguageModel>::load(&ctx, std::path::Path::new(&path), &options)
+            .expect("load")
+    };
+    let mapped = {
+        let model = load(0);
+        assert!(model.draft_head.is_none());
+        model.weight_buffers().len()
+    };
+    let model = load(1);
+    let head = model.draft_head.as_ref().expect("a draft head").t.shared_buffer();
+    let all = model.weight_buffers();
+    assert_eq!(all.len(), mapped + 1);
+    let same = |b: &Buffer| std::ptr::eq::<GpuBuffer>(&**b, &*head);
+    assert_eq!(all.iter().filter(|b| same(b)).count(), 1);
+}
+
 fn real_model(ctx: &MetalContext) -> Glm53Model {
     use crate::engine::{LanguageModel, LoadOptions};
     let path = std::env::var("LILY_GLM53_GGUF").expect("LILY_GLM53_GGUF");

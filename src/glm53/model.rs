@@ -17,7 +17,7 @@ use crate::kernels::glm53::{
     self as k, GemvLayout, KdaInputs, KdaParams, PoolParams, QWeight, Rows,
 };
 use crate::kernels::sample::SamplerScratch;
-use crate::metal::{Buffer, ComputePass, MetalContext};
+use crate::metal::{Buffer, ComputePass, GpuBuffer, MetalContext};
 use crate::tensor::{DType, Tensor};
 
 /// Rows one forward step takes (the GEMV's limit).
@@ -385,7 +385,7 @@ impl Glm53Model {
 
     /// The buffers holding the mapped file.
     pub fn weight_buffers(&self) -> Vec<Buffer> {
-        self.mapped.buffers.clone()
+        weight_inventory(&self.mapped.buffers, self.draft_head.as_ref().map(|w| &w.t))
     }
 
     pub fn new_state(&self, ctx: &MetalContext, capacity: usize) -> Result<Glm53State> {
@@ -522,6 +522,19 @@ impl Glm53State {
             }
         }
     }
+}
+
+/// The weight buffers a model holds: the mapped file's, and the buffer of
+/// a generated weight (the MTP draft head) once, unless it is one of them.
+fn weight_inventory(mapped: &[Buffer], generated: Option<&Tensor>) -> Vec<Buffer> {
+    let mut all = mapped.to_vec();
+    if let Some(t) = generated {
+        let b = t.shared_buffer();
+        if !all.iter().any(|x| std::ptr::eq::<GpuBuffer>(&**x, &*b)) {
+            all.push(b);
+        }
+    }
+    all
 }
 
 /// One Q8_0 block (f16 scale, 32 int8) as a Q4_0 block (f16 scale, 16
