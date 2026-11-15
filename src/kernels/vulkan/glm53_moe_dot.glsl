@@ -1,9 +1,9 @@
 // The register path of glm53_gemm.comp's expert GEMMs for a tile of
-// GM_DR rows (included once per row count inside the kernel's main: its
-// variables are main's). The decode is the tile path's; each thread dots
-// its own decoded weights with the rows' bfloat values, and the eight
-// threads of a weight row add their sums through threadgroup memory in k8
-// order.
+// GM_DR rows, included once per row count inside the kernel's main (its
+// variables are main's; dq, dk8 and dwr are the path's own lane layout).
+// The decode is the tile path's; each thread dots its own decoded weights
+// with the rows' bfloat values, and the eight threads of a weight row add
+// their sums through threadgroup memory in dk8 order.
 {
     U32x4 xd = U32x4(arg(0));
     uint xr[GM_DR];
@@ -16,9 +16,9 @@
         [[unroll]] for (uint j = 0u; j < GM_DR; j++) dacc[r][j] = 0.0;
     for (uint k0 = 0u; k0 < K; k0 += GM_STEP) {
         float w[4][8];
-        [[unroll]] for (uint r = 0u; r < 4u; r++) gm_decode8(wr[r], k0 + 8u * k8, w[r]);
+        [[unroll]] for (uint r = 0u; r < 4u; r++) gm_decode8(dwr[r], k0 + 8u * dk8, w[r]);
         [[unroll]] for (uint j = 0u; j < GM_DR; j++) {
-            const uvec4 v = xd.v[xr[j] + (k0 >> 3u) + k8];
+            const uvec4 v = xd.v[xr[j] + (k0 >> 3u) + dk8];
             float xf[8];
             [[unroll]] for (uint c = 0u; c < 4u; c++) {
                 xf[2u * c] = uintBitsToFloat(v[c] << 16u);
@@ -29,10 +29,10 @@
             }
         }
     }
-    // Partial sums: word (k8 * 64 + col) * GM_DR + j.
+    // Partial sums: word (dk8 * 64 + col) * GM_DR + j.
     [[unroll]] for (uint r = 0u; r < 4u; r++)
         [[unroll]] for (uint j = 0u; j < GM_DR; j++) {
-            const uint f = (k8 * 64u + 4u * quad + r) * GM_DR + j;
+            const uint f = (dk8 * 64u + 4u * dq + r) * GM_DR + j;
             gm_tile[f >> 2u][f & 3u] = floatBitsToUint(dacc[r][j]);
         }
     barrier();
