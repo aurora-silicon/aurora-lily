@@ -414,8 +414,13 @@ impl RawWindow {
     pub const MODEL: Self = Self { at: None, window: WINDOW, lo: 0 };
 }
 
+/// Runs of more rows than this take [`attend`]'s matrix-unit kernel.
+pub const ATTEND_MU_ABOVE: usize = 8;
+
 /// Sink attention of every head of every step row over its raw window
-/// (`kv_run` for the step's positions, `ring` before) and compressed rows.
+/// (`kv_run` for the step's positions, `ring` before) and compressed rows:
+/// a prompt run (more than [`ATTEND_MU_ABOVE`] rows, each at its own
+/// position) on the matrix units in f16, others in f32.
 #[allow(clippy::too_many_arguments)]
 pub fn attend(
     ctx: &MetalContext,
@@ -431,6 +436,33 @@ pub fn attend(
     pos0: usize,
     raw: RawWindow,
 ) -> Result<()> {
+    let matrix = m > ATTEND_MU_ABOVE && raw.at.is_none() && heads.is_multiple_of(16);
+    attend_with(ctx, pass, q, kv_run, ring, comp, sinks, out, m, heads, pos0, raw, matrix)
+}
+
+/// [`attend`], on the matrix units or not as `matrix` says (the f32
+/// kernel takes any run; the matrix one rows at their own positions and
+/// heads a multiple of 16).
+#[allow(clippy::too_many_arguments)]
+pub fn attend_with(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    kv_run: &Tensor,
+    ring: &Tensor,
+    comp: CompRows<'_>,
+    sinks: &Tensor,
+    out: &Tensor,
+    m: usize,
+    heads: usize,
+    pos0: usize,
+    raw: RawWindow,
+    matrix: bool,
+) -> Result<()> {
+    ensure!(
+        !matrix || (raw.at.is_none() && heads.is_multiple_of(16)),
+        "matrix attention of {heads} heads"
+    );
     check(&[q, sinks, out], DType::F32)?;
     if let Some(at) = raw.at {
         ensure!(at >= pos0 && raw.lo <= at, "raw window at {at}");
@@ -456,7 +488,8 @@ pub fn attend(
         }
     };
     check(&[cache], DType::F16)?;
-    let pipeline = ctx.pipeline("ds4_attend", SOURCE, MslVersion::V3_1)?;
+    let name = if matrix { "ds4_attend_mu" } else { "ds4_attend" };
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[
@@ -479,7 +512,10 @@ pub fn attend(
             &u32_bytes(raw.window),
             &u32_bytes(raw.lo),
         ],
-        Grid::Threadgroups { groups: (heads, m, 1), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups {
+            groups: (if matrix { heads / 16 } else { heads }, m, 1),
+            threadgroup: (256, 1, 1),
+        },
     )
 }
 

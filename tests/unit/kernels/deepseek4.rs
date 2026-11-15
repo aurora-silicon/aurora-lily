@@ -410,18 +410,51 @@ fn indexer_matches_cpu() {
 /// compressed rows, all or selected, against the reference.
 #[test]
 fn attention_matches_cpu() {
+    attention_case(
+        408,
+        false,
+        &[
+            (0, 1, 0, false),
+            (5, 3, 4, false),
+            (300, 4, 128, false),
+            (130, 70, 4, false),
+            (2100, 2, 4, true),
+        ],
+        (2e-5, 1e-4),
+    );
+}
+
+/// The matrix-unit attention of prompt runs (f16 operands): runs within
+/// the first window, across it, ratio 128, selected rows, and partial key
+/// steps.
+#[test]
+fn attention_mu_matches_cpu() {
+    attention_case(
+        409,
+        true,
+        &[
+            (0, 40, 0, false),
+            (130, 70, 4, false),
+            (300, 33, 128, false),
+            (2100, 20, 4, true),
+            (7, 200, 4, false),
+        ],
+        (3e-4, 1e-3),
+    );
+}
+
+fn attention_case(
+    seed: u64,
+    matrix: bool,
+    cases: &[(usize, usize, usize, bool)],
+    tol: (f32, f32),
+) {
     let ctx = ctx();
-    let mut rng = StdRng::seed_from_u64(408);
+    let mut rng = StdRng::seed_from_u64(seed);
     let heads = 64;
     let sinks = f32s(&mut rng, heads, -1.0, 2.0);
     let tsinks = tensor(&ctx, &sinks);
-    for (pos0, m, ratio, select) in [
-        (0usize, 1usize, 0usize, false),
-        (5, 3, 4, false),
-        (300, 4, 128, false),
-        (130, 70, 4, false),
-        (2100, 2, 4, true),
-    ] {
+    for &(pos0, m, ratio, select) in cases {
         let total = pos0 + m;
         // Every position's KV row (f16 values).
         let rows: Vec<Vec<f32>> = (0..total)
@@ -472,7 +505,7 @@ fn attention_matches_cpu() {
             }
         };
         run(&ctx, |p| {
-            attend(
+            attend_with(
                 &ctx,
                 p,
                 &tq,
@@ -485,6 +518,7 @@ fn attention_matches_cpu() {
                 heads,
                 pos0,
                 RawWindow::MODEL,
+                matrix,
             )
             .unwrap()
         });
@@ -510,12 +544,8 @@ fn attention_matches_cpu() {
                 &sinks,
                 512,
             );
-            assert_close(
-                &got[i * heads * 512..(i + 1) * heads * 512],
-                &want,
-                2e-5,
-                1e-4,
-            );
+            let got = &got[i * heads * 512..(i + 1) * heads * 512];
+            assert_close(got, &want, tol.0, tol.1);
         }
         // The ring after the step holds the newest position of each slot.
         let tring2 = f16_tensor(&ctx, &ring);
