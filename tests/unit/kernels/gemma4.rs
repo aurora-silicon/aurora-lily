@@ -723,3 +723,99 @@ fn moe_grouped_matches_a_bf16_reference() {
         );
     }
 }
+/// Each kernel's least GPU time in one pass among the profiled passes
+/// since the last call.
+fn best_kernel_secs() -> std::collections::BTreeMap<&'static str, f64> {
+    let mut best = std::collections::BTreeMap::new();
+    for p in crate::metal::profile::take() {
+        let mut by: std::collections::BTreeMap<&'static str, f64> = Default::default();
+        for k in &p.kernels {
+            *by.entry(k.name).or_default() += k.gpu_secs;
+        }
+        for (k, s) in by {
+            let e = best.entry(k).or_insert(f64::MAX);
+            *e = s.min(*e);
+        }
+    }
+    best
+}
+
+/// Prompt-run GEMM speed at Gemma 4 26B-A4B's shapes for a run of
+/// `LILY_PROBE_M` rows (default 1024): the dense projections and the grouped
+/// experts (routing skewed over 128 experts), best of 8 per kernel from the
+/// per-kernel profile, ms and TFLOPS. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn prefill_gemm_probe() {
+    let ctx = MetalContext::new_with_profile(true).expect("metal context");
+    let mut rng = StdRng::seed_from_u64(5);
+    let m =
+        std::env::var("LILY_PROBE_M").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+    for (ty, n, k) in [
+        (GgmlType::Q5K, 4096usize, 2816usize),
+        (GgmlType::Q5K, 2816, 4096),
+        (GgmlType::Q8_0, 2816, 2112),
+    ] {
+        let raw = random_blocks(&mut rng, ty, n * k);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, k, n).unwrap();
+        let x = tensor(&ctx, &f32s(&mut rng, m * k, -1.0, 1.0));
+        let y = zeros(&ctx, m * n);
+        for _ in 0..8 {
+            run(&ctx, |p| crate::kernels::glm53::gemm(&ctx, p, &w, &x, &y, m).unwrap());
+        }
+        for (name, s) in best_kernel_secs() {
+            let flops = 2.0 * (m * n * k) as f64;
+            eprintln!(
+                "{ty:?} {m}x{n}x{k}: {name} {:.3} ms {:.3} TFLOPS",
+                s * 1e3,
+                flops / s / 1e12
+            );
+        }
+    }
+    let (hid, ff, ne, used) = (2816usize, 704usize, 128usize, 8usize);
+    // Expert e drawn with weight 1 / (e + 8): the busiest expert several
+    // times the quietest, as a prompt's routing is uneven.
+    let pw: Vec<f64> = (0..ne).map(|e| 1.0 / (e as f64 + 8.0)).collect();
+    let total: f64 = pw.iter().sum();
+    let mut sel = Vec::with_capacity(m * used);
+    for _ in 0..m {
+        let mut row: Vec<u32> = Vec::new();
+        while row.len() < used {
+            let mut t = rng.gen_range(0.0..total);
+            let mut e = 0;
+            while t >= pw[e] {
+                t -= pw[e];
+                e += 1;
+            }
+            if !row.contains(&(e as u32)) {
+                row.push(e as u32);
+            }
+        }
+        sel.extend(row);
+    }
+    let gu_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, ne * 2 * ff * hid);
+    let gu =
+        QWeight::from_bytes(&ctx, &gu_raw, GgmlType::Iq2Xxs, hid, ne * 2 * ff).unwrap();
+    drop(gu_raw);
+    let dn_raw = random_blocks(&mut rng, GgmlType::Iq4Nl, ne * hid * ff);
+    let dn = QWeight::from_bytes(&ctx, &dn_raw, GgmlType::Iq4Nl, ff, ne * hid).unwrap();
+    drop(dn_raw);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hid, -1.0, 1.0));
+    let ts = u32s(&ctx, &sel);
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.05, 0.2));
+    let out = zeros(&ctx, m * hid);
+    let sc = MoeGroupScratch::new(&ctx, m, used, ne, ff, hid).unwrap();
+    for _ in 0..8 {
+        run(&ctx, |p| {
+            moe_grouped(&ctx, p, &gu, &dn, ff, &x, &ts, &tw, &out, &sc, m, used, ne)
+                .unwrap()
+        });
+    }
+    let gemms = best_kernel_secs().into_iter().filter(|(n, _)| n.contains("gemm"));
+    for (name, s) in gemms {
+        // Gate/up: 2 ff x hid a pair; down: hid x ff.
+        let macs = if name.contains("iq2") { 2 * ff * hid } else { hid * ff };
+        let flops = 2.0 * (m * used * macs) as f64;
+        eprintln!("grouped {name} {:.3} ms {:.3} TFLOPS", s * 1e3, flops / s / 1e12);
+    }
+}
