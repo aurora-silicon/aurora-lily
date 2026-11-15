@@ -402,8 +402,10 @@ pub struct Qwen36State {
     pub layers: Vec<LayerState>,
     pub mtp: Option<MtpState>,
     /// A verify pass that fed rows from this position and the draws of its
-    /// rows, until `finish_speculation` decides what stays.
-    pub(crate) spec: Option<(usize, usize, Vec<u32>)>,
+    /// rows, and whether it also ran the MTP head over its rows' pairs (the
+    /// next drafts in `mtp_io`), until `finish_speculation` decides what
+    /// stays.
+    pub(crate) spec: Option<(usize, usize, Vec<u32>, bool)>,
 }
 
 impl Qwen36State {
@@ -547,9 +549,10 @@ pub struct Scratch {
     cat: Tensor,
     /// The MTP head's normed last row.
     mtp_hn: Tensor,
-    /// U32[2]: the MTP step's input token (0) and its greedy draft (1).
+    /// U32[1 + MAX_ROWS]: the MTP step's input token (0) and its greedy
+    /// drafts (1..), one a drafted row.
     pub mtp_io: Tensor,
-    /// F32[1]: the draft's probability under the MTP head.
+    /// F32[MAX_ROWS]: the drafts' probabilities under the MTP head.
     pub mtp_prob: Tensor,
     pub logits: Tensor,
     /// The last (or only) row's logits: `logits[0..vocab]`.
@@ -622,9 +625,9 @@ impl Scratch {
             hidden_norm: f(MAX_ROWS * h)?,
             hbuf: f((r + 1) * h)?,
             cat: f(r * 2 * h)?,
-            mtp_hn: f(h)?,
-            mtp_io: u(2)?,
-            mtp_prob: f(1)?,
+            mtp_hn: f(MAX_ROWS * h)?,
+            mtp_io: u(1 + MAX_ROWS)?,
+            mtp_prob: f(MAX_ROWS)?,
             logits,
             sampler: SamplerScratch::new(ctx, cfg.vocab)?,
             next_token: u(2)?,
@@ -895,9 +898,10 @@ impl Qwen36Model {
     /// The MTP head over `m` pairs (llama.cpp's `graph_mtp`): pair `r` is
     /// token `tokens[r]` with the trunk's normed hidden row `hin[r]` (the row
     /// before the token's position), written to the head's cache row
-    /// `pos0 + r`. With `draft`, the last pair's greedy next token goes to
-    /// `sc.mtp_io[1]`. Uses `sc.x` as its residual stream (after the trunk's
-    /// head has read it).
+    /// `pos0 + r`. The last `drafts` pairs' greedy next tokens go to
+    /// `sc.mtp_io[1..=drafts]` and their probabilities to `sc.mtp_prob`.
+    /// Uses `sc.x` as its residual stream (after the trunk's head has read
+    /// it).
     #[allow(clippy::too_many_arguments)]
     pub fn encode_mtp(
         &self,
@@ -909,11 +913,12 @@ impl Qwen36Model {
         hin: &Tensor,
         pos0: usize,
         m: usize,
-        draft: bool,
+        drafts: usize,
     ) -> Result<()> {
         let cfg = &self.cfg;
         let w =
             self.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no MTP head loaded"))?;
+        ensure!(drafts <= m.min(MAX_ROWS), "{drafts} drafts of {m} MTP pairs");
         let ms = st.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no MTP state"))?;
         ensure!((1..=self.prefill_rows).contains(&m), "MTP over {m} pairs");
         ensure!(pos0 + m <= st.capacity, "MTP rows past the state's capacity");
@@ -937,26 +942,33 @@ impl Qwen36Model {
         pass.memory_barrier()?;
         let ls = LayerState::Attn { k: ms.k.clone(), v: ms.v.clone() };
         self.encode_block(ctx, pass, sc, &w.layer, &ls, pos0, None, m, false, None)?;
-        if !draft {
+        if drafts == 0 {
             return Ok(());
         }
-        let x = sc.x.view((m - 1) * cfg.hidden, &[cfg.hidden])?;
-        self.rmsnorm(ctx, pass, &x, &w.head_norm, &sc.mtp_hn, 1)?;
+        let h = cfg.hidden;
+        let x = sc.x.view((m - drafts) * h, &[drafts * h])?;
+        let hn = sc.mtp_hn.view(0, &[drafts * h])?;
+        self.rmsnorm(ctx, pass, &x, &w.head_norm, &hn, drafts)?;
         pass.memory_barrier()?;
-        self.proj(ctx, pass, &[(&self.output, &sc.logits)], &sc.mtp_hn, None, 1)?;
+        self.proj(ctx, pass, &[(&self.output, &sc.logits)], &hn, None, drafts)?;
         pass.memory_barrier()?;
-        let out = sc.mtp_io.view(1, &[1])?;
-        g::top_prob(ctx, pass, &sc.logits_last, &sc.mtp_prob, cfg.vocab)?;
-        crate::kernels::sample::sample_f32(
-            ctx,
-            pass,
-            &sc.logits_last,
-            &sc.sampler,
-            &crate::kernels::sample::SamplingParams::greedy(),
-            0,
-            &out,
-        )?;
-        pass.memory_barrier()
+        for j in 0..drafts {
+            let logits = sc.logits.view(j * cfg.vocab, &[cfg.vocab])?;
+            let out = sc.mtp_io.view(1 + j, &[1])?;
+            let prob = sc.mtp_prob.view(j, &[1])?;
+            g::top_prob(ctx, pass, &logits, &prob, cfg.vocab)?;
+            crate::kernels::sample::sample_f32(
+                ctx,
+                pass,
+                &logits,
+                &sc.sampler,
+                &crate::kernels::sample::SamplingParams::greedy(),
+                0,
+                &out,
+            )?;
+            pass.memory_barrier()?;
+        }
+        Ok(())
     }
 
     /// For a prompt run with the MTP head: the run's rows normed into
@@ -976,7 +988,7 @@ impl Qwen36Model {
         self.rmsnorm(ctx, pass, &sc.x, &self.output_norm, &rows, m)?;
         pass.memory_barrier()?;
         let hin = sc.hbuf.view(0, &[m * h])?;
-        self.encode_mtp(ctx, pass, st, sc, &sc.tokens, &hin, pos0, m, false)
+        self.encode_mtp(ctx, pass, st, sc, &sc.tokens, &hin, pos0, m, 0)
     }
 
     /// Copies hidden row `row` of `src` (`[rows][hidden]`) into `dst`
