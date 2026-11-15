@@ -27,8 +27,10 @@ pub const MAX_ROWS: usize = k::GEMV_MAX_ROWS;
 /// [`MAX_ROWS`]; longer runs the matrix units.
 pub const EXACT_ROWS: usize = 8;
 
-/// Rows a forward run takes at most.
-pub const PREFILL_ROWS: usize = 2048;
+/// Rows a forward run takes at most: 4 096 against 2 048 gives the routed
+/// experts twice the rows a decoded weight serves (4500-token prefill
+/// 901-920 -> 933-954 tok/s, 2026-11-15) for about 1.5 GB more scratch.
+pub const PREFILL_ROWS: usize = 4096;
 
 /// The indexer's selection width (`indexer_top_k`).
 const TOP_K: usize = 512;
@@ -1366,10 +1368,9 @@ impl Ds4Model {
                 used,
                 cfg.n_expert,
                 lim,
-                // Tiles of 64 rows: a run averages 48 pairs an expert at
-                // most (2 048 rows x 6 of 256), where 128-row tiles leave
-                // half their subgroups idle (2048-token prefill 898-915
-                // -> 924-952 tok/s, 2026-11-15).
+                // Tiles of 64 rows, also at a 4 096-row run's 96 pairs an
+                // expert (2048-token prefill 898-915 -> 924-952 tok/s,
+                // 4500-token 892-922 -> 945-962, 2026-11-15).
                 k::MoeTiles::R64,
             )?;
             return pass.memory_barrier();

@@ -49,11 +49,12 @@ chat template are read from it.
   files, so neither GLM 5.3 nor Qwen3.8 fits beside it.
 
 As with GLM, run it on a Mesa with the compute kick
-(aurora-silicon/mesa #260): a prompt pass of 2 048 rows is one long compute
-command, and without the kick the desktop's GPU work waits behind it.
+(aurora-silicon/mesa #260): a prompt pass (a layer of up to 4 096 rows) is
+one long compute command, and without the kick the desktop's GPU work waits
+behind it.
 
-Memory: the weights in the page cache, about 1 GB of prompt scratch (runs of
-2 048 rows), DSpark's scratch and support rings, and the sessions.
+Memory: the weights in the page cache, about 3 GB of prompt scratch (runs of
+4 096 rows), DSpark's scratch and support rings, and the sessions.
 
 ## What runs
 
@@ -75,7 +76,7 @@ shared expert. Four hyper-connection streams with the Sinkhorn split, and a
 sigmoid-weighted collapse before the output head.
 
 Decode and verify rows use the GEMV kernels on f32 activations (up to 8 rows
-a pass); prompts run in runs of 2 048 rows on the matrix units, one pass a
+a pass); prompts run in runs of 4 096 rows on the matrix units, one pass a
 layer, with routed experts grouped by expert.
 
 DSpark: three stages over the mean hyper-connection state after the trunk's
