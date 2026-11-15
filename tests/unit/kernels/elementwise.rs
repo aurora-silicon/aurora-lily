@@ -1203,6 +1203,7 @@ fn threadgroup_mode_probe() {
 /// probability of the maximum, with runs of -inf (the draft head's narrow
 /// LM head leaves them) and a tie.
 #[test]
+#[cfg(target_os = "linux")]
 fn argmax_prob_matches_softmax_max() {
     let ctx = MetalContext::new().expect("metal context");
     let mut rng = StdRng::seed_from_u64(9);

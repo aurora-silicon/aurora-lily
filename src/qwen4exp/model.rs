@@ -338,6 +338,11 @@ pub struct Qwen4ExpModel {
     /// the GPU runs chunk k (paged table only; on by default, off for the
     /// bit-identity test of the staging pipeline).
     ngram_ahead: bool,
+    /// The draft head's narrow LM head and the draft gate (`spec.rs`): on
+    /// unless `LILY_DRAFT_HEAD=full` / `LILY_DRAFT_GATE=0`
+    /// ([`Self::set_draft_policy`] for tests).
+    pub(super) draft_narrow: bool,
+    pub(super) draft_gate: bool,
     /// The attention K/V caches' element format (`--kv-cache`); states and
     /// scratch made after [`Self::set_kv_format`] follow it.
     kv_format: KvFormat,
@@ -448,9 +453,9 @@ pub struct DecodeState {
     /// The next verify pass encoded ahead and what it needs (`spec.rs`).
     #[cfg(target_os = "linux")]
     pub(super) ahead: super::spec::SpecAhead,
-    /// Draft passes still to take the draft head's whole LM head after a
-    /// token outside its narrow one was drawn (`spec.rs`, `DRAFT_LOW_ROWS`).
-    pub(super) wide_drafts: usize,
+    /// Where the last token outside the draft head's narrow LM head was fed
+    /// (`spec.rs`, [`super::spec::DraftVocab`]).
+    pub(super) draft_vocab: super::spec::DraftVocab,
     kv_format: KvFormat,
     kv_heads: usize,
     head_dim: usize,
@@ -466,6 +471,9 @@ pub struct Snapshot {
     gdn: Vec<(Tensor, Tensor)>,
     ple: Option<([u32; 2], Tensor)>,
     mtp_hidden: Option<Tensor>,
+    /// Which LM head the draft head takes from here (not in the persisted
+    /// layout: a disk read takes [`super::spec::DraftVocab::after_disk_restore`]).
+    draft_vocab: super::spec::DraftVocab,
 }
 
 impl SnapshotApi for Snapshot {
@@ -781,7 +789,7 @@ impl DecodeState {
             mtp.hidden.zero_fill();
         }
         self.spec = None;
-        self.wide_drafts = 0;
+        self.draft_vocab = Default::default();
         self.pos = 0;
         self.rope_delta = 0;
         self.conv_slot = 0;
@@ -1297,7 +1305,7 @@ impl SpecScratch {
                 .map(|_| Tensor::zeros(ctx, &[rows, cfg.hc_width()], DType::BF16))
                 .transpose()?,
             logits: Tensor::zeros(ctx, &[rows, cfg.vocab_size], DType::F32)?,
-            draft_logits: super::spec::narrow_draft_head(cfg)
+            draft_logits: super::spec::has_narrow_head(cfg)
                 .then(|| {
                     Tensor::from_f32(
                         ctx,
@@ -1763,6 +1771,8 @@ impl Qwen4ExpModel {
             hasher,
             prefill_chunk,
             ngram_ahead: true,
+            draft_narrow: super::spec::narrow_head_env(),
+            draft_gate: super::spec::draft_gate_env(),
             kv_format: kv_format_from_env()?.unwrap_or_default(),
             checkpoint_id,
             context_cap,
@@ -2022,7 +2032,7 @@ impl Qwen4ExpModel {
             spec: None,
             #[cfg(target_os = "linux")]
             ahead: Default::default(),
-            wide_drafts: 0,
+            draft_vocab: Default::default(),
             kv_format: self.kv_format,
             kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
@@ -2798,7 +2808,7 @@ impl Qwen4ExpModel {
         if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= vocab) {
             anyhow::bail!("token id {bad} is outside the vocabulary of {vocab}");
         }
-        super::spec::note_prompt(state, tokens);
+        state.draft_vocab.note(state.pos, tokens);
         let h = self.config.hidden_size;
         if let Some(v) = vision {
             let n = v.positions.len();
@@ -4969,7 +4979,13 @@ impl DecodeStateApi for DecodeState {
         }
         let ple = self.ple.as_ref().map(|p| (p.hist, next()));
         let mtp_hidden = self.mtp.as_ref().map(|_| next());
-        Ok(Snapshot { pos: self.pos, gdn, ple, mtp_hidden })
+        Ok(Snapshot {
+            pos: self.pos,
+            gdn,
+            ple,
+            mtp_hidden,
+            draft_vocab: self.draft_vocab.at(self.pos),
+        })
     }
 
     fn restore(&mut self, ctx: &MetalContext, snapshot: &Snapshot) -> Result<()> {
@@ -5034,6 +5050,7 @@ impl DecodeStateApi for DecodeState {
         self.pos = snapshot.pos;
         self.conv_slot = 0;
         self.spec = None;
+        self.draft_vocab = snapshot.draft_vocab;
         Ok(())
     }
 
@@ -5414,7 +5431,8 @@ impl LanguageModel for Qwen4ExpModel {
             }
             None => None,
         };
-        Ok(Snapshot { pos, gdn, ple, mtp_hidden })
+        let draft_vocab = super::spec::DraftVocab::after_disk_restore(pos);
+        Ok(Snapshot { pos, gdn, ple, mtp_hidden, draft_vocab })
     }
 
     fn bytes_per_token(&self) -> usize {

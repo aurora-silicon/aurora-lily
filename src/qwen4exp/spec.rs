@@ -74,54 +74,90 @@ static DRAFT_GPU_END: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None
 /// 100% of the tokens are among them (2026-11-15); its multilingual ids
 /// (151 643 up) are not, and Italian text draws 14% of its tokens there.
 /// The rows read per proposal drop from 248 320 to 98 580 (Q2 file: 1.2 to
-/// 0.5 ms). Outputs stay exact: the trunk draws every emitted token, the
-/// proposals only decide how many rows a verify pass confirms.
+/// 0.5 ms). The trunk draws every emitted token with the whole LM head, so
+/// greedy output is unchanged; under a sampler, speculative sampling still
+/// draws from the trunk's distribution, but with other proposals a given
+/// seed may draw other tokens.
 const DRAFT_LOW_ROWS: usize = 98_304;
 const DRAFT_SPECIAL_FROM: usize = 248_044;
 const QWEN38_VOCAB: usize = 248_320;
-/// Draft passes that take the whole LM head after a drawn token outside the
-/// narrow one: text in another script keeps drafting at full acceptance.
-const WIDE_DRAFT_STEPS: usize = 32;
+/// Positions after a fed token outside the narrow head during which drafts
+/// take the whole LM head: text in another script keeps drafting at full
+/// acceptance.
+const WIDE_WINDOW: usize = 96;
 
-/// Whether the draft head drafts over the narrow LM head (Qwen3.8's
-/// vocabulary; `LILY_DRAFT_HEAD=full` turns it off).
-pub(super) fn narrow_draft_head(cfg: &super::config::Qwen4ExpConfig) -> bool {
-    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// Whether the checkpoint's vocabulary has the narrow draft head (Qwen3.8's).
+pub(super) fn has_narrow_head(cfg: &super::config::Qwen4ExpConfig) -> bool {
     cfg.vocab_size == QWEN38_VOCAB
-        && !*FULL.get_or_init(|| {
-            std::env::var("LILY_DRAFT_HEAD").is_ok_and(|v| v == "full")
-        })
 }
 
-fn in_narrow_head(token: u32) -> bool {
+/// `LILY_DRAFT_HEAD=full`: the draft head always takes the whole LM head.
+pub(super) fn narrow_head_env() -> bool {
+    !std::env::var("LILY_DRAFT_HEAD").is_ok_and(|v| v == "full")
+}
+
+pub(super) fn in_narrow_head(token: u32) -> bool {
     let t = token as usize;
     t < DRAFT_LOW_ROWS || t >= DRAFT_SPECIAL_FROM
 }
 
-/// Prompt tokens fed: the draft head drafts the reply over the whole LM
-/// head when the prompt's tail has a token outside the narrow one (a prompt
-/// in another script is answered in it), else over the narrow head.
-pub(super) fn note_prompt(state: &mut DecodeState, tokens: &[u32]) {
-    let tail = &tokens[tokens.len().saturating_sub(256)..];
-    state.wide_drafts =
-        if tail.iter().all(|&t| in_narrow_head(t)) { 0 } else { WIDE_DRAFT_STEPS };
+/// Which LM head the draft head takes, from the position of the last fed
+/// token outside the narrow head. A position, not a countdown, so it is the
+/// same whatever pieces the tokens were fed in (the server prefills a
+/// prompt up to its last token, then that token; a cached prefix feeds only
+/// the suffix) and it travels with a snapshot to restores and forks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DraftVocab {
+    last_wide: Option<usize>,
+}
+
+impl DraftVocab {
+    /// `tokens` fed at positions `pos0..`.
+    pub fn note(&mut self, pos0: usize, tokens: &[u32]) {
+        if let Some(i) = tokens.iter().rposition(|&t| !in_narrow_head(t)) {
+            self.last_wide = Some(pos0 + i);
+        }
+    }
+
+    /// Whether drafts at state position `pos` take the whole LM head.
+    pub fn wide(&self, pos: usize) -> bool {
+        self.last_wide.is_some_and(|at| pos < at + WIDE_WINDOW)
+    }
+
+    /// Kept for a snapshot at `pos`: nothing past it.
+    pub fn at(self, pos: usize) -> Self {
+        Self { last_wide: self.last_wide.filter(|&at| at < pos) }
+    }
+
+    /// A state read back from the disk tier, whose layout does not carry
+    /// the history: taken as if the token before `pos` were outside the
+    /// narrow head (the whole head for the first drafts, never a narrow
+    /// head the history would not have allowed).
+    pub fn after_disk_restore(pos: usize) -> Self {
+        Self { last_wide: Some(pos.saturating_sub(1)) }
+    }
 }
 
 /// The draft gate: a step verifies the first proposal and the ones after
-/// it while their probability under the head is at least this (per
-/// position); the rest are dropped. A verified row costs about a fifth of a
-/// plain step (q4-xl: 2.9 ms of 14.6, the Q2 file 4.5 of 18.7), so a
-/// proposal below a third or so costs more than it returns. The first is
-/// always verified: a verify pass of one row takes other kernels, whose
-/// rounding would make the output differ from the ungated run's. Chosen on
-/// logged (probability, accepted) steps of both checkpoints over prose,
+/// it while the head's confidence in them is at least this (per position);
+/// the rest are dropped. The confidence is a heuristic: the largest softmax
+/// probability of the head's raw logits (before a sampler's temperature or
+/// truncation), not the probability the proposal was drawn with. A
+/// verified row costs about a fifth of a plain step (q4-xl: 2.9 ms of 14.6,
+/// the Q2 file 4.5 of 18.7), so a proposal below a third or so costs more
+/// than it returns. The first is always verified: a verify pass of one row
+/// takes other kernels, whose rounding would make the output differ from
+/// the ungated run's. Greedy output is unchanged; under a sampler,
+/// speculative sampling still draws from the trunk's distribution, but a
+/// step verifying fewer rows may draw other tokens for a given seed. Chosen
+/// on logged (confidence, accepted) steps of both checkpoints over prose,
 /// code and Italian, 2026-11-15 (`lily-wt/night/q38.md`).
-/// `LILY_DRAFT_GATE=0` verifies every proposal.
 const DRAFT_MIN_PROB: [f32; MAX_DRAFTS] = [0.0, 0.4, 0.3];
 
-fn draft_gate() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LILY_DRAFT_GATE").map_or(true, |v| v != "0"))
+/// `LILY_DRAFT_GATE=0` verifies every proposal. Linux only: the confidence
+/// kernels exist only in GLSL.
+pub(super) fn draft_gate_env() -> bool {
+    cfg!(target_os = "linux") && std::env::var("LILY_DRAFT_GATE").map_or(true, |v| v != "0")
 }
 
 /// The proposals the gate keeps of `tokens` drawn with `probs`.
@@ -231,7 +267,20 @@ impl Qwen4ExpModel {
     /// it changed the tokens, and on prose cost GPU time per token
     /// (2026-11-15).
     fn draft_gated(&self) -> bool {
-        draft_gate() && self.config.gguf_down_cols.is_none()
+        self.draft_gate && self.config.gguf_down_cols.is_none()
+    }
+
+    /// Whether drafts from `state` take the draft head's whole LM head.
+    fn draft_wide(&self, state: &DecodeState) -> bool {
+        !self.draft_narrow || state.draft_vocab.wide(state.pos)
+    }
+
+    /// Turns the narrow draft head and the draft gate on or off (both on by
+    /// default unless the environment says otherwise); greedy output does
+    /// not depend on either.
+    pub fn set_draft_policy(&mut self, narrow: bool, gate: bool) {
+        self.draft_narrow = narrow;
+        self.draft_gate = gate && cfg!(target_os = "linux");
     }
 
     /// Draft tokens per step, or 0 without the head.
@@ -329,7 +378,6 @@ impl Qwen4ExpModel {
                 step0 + m,
             )?
             .commit()?;
-        state.wide_drafts = state.wide_drafts.saturating_sub(1);
         mark("committed");
         let done = committed.wait_retain_polled()?;
         let verify_gpu_end = if profiling() {
@@ -394,9 +442,11 @@ impl Qwen4ExpModel {
             "accepted {accepted} rows but only {gpu_accepted} drafts were confirmed"
         );
         let chain = pending.chain;
-        if pending.sampled[..=accepted].iter().any(|&t| !in_narrow_head(t)) {
-            state.wide_drafts = WIDE_DRAFT_STEPS;
-        }
+        // The emitted draws: draw j is fed at pos_before + 1 + j. The draft
+        // pass already running chose its head before they were known, so a
+        // token outside the narrow head moves the step after it to the whole
+        // head (one pass late).
+        state.draft_vocab.note(pending.pos_before + 1, &pending.sampled[..=accepted]);
 
         // Host-side rollback: position, hash history, penalty counts of the
         // rejected rows' draws. (The running draft pass never touches the
@@ -600,9 +650,7 @@ impl Qwen4ExpModel {
         ensure!(state.pos > 0, "draft_initial before any token was fed");
         let wide = self.config.hc_width();
         let drafts = drafts.min(MAX_DRAFTS);
-        if !in_narrow_head(first) {
-            state.wide_drafts = WIDE_DRAFT_STEPS;
-        }
+        state.draft_vocab.note(state.pos, &[first]);
         self.ensure_room(ctx, state, s, 1 + drafts)?;
         let hidden = state
             .mtp
@@ -847,7 +895,7 @@ impl Qwen4ExpModel {
                     &ps1.hc.mixed,
                     sp,
                     s,
-                    state.wide_drafts > 0,
+                    self.draft_wide(state),
                 )?;
                 let out = sp.draft_tokens.view(i, &[1])?;
                 draft_draw(
@@ -1011,7 +1059,7 @@ impl Qwen4ExpModel {
                         &ps1.hc.mixed,
                         sp,
                         s,
-                        state.wide_drafts > 0,
+                        self.draft_wide(state),
                     )?;
                     let out = sp.draft_tokens.view(i, &[1])?;
                     draft_draw(
