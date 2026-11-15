@@ -499,6 +499,25 @@ pub fn moe_gate_up(
     m: usize,
     used: usize,
 ) -> Result<()> {
+    moe_gate_up_q8x(ctx, pass, gate_up, ff, x, sel, mid, m, used, None)
+}
+
+/// [`moe_gate_up`], with `q8` its Q5_K experts over `x` as int8 (codes
+/// and pairs as [`quant_q8x`] writes them, `x` itself unread); other types
+/// and a G16 GPU take `x`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gate_up_q8x(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate_up: &QWeight,
+    ff: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    mid: &Tensor,
+    m: usize,
+    used: usize,
+    q8: Option<(&Tensor, &Tensor)>,
+) -> Result<()> {
     check_f32(&[x, mid])?;
     ensure!(
         gate_up.rows.is_multiple_of(2 * ff),
@@ -525,10 +544,18 @@ pub fn moe_gate_up(
     } else {
         (name, 1)
     };
+    let mut bindings =
+        vec![gate_up.t.binding(), x.binding(), sel.binding(), mid.binding()];
+    let name = if gate_up.ty == GgmlType::Q5K && !ctx.g16() {
+        let q8_name = "gemma4_moe_gate_up_q5_k_q8x";
+        q8_variant(q8, m, gate_up.cols, &mut bindings, name, q8_name)?
+    } else {
+        name
+    };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
-        &[gate_up.t.binding(), x.binding(), sel.binding(), mid.binding()],
+        &bindings,
         &[
             &u32_bytes(gate_up.cols),
             &u32_bytes(ff),
@@ -819,11 +846,11 @@ pub fn post_attn(
     n: usize,
     eps: f32,
 ) -> Result<()> {
-    post_attn_q8x(ctx, pass, a, w_post, x, r, w, o, m, n, eps, None)
+    post_attn_q8x(ctx, pass, a, w_post, x, r, w, o, m, n, eps, [None, None])
 }
 
-/// [`post_attn`], with `q8` also writing `o[0]` (the dense MLP's input) as
-/// [`quant_q8x`] does.
+/// [`post_attn`], with `q8[0]` also writing `o[0]` (the dense MLP's input)
+/// and `q8[1]` `o[1]` (the routed experts') as [`quant_q8x`] does.
 #[allow(clippy::too_many_arguments)]
 pub fn post_attn_q8x(
     ctx: &MetalContext,
@@ -837,7 +864,7 @@ pub fn post_attn_q8x(
     m: usize,
     n: usize,
     eps: f32,
-    q8: Option<(&Tensor, &Tensor)>,
+    q8: [Option<(&Tensor, &Tensor)>; 2],
 ) -> Result<()> {
     check_f32(&[a, w_post, x, r, w[0], w[1], w[2], o[0], o[1], o[2]])?;
     ensure!(
@@ -857,19 +884,29 @@ pub fn post_attn_q8x(
         o[1].binding(),
         o[2].binding(),
     ];
-    let name = q8_variant(
-        q8,
-        m,
-        n,
-        &mut bindings,
-        "gemma4_post_attn",
-        "gemma4_post_attn_q8x",
-    )?;
-    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    // Both pairs bound (an unused one as the other), a mask of the
+    // written ones.
+    let Some(any) = q8[0].or(q8[1]) else {
+        let pipeline = ctx.pipeline("gemma4_post_attn", SOURCE, MslVersion::V3_1)?;
+        return pass.dispatch_at(
+            &pipeline,
+            &bindings,
+            &[&u32_bytes(n), &f32_bytes(eps)],
+            Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (threads, 1, 1) },
+        );
+    };
+    let mut mask = 0;
+    for (j, pair) in q8.iter().enumerate() {
+        if pair.is_some() {
+            mask |= 1 << j;
+        }
+        q8_variant(Some(pair.unwrap_or(any)), m, n, &mut bindings, "", "")?;
+    }
+    let pipeline = ctx.pipeline("gemma4_post_attn_q8x", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &bindings,
-        &[&u32_bytes(n), &f32_bytes(eps)],
+        &[&u32_bytes(n), &f32_bytes(eps), &u32_bytes(mask)],
         Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (threads, 1, 1) },
     )
 }

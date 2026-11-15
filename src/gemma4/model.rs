@@ -111,6 +111,10 @@ pub struct Gemma4Model {
     /// steps of up to MAX_ROWS rows run their projections over int8
     /// activations, which the kernels before them write.
     q8x: bool,
+    /// Q5_K routed experts' gate/up (UD-Q5_K_M), not on a G16 GPU: steps of
+    /// up to MAX_ROWS rows run them over the int8 form of their input, which
+    /// the residual's norms write.
+    q8x_experts: bool,
     /// The longest context served: the file's, the server's limit, or what
     /// fits the memory limit ([`Gemma4Model::fit_context`]).
     pub context_cap: usize,
@@ -190,6 +194,10 @@ impl Gemma4Model {
         // A G16 GPU (an M4) keeps its own Q5_K GEMVs (`gemv_g16.comp`).
         let q8x = !ctx.g16()
             && layers.first().is_some_and(|l| l.q.ty == crate::gguf::GgmlType::Q5K);
+        let q8x_experts = !ctx.g16()
+            && layers
+                .first()
+                .is_some_and(|l| l.gate_up_exps.ty == crate::gguf::GgmlType::Q5K);
         let embed = mapped.q("token_embd.weight")?;
         let output_norm = mapped.f32("output_norm.weight")?;
         let rope_freqs = mapped.f32("rope_freqs.weight")?;
@@ -209,6 +217,7 @@ impl Gemma4Model {
             acquire_reserve: None,
             prefill_rows: PREFILL_ROWS,
             q8x,
+            q8x_experts,
         })
     }
 
@@ -369,6 +378,9 @@ pub struct Scratch {
     xq8: Tensor,
     xds: Tensor,
     q8_width: usize,
+    /// The routed experts' input (n2) as int8, rows of `hidden` values.
+    eq8: Tensor,
+    eds: Tensor,
     q: Tensor,
     kv: Tensor,
     vraw: Tensor,
@@ -455,6 +467,8 @@ impl Scratch {
             xq8: Tensor::zeros(ctx, &[MAX_ROWS * q8_width(cfg)], DType::I8)?,
             xds: f(MAX_ROWS * q8_width(cfg).div_ceil(32) * 2)?,
             q8_width: q8_width(cfg),
+            eq8: Tensor::zeros(ctx, &[MAX_ROWS * h], DType::I8)?,
+            eds: f(MAX_ROWS * h.div_ceil(32) * 2)?,
             xb: Tensor::zeros(
                 ctx,
                 &[if ctx.matrix_units() {
@@ -779,6 +793,7 @@ impl Gemma4Model {
         // too (the layer's input norm, the attention's merge, the residual's
         // norms).
         let q8 = (self.q8x && m <= MAX_ROWS).then_some((&sc.xq8, &sc.xds));
+        let q8e = (self.q8x_experts && m <= MAX_ROWS).then_some((&sc.eq8, &sc.eds));
         let pre = q8.is_some();
         match &l.v {
             Some(v) => self.proj_q8(
@@ -877,7 +892,7 @@ impl Gemma4Model {
             m,
             h,
             eps,
-            q8,
+            [q8, q8e],
         )?;
         pass.memory_barrier()?;
         self.proj_q8(
@@ -923,7 +938,7 @@ impl Gemma4Model {
                 cfg.n_expert,
             )?;
         } else {
-            g4::moe_gate_up(
+            g4::moe_gate_up_q8x(
                 ctx,
                 pass,
                 &l.gate_up_exps,
@@ -933,6 +948,7 @@ impl Gemma4Model {
                 &sc.emid,
                 m,
                 cfg.n_expert_used,
+                q8e,
             )?;
             pass.memory_barrier()?;
             g4::moe_down(

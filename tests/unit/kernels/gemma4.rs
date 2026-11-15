@@ -514,8 +514,13 @@ fn moe_timing() {
         let tw = tensor(&ctx, &vec![0.2f32; used]);
         let mid = zeros(&ctx, used * ff);
         let out = zeros(&ctx, hidden);
+        // Q5_K gate/up also over int8 x (part 2).
+        let codes = Tensor::zeros(&ctx, &[hidden], DType::I8).unwrap();
+        let ds = zeros(&ctx, hidden / 16);
+        run(&ctx, |p| quant_q8x(&ctx, p, &x, &codes, &ds, 1, hidden).unwrap());
+        let parts = if gt == GgmlType::Q5K { 3 } else { 2 };
         let mut line = format!("moe {gt:?}/{dt:?}:");
-        for part in 0..2 {
+        for part in 0..parts {
             let mut best = f64::MAX;
             for pass_no in 0..9 {
                 let pass = ctx.begin().unwrap();
@@ -524,6 +529,12 @@ fn moe_timing() {
                     if part == 0 {
                         moe_gate_up(&ctx, &pass, gu, ff, &x, &ts, &mid, 1, used)
                             .unwrap();
+                    } else if part == 2 {
+                        let q8 = Some((&codes, &ds));
+                        moe_gate_up_q8x(
+                            &ctx, &pass, gu, ff, &x, &ts, &mid, 1, used, q8,
+                        )
+                        .unwrap();
                     } else {
                         moe_down(
                             &ctx, &pass, dn, hidden, &mid, &ts, &tw, &out, 1, used,
@@ -539,7 +550,7 @@ fn moe_timing() {
             }
             line += &format!(
                 " {} {:.1} us",
-                if part == 0 { "gate/up" } else { "down" },
+                ["gate/up", "down", "gate/up int8"][part],
                 best / repeat as f64 * 1e6
             );
         }
@@ -1549,10 +1560,13 @@ fn producers_write_the_int8_quant_q8x_writes() {
     };
     // The f32 output of each producer, plain and with int8, then
     // quant_q8x of the plain one.
-    let cases: [(&str, usize); 3] = [("rmsnorm", n), ("post_attn", n), ("ffn_out", n)];
-    for (name, k) in cases {
+    // post_attn writes n1 (mask bit 0), n2 (bit 1) or both as int8; with
+    // both, n1 and n2 share the edge weight and their int8 forms match.
+    let cases = ["rmsnorm", "post_attn", "post_attn_n2", "post_attn_both", "ffn_out"];
+    for name in cases {
+        let k = n;
         let (plain, with) = (zeros(&ctx, m * n), zeros(&ctx, m * n));
-        let ((c1, d1), (c2, d2)) = (q8(), q8());
+        let ((c1, d1), (c2, d2), (c3, d3)) = (q8(), q8(), q8());
         let o: Vec<Tensor> = (0..6).map(|_| zeros(&ctx, m * n)).collect();
         run(&ctx, |p| {
             match name {
@@ -1571,34 +1585,26 @@ fn producers_write_the_int8_quant_q8x_writes() {
                     )
                     .unwrap();
                 }
-                "post_attn" => {
-                    post_attn(
-                        &ctx,
-                        p,
-                        &t[0],
-                        &tw[0],
-                        &t[1],
-                        &o[0],
-                        [&sw, &tw[2], &tw[3]],
-                        [&plain, &o[1], &o[2]],
-                        m,
-                        n,
-                        eps,
-                    )
-                    .unwrap();
+                "post_attn" | "post_attn_n2" | "post_attn_both" => {
+                    // The edge weight on the output under test.
+                    let (w, q8s) = match name {
+                        "post_attn" => {
+                            ([&sw, &tw[2], &tw[3]], [Some((&c1, &d1)), None])
+                        }
+                        "post_attn_n2" => {
+                            ([&tw[1], &sw, &tw[3]], [None, Some((&c1, &d1))])
+                        }
+                        _ => ([&sw, &sw, &tw[3]], [Some((&c3, &d3)), Some((&c1, &d1))]),
+                    };
+                    let j = usize::from(name == "post_attn_n2");
+                    let mut po = [&o[0], &o[1], &o[2]];
+                    po[j] = &plain;
+                    let mut wo = [&o[3], &o[4], &o[5]];
+                    wo[j] = &with;
+                    post_attn(&ctx, p, &t[0], &tw[0], &t[1], &o[0], w, po, m, n, eps)
+                        .unwrap();
                     post_attn_q8x(
-                        &ctx,
-                        p,
-                        &t[0],
-                        &tw[0],
-                        &t[1],
-                        &o[3],
-                        [&sw, &tw[2], &tw[3]],
-                        [&with, &o[4], &o[5]],
-                        m,
-                        n,
-                        eps,
-                        Some((&c1, &d1)),
+                        &ctx, p, &t[0], &tw[0], &t[1], &o[3], w, wo, m, n, eps, q8s,
                     )
                     .unwrap();
                 }
@@ -1652,6 +1658,16 @@ fn producers_write_the_int8_quant_q8x_writes() {
         let scales: Vec<f32> = ds[..m * k / 16].iter().step_by(2).copied().collect();
         assert!(scales.iter().any(|d| d.is_nan()), "{name}: no nonfinite block");
         assert!(scales.iter().any(|&d| d == 0.0), "{name}: no zero block");
+        if name == "post_attn_both" {
+            assert!(same_codes(&c3, &c2, m * k), "{name}: n1 codes");
+            assert!(
+                same(
+                    &d3.view(0, &[m * k / 16]).unwrap(),
+                    &d2.view(0, &[m * k / 16]).unwrap()
+                ),
+                "{name}: n1 scales"
+            );
+        }
     }
     // The attention merge: heads of 16 x 256 a row.
     let (d, kvh, heads, pos) = (256, 8, 16, 700);
@@ -1896,4 +1912,72 @@ fn int8_gemv_sets_match_one_set_and_the_block_layout() {
             assert_close(&one[s], &want, 1e-4, 1e-4);
         }
     }
+}
+
+/// The routed experts' Q5_K gate/up over int8 x: each row equals its
+/// one-row dispatch bit for bit (a verify pass decodes as a plain step),
+/// and gelu(g) u follows the products of the codes with independently
+/// decoded weights.
+#[test]
+fn moe_gate_up_q8x_matches_int8_products() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(84);
+    let (hid, ff, ne, used, m) = (1024, 72, 6, 3, 3);
+    let raw = random_blocks(&mut rng, GgmlType::Q5K, ne * 2 * ff * hid);
+    let gu = QWeight::from_bytes(&ctx, &raw, GgmlType::Q5K, hid, ne * 2 * ff).unwrap();
+    let w = q5_k_values(&raw);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hid, -1.0, 1.0));
+    let sel: Vec<u32> = vec![0, 4, 2, 5, 4, 1, 3, 0, 5];
+    let ts = u32s(&ctx, &sel);
+    let codes = Tensor::zeros(&ctx, &[m * hid], DType::I8).unwrap();
+    let ds = zeros(&ctx, m * hid / 16);
+    let mid = zeros(&ctx, m * used * ff);
+    run(&ctx, |p| {
+        quant_q8x(&ctx, p, &x, &codes, &ds, m, hid).unwrap();
+        p.memory_barrier().unwrap();
+        moe_gate_up_q8x(&ctx, p, &gu, ff, &x, &ts, &mid, m, used, Some((&codes, &ds)))
+            .unwrap();
+    });
+    let got = mid.to_f32().unwrap();
+    for i in 0..m {
+        let one = zeros(&ctx, used * ff);
+        let (xi, ci) =
+            (x.view(i * hid, &[hid]).unwrap(), codes.view(i * hid, &[hid]).unwrap());
+        let (di, si) = (
+            ds.view(i * hid / 16, &[hid / 16]).unwrap(),
+            u32s(&ctx, &sel[i * used..][..used]),
+        );
+        run(&ctx, |p| {
+            moe_gate_up_q8x(&ctx, p, &gu, ff, &xi, &si, &one, 1, used, Some((&ci, &di)))
+                .unwrap()
+        });
+        let one = one.to_f32().unwrap();
+        let row = &got[i * used * ff..][..used * ff];
+        assert!(
+            row.iter().zip(&one).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "row {i}"
+        );
+    }
+    let (c, d) = (codes.to_f32().unwrap(), ds.to_f32().unwrap());
+    let prod = |i: usize, wr: usize| -> f32 {
+        (0..hid)
+            .map(|k| {
+                let b = (i * hid + k) / 32;
+                w[wr * hid + k] as f64 * d[2 * b] as f64 * c[i * hid + k] as f64
+            })
+            .sum::<f64>() as f32
+    };
+    let mut want = vec![0f32; m * used * ff];
+    for i in 0..m {
+        for s in 0..used {
+            let e = sel[i * used + s] as usize;
+            for r in 0..ff {
+                let (g, u) = (prod(i, e * 2 * ff + r), prod(i, e * 2 * ff + ff + r));
+                want[(i * used + s) * ff + r] = gelu(g) * u;
+            }
+        }
+    }
+    // Q5_K's sums of scale and min terms cancel to ~1e-4 of their size with
+    // these random blocks (as in moe_matches_cpu).
+    assert_close(&got, &want, 1e-3, 1e-3);
 }
