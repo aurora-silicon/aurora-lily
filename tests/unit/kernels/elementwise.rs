@@ -23,6 +23,10 @@ use crate::cpu_ref;
 #[test]
 fn elementwise_ops_match_cpu() {
     let ctx = MetalContext::new().expect("metal context");
+    // bfloat arithmetic kernels: a device without matrix units has no bfloat.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(3);
     let n = 1000;
     let a: Vec<f32> = (0..n).map(|_| rng.gen_range(-2.0f32..2.0)).collect();
@@ -204,6 +208,10 @@ fn memory_bandwidth_probe() {
 #[test]
 fn silu_mul_rows_matches_split_silu_mul_bitwise() {
     let ctx = MetalContext::new().expect("metal context");
+    // bfloat arithmetic kernels: a device without matrix units has no bfloat.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(97);
     for (m, n) in [(1usize, 640usize), (3, 640), (8, 96), (16, 1280)] {
         let gu: Vec<f32> =
@@ -261,6 +269,10 @@ fn gelu_erf(x: f32) -> f32 {
 #[test]
 fn gelu_forms_match_cpu() {
     let ctx = MetalContext::new().expect("metal context");
+    // bfloat arithmetic kernels: a device without matrix units has no bfloat.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(7);
     let n = 1500;
     let x: Vec<f32> = (0..n).map(|_| rng.gen_range(-5.0f32..5.0)).collect();
