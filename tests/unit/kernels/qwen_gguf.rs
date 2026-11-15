@@ -282,7 +282,7 @@ fn routed_experts_match_cpu_with_padded_down_rows() {
                         .unwrap();
                     p.memory_barrier().unwrap();
                     let shared =
-                        with_shared.then(|| SharedAdd { out: &tso, gate: &tsg });
+                        with_shared.then_some(SharedAdd { out: &tso, gate: &tsg });
                     moe_down(
                         &ctx, p, &wd, ff, h, &act, &tsel, &tsc, shared, &out, m, used,
                     )

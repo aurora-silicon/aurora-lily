@@ -369,6 +369,7 @@ fn regroup(src: &[u8], unit: usize, n_k: usize, r: usize, dst: &mut [u8]) {
 /// grouped order: rows from `first_v_row` on are `heads` heads of `head_rows`
 /// rows (`attn_qkv`, `attn_gate`), or, with `columns`, every row's columns
 /// are heads of `head_rows` values (`ssm_out`).
+#[allow(clippy::too_many_arguments)]
 fn regrouped(
     ctx: &MetalContext,
     g: &Gguf,
