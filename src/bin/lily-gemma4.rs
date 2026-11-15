@@ -108,7 +108,7 @@ enum Cmd {
         n: usize,
         #[arg(long, default_value_t = 2)]
         runs: usize,
-        /// Rows a prompt run takes (default: the model's, 1024).
+        /// Rows a prompt run takes, 4 to 1024 (default: the model's, 1024).
         #[arg(long)]
         prefill_rows: Option<usize>,
     },
@@ -503,6 +503,13 @@ fn bench(
     runs: usize,
     prefill_rows: Option<usize>,
 ) -> Result<()> {
+    if let Some(r) = prefill_rows {
+        use lily::gemma4::model::{MAX_ROWS, PREFILL_ROWS};
+        ensure!(
+            (MAX_ROWS..=PREFILL_ROWS).contains(&r),
+            "--prefill-rows {r}: runs of {MAX_ROWS} to {PREFILL_ROWS} rows"
+        );
+    }
     let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
     let text = std::fs::read_to_string(text)?;
     let mut ids = vec![2u32];

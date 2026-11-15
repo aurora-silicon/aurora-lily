@@ -1322,3 +1322,64 @@ fn attention_decode_timing() {
         eprintln!("attn decode {label:10} {:7.1} us", best / repeat as f64 * 1e6);
     }
 }
+
+/// GeGLU written over its gate (the scratch's `mid` is `g`) equals it
+/// written apart, bit for bit, at decode and prompt-run lengths.
+#[test]
+fn geglu_in_place_matches_geglu_apart() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(77);
+    for n in [2112, 4 * 2112, 1000 * 2112 + 7] {
+        let g = f32s(&mut rng, n, -6.0, 6.0);
+        let u = f32s(&mut rng, n, -3.0, 3.0);
+        let (tg, tu, apart) = (tensor(&ctx, &g), tensor(&ctx, &u), zeros(&ctx, n));
+        let inplace = tensor(&ctx, &g);
+        run(&ctx, |p| {
+            geglu(&ctx, p, &tg, &tu, &apart, n).unwrap();
+            geglu(&ctx, p, &inplace, &tu, &inplace, n).unwrap();
+        });
+        let (a, b) = (apart.to_f32().unwrap(), inplace.to_f32().unwrap());
+        assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "n {n}");
+    }
+}
+
+/// The grouped experts with their outputs in a pool supplied from outside
+/// (a view inside a larger buffer, as the model's scratch shares it) equal
+/// them in their own scratch, bit for bit, and write nothing outside it.
+#[test]
+fn moe_grouped_in_an_external_pool_stays_in_it() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(78);
+    let (hid, ff, ne, used) = (512, 128, 12, 8);
+    let (gt, dt) = (GgmlType::Iq2Xxs, GgmlType::Iq4Nl);
+    let gu_raw = random_blocks(&mut rng, gt, ne * 2 * ff * hid);
+    let dn_raw = random_blocks(&mut rng, dt, ne * hid * ff);
+    let gu = QWeight::from_bytes(&ctx, &gu_raw, gt, hid, ne * 2 * ff).unwrap();
+    let dn = QWeight::from_bytes(&ctx, &dn_raw, dt, ff, ne * hid).unwrap();
+    // Scratch for 140 rows; runs of fewer use the pool's front.
+    let rows = 140;
+    let len = MoeGroupScratch::pool_len(rows, used, ff, hid);
+    let pad = 4096;
+    let sentinel = -12345.5f32;
+    let big = tensor(&ctx, &vec![sentinel; pad + len + pad]);
+    let pool = big.view(pad, &[len]).unwrap();
+    let own = MoeGroupScratch::new(&ctx, rows, used, ne, ff, hid).unwrap();
+    let shared = MoeGroupScratch::in_pool(&ctx, rows, used, ne, ff, hid, &pool).unwrap();
+    for m in [140, 37, 5] {
+        let x = tensor(&ctx, &f32s(&mut rng, m * hid, -1.0, 1.0));
+        let sel: Vec<u32> = (0..m * used).map(|i| ((i * 7 + i / used) % ne) as u32).collect();
+        let ts = u32s(&ctx, &sel);
+        let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.05, 0.2));
+        let (a, b) = (zeros(&ctx, m * hid), zeros(&ctx, m * hid));
+        run(&ctx, |p| {
+            moe_grouped(&ctx, p, &gu, &dn, ff, &x, &ts, &tw, &a, &own, m, used, ne).unwrap();
+            p.memory_barrier().unwrap();
+            moe_grouped(&ctx, p, &gu, &dn, ff, &x, &ts, &tw, &b, &shared, m, used, ne).unwrap();
+        });
+        let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+        assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "m {m}");
+        let all = big.to_f32().unwrap();
+        let outside = all[..pad].iter().chain(&all[pad + len..]);
+        assert!(outside.into_iter().all(|&v| v == sentinel), "m {m}: wrote outside the pool");
+    }
+}
