@@ -437,9 +437,14 @@ fn bench(
     let mut st = model.new_state(&ctx, prompt.len() + n + 8)?;
     for run in 0..runs {
         st.reset();
+        let _ = lily::metal::profile::take();
         let t = Instant::now();
         model.forward(&ctx, &mut st, &sc, &prompt, Logits::Last)?;
         let pf = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("prefill of {} tokens, per prefill:", prompt.len());
+            profile_report(1);
+        }
         let mut next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
         let mut out = Vec::with_capacity(n);
         let mut steps = Vec::with_capacity(n);
@@ -452,6 +457,10 @@ fn bench(
             steps.push(s.elapsed().as_secs_f64() * 1e3);
         }
         let dt = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("decode at prompt {}, per step:", prompt.len());
+            profile_report(n);
+        }
         steps.sort_by(f64::total_cmp);
         let digest = out.iter().fold(0xcbf29ce484222325u64, |h, &t| {
             (h ^ u64::from(t)).wrapping_mul(0x100000001b3)
@@ -465,6 +474,35 @@ fn bench(
         );
     }
     Ok(())
+}
+
+/// With `LILY_KERNEL_PROFILE=1`: GPU time per kernel name per pass (each
+/// dispatch timed alone, so the sum exceeds a real pass).
+fn profile_report(steps: usize) {
+    let passes = lily::metal::profile::take();
+    let mut by: std::collections::HashMap<&str, (usize, f64)> = Default::default();
+    let mut total = 0.0;
+    for p in &passes {
+        for k in &p.kernels {
+            let e = by.entry(k.name).or_default();
+            e.0 += 1;
+            e.1 += k.gpu_secs;
+            total += k.gpu_secs;
+        }
+    }
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+    let n = steps as f64;
+    eprintln!("  ms/step  share  calls/step  kernel");
+    for (name, (calls, secs)) in rows {
+        eprintln!(
+            "  {:7.3}  {:4.1}%  {:9.1}  {name}",
+            secs / n * 1e3,
+            100.0 * secs / total,
+            calls as f64 / n
+        );
+    }
+    eprintln!("  {:7.3}  kernels summed per step", total / n * 1e3);
 }
 
 fn spec(
