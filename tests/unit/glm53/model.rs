@@ -599,7 +599,12 @@ fn unlikely_drafts_are_not_proposed() {
 
 /// A prompt of `n` ordinary text tokens.
 fn prompt(n: usize) -> Vec<u32> {
-    (0..n as u32).map(|i| 1000 + (i * 7919) % 50_000).collect()
+    prompt_with(n, 7919)
+}
+
+/// A prompt of `n` ordinary text tokens stepping by `a`.
+fn prompt_with(n: usize, a: u32) -> Vec<u32> {
+    (0..n as u32).map(|i| 1000 + (i * a) % 50_000).collect()
 }
 
 /// Relative L2 distance of two logit vectors.
@@ -616,47 +621,134 @@ fn argmax(v: &[f32]) -> u32 {
     v.iter().enumerate().fold(0, |b, (i, &x)| if x > v[b] { i } else { b }) as u32
 }
 
-/// Ordinary decoding: the logits after each of `tokens`, fed one at a time
-/// after `prompt`.
+/// One ordinary step's logits and per-layer record (`step_layers`, the
+/// production kernels a layer a pass: the same values as `forward`).
+struct Step {
+    logits: Vec<f32>,
+    layers: Vec<StepLayer>,
+}
+
+/// Ordinary decoding: each of `tokens`, fed one at a time after `prompt`.
 fn ordinary(
     m: &Glm53Model,
     ctx: &MetalContext,
     prompt: &[u32],
     tokens: &[u32],
-) -> Vec<Vec<f32>> {
+) -> Vec<Step> {
     let mut st = m.new_state(ctx, prompt.len() + tokens.len() + 8).unwrap();
     let mut sc = m.new_scratch(ctx).unwrap();
     m.prefill(ctx, &mut st, &mut sc, prompt).unwrap();
     tokens
         .iter()
         .map(|&t| {
-            m.forward(ctx, &mut st, &mut sc, &[t], true).unwrap();
-            sc.logits_last.to_f32().unwrap()
+            let (layers, logits) = m.step_layers(ctx, &mut st, &mut sc, &[t]).unwrap();
+            Step { logits, layers }
         })
         .collect()
 }
 
-/// Continues `st` ordinarily with `tokens` and checks each step's logits
-/// against `want`: the same top token and a relative L2 distance within
-/// 5e-3 (the verify pass runs KDA's multi-row kernels where ordinary
-/// decoding runs the one-row kernel, so the sums differ in the last bits).
+/// The smallest 8th-to-9th selection-score margin the speculative-step
+/// fixtures' ordinary steps may have at any routed layer. A verify pass runs
+/// KDA's multi-row kernels where ordinary decoding runs the one-row kernel,
+/// so the steps after it differ in the last bits, and an expert at a closer
+/// margin could legitimately swap; on fixtures without one, the speculative
+/// side must route exactly as ordinary decoding.
+const ROUTING_MARGIN: f32 = 8e-5;
+
+/// Fails, as a fixture error, unless every routed layer of every step in
+/// `want` selects its experts with a margin above [`ROUTING_MARGIN`].
+fn assert_no_near_ties(want: &[Step], case: &str) {
+    for (s, w) in want.iter().enumerate() {
+        assert!(
+            w.logits.iter().all(|x| x.is_finite()),
+            "{case}: ordinary step {s} logits"
+        );
+        for (il, l) in w.layers.iter().enumerate() {
+            if let Some(&g) = l.margin.first() {
+                assert!(
+                    g > ROUTING_MARGIN,
+                    "fixture {case}: ordinary step {s} layer {il} has a routing near-tie (margin {g:.2e}); pick another prompt"
+                );
+            }
+        }
+    }
+}
+
+/// The experts with the `k` highest of `scores`, sorted by index.
+fn top_k(scores: &[f32], k: usize) -> Vec<u32> {
+    let mut i: Vec<u32> = (0..scores.len() as u32).collect();
+    i.sort_by(|&a, &b| scores[b as usize].total_cmp(&scores[a as usize]));
+    i.truncate(k);
+    i.sort_unstable();
+    i
+}
+
+/// Continues `st` ordinarily with `tokens` and checks each step against
+/// `want` (fixtures that pass [`assert_no_near_ties`]): finite logits; at
+/// every routed layer the GPU's selection is the top 8 of its own scores and
+/// ordinary decoding's experts; and the logits have the same top token and a
+/// relative L2 distance within 5e-3. Returns the largest relative L2
+/// distance and the largest change of a layer's selection margin (the
+/// selected experts' lowest score minus the best other's) from ordinary
+/// decoding's.
 fn continue_and_compare(
     m: &Glm53Model,
     ctx: &MetalContext,
     st: &mut Glm53State,
     sc: &mut Scratch,
     tokens: &[u32],
-    want: &[Vec<f32>],
+    want: &[Step],
     case: &str,
-) {
-    for (k, (&t, w)) in tokens.iter().zip(want).enumerate() {
-        m.forward(ctx, st, sc, &[t], true).unwrap();
-        let got = sc.logits_last.to_f32().unwrap();
-        let r = rel(&got, w);
-        eprintln!("{case}: step {k} relative L2 {r:.2e}");
-        assert!(r < 5e-3, "{case}: step {k} logits differ (relative L2 {r:.2e})");
-        assert_eq!(argmax(&got), argmax(w), "{case}: step {k} top token");
+) -> (f64, f32) {
+    let k = m.cfg.n_expert_used;
+    let sorted = |v: &[u32]| {
+        let mut w = v[..k].to_vec();
+        w.sort_unstable();
+        w
+    };
+    let margin = |scores: &[f32], sel: &[u32]| {
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for (e, &x) in scores.iter().enumerate() {
+            if sel.contains(&(e as u32)) {
+                lo = lo.min(x);
+            } else {
+                hi = hi.max(x);
+            }
+        }
+        lo - hi
+    };
+    let (mut worst, mut shift, mut closest) = (0f64, 0f32, f32::MAX);
+    for (s, (&t, w)) in tokens.iter().zip(want).enumerate() {
+        let (layers, got) = m.step_layers(ctx, st, sc, &[t]).unwrap();
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "{case}: step {s} logits not finite"
+        );
+        for (il, (a, b)) in layers.iter().zip(&w.layers).enumerate() {
+            if a.sel.is_empty() {
+                continue;
+            }
+            let sel = sorted(&a.sel);
+            assert_eq!(
+                sel,
+                top_k(&a.scores, k),
+                "{case}: step {s} layer {il} selection"
+            );
+            assert_eq!(sel, sorted(&b.sel), "{case}: step {s} layer {il} routing");
+            let g = margin(&a.scores, &sel);
+            shift = shift.max((g - margin(&b.scores, &sel)).abs());
+            closest = closest.min(g);
+        }
+        let r = rel(&got, &w.logits);
+        eprintln!("{case}: step {s} relative L2 {r:.2e}");
+        assert!(r < 5e-3, "{case}: step {s} logits differ (relative L2 {r:.2e})");
+        assert_eq!(argmax(&got), argmax(&w.logits), "{case}: step {s} top token");
+        worst = worst.max(r);
     }
+    eprintln!(
+        "{case}: largest selection-margin change {shift:.2e}, smallest margin {closest:.2e}"
+    );
+    (worst, shift)
 }
 
 /// Speculative steps leave the state ordinary decoding would have, for an
@@ -673,23 +765,26 @@ fn speculative_steps_match_ordinary_decoding() {
     let m = real_model(&ctx);
     let greedy = SamplingParams::greedy();
     // 2102 = 2 mod 4 and past 2051: the verify pass's row 1 (position 2103)
-    // completes a pool and the attention is sparse.
-    for (n, cases) in
-        [(37usize, &["accept", "reject", "first-row"][..]), (2102, &["reject"][..])]
-    {
-        let p = prompt(n);
+    // completes a pool and the attention is sparse. The prompts, and the
+    // greedy continuations' lengths, are ones without a routing near-tie.
+    for (n, a, len, cases) in [
+        (37usize, 7847, 7, &["accept", "reject", "first-row"][..]),
+        (2102, 7793, 4, &["reject"][..]),
+    ] {
+        let p = prompt_with(n, a);
         // The greedy continuation; t0 is what the prompt's logits pick.
         let mut st = m.new_state(&ctx, n + 16).unwrap();
         let mut sc = m.new_scratch(&ctx).unwrap();
         m.prefill(&ctx, &mut st, &mut sc, &p).unwrap();
         let mut toks = vec![argmax(&sc.logits_last.to_f32().unwrap())];
-        for _ in 0..6 {
+        while toks.len() < len {
             let last = *toks.last().unwrap();
             m.forward(&ctx, &mut st, &mut sc, &[last], true).unwrap();
             toks.push(argmax(&sc.logits_last.to_f32().unwrap()));
         }
         drop((st, sc));
         let want = ordinary(&m, &ctx, &p, &toks);
+        assert_no_near_ties(&want, &format!("n={n}"));
         for &case in cases {
             let mut st = LanguageModel::new_state(&m, &ctx, n + 16).unwrap();
             let mut sc = m.new_scratch(&ctx).unwrap();
@@ -735,8 +830,15 @@ fn speculative_steps_match_ordinary_decoding() {
             fork.restore(&ctx, &snap).unwrap();
             st.restore(&ctx, &snap).unwrap();
             assert_eq!((st.pos(), fork.pos()), (n, n));
-            continue_and_compare(&m, &ctx, &mut st, &mut sc, &toks, &want, "restored");
-            continue_and_compare(&m, &ctx, &mut fork, &mut sc, &toks, &want, "forked");
+            // The same one-row steps from the same state: the same bits.
+            let got = continue_and_compare(
+                &m, &ctx, &mut st, &mut sc, &toks, &want, "restored",
+            );
+            assert_eq!(got, (0.0, 0.0), "restored");
+            let got = continue_and_compare(
+                &m, &ctx, &mut fork, &mut sc, &toks, &want, "forked",
+            );
+            assert_eq!(got, (0.0, 0.0), "forked");
         }
     }
 }

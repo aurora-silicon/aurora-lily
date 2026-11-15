@@ -822,6 +822,9 @@ pub struct StepLayer {
     /// from the GPU's router logits: near-tie evidence, not the GPU's own
     /// scores.
     pub margin: Vec<f32>,
+    /// Routed layers: each row's selection scores of every expert, by expert,
+    /// reconstructed as `margin` is.
+    pub scores: Vec<f32>,
 }
 
 /// The first fed position below `end`, and its layer, where two runs'
@@ -906,6 +909,7 @@ impl Glm53Model {
                         .zip(&bias)
                         .map(|(&x, &b)| 1.0 / (1.0 + (-x).exp()) + b)
                         .collect();
+                    l.scores.extend_from_slice(&sc);
                     sc.sort_by(|a, b| b.total_cmp(a));
                     l.margin.push(sc[k - 1] - sc[k]);
                 }
