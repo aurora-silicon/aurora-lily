@@ -8,16 +8,16 @@ workstation. The server is OpenAI-compatible (`/v1/chat/completions`,
 `/v1/completions`, `/v1/models`, tools, `reasoning_content`, streaming) and
 is used daily as a coding-agent backend.
 
-| memory | model | weights | speculative drafts |
-|---|---|---|---|
-| 16 GB | Gemma 4 26B-A4B | unsloth's UD-IQ2_M GGUF | optional: Gemma's draft model |
-| 32 GB | Qwen3.6-35B-A3B | ggml-org's Q4_K_M GGUF | its MTP head |
-| 32 GB | Gemma 4 26B-A4B | unsloth's UD-Q5_K_M GGUF | Gemma's draft model |
-| 64 GB | Qwen3.6-35B-A3B | ggml-org's Q8_0 GGUF | its MTP head |
-| 64 GB | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | antirez's Q2 GGUF | its MTP head |
-| 128 GB | Qwen3.8-Flash-Next | lily's 4-bit conversions (q4-xl, q4) | its MTP head |
-| 128 GB | GLM 5.3 Flash | antirez's Q2 GGUF | its MTP block |
-| 128 GB | DeepSeek V4 Flash | antirez's Q2 GGUF | DSpark |
+| Memory | Model              | Weights                              | Speculative drafts            |
+|--------|--------------------|--------------------------------------|-------------------------------|
+| 16 GB  | Gemma 4 26B-A4B    | unsloth's UD-IQ2_M GGUF              | optional: Gemma's draft model |
+| 32 GB  | Qwen3.6-35B-A3B    | ggml-org's Q4_K_M GGUF               | its MTP head                  |
+| 32 GB  | Gemma 4 26B-A4B    | unsloth's UD-Q5_K_M GGUF             | Gemma's draft model           |
+| 64 GB  | Qwen3.6-35B-A3B    | ggml-org's Q8_0 GGUF                 | its MTP head                  |
+| 64 GB  | Qwen3.8-Flash-Next | antirez's Q2 GGUF                    | its MTP head                  |
+| 128 GB | Qwen3.8-Flash-Next | lily's 4-bit conversions (q4-xl, q4) | its MTP head                  |
+| 128 GB | GLM 5.3 Flash      | antirez's Q2 GGUF                    | its MTP block                 |
+| 128 GB | DeepSeek V4 Flash  | antirez's Q2 GGUF                    | DSpark                        |
 
 GGUF files load as published, without re-quantization. On the smaller
 machines `--memory-limit-gb` keeps everything lily allocates on the GPU
@@ -38,79 +38,90 @@ leaves the GPU, and fits the longest context that budget allows.
 
 ### Linux, M5 Max (128 GB)
 
-The server as each configuration runs it (the commands below), five chat
-requests, greedy, 400 generated tokens each: four short coding-agent
-questions (40 to 100 prompt tokens) and one long-context request (a
-14 000-character source file to summarize, 4 200 to 4 900 prompt tokens).
-Measured 2026-11-15 on `main` with Mesa `aurora-wip` plus the AGX compiler
-pull requests aurora-silicon/mesa #370 to #375, tokens per second, on an
-otherwise idle machine:
+The server as each configuration runs it (the commands below), on five chat requests, greedy, 400
+generated tokens each: four short coding-agent questions (40–90 prompt tokens) and one long-context
+request (a 14 000-character source file to summarize, 4 200–4 900 prompt tokens). Tokens per second,
+measured 2026-11-15 on `main` (7838f9b) with Mesa `aurora-wip` plus the AGX compiler pull requests
+listed under [Running it](#running-it):
 
-| memory | model | decode | drafts accepted | prefill, long prompt | prefill, short prompts |
-|---|---|---:|---:|---:|---:|
-| 16 GB | Gemma 4 UD-IQ2_M | 118-128 | (no drafts) | 3 390 | 820-1 000 |
-| 32 GB | Qwen3.6 Q4_K_M | 140-148 | 87-90% | 3 550 | 530-920 |
-| 32 GB | Gemma 4 UD-Q5_K_M | 140-161 | 68-83% | 3 540 | 680-920 |
-| 64 GB | Qwen3.6 Q8_0 | 138-146 | 86-89% | 3 260 | 640-820 |
-| 64 GB | Qwen3.8-Flash-Next Q2 | 80-98 | 62-89% | 1 580 | 200-340 |
-| 128 GB | Qwen3.8-Flash-Next q4-xl | 104-124 | 68-88% | 1 770 | 460-530 |
-| 128 GB | DeepSeek V4 Flash Q2 | 50-56 | 68-81% | 830 | 145-185 |
-| 128 GB | GLM 5.3 Flash Q2 | 41-47 | 58-80% | 580 | 195-220 |
+| Memory | Model              | Weights   |  Decode | Drafts accepted | Prefill, long prompt | Prefill, short prompts |
+|--------|--------------------|-----------|--------:|----------------:|---------------------:|-----------------------:|
+| 16 GB  | Gemma 4            | UD-IQ2_M  | 123–131 |               – |                3 400 |                680–940 |
+| 32 GB  | Qwen3.6            | Q4_K_M    | 138–149 |          82–87% |                3 710 |                580–860 |
+| 32 GB  | Gemma 4            | UD-Q5_K_M | 150–169 |          67–83% |                3 460 |                570–780 |
+| 64 GB  | Qwen3.6            | Q8_0      | 138–145 |          83–90% |          3 170–3 450 |                570–690 |
+| 64 GB  | Qwen3.8-Flash-Next | Q2        |   80–97 |          67–88% |                1 640 |                260–300 |
+| 128 GB | Qwen3.8-Flash-Next | q4-xl     |  93–119 |          67–89% |                1 830 |                230–410 |
+| 128 GB | DeepSeek V4 Flash  | Q2        |   51–58 |          67–89% |                  770 |                130–170 |
+| 128 GB | GLM 5.3 Flash      | Q2        |   41–46 |          66–83% |                  520 |                100–190 |
 
-Short prompts mostly measure fixed per-request costs. Agent output (tool
-calls, code copied from the context) drafts well, so decode in agent use is
-often faster than this set. Without the Mesa compiler pull requests, prefill
-is 2 to 15% lower (Gemma loses the most) and decode 0 to 3% lower.
+- Decode is the range over the five requests; drafts are on wherever the configuration has a draft
+  model or head (the 16 GB Gemma setting leaves them off to save memory).
+- Short prompts mostly measure fixed per-request costs. Agent output (tool calls, code copied from the
+  context) drafts well, so decode in agent use is often faster than this set.
+- On the 140 W adapter, minutes of continuous GPU load can exceed what the adapter and battery supply,
+  and the GPU then clocks down. These are short runs; long batch jobs may see lower numbers.
 
 ### Compared with macOS
 
-The same M5 Max model under macOS, as published by the projects lily on
-Linux follows:
+The same M5 Max under macOS, as published by the projects lily on Linux follows:
 
-| model | engine on macOS (Metal) | prefill | decode | lily on Linux |
-|---|---|---:|---:|---|
-| Qwen3.8-Flash-Next q4-xl | [fabiogreter's lily](https://github.com/fabiogreter/lily-qwen3.8-flash-next) (`docs/performance.md`, 2026-10-12: fresh prompts over HTTP, 4K-64K) | 2 410-2 524 | 98-107 with 2 drafts, 77-80 plain | prefill 1 770, decode 104-124 with 2 drafts, ~69 plain |
-| DeepSeek V4 Flash Q2 | [antirez's ds4](https://github.com/antirez/ds4) (`speed-bench/m5_max.csv`) | 790 at 2K, 710 at 4K | 39 plain | prefill ~1 000 at 2K, 830 at 4.4K; decode ~40 plain, 50-56 with DSpark |
+| Model                    | Engine on macOS   | Prefill, macOS     | Prefill, Linux          | Decode, macOS               | Decode, Linux                |
+|--------------------------|-------------------|--------------------|-------------------------|-----------------------------|------------------------------|
+| Qwen3.8-Flash-Next q4-xl | lily (Metal) [^1] | 2 410–2 524        | 1 830                   | 77–80 plain, 98–107 drafted | ~69 plain, 93–119 drafted    |
+| DeepSeek V4 Flash Q2     | ds4 (Metal) [^2]  | 790 (2K), 710 (4K) | ~1 000 (2K), 770 (4.4K) | 39 plain                    | ~40 plain, 51–58 with DSpark |
 
-Decode on Linux matches or beats macOS; Qwen3.8's prefill is still about
-30% behind lily on Metal. Neither project publishes M5 Max numbers for the
-other models.
+[^1]: [fabiogreter's lily](https://github.com/fabiogreter/lily-qwen3.8-flash-next), `docs/performance.md`
+    (2026-10-12): fresh prompts over HTTP, 4K–64K tokens, 2 drafts.
+[^2]: [antirez's ds4](https://github.com/antirez/ds4), `speed-bench/m5_max.csv`.
+
+Decode on Linux matches or beats macOS; Qwen3.8's prefill is still about 25% behind lily on Metal.
+Neither project publishes M5 Max numbers for the other models.
 
 ### Linux, M4 (16 GB)
 
-Gemma 4 UD-IQ2_M on an M4 MacBook Air (8-core GPU, fanless, measured below
-60 °C): decode about 25 tok/s (a 40 ms step at 1K context), prefill 160 to
-190 tok/s at 1K and 132 at 4K, 21 760 tokens of context at
-`--memory-limit-gb 10.2`.
+Gemma 4 UD-IQ2_M on an M4 MacBook Air (8-core GPU, fanless, measured below 60 °C): decode about
+25 tok/s (a 40 ms step at 1K context), prefill 160–190 tok/s at 1K and 132 at 4K, 21 760 tokens of
+context at `--memory-limit-gb 10.2`.
 
 ### Quality
 
-| model | check | lily | reference |
-|---|---|---|---|
-| Qwen3.8-Flash-Next Q2 | ds4's 100 official continuations, NLL / first tokens | 0.354, 68/100 | ds4 0.353, 70/100 |
-| GLM 5.3 Flash Q2 | ds4's 100 official continuations | 0.464, 91/100 | ds4 0.458-0.462, 89-90/100 |
-| DeepSeek V4 Flash Q2 | ds4's 100 official continuations | 0.399, 55/100 | ds4 0.398, 56/100 |
-| Qwen3.6-35B-A3B | 24 long texts, NLL per token, against llama.cpp on the same file | Q4_K_M 1.813, Q8_0 1.809 | llama.cpp within 0.002 |
-| Gemma 4 UD-Q5_K_M | KL divergence from llama.cpp on the same file (chat / human text) | 0.0018 / 0.0105 | |
-| Gemma 4 UD-IQ2_M | KL divergence from llama.cpp on the same file | 0.0077 / 0.0261 | |
+Against ds4's 100 official continuations, on the same GGUF files ds4 runs:
+
+| Model                 | NLL, lily |    NLL, ds4 | First tokens right, lily | First tokens right, ds4 |
+|-----------------------|----------:|------------:|-------------------------:|------------------------:|
+| Qwen3.8-Flash-Next Q2 |     0.354 |       0.353 |                   68/100 |                  70/100 |
+| DeepSeek V4 Flash Q2  |     0.396 |       0.398 |                   55/100 |                  56/100 |
+| GLM 5.3 Flash Q2      |     0.465 | 0.458–0.462 |                   91/100 |               89–90/100 |
+
+Against llama.cpp on the same file:
+
+| Model           | Weights   | Check                                           | lily            |
+|-----------------|-----------|-------------------------------------------------|-----------------|
+| Qwen3.6-35B-A3B | Q4_K_M    | NLL per token, 24 long texts                    | 1.813 [^3]      |
+| Qwen3.6-35B-A3B | Q8_0      | NLL per token, 24 long texts                    | 1.812 [^3]      |
+| Gemma 4         | UD-Q5_K_M | KL divergence from llama.cpp, chat / human text | 0.0017 / 0.0107 |
+| Gemma 4         | UD-IQ2_M  | KL divergence from llama.cpp, chat / human text | 0.0080 / 0.0282 |
+
+[^3]: Within 0.002 of llama.cpp before the chunked prefill (#24), whose bf16 operands added 0.001
+    (Q4_K_M) and 0.003 (Q8_0).
 
 Speculative output equals plain greedy decoding up to rounding ties.
 
 ### Memory
 
-| memory | configuration | everything on the GPU | longest context |
-|---|---|---:|---:|
-| 16 GB | Gemma 4 UD-IQ2_M, `--memory-limit-gb 10.2` | 11.0 GB | 21 248 (10 496 with the draft model) |
-| 32 GB | Qwen3.6 Q4_K_M, `--memory-limit-gb 22` | 23.6 GB | 52 088 |
-| 32 GB | Gemma 4 UD-Q5_K_M, `--memory-limit-gb 22` | 23.6 GB | 55 296 |
-| 64 GB | Qwen3.6 Q8_0, `--memory-limit-gb 44` | 47.2 GB | 262 144 |
-| 64 GB | Qwen3.8-Flash-Next Q2, `--memory-limit-gb 44.7` | 48.0 GB | 73 720 (163 832 without drafts) |
-| 128 GB | Qwen3.8-Flash-Next q4-xl | 75 GB, plus the 32 GB n-gram table paged | 131 072 |
-| 128 GB | GLM 5.3 Flash Q2 | 100 GB | 65 536 |
-| 128 GB | DeepSeek V4 Flash Q2 | 95 GB | 65 536 |
+| Memory | Configuration                                   | Allocated on the GPU                     | Longest context                      |
+|--------|-------------------------------------------------|------------------------------------------|--------------------------------------|
+| 16 GB  | Gemma 4 UD-IQ2_M, `--memory-limit-gb 10.2`      | 11.0 GB                                  | 21 248 (10 496 with the draft model) |
+| 32 GB  | Qwen3.6 Q4_K_M, `--memory-limit-gb 22`          | 23.6 GB                                  | 52 088                               |
+| 32 GB  | Gemma 4 UD-Q5_K_M, `--memory-limit-gb 22`       | 23.6 GB                                  | 55 296                               |
+| 64 GB  | Qwen3.6 Q8_0, `--memory-limit-gb 44`            | 47.2 GB                                  | 262 144                              |
+| 64 GB  | Qwen3.8-Flash-Next Q2, `--memory-limit-gb 44.7` | 48.0 GB                                  | 73 720 (163 832 without drafts)      |
+| 128 GB | Qwen3.8-Flash-Next q4-xl                        | 75 GB, plus the 32 GB n-gram table paged | 131 072                              |
+| 128 GB | GLM 5.3 Flash Q2                                | 100 GB                                   | 65 536                               |
+| 128 GB | DeepSeek V4 Flash Q2                            | 95 GB                                    | 65 536                               |
 
-`--memory-limit-gb` counts GiB. A memory-limited configuration serves one
-request at a time.
+`--memory-limit-gb` counts GiB. A memory-limited configuration serves one request at a time.
 
 ## Running it
 
@@ -122,7 +133,8 @@ You need:
   (#1844) for full decode speed.
 - Mesa's Honeykrisp from aurora-silicon/mesa `aurora-wip`, with the M5's
   matrix units enabled (`ASAHI_M5_COOPERATIVE_MATRIX=1`). The AGX compiler
-  pull requests #370 to #375 add the prefill gains measured above.
+  pull requests #370 to #375, #379 and #380 are in the build measured above;
+  they add 2–15% to prefill.
 - The Rust toolchain pinned by `rust-toolchain.toml`.
 
 Weights are mapped read-only from the page cache rather than copied, and the
@@ -173,7 +185,7 @@ instance lock before mapping weights.
 
 ## The models
 
-- **Qwen3.8-Flash-Next**: Qwen's `qwen4_exp` preview: 48 layers (36 Gated
+- **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**: Qwen's `qwen4_exp` preview: 48 layers (36 Gated
   DeltaNet, 12 sparse attention with an indexer), 512 experts with 10
   active, a four-stream gated residual, a 32 GB hashed n-gram embedding and
   a draft head. Two 4-bit conversions,
