@@ -644,8 +644,8 @@ void main() {
 #define G16_DR 2u
 #endif
 #ifdef KERNEL_g16_moe_gate_up_iq2_xxs
-// IQ2_XXS task t of the row at 16-bit word rw of W against xv: as
-// glm53_dot_iq2_xxs.
+// IQ2_XXS task t of the row at 16-bit word rw of W against xv: the values
+// of glm53_dot_iq2_xxs, summed in one fma chain.
 float g16_dot_iq2_xxs(uint64_t W, uint rw, uint t, in vec4 xv[8]) {
     const uint bw = rw + (t >> 3u) * 33u;
     const uint qw = bw + 1u + 4u * (t & 7u);
@@ -660,11 +660,11 @@ float g16_dot_iq2_xxs(uint64_t W, uint rw, uint t, in vec4 xv[8]) {
         const uvec4 sg = (uvec4(q) << uvec4(15u, 14u, 13u, 12u)) & 0x80008000u;
         const uvec4 g = glm53_iq2xxs_grid_h[(aux0 >> (8u * l)) & 0xffu] ^ sg;
         const vec4 a = xv[2u * l], b = xv[2u * l + 1u];
-        const vec2 p0 = unpackHalf2x16(g.x), p1 = unpackHalf2x16(g.y);
-        const vec2 p2 = unpackHalf2x16(g.z), p3 = unpackHalf2x16(g.w);
-        precise float e = ((p0.x * a.x + p0.y * b.x) + (p1.x * a.y + p1.y * b.y))
-                        + ((p2.x * a.z + p2.y * b.z) + (p3.x * a.w + p3.y * b.w));
-        s += e;
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            const vec2 p = unpackHalf2x16(g[c]);
+            s = fma(p.x, a[c], s);
+            s = fma(p.y, b[c], s);
+        }
     }
     precise float k = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
     precise float v = k * s;
