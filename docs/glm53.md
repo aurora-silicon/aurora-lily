@@ -71,7 +71,8 @@ the model (45 trunk layers of KDA linear attention and DSA sparse attention,
 hyper-connection streams with the Sinkhorn split), the MTP draft block, the
 engine interface, the tokenizer and template built from the GGUF, and a CPU
 reference of every operation. Decode and the speculative verify pass use the
-GEMV kernels on f32 activations (up to four rows); prompts run in runs of
+GEMV kernels on f32 activations (up to four rows; the IQ2_XXS routed
+experts' gate/up on an f16 copy of them); prompts run in runs of
 1 024 rows on the matrix units, routed experts grouped by expert, one pass a
 layer. Speculation uses the trunk sampler with the same request steps and
 penalty accounting as ordinary decoding. One-row and multi-row
@@ -100,7 +101,12 @@ or restore a snapshot taken before the step.
   run). This changes the drafts, not the sampling rule: drafts only decide
   which steps verify two rows (see the finite-precision caveat above).
 - Prefill GEMMs round both operands to bfloat16 (the weights to nearest,
-  ties away from zero; f32 accumulators); decode works on f32 activations.
+  ties away from zero; f32 accumulators); decode works on f32 activations,
+  except the IQ2_XXS routed experts' gate/up, which reads them as f16 (other
+  expert formats read f32). That input is RMS-normalized, so each value is
+  at most sqrt(hidden) = 64 times the layer's largest `ffn_norm` weight:
+  at most 0.94 in `GLM-5.3-Flash-Q2.gguf` (layer 44), a bound of about 60,
+  far inside f16's range; non-finite inputs stay non-finite, as in f32.
   Quality is close to ds4's (below).
 - Prompt runs of more than 32 rows (gate bound in [-5, 0]) compute KDA in
   its chunked (WY) form, 32 tokens a chunk, in f32: algebraically the

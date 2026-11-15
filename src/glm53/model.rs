@@ -606,6 +606,8 @@ pub struct Scratch {
     /// writes (one request at a time decodes: they are the scratch's, not
     /// every session's), views of one allocation.
     kda_alt: Vec<Option<(Tensor, Tensor)>>,
+    /// F16: a step's expert activations in the IQ2_XXS dot's pairing.
+    xh: Tensor,
     moe_group: k::MoeGroupScratch,
     // Head
     /// The stream mean of the last step's rows (the MTP head's input).
@@ -755,6 +757,7 @@ impl Scratch {
             rsel: u(m * cfg.n_expert_used)?,
             rw: f(m * cfg.n_expert_used)?,
             moe_mid: f(MAX_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
+            xh: Tensor::zeros(ctx, &[MAX_ROWS * cfg.hidden], DType::F16)?,
             moe_group: k::MoeGroupScratch::new(
                 ctx,
                 m * cfg.n_expert_used,
@@ -822,6 +825,9 @@ pub struct StepLayer {
     /// from the GPU's router logits: near-tie evidence, not the GPU's own
     /// scores.
     pub margin: Vec<f32>,
+    /// Routed layers: each row's selection scores of every expert, by expert,
+    /// reconstructed as `margin` is.
+    pub scores: Vec<f32>,
 }
 
 /// The first fed position below `end`, and its layer, where two runs'
@@ -906,6 +912,7 @@ impl Glm53Model {
                         .zip(&bias)
                         .map(|(&x, &b)| 1.0 / (1.0 + (-x).exp()) + b)
                         .collect();
+                    l.scores.extend_from_slice(&sc);
                     sc.sort_by(|a, b| b.total_cmp(a));
                     l.margin.push(sc[k - 1] - sc[k]);
                 }
@@ -1782,6 +1789,16 @@ impl Glm53Model {
             FfnW::Moe { router, bias, gate, up, down, sh_gate, sh_up, sh_down } => {
                 let used = cfg.n_expert_used;
                 let xb = self.bf16_input(ctx, pass, sc, &sc.xn, cfg.hidden, m)?;
+                // A step's IQ2_XXS experts (every row count up to MAX_ROWS:
+                // a verify row is computed as a one-row step) read the
+                // activations as f16 in the dot's pairing, half the bytes of
+                // their loads (DeepSeek V4's `moe_gate_up_xh`).
+                let xh = m <= MAX_ROWS && gate.ty == crate::gguf::GgmlType::Iq2Xxs;
+                if xh {
+                    crate::kernels::deepseek4::x_f16_iq2(
+                        ctx, pass, &sc.xn, &sc.xh, m, cfg.hidden,
+                    )?;
+                }
                 self.proj(ctx, pass, &[(router, &sc.rlogits)], &sc.xn, None, m)?;
                 self.proj(
                     ctx,
@@ -1835,20 +1852,37 @@ impl Glm53Model {
                     )?;
                     return pass.memory_barrier();
                 }
-                k::moe_gate_up(
-                    ctx,
-                    pass,
-                    gate,
-                    up,
-                    cfg.ff_expert,
-                    &sc.xn,
-                    &sc.rsel,
-                    &sc.rw,
-                    &sc.moe_mid,
-                    m,
-                    used,
-                    lim,
-                )?;
+                if xh {
+                    k::moe_gate_up_xh(
+                        ctx,
+                        pass,
+                        gate,
+                        up,
+                        cfg.ff_expert,
+                        &sc.xh,
+                        &sc.rsel,
+                        &sc.rw,
+                        &sc.moe_mid,
+                        m,
+                        used,
+                        lim,
+                    )?;
+                } else {
+                    k::moe_gate_up(
+                        ctx,
+                        pass,
+                        gate,
+                        up,
+                        cfg.ff_expert,
+                        &sc.xn,
+                        &sc.rsel,
+                        &sc.rw,
+                        &sc.moe_mid,
+                        m,
+                        used,
+                        lim,
+                    )?;
+                }
                 self.proj(ctx, pass, &[(sh_down, &sc.ffn_out)], &sc.fmid, None, m)?;
                 pass.memory_barrier()?;
                 // Routed sum plus the shared expert's output.
