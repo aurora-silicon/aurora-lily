@@ -376,13 +376,18 @@ pub(crate) fn fit_tokens(cfg: &super::config::Config, room: u64, checkpoints: us
     context.min(cfg.context_length).min(MAX_SEQ)
 }
 
+/// The context a longer prompt run must keep to be taken.
+pub(crate) const PROMPT_RUN_CONTEXT_FLOOR: usize = 16384;
+
 /// The prompt run a memory limit takes, from each run's fitted context
 /// (`(rows, context)`, longest run first and 256 rows last; `None` where
 /// less than 4096 tokens fit): the longest run that keeps a context of
-/// 32K tokens, or that of the last run when that is less (a 16 GB tier
-/// keeps its context and short runs). `None` when nothing fits.
+/// [`PROMPT_RUN_CONTEXT_FLOOR`] tokens, or that of the last run when that
+/// is less. On a 16 GB tier 512-row runs prefill a 4K prompt 22% faster
+/// than 256-row ones for ~3.6K tokens of its 25K context (UD-IQ2_M,
+/// 2026-11-15). `None` when nothing fits.
 pub(crate) fn choose_prompt_run(fits: &[(usize, Option<usize>)]) -> Option<usize> {
-    let floor = fits.last()?.1?.min(32768);
+    let floor = fits.last()?.1?.min(PROMPT_RUN_CONTEXT_FLOOR);
     fits.iter().position(|f| f.1.is_some_and(|c| c >= floor))
 }
 

@@ -249,18 +249,18 @@ fn speculation_at_rest_restores_and_forks_like_plain_decoding() {
 
 /// The prompt run a memory limit takes from the runs' fitted contexts.
 #[test]
-fn the_prompt_run_keeps_32k_tokens_or_the_shortest_runs_context() {
+fn the_prompt_run_keeps_16k_tokens_or_the_shortest_runs_context() {
     let pick = |fits: &[(usize, Option<usize>)]| choose_prompt_run(fits).map(|i| fits[i].0);
-    // 1024 rows still fit 32K.
+    // 1024 rows still fit 16K.
     assert_eq!(pick(&[(1024, Some(40000)), (512, Some(45000)), (256, Some(48000))]), Some(1024));
-    assert_eq!(pick(&[(1024, Some(32768)), (512, Some(36000)), (256, Some(40000))]), Some(1024));
-    // Only 512 rows do.
-    assert_eq!(pick(&[(1024, Some(30000)), (512, Some(33000)), (256, Some(40000))]), Some(512));
-    // Only 256 rows do (a longer run below 32K, or not fitting at all).
-    assert_eq!(pick(&[(1024, None), (512, Some(30000)), (256, Some(34000))]), Some(256));
-    // 256-row runs fit less than 32K: their context is kept.
-    assert_eq!(pick(&[(1024, Some(15000)), (512, Some(19000)), (256, Some(22784))]), Some(256));
-    assert_eq!(pick(&[(1024, Some(22784)), (512, Some(22784)), (256, Some(22784))]), Some(1024));
+    assert_eq!(pick(&[(1024, Some(16384)), (512, Some(20000)), (256, Some(24000))]), Some(1024));
+    // Only 512 rows do (the 16 GB tier).
+    assert_eq!(pick(&[(1024, Some(14336)), (512, Some(21760)), (256, Some(25344))]), Some(512));
+    // Only 256 rows do (a longer run below 16K, or not fitting at all).
+    assert_eq!(pick(&[(1024, None), (512, Some(16000)), (256, Some(18000))]), Some(256));
+    // 256-row runs fit less than 16K: their context is kept.
+    assert_eq!(pick(&[(1024, Some(6000)), (512, Some(9000)), (256, Some(10496))]), Some(256));
+    assert_eq!(pick(&[(1024, Some(10496)), (512, Some(10496)), (256, Some(10496))]), Some(1024));
     // Nothing fits 4096 tokens.
     assert_eq!(pick(&[(1024, None), (512, None), (256, None)]), None);
 }
