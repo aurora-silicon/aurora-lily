@@ -722,8 +722,7 @@ fn moe_grouped_matches_a_bf16_reference() {
             mean / (m * hid) as f64
         );
     }
-}
-/// Each kernel's least GPU time in one pass among the profiled passes
+}/// Each kernel's least GPU time in one pass among the profiled passes
 /// since the last call.
 fn best_kernel_secs() -> std::collections::BTreeMap<&'static str, f64> {
     let mut best = std::collections::BTreeMap::new();
@@ -748,6 +747,30 @@ fn best_kernel_secs() -> std::collections::BTreeMap<&'static str, f64> {
 #[ignore = "timing probe; run with --ignored --nocapture"]
 fn prefill_gemm_probe() {
     let ctx = MetalContext::new_with_profile(true).expect("metal context");
+    // The GPU's clock varies from run to run (a fanless Mac's heat): the
+    // FMA peak kernel's rate at the start and end is the yardstick.
+    #[cfg(target_os = "linux")]
+    let clock = |when: &str| {
+        let fma = ctx.pipeline("pk_fma_f32", "", MslVersion::V3_1).expect("fma");
+        let out = zeros(&ctx, 1024);
+        for _ in 0..8 {
+            run(&ctx, |p| {
+                let grid = Grid::Threadgroups {
+                    groups: (1024, 1, 1),
+                    threadgroup: (256, 1, 1),
+                };
+                p.dispatch_at(&fma, &[out.binding()], &[&u32_bytes(2048)], grid)
+                    .unwrap()
+            });
+        }
+        let s = best_kernel_secs()["pk_fma_f32"];
+        eprintln!(
+            "clock {when}: f32 FMA {:.3} TFLOPS",
+            2.0 * (1024.0 * 256.0 * 2048.0 * 32.0) / s / 1e12
+        );
+    };
+    #[cfg(target_os = "linux")]
+    clock("before");
     let mut rng = StdRng::seed_from_u64(5);
     let m =
         std::env::var("LILY_PROBE_M").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
@@ -818,4 +841,6 @@ fn prefill_gemm_probe() {
         let flops = 2.0 * (m * used * macs) as f64;
         eprintln!("grouped {name} {:.3} ms {:.3} TFLOPS", s * 1e3, flops / s / 1e12);
     }
+    #[cfg(target_os = "linux")]
+    clock("after");
 }
