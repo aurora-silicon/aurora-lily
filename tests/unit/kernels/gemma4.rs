@@ -469,13 +469,14 @@ fn embed_geglu_softcap_match_cpu() {
 
 /// Per-dispatch time of the routed-expert kernels at Gemma 4's shapes
 /// (hidden 2816, expert FF 704, top 8): one layer's gate/up and down, the
-/// dispatches of a serial pass over four layers' weights in turn.
+/// dispatches of a serial pass over four layers' weights in turn, best of
+/// eight passes after one that wakes the GPU's clocks.
 #[test]
 #[ignore = "timing only"]
 fn moe_timing() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(70);
-    let repeat = 32;
+    let repeat = 128;
     let (experts, hidden, ff, used) = (24, 2816, 704, 8);
     for (gt, dt) in
         [(GgmlType::Iq2Xxs, GgmlType::Iq4Nl), (GgmlType::Q5K, GgmlType::Q8_0)]
@@ -500,7 +501,7 @@ fn moe_timing() {
         let mut line = format!("moe {gt:?}/{dt:?}:");
         for part in 0..2 {
             let mut best = f64::MAX;
-            for _ in 0..5 {
+            for pass_no in 0..9 {
                 let pass = ctx.begin().unwrap();
                 for r in 0..repeat {
                     let (gu, dn) = &layers[r % 4];
@@ -516,7 +517,9 @@ fn moe_timing() {
                 }
                 let t = std::time::Instant::now();
                 pass.commit_wait().unwrap();
-                best = best.min(t.elapsed().as_secs_f64());
+                if pass_no > 0 {
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
             }
             line += &format!(
                 " {} {:.1} us",
@@ -721,5 +724,98 @@ fn moe_grouped_matches_a_bf16_reference() {
             "{gt:?}/{dt:?}: worst error {worst:.3} of the bound, mean {:.2e} of the inputs' magnitude",
             mean / (m * hid) as f64
         );
+    }
+}
+
+/// Per-dispatch time of the decode GEMVs at Gemma 4's shapes (one row):
+/// attention and dense FFN projections as the model groups them, the tied
+/// LM head and the dense down, best of eight passes of 128 dispatches (16
+/// of the head) over weight copies in turn (so the cache does not hold
+/// them), after a pass that wakes the GPU's clocks.
+#[test]
+#[ignore = "timing only"]
+fn gemv_timing() {
+    use crate::kernels::glm53::gemv_sets;
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(71);
+    let shapes: [(&str, GgmlType, usize, &[usize]); 7] = [
+        ("local q/k/v Q5_K", GgmlType::Q5K, 2816, &[4096, 2048, 2048]),
+        ("local o Q5_K", GgmlType::Q5K, 4096, &[2816]),
+        ("gate/up Q5_K", GgmlType::Q5K, 2816, &[2112, 2112]),
+        ("global q/k Q5_K", GgmlType::Q5K, 2816, &[8192, 1024]),
+        ("global o Q5_K", GgmlType::Q5K, 8192, &[2816]),
+        ("head Q5_K", GgmlType::Q5K, 2816, &[262144]),
+        ("down Q8_0", GgmlType::Q8_0, 2112, &[2816]),
+    ];
+    for (label, ty, cols, rows) in shapes {
+        let total: usize = rows.iter().sum();
+        let copies = if total > 100_000 { 1 } else { 4 };
+        let ws: Vec<Vec<QWeight>> = (0..copies)
+            .map(|_| {
+                rows.iter()
+                    .map(|&r| {
+                        let raw = random_blocks(&mut rng, ty, r * cols);
+                        QWeight::from_bytes(&ctx, &raw, ty, cols, r).unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+        let x = tensor(&ctx, &f32s(&mut rng, cols, -1.0, 1.0));
+        let ys: Vec<Tensor> = rows.iter().map(|&r| zeros(&ctx, r)).collect();
+        let repeat = if total > 100_000 { 16 } else { 128 };
+        let mut best = f64::MAX;
+        for pass_no in 0..9 {
+            let pass = ctx.begin().unwrap();
+            for r in 0..repeat {
+                let sets: Vec<(&QWeight, &Tensor)> =
+                    ws[r % copies].iter().zip(&ys).collect();
+                gemv_sets(&ctx, &pass, &sets, &x, 1).unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            if pass_no > 0 {
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+        }
+        let bytes: usize = ws[0].iter().map(|w| w.row_bytes * w.rows).sum();
+        let per = best / repeat as f64;
+        eprintln!(
+            "gemv {label:20} {total:6}x{cols:<5} {:8.1} us {:6.1} GB/s",
+            per * 1e6,
+            bytes as f64 / per / 1e9
+        );
+    }
+}
+
+/// The device's read bandwidth (tests/vulkan/g16_probe_test.comp) over a
+/// 512 MB buffer at several grid sizes: the ceiling the GEMVs aim at.
+#[test]
+#[ignore = "timing only"]
+fn read_bandwidth_probe() {
+    let ctx = ctx();
+    let bytes = 512usize << 20;
+    let src = Tensor::zeros(&ctx, &[bytes / 4], DType::F32).unwrap();
+    let out = zeros(&ctx, 1);
+    let pipeline = ctx.pipeline("g16_read_bw", SOURCE, MslVersion::V3_1).unwrap();
+    for groups in [64usize, 128, 256, 512, 1024, 2048, 4096] {
+        let mut best = f64::MAX;
+        for pass_no in 0..6 {
+            let pass = ctx.begin().unwrap();
+            for _ in 0..4 {
+                pass.dispatch_at(
+                    &pipeline,
+                    &[src.binding(), out.binding()],
+                    &[&u32_bytes(bytes / 16)],
+                    Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
+                )
+                .unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            if pass_no > 0 {
+                best = best.min(t.elapsed().as_secs_f64() / 4.0);
+            }
+        }
+        eprintln!("read {groups:5} groups: {:7.1} GB/s", bytes as f64 / best / 1e9);
     }
 }
