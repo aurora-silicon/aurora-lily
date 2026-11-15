@@ -102,10 +102,14 @@ quantizes the activations to 8 bits; lily keeps them f32).
 
 | | UD-IQ2_M | UD-Q5_K_M |
 |---|---|---|
-| prefill 1K / 4K / 16K | 1.5K tok/s at 4K, 1.0K at 16K | |
-| decode (plain, 1K context) | about 80 tok/s | about 80 tok/s |
-| decode, 2 drafts (prose, code) | 121, 124 tok/s | 132, 150 tok/s |
+| prefill 1K / 4K tokens | 1820 / 1500 tok/s | 1343 / 1174 tok/s |
+| prefill 16K | 1038 tok/s | |
+| decode, plain (1K / 4K context) | 10.9 / 10.6 ms a step | 11.1 / 11.1 ms |
+| decode, 2 drafts, greedy (prose, code) | 121, 124 tok/s | 131, 150 tok/s |
 
-Not done: Metal kernels; prompt attention on the matrix units (a 31K
-prompt prefills at about 140-700 tok/s depending on the global layers);
+Served (`--mtp-drafts 2`, UD-Q5_K_M, 400-token answers): 118 to 150 tok/s
+depending on the prompt, 58 to 87% of the drafts accepted.
+
+Not done: Metal kernels; prompt attention on the matrix units (it is a third of a 4K
+prompt's time and grows with the global layers' context);
 batching of decode steps across sessions; vision and audio towers.

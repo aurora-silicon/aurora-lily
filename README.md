@@ -1,4 +1,4 @@
-# lily on Linux: Qwen3.8-Flash-Next, GLM 5.3 Flash and DeepSeek V4 Flash on the Apple M5 Max
+# lily on Linux: Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash and Gemma 4 on the Apple M5 Max
 
 This fork runs [lily](https://github.com/perplexityai/pplx-garden/tree/main/lily),
 a compact inference server with hand-written GPU kernels, on **Linux on an
@@ -10,6 +10,7 @@ Apple M5 Max**, through Vulkan, and serves more than one model family:
 | Qwen3.8-Flash-Next (64 GB tier) | antirez's Q2 GGUF, loaded as it is | runs |
 | GLM 5.3 Flash | antirez's Q2 GGUF, loaded as it is | runs |
 | DeepSeek V4 Flash | antirez's Q2 GGUF and DSpark file, loaded as they are | runs |
+| Gemma 4 26B-A4B (16 GB and 32 GB machines) | unsloth's UD-IQ2_M and UD-Q5_K_M GGUFs and Gemma's draft model, loaded as they are | runs |
 
 It is developed on a 16-inch M5 Max MacBook Pro with 128 GB (J716c) running
 the [aurora-silicon](https://github.com/aurora-silicon) Linux kernel and
@@ -140,13 +141,21 @@ cargo build --release --locked
 ./target/release/lily --model ~/models/DeepSeek-V4-Flash-Q2/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
   --bind 127.0.0.1:8002 --max-seq 65536 --cache-bytes 9G --pin-weights off \
   --mtp-drafts 5 --max-batch 1
+
+# Gemma 4 26B-A4B, 32 GB machines (16 GB: UD-IQ2_M, --max-seq 8192
+# --cache-bytes 0.6G, no drafts); the draft model is found beside the model
+./target/release/lily --model ~/models/gemma-4-26B-A4B-it-UD-Q5_K_M.gguf \
+  --bind 127.0.0.1:8003 --max-seq 32768 --cache-bytes 2G --pin-weights off \
+  --mtp-drafts 2
 ```
 
 Only one model fits in 128 GB at a time; every loader takes a machine-wide
 instance lock before mapping weights. [docs/qwen38-q2.md](docs/qwen38-q2.md)
 covers the Q2 GGUF of Qwen. [docs/glm53.md](docs/glm53.md) has
 GLM's checkpoint, memory, differences from ds4 and what is not implemented
-yet; [docs/deepseek4.md](docs/deepseek4.md) the same for DeepSeek V4 Flash. [src/kernels/vulkan/PORTING.md](src/kernels/vulkan/PORTING.md) describes
+yet; [docs/deepseek4.md](docs/deepseek4.md) the same for DeepSeek V4 Flash
+and [docs/gemma4.md](docs/gemma4.md) for Gemma 4, with its files and memory
+for 16 GB and 32 GB machines. [src/kernels/vulkan/PORTING.md](src/kernels/vulkan/PORTING.md) describes
 the Vulkan port.
 
 ## The Linux port
@@ -195,6 +204,17 @@ against a schema of every tensor; `src/deepseek4/` holds the model and a CPU
 reference of every operation. Speculative decoding uses DSpark, antirez's
 three-stage block drafter (`--mtp-drafts 5`), which drafts up to five tokens
 a step and backs off when its drafts keep being rejected.
+
+## Gemma 4 26B-A4B
+
+Gemma 4 26B-A4B (30 layers: 25 sliding-window and 5 global attention
+layers, a dense GeGLU MLP and 128 routed experts with 8 active in each)
+runs from the published GGUF files, chosen so that everything lily
+allocates on the GPU stays under 11 GB on a 16 GB machine (UD-IQ2_M, 8K
+context) and under 24 GB on a 32 GB one (UD-Q5_K_M, 32K). `src/gemma4/`
+follows llama.cpp's graph, which is also the reference its scores are
+checked against on the same files. Speculative decoding uses Gemma's own
+draft model, which reads the target's caches (`--mtp-drafts 2`).
 
 ## Qwen3.8-Flash-Next
 
