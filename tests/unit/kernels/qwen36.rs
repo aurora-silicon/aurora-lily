@@ -669,3 +669,40 @@ fn gdn_step_matches_gdn_bitwise() {
         }
     }
 }
+
+/// The K = 2048 gate/up kernels against GLM's: the same bits.
+#[test]
+fn moe_gate_up_matches_glm53_bitwise() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(80);
+    let (experts, hidden, ff, used) = (12, 2048, 512, 8);
+    for (ty, m) in [(GgmlType::Q4K, 1), (GgmlType::Q4K, 3), (GgmlType::Q8_0, 2)] {
+        let q = |rng: &mut StdRng| {
+            let raw = random_blocks(rng, ty, hidden * experts * ff);
+            QWeight::from_bytes(&ctx, &raw, ty, hidden, experts * ff).unwrap()
+        };
+        let (gw, uw) = (q(&mut rng), q(&mut rng));
+        let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+        let sel: Vec<u32> =
+            (0..m * used).map(|p| ((p * 5 + 1) % experts) as u32).collect();
+        let tsel = u32s(&ctx, &sel);
+        let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+        let a = zeros(&ctx, m * used * ff, DType::F32);
+        let b = zeros(&ctx, m * used * ff, DType::F32);
+        run(&ctx, |p| {
+            moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &a, m, used).unwrap();
+            crate::kernels::glm53::moe_gate_up(
+                &ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &b, m, used, 0.0,
+            )
+            .unwrap();
+        });
+        let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+        for (k, (u, v)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(
+                u.to_bits(),
+                v.to_bits(),
+                "{ty:?} m {m} element {k}: {u} vs {v}"
+            );
+        }
+    }
+}

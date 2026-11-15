@@ -721,6 +721,74 @@ pub fn gdn_step(
     )
 }
 
+/// The routed experts' gate and up at decode (`glm53::moe_gate_up` without
+/// the clamp, the same bits) for rows of 2048 values (the model's hidden
+/// width) over Q4_K or Q8_0 experts, in less code; other widths take GLM's
+/// kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gate_up(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    ff: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    mid: &Tensor,
+    m: usize,
+    used: usize,
+) -> Result<()> {
+    let name = match gate.ty {
+        GgmlType::Q4K => "qwen36_moe_gate_up_q4_k_k2048",
+        GgmlType::Q8_0 => "qwen36_moe_gate_up_q8_0_k2048",
+        _ => "",
+    };
+    if gate.cols != 2048 || name.is_empty() {
+        return crate::kernels::glm53::moe_gate_up(
+            ctx, pass, gate, up, ff, x, sel, weights, mid, m, used, 0.0,
+        );
+    }
+    check(&[
+        (x, DType::F32),
+        (mid, DType::F32),
+        (sel, DType::U32),
+        (weights, DType::F32),
+    ])?;
+    ensure!(sel.numel() >= m * used && weights.numel() >= m * used, "selection");
+    ensure!(
+        gate.ty == up.ty && gate.cols == up.cols && gate.rows == up.rows,
+        "gate and up experts differ"
+    );
+    ensure!(gate.rows.is_multiple_of(ff), "expert rows {} of {ff}", gate.rows);
+    ensure!(
+        mid.numel() >= m * used * ff && x.numel() >= m * gate.cols,
+        "gate/up shapes"
+    );
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            gate.t.binding(),
+            up.t.binding(),
+            x.binding(),
+            sel.binding(),
+            weights.binding(),
+            mid.binding(),
+        ],
+        &[
+            &u32_bytes(gate.cols),
+            &u32_bytes(ff),
+            &u32_bytes(gate.row_bytes),
+            &u32_bytes(used),
+        ],
+        Grid::Threadgroups {
+            groups: (ff.div_ceil(8), m * used, 1),
+            threadgroup: (256, 1, 1),
+        },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/qwen36.rs"]
 mod tests;

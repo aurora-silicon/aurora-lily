@@ -1311,7 +1311,7 @@ impl Qwen36Model {
             }
             return pass.memory_barrier();
         }
-        g::moe_gate_up(
+        k::moe_gate_up(
             ctx,
             pass,
             &f.gate,
@@ -1323,7 +1323,6 @@ impl Qwen36Model {
             &sc.moe_mid,
             m,
             used,
-            0.0,
         )?;
         let xb = self.bf16_input(ctx, pass, sc, &sc.sfm, cfg.ff_shared, m)?;
         self.proj(ctx, pass, &[(&f.sh_down, &sc.sout)], &sc.sfm, xb, m)?;

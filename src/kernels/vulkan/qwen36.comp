@@ -793,3 +793,94 @@ void main() {
     }
 }
 #endif
+// ---------------------------------------------------------------------------
+// Routed experts' gate and up at decode (glm53_moe_gate_up_q4_k / _q8_0, the
+// same arithmetic bit for bit) for the model's rows of K = 2048 in less
+// code: no division or clamp by parameters, the task loop rolled (unrolled
+// it was slower: every level fetches its kernel's code cold), a Q4_K
+// block's header (d, dmin, 12 scale bytes) one 16-byte load. mid[slot][r] =
+// glm53_moe_act(gate_r . x, up_r . x, 0, w). One subgroup a row r. Grid
+// (F / 8, m * used), 256 threads. Buffers and params as glm53's: 0 gate,
+// 1 up, 2 x [m][K], 3 sel [m][used], 4 w [m][used], 5 mid; 6 K, 7 F,
+// 8 row_bytes, 9 used.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qwen36_moe_gate_up_q4_k_k2048) || defined(KERNEL_qwen36_moe_gate_up_q8_0_k2048)
+// glm53_moe_act (glm53.comp) without the clamp (limit 0): w ((g u) / (1 +
+// 2^(-g log2 e))) in its pinned order.
+float qwen36_moe_act(float g, float u, float we) {
+    precise float gu = g * u;
+    precise float e = exp2(-(g * uintBitsToFloat(0x3fb8aa3bu)));
+    precise float sv = we * (gu * (1.0 / (1.0 + e)));
+    return sv;
+}
+// glm53_decode_q4_k with the header as one load.
+void qwen36_decode_q4_k(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 144u;
+    const uint j = t & 7u;
+    const uvec4 hd = U32x4(b).v[0];
+    const float d = glm53_h2f(hd.x & 0xffffu);
+    const float dmin = glm53_h2f(hd.x >> 16u);
+    const uvec3 sw = hd.yzw;
+    #define Q4K_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
+    uint sc, m;
+    if (j < 4u) {
+        sc = Q4K_BYTE(j) & 63u;
+        m = Q4K_BYTE(j + 4u) & 63u;
+    } else {
+        sc = (Q4K_BYTE(j + 4u) & 0xfu) | ((Q4K_BYTE(j - 4u) >> 6u) << 4u);
+        m = (Q4K_BYTE(j + 4u) >> 4u) | ((Q4K_BYTE(j) >> 6u) << 4u);
+    }
+    #undef Q4K_BYTE
+    const float scale = d * float(sc);
+    const float minv = dmin * float(m);
+    const uint shift = (j & 1u) * 4u;
+    const uint64_t qs = b + 16u + (j >> 1u) * 32u;
+    [[unroll]] for (uint q = 0u; q < 2u; q++) {
+        const uvec4 v = U32x4(qs + 16u * q).v[0];
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            const uint word = v[c] >> shift;
+            [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                w[16u * q + 4u * c + k] = scale * float((word >> (8u * k)) & 0xfu) - minv;
+            }
+        }
+    }
+}
+void main() {
+    const uint K = 2048u;
+    const uint F = arg_u32(7);
+    const uint row_bytes = arg_u32(8);
+    const uint used = arg_u32(9);
+    const uint slot = gl_WorkGroupID.y;
+    const uint i = slot / used;
+    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    if (r >= F) return;
+    const uint e = U32(arg(3)).v[slot];
+    const float we = F32(arg(4)).v[slot];
+    const uint64_t off = (uint64_t(e) * F + r) * row_bytes;
+    const uint64_t gate = arg(0) + off;
+    const uint64_t up = arg(1) + off;
+    const uint64_t X = arg(2) + 4u * uint64_t(i) * K;
+    const uint tasks = K / GLM53_TASK;
+    float ag = 0.0, au = 0.0;
+    [[dont_unroll]] for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
+        float w[32];
+#ifdef KERNEL_qwen36_moe_gate_up_q4_k_k2048
+        qwen36_decode_q4_k(gate, t, w);
+#else
+        glm53_decode_q8_0(gate, t, w);
+#endif
+        ag += glm53_task_dot(w, X + 128u * t);
+#ifdef KERNEL_qwen36_moe_gate_up_q4_k_k2048
+        qwen36_decode_q4_k(up, t, w);
+#else
+        glm53_decode_q8_0(up, t, w);
+#endif
+        au += glm53_task_dot(w, X + 128u * t);
+    }
+    ag = subgroupAdd(ag);
+    au = subgroupAdd(au);
+    if (gl_SubgroupInvocationID == 0u) {
+        F32(arg(5)).v[slot * F + r] = qwen36_moe_act(ag, au, we);
+    }
+}
+#endif
