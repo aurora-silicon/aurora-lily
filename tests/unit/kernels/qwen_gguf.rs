@@ -800,3 +800,67 @@ fn moe_timing() {
         );
     }
 }
+
+/// The expert kernels' error against the CPU (f64 dots) at the model's
+/// shapes: RMS and max of the bfloat activations and outputs, relative to
+/// their RMS (`LILY_QG_MOE=old` for the one-row kernels).
+#[test]
+#[ignore = "accuracy report"]
+fn moe_accuracy() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(79);
+    let (h, ff, d_cols, experts, used) = (2560usize, 640usize, 768usize, 24usize, 10usize);
+    let raw_g = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * h);
+    let raw_u = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * h);
+    let raw_d = random_blocks(&mut rng, GgmlType::Q2K, experts * h * d_cols);
+    let wg = QWeight::from_bytes(&ctx, &raw_g, GgmlType::Iq2Xxs, h, experts * ff).unwrap();
+    let wu = QWeight::from_bytes(&ctx, &raw_u, GgmlType::Iq2Xxs, h, experts * ff).unwrap();
+    let wd = QWeight::from_bytes(&ctx, &raw_d, GgmlType::Q2K, d_cols, experts * h).unwrap();
+    let (cg, cu, cd) = (
+        decode(GgmlType::Iq2Xxs, &raw_g),
+        decode(GgmlType::Iq2Xxs, &raw_u),
+        decode(GgmlType::Q2K, &raw_d),
+    );
+    let rel = |got: &[f32], want: &[f32]| {
+        let n = want.len() as f64;
+        let rms = (want.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / n).sqrt();
+        let d: Vec<f64> = got.iter().zip(want).map(|(a, b)| f64::from(*a - *b).abs()).collect();
+        let e = (d.iter().map(|v| v * v).sum::<f64>() / d.len() as f64).sqrt();
+        (e / rms, d.iter().cloned().fold(0.0, f64::max) / rms)
+    };
+    for m in [1usize, 3] {
+        let (x, tx) = bf16_input(&ctx, &mut rng, m * h);
+        let sel: Vec<u32> = (0..m * used).map(|k| ((k * 7 + k / used) % experts) as u32).collect();
+        let scores: Vec<f32> = (0..m * used).map(|_| rng.gen_range(0.0..0.3)).collect();
+        let tsel =
+            Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32).unwrap();
+        let tsc = Tensor::from_f32(&ctx, &scores, &[scores.len()]).unwrap();
+        let act = Tensor::zeros(&ctx, &[m * used * ff], DType::BF16).unwrap();
+        let out = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
+        run(&ctx, |p| {
+            moe_gate_up(&ctx, p, &wg, &wu, ff, &tx, &tsel, &act, m, used).unwrap();
+            p.memory_barrier().unwrap();
+            moe_down(&ctx, p, &wd, ff, h, &act, &tsel, &tsc, None, &out, m, used).unwrap();
+        });
+        // The down stage against the CPU on the GPU's own activations.
+        let gact = act.to_f32().unwrap();
+        let (eact, _) =
+            cpu_moe(&cg, &cu, &cd, d_cols, &x, &sel, &scores, None, (m, used, ff, h));
+        let mut eout = vec![0f32; m * h];
+        for i in 0..m {
+            for r in 0..h {
+                let mut c = 0f64;
+                for s in 0..used {
+                    let slot = i * used + s;
+                    let row = (sel[slot] as usize * h + r) * d_cols;
+                    let v = dot(&cd[row..row + ff], &gact[slot * ff..(slot + 1) * ff]);
+                    c += f64::from(scores[slot]) * f64::from(v);
+                }
+                eout[i * h + r] = c as f32;
+            }
+        }
+        let (ar, am) = rel(&gact, &eact);
+        let (or, om) = rel(&out.to_f32().unwrap(), &eout);
+        println!("m={m}: act rms {ar:.3e} max {am:.3e} | out rms {or:.3e} max {om:.3e}");
+    }
+}

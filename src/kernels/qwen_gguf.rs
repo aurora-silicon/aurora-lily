@@ -251,11 +251,16 @@ pub fn moe_gate_up(
         act.dtype() == DType::BF16 && act.numel() >= m * used * ff,
         "expert activations"
     );
-    let name = match gate.ty {
-        GgmlType::Iq2Xxs => "qg_moe_gate_up_iq2_xxs",
-        GgmlType::Q4K => "qg_moe_gate_up_q4_k",
-        other => anyhow::bail!("no Qwen expert gate/up over {other:?}"),
+    // Rows of 16 x 32 x n values take the two-rows-a-subgroup kernels.
+    let pair = gate.cols.is_multiple_of(512) && !old_moe();
+    let name = match (gate.ty, pair) {
+        (GgmlType::Iq2Xxs, false) => "qg_moe_gate_up_iq2_xxs",
+        (GgmlType::Q4K, false) => "qg_moe_gate_up_q4_k",
+        (GgmlType::Iq2Xxs, true) => "qg_moe_gate_up2_iq2_xxs",
+        (GgmlType::Q4K, true) => "qg_moe_gate_up2_q4_k",
+        (other, _) => anyhow::bail!("no Qwen expert gate/up over {other:?}"),
     };
+    let rows_per_group = if pair { 16 } else { 8 };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -268,10 +273,16 @@ pub fn moe_gate_up(
             &u32_bytes(gate.rows / ff),
         ],
         Grid::Threadgroups {
-            groups: (ff.div_ceil(8), m * used, 1),
+            groups: (ff.div_ceil(rows_per_group), m * used, 1),
             threadgroup: (256, 1, 1),
         },
     )
+}
+
+/// `LILY_QG_MOE=old`: the one-row-a-subgroup expert kernels (A/B).
+fn old_moe() -> bool {
+    static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OLD.get_or_init(|| std::env::var("LILY_QG_MOE").is_ok_and(|v| v == "old"))
 }
 
 /// The shared expert a routed combine adds: its output `[m, hidden]`
@@ -311,11 +322,17 @@ pub fn moe_down(
     ensure!(sel.dtype() == DType::U32 && sel.numel() >= m * used, "selection");
     ensure!(scores.dtype() == DType::F32 && scores.numel() >= m * used, "scores");
     ensure!(out.dtype() == DType::BF16 && out.numel() >= m * hidden, "down output");
-    let name = match down.ty {
-        GgmlType::Q2K => "qg_moe_down_q2_k",
-        GgmlType::Mxfp4 => "qg_moe_down_mxfp4",
-        GgmlType::Q8_0 => "qg_moe_down_q8_0",
-        other => anyhow::bail!("no Qwen expert down over {other:?}"),
+    // 640 activations (Qwen3.8's experts): every row's slots in one
+    // subgroup, three a round.
+    let packed = ff == 640 && m <= 4 && !old_moe();
+    let name = match (down.ty, packed) {
+        (GgmlType::Q2K, false) => "qg_moe_down_q2_k",
+        (GgmlType::Mxfp4, false) => "qg_moe_down_mxfp4",
+        (GgmlType::Q8_0, false) => "qg_moe_down_q8_0",
+        (GgmlType::Q2K, true) => "qg_moe_down3_q2_k",
+        (GgmlType::Mxfp4, true) => "qg_moe_down3_mxfp4",
+        (GgmlType::Q8_0, true) => "qg_moe_down3_q8_0",
+        (other, _) => anyhow::bail!("no Qwen expert down over {other:?}"),
     };
     let mut flags = 0usize;
     let (sh_out, sh_gate) = match &shared {
@@ -354,9 +371,10 @@ pub fn moe_down(
             &u32_bytes(used),
             &u32_bytes(flags),
             &u32_bytes(down.rows / hidden),
+            &u32_bytes(m),
         ],
         Grid::Threadgroups {
-            groups: (hidden.div_ceil(8), m, 1),
+            groups: (hidden.div_ceil(8), if packed { 1 } else { m }, 1),
             threadgroup: (256, 1, 1),
         },
     )
