@@ -593,6 +593,8 @@ struct Run<'t> {
     tokens: &'t Tensor,
     /// A verify pass: no ring writes (see `Scratch::verify`).
     defer: bool,
+    /// A traced run: every intermediate in its f32 tensor.
+    traced: bool,
 }
 
 fn read(t: &Tensor, n: usize) -> Result<Vec<f32>> {
@@ -715,7 +717,7 @@ impl Ds4Model {
         ensure!(st.pos + m <= st.capacity, "state capacity {}", st.capacity);
         ensure!(layers.end <= cfg.n_layer, "layers {layers:?}");
         ensure!(!enc.defer || m <= EXACT_ROWS, "a verify pass of {m} rows");
-        let r = Run { pos0: st.pos, m, tokens, defer: enc.defer };
+        let r = Run { pos0: st.pos, m, tokens, defer: enc.defer, traced: false };
         // DSpark's target features: the rows whose support rows the drafter
         // can use (the last 128 of a run), captured after its target layers.
         let capture = enc.capture && self.dspark.is_some();
@@ -764,7 +766,7 @@ impl Ds4Model {
         trace: &mut Vec<LayerTrace>,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        let r = Run { pos0: st.pos, m, tokens: &sc.tokens, defer: false };
+        let r = Run { pos0: st.pos, m, tokens: &sc.tokens, defer: false, traced: true };
         let mut pass = ctx.begin_concurrent()?;
         d::embed(ctx, &pass, &self.embed, &sc.tokens, &sc.h, m)?;
         pass.memory_barrier()?;
@@ -1092,20 +1094,26 @@ impl Ds4Model {
             }
         }
         pass.memory_barrier()?;
+        // A prompt run's attention normalizes and rotates its queries as it
+        // loads them and rotates its output back into the grouped output's
+        // bfloat operand (a traced run keeps every step).
+        let fused = m > EXACT_ROWS && !r.traced;
         // Level 4: query norm and rotation; indexer queries.
-        d::head_norm_rope(
-            ctx,
-            pass,
-            &sc.q,
-            table,
-            t0,
-            m,
-            cfg.n_head,
-            cfg.head_dim,
-            cfg.n_rot,
-            cfg.rms_eps,
-            HeadOp::NormRope,
-        )?;
+        if !fused {
+            d::head_norm_rope(
+                ctx,
+                pass,
+                &sc.q,
+                table,
+                t0,
+                m,
+                cfg.n_head,
+                cfg.head_dim,
+                cfg.n_rot,
+                cfg.rms_eps,
+                HeadOp::NormRope,
+            )?;
+        }
         if sparse {
             d::indexer_q(ctx, pass, &sc.iq, &st.rope_yarn, t0, m, cfg.indexer_heads)?;
         }
@@ -1151,43 +1159,64 @@ impl Ds4Model {
         } else {
             CompRows::None
         };
-        d::attend(
-            ctx,
-            pass,
-            &sc.q,
-            b.kv_run,
-            &ls.ring,
-            rows,
-            &l.sinks,
-            &sc.heads,
-            m,
-            cfg.n_head,
-            pos0,
-            d::RawWindow::MODEL,
-        )?;
+        if fused {
+            let fuse = d::PromptFuse { table, t0, eps: cfg.rms_eps };
+            d::attend_prompt(
+                ctx,
+                pass,
+                &sc.q,
+                b.kv_run,
+                &ls.ring,
+                rows,
+                &l.sinks,
+                &sc.headsb,
+                m,
+                cfg.n_head,
+                pos0,
+                fuse,
+            )?;
+        } else {
+            d::attend(
+                ctx,
+                pass,
+                &sc.q,
+                b.kv_run,
+                &ls.ring,
+                rows,
+                &l.sinks,
+                &sc.heads,
+                m,
+                cfg.n_head,
+                pos0,
+                d::RawWindow::MODEL,
+            )?;
+        }
         pass.memory_barrier()?;
         // Rotate back; the ring takes the run's rows.
-        d::head_norm_rope(
-            ctx,
-            pass,
-            &sc.heads,
-            table,
-            t0,
-            m,
-            cfg.n_head,
-            cfg.head_dim,
-            cfg.n_rot,
-            0.0,
-            HeadOp::InverseRope,
-        )?;
+        if !fused {
+            d::head_norm_rope(
+                ctx,
+                pass,
+                &sc.heads,
+                table,
+                t0,
+                m,
+                cfg.n_head,
+                cfg.head_dim,
+                cfg.n_rot,
+                0.0,
+                HeadOp::InverseRope,
+            )?;
+        }
         if !r.defer {
             d::ring_store(ctx, pass, b.kv_run, &ls.ring, pos0, m)?;
         }
         pass.memory_barrier()?;
-        self.grouped_out(ctx, pass, sc, l, m)
+        self.grouped_out(ctx, pass, sc, l, m, fused)
     }
 
-    /// The grouped output projection from `sc.heads` to `sc.attn_out`.
+    /// The grouped output projection from `sc.heads` (`sc.headsb` when
+    /// `bf16_heads`, a prompt run's fused attention output) to `sc.attn_out`.
     fn grouped_out(
         &self,
         ctx: &MetalContext,
@@ -1195,6 +1224,7 @@ impl Ds4Model {
         sc: &Scratch,
         l: &LayerW,
         m: usize,
+        bf16_heads: bool,
     ) -> Result<()> {
         let cfg = &self.cfg;
         // The grouped output projection.
@@ -1210,9 +1240,11 @@ impl Ds4Model {
                 w_batch: cfg.o_lora,
                 y_batch: cfg.o_lora,
             };
-            let hb = self.bf16_copy(ctx, pass, &sc.heads, &sc.headsb, m, cfg.q_dim())?;
-            let hb = hb.expect("a prompt run");
-            k::gemm_bx_with(ctx, pass, &l.out_a, hb, &sc.low, m, cfg.o_lora, gl)?;
+            if !bf16_heads {
+                k::to_bf16(ctx, pass, &sc.heads, &sc.headsb, m * cfg.q_dim())?;
+                pass.memory_barrier()?;
+            }
+            k::gemm_bx_with(ctx, pass, &l.out_a, &sc.headsb, &sc.low, m, cfg.o_lora, gl)?;
         }
         let chunk = k::gemv_max_rows(l.out_a.ty);
         for c0 in (0..m).step_by(chunk).take_while(|_| m <= EXACT_ROWS) {

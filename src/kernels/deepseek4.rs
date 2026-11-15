@@ -387,6 +387,7 @@ pub fn topk(
 }
 
 /// The compressed rows a step's attention reads.
+#[derive(Clone, Copy)]
 pub enum CompRows<'t> {
     /// A layer without compression.
     None,
@@ -459,11 +460,84 @@ pub fn attend_with(
     raw: RawWindow,
     matrix: bool,
 ) -> Result<()> {
+    attend_inner(ctx, pass, q, kv_run, ring, comp, sinks, out, m, heads, pos0, raw, matrix, None)
+}
+
+/// What [`attend_prompt`] folds into the matrix-unit attention: the RoPE
+/// table of the rows (`table` row `t0` is row 0's) and the query norm's
+/// epsilon.
+#[derive(Clone, Copy)]
+pub struct PromptFuse<'a> {
+    pub table: &'a Tensor,
+    pub t0: usize,
+    pub eps: f32,
+}
+
+/// [`attend`] of a prompt run on the matrix units, with the queries as
+/// projected (their per-head norm and RoPE, [`head_norm_rope`]'s
+/// `NormRope`, applied as they load) and the output's inverse RoPE applied
+/// and stored as bfloat into `out` (BF16), the grouped output GEMM's
+/// operand.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_prompt(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    kv_run: &Tensor,
+    ring: &Tensor,
+    comp: CompRows<'_>,
+    sinks: &Tensor,
+    out: &Tensor,
+    m: usize,
+    heads: usize,
+    pos0: usize,
+    fuse: PromptFuse<'_>,
+) -> Result<()> {
+    attend_inner(
+        ctx,
+        pass,
+        q,
+        kv_run,
+        ring,
+        comp,
+        sinks,
+        out,
+        m,
+        heads,
+        pos0,
+        RawWindow::MODEL,
+        true,
+        Some(fuse),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attend_inner(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    kv_run: &Tensor,
+    ring: &Tensor,
+    comp: CompRows<'_>,
+    sinks: &Tensor,
+    out: &Tensor,
+    m: usize,
+    heads: usize,
+    pos0: usize,
+    raw: RawWindow,
+    matrix: bool,
+    fuse: Option<PromptFuse<'_>>,
+) -> Result<()> {
     ensure!(
         !matrix || (raw.at.is_none() && heads.is_multiple_of(16)),
         "matrix attention of {heads} heads"
     );
-    check(&[q, sinks, out], DType::F32)?;
+    check(&[q, sinks], DType::F32)?;
+    check(&[out], if fuse.is_some() { DType::BF16 } else { DType::F32 })?;
+    if let Some(f) = fuse {
+        check(&[f.table], DType::F32)?;
+        ensure!(f.table.numel() >= (f.t0 + m) * 64, "RoPE table of {}", f.table.numel());
+    }
     if let Some(at) = raw.at {
         ensure!(at >= pos0 && raw.lo <= at, "raw window at {at}");
         // The ring holds the positions before pos0: no two may share a slot.
@@ -488,8 +562,40 @@ pub fn attend_with(
         }
     };
     check(&[cache], DType::F16)?;
-    let name = if matrix { "ds4_attend_mu" } else { "ds4_attend" };
-    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    let scale = 1.0 / (KV_DIM as f32).sqrt();
+    if matrix {
+        let pipeline = ctx.pipeline("ds4_attend_mu", SOURCE, MslVersion::V3_1)?;
+        let (table, t0, eps) = fuse.map_or((q, 0, 0.0), |f| (f.table, f.t0, f.eps));
+        let flags = if fuse.is_some() { 3 } else { 0 };
+        return pass.dispatch_at(
+            &pipeline,
+            &[
+                q.binding(),
+                kv_run.binding(),
+                ring.binding(),
+                cache.binding(),
+                sel.unwrap_or(q).binding(),
+                count.unwrap_or(q).binding(),
+                sinks.binding(),
+                out.binding(),
+                table.binding(),
+            ],
+            &[
+                &u32_bytes(pos0),
+                &u32_bytes(ratio),
+                &u32_bytes(usize::from(use_sel)),
+                &u32_bytes(s),
+                &f32_bytes(scale),
+                &u32_bytes(raw.window),
+                &u32_bytes(raw.lo),
+                &u32_bytes(t0),
+                &u32_bytes(flags),
+                &f32_bytes(eps),
+            ],
+            Grid::Threadgroups { groups: (heads / 16, m, 1), threadgroup: (256, 1, 1) },
+        );
+    }
+    let pipeline = ctx.pipeline("ds4_attend", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[
@@ -507,15 +613,12 @@ pub fn attend_with(
             &u32_bytes(ratio),
             &u32_bytes(usize::from(use_sel)),
             &u32_bytes(s),
-            &f32_bytes(1.0 / (KV_DIM as f32).sqrt()),
+            &f32_bytes(scale),
             &u32_bytes(raw.at.map_or(0, |p| p + 1)),
             &u32_bytes(raw.window),
             &u32_bytes(raw.lo),
         ],
-        Grid::Threadgroups {
-            groups: (if matrix { heads / 16 } else { heads }, m, 1),
-            threadgroup: (256, 1, 1),
-        },
+        Grid::Threadgroups { groups: (heads, m, 1), threadgroup: (256, 1, 1) },
     )
 }
 

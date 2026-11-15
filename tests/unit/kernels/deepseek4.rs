@@ -443,6 +443,53 @@ fn attention_mu_matches_cpu() {
     );
 }
 
+/// The prompt attention with the query norm + RoPE folded into its loads
+/// and the inverse RoPE + bfloat store into its output, against the three
+/// separate steps (and a bfloat copy).
+#[test]
+fn attend_prompt_matches_separate_steps() {
+    let ctx = ctx();
+    let c = Config::deepseek4_flash();
+    let mut rng = StdRng::seed_from_u64(410);
+    let heads = 64;
+    let (pos0, m) = (100usize, 60usize);
+    let sinks = tensor(&ctx, &f32s(&mut rng, heads, -1.0, 2.0));
+    let (_, yarn) = tables(&c, 0, pos0 + m);
+    let tt = tensor(&ctx, &yarn);
+    let f16_rows = |rng: &mut StdRng, n: usize| -> Vec<f32> {
+        f32s(rng, n * 512, -1.0, 1.0).iter().map(|&v| round_f16(v)).collect()
+    };
+    let ring = f16_tensor(&ctx, &f16_rows(&mut rng, 128));
+    let run_rows = f16_tensor(&ctx, &f16_rows(&mut rng, m));
+    let comp = f16_tensor(&ctx, &f16_rows(&mut rng, (pos0 + m) / 4));
+    let rows = CompRows::All { cache: &comp, ratio: 4 };
+    let q = f32s(&mut rng, m * heads * 512, -2.0, 2.0);
+    let (qa, qb) = (tensor(&ctx, &q), tensor(&ctx, &q));
+    let out = zeros(&ctx, m * heads * 512, DType::F32);
+    let want = zeros(&ctx, m * heads * 512, DType::BF16);
+    let got = zeros(&ctx, m * heads * 512, DType::BF16);
+    let n = m * heads * 512;
+    run(&ctx, |p| {
+        head_norm_rope(&ctx, p, &qa, &tt, pos0, m, heads, 512, 64, 1e-6, HeadOp::NormRope)
+            .unwrap();
+        p.memory_barrier().unwrap();
+        let raw = RawWindow::MODEL;
+        attend_with(&ctx, p, &qa, &run_rows, &ring, rows, &sinks, &out, m, heads, pos0, raw, true)
+            .unwrap();
+        p.memory_barrier().unwrap();
+        head_norm_rope(&ctx, p, &out, &tt, pos0, m, heads, 512, 64, 0.0, HeadOp::InverseRope)
+            .unwrap();
+        p.memory_barrier().unwrap();
+        crate::kernels::glm53::to_bf16(&ctx, p, &out, &want, n).unwrap();
+        let fuse = PromptFuse { table: &tt, t0: pos0, eps: 1e-6 };
+        attend_prompt(&ctx, p, &qb, &run_rows, &ring, rows, &sinks, &got, m, heads, pos0, fuse)
+            .unwrap();
+    });
+    // A bfloat step, or an f16 step of a query moving a score (the norm's
+    // sum is in another order).
+    assert_close(&got.to_f32().unwrap(), &want.to_f32().unwrap(), 1e-4, 8e-3);
+}
+
 fn attention_case(
     seed: u64,
     matrix: bool,

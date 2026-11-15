@@ -629,8 +629,12 @@ void main() {
 // softmax weights are f16 on the matrix units with f32 accumulators (ds4's
 // prefill attention is f16 the same way); the scores take K 64 at a time in
 // MAT_K64's order, Q staged in that order at the A operand's places. Grid
-// (heads / 16, m), 256 threads; buffers and params as ds4_attend's (p_last
-// 0: no DSpark block).
+// (heads / 16, m), 256 threads. Buffers 0-7 as ds4_attend's, 8 the RoPE
+// table. Params: 9 pos0, 10 ratio, 11 use_sel, 12 S, 13 scale, 14 window,
+// 15 raw_lo, 16 table row of row 0, 17 flags, 18 eps. Flags bit 0: Q as
+// projected, its per-head norm and RoPE (ds4_head_norm_rope's NormRope)
+// applied as it is staged; bit 1: the output's inverse RoPE applied and
+// the result stored as bfloat (the grouped output GEMM's operand).
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_ds4_attend_mu
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -648,13 +652,16 @@ shared uint64_t kaddr[128];
 shared float red_m[8u * 16u];
 shared float red_l[8u * 16u];
 void main() {
-    const uint pos0 = arg_u32(8);
-    const uint ratio = arg_u32(9);
-    const bool use_sel = arg_u32(10) != 0u;
-    const uint S = arg_u32(11);
-    const float scale = arg_f32(12);
+    const uint pos0 = arg_u32(9);
+    const uint ratio = arg_u32(10);
+    const bool use_sel = arg_u32(11) != 0u;
+    const uint S = arg_u32(12);
+    const float scale = arg_f32(13);
     const uint window = arg_u32(14);
     const uint raw_lo = arg_u32(15);
+    const uint t0 = arg_u32(16);
+    const uint flags = arg_u32(17);
+    const float eps = arg_f32(18);
     const uint hg = gl_WorkGroupID.x;
     const uint i = gl_WorkGroupID.y;
     const uint heads = 16u * gl_NumWorkGroups.x;
@@ -673,6 +680,25 @@ void main() {
         const uint64_t Q = arg(0) + 4u * ((uint64_t(i) * heads + 16u * hg + r) * 512u + k0);
         vec4 v[8];
         [[unroll]] for (uint u = 0u; u < 8u; u++) v[u] = F32x4(Q + 16u * u).v[0];
+        if ((flags & 1u) != 0u) {
+            // The head's 512 values are 16 lanes' (lane bits 0-3).
+            float ss = 0.0;
+            [[unroll]] for (uint u = 0u; u < 8u; u++) ss += dot(v[u], v[u]);
+            ss += subgroupShuffleXor(ss, 1u);
+            ss += subgroupShuffleXor(ss, 2u);
+            ss += subgroupShuffleXor(ss, 4u);
+            ss += subgroupShuffleXor(ss, 8u);
+            const float norm = inversesqrt(ss / 512.0 + eps);
+            [[unroll]] for (uint u = 0u; u < 8u; u++) v[u] *= norm;
+            if (k0 >= 448u) {
+                const uint64_t T = arg(8) + 8u * (uint64_t(t0 + i) * 32u + (k0 - 448u) / 2u);
+                [[unroll]] for (uint u = 0u; u < 8u; u++) {
+                    const vec4 cs = F32x4(T + 16u * u).v[0];
+                    v[u].xy = ds4_rotate(v[u].xy, cs.xy, false);
+                    v[u].zw = ds4_rotate(v[u].zw, cs.zw, false);
+                }
+            }
+        }
         [[unroll]] for (uint u = 0u; u < 8u; u++) {
             [[unroll]] for (uint e = 0u; e < 4u; e++) {
                 const uint k = k0 + 4u * u + e;
@@ -808,10 +834,30 @@ void main() {
     const float M0 = max(m0, k0s), M1 = max(m1, k1s);
     const float g0 = exp(m0 - M0) / (l0 * exp(m0 - M0) + exp(k0s - M0));
     const float g1 = exp(m1 - M1) / (l1 * exp(m1 - M1) + exp(k1s - M1));
-    const uint64_t O = arg(7) + 4u * ((uint64_t(i) * heads + 16u * hg + lrow) * 512u + 64u * sg + lcol);
+    const uint64_t at = (uint64_t(i) * heads + 16u * hg + lrow) * 512u + 64u * sg + lcol;
+    if ((flags & 2u) == 0u) {
+        const uint64_t O = arg(7) + 4u * at;
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            F32x4(O + 64u * c).v[0] = vec4(o[c][0], o[c][1], o[c][2], o[c][3]) * g0;
+            F32x4(O + 2048u + 64u * c).v[0] = vec4(o[c][4], o[c][5], o[c][6], o[c][7]) * g1;
+        }
+        return;
+    }
+    const uint64_t O = arg(7) + 2u * at;
     [[unroll]] for (uint c = 0u; c < 4u; c++) {
-        F32x4(O + 64u * c).v[0] = vec4(o[c][0], o[c][1], o[c][2], o[c][3]) * g0;
-        F32x4(O + 2048u + 64u * c).v[0] = vec4(o[c][4], o[c][5], o[c][6], o[c][7]) * g1;
+        vec4 a = vec4(o[c][0], o[c][1], o[c][2], o[c][3]) * g0;
+        vec4 b = vec4(o[c][4], o[c][5], o[c][6], o[c][7]) * g1;
+        if (sg == 7u) {
+            // Dims 448 + 16 c + lcol ..: pairs (16 c + lcol) / 2 and the next.
+            const uint64_t T = arg(8) + 8u * (uint64_t(t0 + i) * 32u + (16u * c + lcol) / 2u);
+            const vec4 cs = F32x4(T).v[0];
+            a.xy = ds4_rotate(a.xy, cs.xy, true);
+            a.zw = ds4_rotate(a.zw, cs.zw, true);
+            b.xy = ds4_rotate(b.xy, cs.xy, true);
+            b.zw = ds4_rotate(b.zw, cs.zw, true);
+        }
+        U32x2(O + 32u * c).v[0] = mat_bf16_words(a);
+        U32x2(O + 1024u + 32u * c).v[0] = mat_bf16_words(b);
     }
 }
 #endif

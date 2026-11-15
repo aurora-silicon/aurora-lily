@@ -360,7 +360,7 @@ impl Ds4Model {
         emb[0] = t;
         crate::glm53::model::write_words(&dsc.emb_tok, &emb)?;
         crate::glm53::model::write_words(&dsc.toks, &[t])?;
-        let r = Run { pos0, m: n, tokens: &dsc.emb_tok, defer: false };
+        let r = Run { pos0, m: n, tokens: &dsc.emb_tok, defer: false, traced: false };
         let pass = ctx.begin_concurrent()?;
         d::embed(ctx, &pass, &self.embed, &dsc.emb_tok, &sc.h, n)?;
         pass.memory_barrier()?;
@@ -533,6 +533,6 @@ impl Ds4Model {
             HeadOp::InverseRope,
         )?;
         pass.memory_barrier()?;
-        self.grouped_out(ctx, pass, sc, l, n)
+        self.grouped_out(ctx, pass, sc, l, n, false)
     }
 }
