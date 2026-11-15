@@ -67,6 +67,7 @@ void main() {
 #define PL_X 1
 #define PL_W 0
 #endif
+// 2048 vec4s fill the M4's 32 KB of threadgroup memory; the x reads wrap.
 shared vec4 pl_s[2048];
 void main() {
     const uint rounds = arg_u32(1), tid = gl_LocalInvocationIndex, lane = tid & 31u;
@@ -88,9 +89,9 @@ void main() {
             vec4 x[PL_X > 0 ? PL_X : 1];
             [[unroll]] for (uint i = 0u; i < PL_X; i++) {
 #ifdef PL_XD
-                x[i] = pl_s[1024u + base + k * 16u + 4u * (lane & 7u) + i];
+                x[i] = pl_s[(1024u + base + k * 16u + 4u * (lane & 7u) + i) & 2047u];
 #else
-                x[i] = pl_s[1024u + base + k * 16u + 2u * sg + i];
+                x[i] = pl_s[(1024u + base + k * 16u + 2u * sg + i) & 2047u];
 #endif
             }
 #endif
