@@ -671,3 +671,132 @@ fn mxfp4_matches_ggml_values() {
         }
     }
 }
+
+/// Best wall time of five passes of `repeat` encodings of `f(pass, r)`.
+fn best_pass(ctx: &MetalContext, repeat: usize, f: impl Fn(&ComputePass<'_>, usize)) -> f64 {
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        let pass = ctx.begin().unwrap();
+        for r in 0..repeat {
+            f(&pass, r);
+        }
+        let t = std::time::Instant::now();
+        pass.commit_wait().unwrap();
+        best = best.min(t.elapsed().as_secs_f64());
+    }
+    best / repeat as f64
+}
+
+fn timing_repeat() -> usize {
+    std::env::var("LILY_QG_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+}
+
+/// The GEMVs of the Qwen3.8 Q2 file at its shapes and the verify pass's row
+/// counts: best of five passes of `LILY_QG_REPEAT` dispatches each over four
+/// weight copies (one for the LM head).
+#[test]
+#[ignore = "timing only"]
+fn gemv_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(77);
+    let repeat = timing_repeat();
+    let shapes = [
+        ("gdn qkv Q8_0 10240x2560", GgmlType::Q8_0, 2560, 10240),
+        ("gdn z Q8_0 6144x2560", GgmlType::Q8_0, 2560, 6144),
+        ("gdn out Q8_0 2560x6144", GgmlType::Q8_0, 6144, 2560),
+        ("attn q Q8_0 12288x2560", GgmlType::Q8_0, 2560, 12288),
+        ("shexp gu Q8_0 1280x2560", GgmlType::Q8_0, 2560, 1280),
+        ("shexp down Q8_0 2560x640", GgmlType::Q8_0, 640, 2560),
+        ("router BF16 512x2560", GgmlType::Bf16, 2560, 512),
+        ("head Q8_0 248320x2560", GgmlType::Q8_0, 2560, 248320),
+    ];
+    for (label, ty, cols, rows) in shapes {
+        let copies = if rows > 100_000 { 1 } else { 4 };
+        let ws: Vec<QWeight> = (0..copies)
+            .map(|_| {
+                let raw = random_blocks(&mut rng, ty, rows * cols);
+                QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+            })
+            .collect();
+        for m in 1..=3usize {
+            let (_, x) = bf16_input(&ctx, &mut rng, m * cols);
+            let y = Tensor::zeros(&ctx, &[m * rows], DType::BF16).unwrap();
+            let per = best_pass(&ctx, repeat, |p, r| {
+                gemv(&ctx, p, &ws[r % copies], &x, &y, m).unwrap()
+            });
+            let bytes = ws[0].row_bytes * rows;
+            println!(
+                "{label:26} m={m} {:8.1} us  {:6.1} GB/s",
+                per * 1e6,
+                bytes as f64 / per / 1e9
+            );
+        }
+    }
+}
+
+/// The routed experts' gathers at the model's shapes (10 of 512 experts,
+/// IQ2_XXS gate/up 640 x 2560, Q2_K down 2560 x 768): one row, and three
+/// rows sharing `LILY_QG_SHARED` (default 4) experts of each later row with
+/// the row before it, as a verify pass's consecutive tokens do. Per layer.
+#[test]
+#[ignore = "timing only"]
+fn moe_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(78);
+    let repeat = timing_repeat();
+    let shared_n: usize =
+        std::env::var("LILY_QG_SHARED").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let (experts, h, ff, d_cols, used) = (64usize, 2560usize, 640usize, 768usize, 10usize);
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let layers: Vec<(QWeight, QWeight, QWeight)> = (0..4)
+        .map(|_| {
+            (
+                mk(&mut rng, GgmlType::Iq2Xxs, h, experts * ff),
+                mk(&mut rng, GgmlType::Iq2Xxs, h, experts * ff),
+                mk(&mut rng, GgmlType::Q2K, d_cols, experts * h),
+            )
+        })
+        .collect();
+    for m in [1usize, 2, 3] {
+        // Row i's experts: shared_n of row i - 1's, the rest new.
+        let mut sel: Vec<u32> = Vec::new();
+        let mut next = 0u32;
+        for i in 0..m {
+            for s in 0..used {
+                if i > 0 && s < shared_n {
+                    sel.push(sel[(i - 1) * used + used - 1 - s]);
+                } else {
+                    sel.push(next % experts as u32);
+                    next += 1;
+                }
+            }
+        }
+        let tsel =
+            Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+                .unwrap();
+        let scores: Vec<f32> = (0..m * used).map(|_| rng.gen_range(0.0..0.5)).collect();
+        let tsc = Tensor::from_f32(&ctx, &scores, &[scores.len()]).unwrap();
+        let (_, x) = bf16_input(&ctx, &mut rng, m * h);
+        let (_, so) = bf16_input(&ctx, &mut rng, m * h);
+        let tsg = Tensor::from_f32(&ctx, &vec![0.5f32; m], &[m]).unwrap();
+        let act = Tensor::zeros(&ctx, &[m * used * ff], DType::BF16).unwrap();
+        let out = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
+        let gu = best_pass(&ctx, repeat, |p, r| {
+            let (g, u, _) = &layers[r % 4];
+            moe_gate_up(&ctx, p, g, u, ff, &x, &tsel, &act, m, used).unwrap();
+        });
+        let down = best_pass(&ctx, repeat, |p, r| {
+            let (_, _, d) = &layers[r % 4];
+            let shared = Some(SharedAdd { out: &so, gate: &tsg });
+            moe_down(&ctx, p, d, ff, h, &act, &tsel, &tsc, shared, &out, m, used).unwrap();
+        });
+        println!(
+            "m={m} shared {shared_n}: gate/up {:7.1} us  down {:7.1} us",
+            gu * 1e6,
+            down * 1e6
+        );
+    }
+}
