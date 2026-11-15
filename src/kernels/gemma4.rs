@@ -365,6 +365,8 @@ pub fn attention(
         u32_bytes(a.window),
     ];
     let chunks = attn_chunks(a, pos0, m);
+    // gemma4_attn_combine holds a row's chunk weights in threadgroup memory.
+    ensure!(chunks <= 1024, "attention over {chunks} chunks");
     ensure!(
         partial.numel() >= attn_partial_len(m, a.heads, d, chunks),
         "attention partials of {} for {chunks} chunks",

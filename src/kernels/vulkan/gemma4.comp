@@ -435,25 +435,48 @@ void main() {
 // Buffers: 0 partial, 1 heads [m][H][d]. Params: 2 d, 3 H, 4 chunks.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_gemma4_attn_combine
+// Each chunk's max and weight exp(m - M) once, in threadgroup memory
+// (every thread recomputed both for every value and chunk); the sums keep
+// their order, so the results are the same.
+#define G4_MAXC 1024u
+shared float g4c_m[G4_MAXC], g4c_w[G4_MAXC], g4c_red[8];
 void main() {
     const uint d = arg_u32(2);
     const uint H = arg_u32(3);
-    const uint chunks = arg_u32(4);
+    const uint chunks = min(arg_u32(4), G4_MAXC);
     const uint h = gl_WorkGroupID.x, i = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
     const uint64_t P = arg(0) + 4u * ((uint64_t(i) * H + h) * chunks * (d + 2u));
-    float M = -1.0 / 0.0;
-    for (uint c = 0u; c < chunks; c++) M = max(M, F32(P).v[c * (d + 2u)]);
-    float L = 0.0;
-    for (uint c = 0u; c < chunks; c++) {
+    float mx = -1.0 / 0.0;
+    for (uint c = tid; c < chunks; c += 256u) {
         const float m = F32(P).v[c * (d + 2u)];
-        if (m != -1.0 / 0.0) L += F32(P).v[c * (d + 2u) + 1u] * exp(m - M);
+        g4c_m[c] = m;
+        mx = max(mx, m);
     }
+    mx = subgroupMax(mx);
+    if (gl_SubgroupInvocationID == 0u) g4c_red[gl_SubgroupID] = mx;
+    barrier();
+    float M = -1.0 / 0.0;
+    [[unroll]] for (uint s = 0u; s < 8u; s++) M = max(M, g4c_red[s]);
+    for (uint c = tid; c < chunks; c += 256u) {
+        const float m = g4c_m[c];
+        g4c_w[c] = m != -1.0 / 0.0 ? exp(m - M) : 0.0;
+    }
+    barrier();
+    if (tid == 0u) {
+        float L = 0.0;
+        for (uint c = 0u; c < chunks; c++) {
+            if (g4c_m[c] != -1.0 / 0.0) L += F32(P).v[c * (d + 2u) + 1u] * g4c_w[c];
+        }
+        g4c_red[0] = L;
+    }
+    barrier();
+    const float L = g4c_red[0];
     const uint64_t O = arg(1) + 4u * ((uint64_t(i) * H + h) * d);
-    for (uint e = gl_LocalInvocationIndex; e < d; e += 256u) {
+    for (uint e = tid; e < d; e += 256u) {
         float a = 0.0;
         for (uint c = 0u; c < chunks; c++) {
-            const float m = F32(P).v[c * (d + 2u)];
-            if (m != -1.0 / 0.0) a += F32(P).v[c * (d + 2u) + 2u + e] * exp(m - M);
+            if (g4c_m[c] != -1.0 / 0.0) a += F32(P).v[c * (d + 2u) + 2u + e] * g4c_w[c];
         }
         F32(O).v[e] = a / L;
     }
