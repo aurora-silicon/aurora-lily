@@ -2343,6 +2343,11 @@ fn gemm_bx_matches_gemm() {
         (GgmlType::Q4K, 512, 136, 1024),
         (GgmlType::F16, 256, 72, 255),
         (GgmlType::F16, 512, 100, 513),
+        // Short runs over 8 192 weight rows (four-subgroup tiles), and
+        // their edge at 128 and 129 rows.
+        (GgmlType::Q8_0, 256, 8192, 24),
+        (GgmlType::Q4K, 256, 8200, 128),
+        (GgmlType::Q8_0, 256, 8192, 129),
     ] {
         let raw = random_blocks(&mut rng, ty, rows * cols);
         let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
@@ -2540,10 +2545,312 @@ fn moe_grouped_case(used: usize) {
     }
 }
 
+/// The register path of short runs' experts ([`moe_grouped_dot`]) on a
+/// sparse selection (40 experts; 6, 9 and 7 rows: experts of one to three
+/// rows, all on the register path) against the per-pair f32 kernels, at
+/// least as close as the bfloat tiles ([`moe_grouped`]), for 8 and 6 slots.
+/// The route boundaries are `moe_grouped_dot_route_boundaries`'.
+#[test]
+fn moe_grouped_dot_matches_per_pair_kernels() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(80);
+    let (experts, hidden, ff) = (40, 512, 256);
+    let g_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
+    let u_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
+    let d_raw = random_blocks(&mut rng, GgmlType::Q2K, experts * hidden * ff);
+    let gw = QWeight::from_bytes(&ctx, &g_raw, GgmlType::Iq2Xxs, hidden, experts * ff)
+        .unwrap();
+    let uw = QWeight::from_bytes(&ctx, &u_raw, GgmlType::Iq2Xxs, hidden, experts * ff)
+        .unwrap();
+    let dw =
+        QWeight::from_bytes(&ctx, &d_raw, GgmlType::Q2K, ff, experts * hidden).unwrap();
+    for (m, used) in [(6usize, 8usize), (9, 8), (7, 6)] {
+        let x = f32s(&mut rng, m * hidden, -2.0, 2.0);
+        // Distinct experts a row; rows 0 and 1 share three, so some experts
+        // have two rows and a few three.
+        let sel: Vec<u32> = (0..m)
+            .flat_map(|i| (0..used).map(move |s| ((i * 5 + s * 7) % experts) as u32))
+            .collect();
+        for i in 0..m {
+            let row = &sel[i * used..(i + 1) * used];
+            for a in 0..used {
+                assert!(!row[a + 1..].contains(&row[a]), "row {i} repeats an expert");
+            }
+        }
+        let wts = f32s(&mut rng, m * used, 0.1, 0.6);
+        let shared = f32s(&mut rng, m * hidden, -1.0, 1.0);
+        let tx = tensor(&ctx, &x);
+        let tsel = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&sel),
+            &[sel.len()],
+            DType::U32,
+        )
+        .unwrap();
+        let tw = tensor(&ctx, &wts);
+        let (tiles, dot, reference) =
+            (tensor(&ctx, &shared), tensor(&ctx, &shared), tensor(&ctx, &shared));
+        let mid = zeros(&ctx, m * used * ff);
+        let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+        run(&ctx, |p| {
+            moe_grouped(
+                &ctx, p, &gw, &uw, &dw, ff, hidden, &tx, &tsel, &tw, &tiles, &gs, m,
+                used, experts, 0.05,
+            )
+            .unwrap();
+        });
+        run(&ctx, |p| {
+            moe_grouped_dot(
+                &ctx, p, &gw, &uw, &dw, ff, hidden, &tx, &tsel, &tw, &dot, &gs, m,
+                used, experts, 0.05,
+            )
+            .unwrap();
+            moe_gate_up(&ctx, p, &gw, &uw, ff, &tx, &tsel, &tw, &mid, m, used, 0.05)
+                .unwrap();
+            moe_down(
+                &ctx,
+                p,
+                &dw,
+                hidden,
+                &mid,
+                &tsel,
+                Some(&reference),
+                &reference,
+                m,
+                used,
+            )
+            .unwrap();
+        });
+        let b = reference.to_f32().unwrap();
+        let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
+        let mut err = [0f64; 2];
+        for (route, t) in [&tiles, &dot].into_iter().enumerate() {
+            let a = t.to_f32().unwrap();
+            for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    (x - y).abs() <= 3e-2 * scale,
+                    "m {m} route {route} element {k}: {x} vs {y}"
+                );
+                err[route] += f64::from(x - y).powi(2);
+            }
+        }
+        assert!(
+            err[1] <= err[0],
+            "m {m}: register path error {} above tiles' {}",
+            err[1],
+            err[0]
+        );
+    }
+}
+
+/// The register path's route boundaries ([`moe_grouped_dot`]) with
+/// controlled expert occupancies: single-tile experts of 1, 2, 3 and 4 rows
+/// take it, one of 5 rows does not, nor do experts split over tiles whose
+/// last tile has 1 to 4 rows (64 + 1..4 with 64-row tiles, 128 + 1..4 with
+/// 128-row tiles), nor full 64-row fillers. Per pair, the gate/up output
+/// (`mid`) and the down output of an expert on the register path differ
+/// from the tile route's and are at least as close to the per-pair f32
+/// kernels; every other expert's are the tile route's bit for bit. Two runs
+/// give the same bits. Unclamped and clamped (10) SwiGLU.
+#[test]
+fn moe_grouped_dot_route_boundaries() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(81);
+    let (hidden, ff, used, m) = (512usize, 256usize, 8usize, 140usize);
+    // Experts 0-4: 1..5 rows; 5-8: 65..68; 9-12: 129..132; then fillers.
+    let mut occ: Vec<usize> = vec![1, 2, 3, 4, 5, 65, 66, 67, 68, 129, 130, 131, 132];
+    let mut left = m * used - occ.iter().sum::<usize>();
+    while left > 0 {
+        let c = left.min(64);
+        occ.push(c);
+        left -= c;
+    }
+    let experts = occ.len();
+    // Pairs of an expert go to consecutive rows (mod m): no row repeats an
+    // expert (every count <= m), and every row gets `used` pairs.
+    let mut rows: Vec<Vec<u32>> = vec![Vec::new(); m];
+    let mut cursor = 0;
+    for (e, &c) in occ.iter().enumerate() {
+        for _ in 0..c {
+            rows[cursor % m].push(e as u32);
+            cursor += 1;
+        }
+    }
+    assert!(rows.iter().all(|r| r.len() == used), "rows of {used} slots");
+    let sel: Vec<u32> = rows.concat();
+    let mut count = vec![0usize; experts];
+    for &e in &sel {
+        count[e as usize] += 1;
+    }
+    assert_eq!(count, occ, "occupancies as built");
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+    let shared = f32s(&mut rng, m * hidden, -1.0, 1.0);
+    let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+    for limit in [0.0f32, 10.0] {
+        // The per-pair f32 kernels: mid and the routed sum plus shared.
+        let mid_ref = zeros(&ctx, m * used * ff);
+        let out_ref = tensor(&ctx, &shared);
+        run(&ctx, |p| {
+            moe_gate_up(
+                &ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid_ref, m, used, limit,
+            )
+            .unwrap();
+            moe_down(
+                &ctx,
+                p,
+                &dw,
+                hidden,
+                &mid_ref,
+                &tsel,
+                Some(&out_ref),
+                &out_ref,
+                m,
+                used,
+            )
+            .unwrap();
+        });
+        let mid_ref = mid_ref.to_f32().unwrap();
+        let out_ref = out_ref.to_f32().unwrap();
+        for (tile_rows, tiles) in [(64usize, MoeTiles::R64), (128, MoeTiles::R128)] {
+            let route = |dot: usize| {
+                let out = tensor(&ctx, &shared);
+                run(&ctx, |p| {
+                    moe_grouped_with(
+                        &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs,
+                        m, used, experts, limit, true, tiles, dot,
+                    )
+                    .unwrap()
+                });
+                (
+                    gs.mid.to_f32().unwrap(),
+                    gs.down.to_f32().unwrap(),
+                    out.to_f32().unwrap(),
+                )
+            };
+            let tiles = route(0);
+            let dot = route(MOE_DOT_ROWS);
+            let again = route(MOE_DOT_ROWS);
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&dot.0), bits(&again.0), "mid repeat, tiles {tile_rows}");
+            assert_eq!(bits(&dot.2), bits(&again.2), "out repeat, tiles {tile_rows}");
+            // Routed sums against the f32 kernels, both routes.
+            let scale = (out_ref.iter().map(|v| v * v).sum::<f32>()
+                / out_ref.len() as f32)
+                .sqrt();
+            // Unclamped, the tiles' worst element is ~3.1% of the RMS, the
+            // register path's ~2.3% (bfloat inputs and intermediate).
+            for (k, ((a, b), r)) in tiles.2.iter().zip(&dot.2).zip(&out_ref).enumerate()
+            {
+                assert!(
+                    (a - r).abs() <= 4e-2 * scale,
+                    "limit {limit} tiles {tile_rows} out {k}"
+                );
+                assert!(
+                    (b - r).abs() <= 4e-2 * scale,
+                    "limit {limit} dot {tile_rows} out {k}"
+                );
+            }
+            let mut err = [0f64; 2];
+            for (pair, &e) in sel.iter().enumerate() {
+                let c = occ[e as usize];
+                let on_dot = c <= MOE_DOT_ROWS && c <= tile_rows;
+                let (mr, mt, md) = (
+                    &mid_ref[pair * ff..(pair + 1) * ff],
+                    &tiles.0[pair * ff..(pair + 1) * ff],
+                    &dot.0[pair * ff..(pair + 1) * ff],
+                );
+                let (dt, dd) = (
+                    &tiles.1[pair * hidden..(pair + 1) * hidden],
+                    &dot.1[pair * hidden..(pair + 1) * hidden],
+                );
+                if on_dot {
+                    assert_ne!(
+                        bits(mt),
+                        bits(md),
+                        "expert {e} ({c} rows) took the tiles"
+                    );
+                    assert_ne!(
+                        bits(dt),
+                        bits(dd),
+                        "expert {e} ({c} rows) down took the tiles"
+                    );
+                    let ms = (mr.iter().map(|v| v * v).sum::<f32>() / ff as f32).sqrt();
+                    // mid is bfloat: half a bfloat step of the value plus the
+                    // inputs' bfloat rounding over the row. (The tiles round
+                    // every weight too: their worst element is a few times
+                    // that, compared in aggregate below.)
+                    for (j, ((t, d), r)) in mt.iter().zip(md).zip(mr).enumerate() {
+                        let tol = r.abs() / 128.0 + 2e-2 * ms + 1e-6;
+                        assert!(
+                            (d - r).abs() <= tol,
+                            "limit {limit} expert {e} pair {pair} mid {j}: {d} vs {r}"
+                        );
+                        err[0] += f64::from(t - r).powi(2);
+                        err[1] += f64::from(d - r).powi(2);
+                    }
+                } else {
+                    assert_eq!(
+                        bits(mt),
+                        bits(md),
+                        "expert {e} ({c} rows) mid, tiles {tile_rows}"
+                    );
+                    assert_eq!(
+                        bits(dt),
+                        bits(dd),
+                        "expert {e} ({c} rows) down, tiles {tile_rows}"
+                    );
+                }
+            }
+            assert!(
+                err[1] <= err[0],
+                "limit {limit} tiles {tile_rows}: register path mid error {} above tiles' {}",
+                err[1],
+                err[0]
+            );
+        }
+    }
+}
+
+/// The GPU zero fill (`zero`) clears exactly its tensor: a view 64 values
+/// into a nonzero buffer, 3 140 values long (785 16-byte units: the last
+/// 256-thread group partial), with the values around it untouched.
+#[test]
+fn gpu_zero_fills_its_view_only() {
+    let ctx = ctx();
+    let (lead, len, tail) = (64usize, 4 * (256 * 3 + 17), 64usize);
+    let n = lead + len + tail;
+    let pattern: Vec<f32> = (0..n).map(|i| 1.0 + i as f32).collect();
+    let all = tensor(&ctx, &pattern);
+    let view = all.view(lead, &[len]).unwrap();
+    run(&ctx, |p| zero(&ctx, p, &view).unwrap());
+    let got = all.to_f32().unwrap();
+    for (i, (&g, &p)) in got.iter().zip(&pattern).enumerate() {
+        let want = if (lead..lead + len).contains(&i) { 0.0 } else { p };
+        assert_eq!(g.to_bits(), want.to_bits(), "value {i}");
+    }
+    // A length that is not whole 16-byte units is refused.
+    let odd = all.view(lead, &[len - 1]).unwrap();
+    let pass = ctx.begin().unwrap();
+    assert!(zero(&ctx, &pass, &odd).is_err());
+    pass.commit_wait().unwrap();
+}
+
 /// The prefill's grouped routed experts at the model's shapes (gate/up
 /// IQ2_XXS 2048 x 4096, down Q2_K 4096 x 2048) over 64 experts, for runs
 /// whose pairs per expert match a 256-token and a 4K-token prompt of the
-/// model (288 experts, 8 used): best of three passes of one call.
+/// model (288 experts, 8 used), and a 24- and 64-token prompt: best of five
+/// passes of four calls.
 #[test]
 #[ignore = "timing only"]
 fn moe_grouped_timing() {
@@ -2558,8 +2865,12 @@ fn moe_grouped_timing() {
     let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
     // Rows such that pairs per expert = n * 8 / 288 for prompts of 256, 1K
-    // and 4K tokens; DeepSeek V4's 2K (6 of 256: 48 a expert).
+    // and 4K tokens; DeepSeek V4's 2K (6 of 256: 48 a expert). A 24-token
+    // prompt picks ~140 of 288 experts, 1.4 pairs each; 64 tokens ~240, 2.1
+    // each.
     for (label, m) in [
+        ("24-token density", 11),
+        ("64-token density", 17),
         ("256-token density", 57),
         ("1K-token density", 228),
         ("4K-token density", 910),
@@ -2582,21 +2893,27 @@ fn moe_grouped_timing() {
         let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
         let out = zeros(&ctx, m * hidden);
         let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
-        for tile_rows in [MoeTiles::R64, MoeTiles::R128] {
+        for (tile_rows, dot) in
+            [(MoeTiles::R64, 0), (MoeTiles::R64, MOE_DOT_ROWS), (MoeTiles::R128, 0)]
+        {
             let mut best = f64::MAX;
-            for _ in 0..3 {
+            for _ in 0..5 {
                 let pass = ctx.begin().unwrap();
-                moe_grouped_with(
-                    &ctx, &pass, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs,
-                    m, used, experts, 10.0, true, tile_rows,
-                )
-                .unwrap();
+                for _ in 0..4 {
+                    moe_grouped_with(
+                        &ctx, &pass, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out,
+                        &gs, m, used, experts, 10.0, true, tile_rows, dot,
+                    )
+                    .unwrap();
+                    pass.memory_barrier().unwrap();
+                }
                 let t = std::time::Instant::now();
                 pass.commit_wait().unwrap();
-                best = best.min(t.elapsed().as_secs_f64());
+                best = best.min(t.elapsed().as_secs_f64() / 4.0);
             }
             println!(
-                "moe grouped {label:20} m {m:4} tiles {tile_rows:?}: {:8.1} us",
+                "moe grouped {label:20} m {m:4} tiles {tile_rows:?}{}: {:8.1} us",
+                if dot > 0 { " dot" } else { "    " },
                 best * 1e6
             );
         }
@@ -2760,7 +3077,7 @@ fn moe_grouped_fused_matches_separate() {
             run(&ctx, |p| {
                 moe_grouped_with(
                     &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m,
-                    used, experts, limit, fused, tile_rows,
+                    used, experts, limit, fused, tile_rows, 0,
                 )
                 .unwrap()
             });
@@ -3013,5 +3330,55 @@ fn moe_rows_timing() {
             line += &format!("  {name} {:6.1} us", best / repeat as f64 * 1e6);
         }
         println!("{line}");
+    }
+}
+
+/// The dense bfloat-input GEMM at a short prompt's rows (`LILY_GLM53_ROWS`,
+/// default 8,24,64): us a call, eight calls a pass (independent: they
+/// overlap as a level's do).
+#[test]
+#[ignore = "timing only"]
+fn gemm_small_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(74);
+    let rows_list: Vec<usize> = std::env::var("LILY_GLM53_ROWS")
+        .unwrap_or_else(|_| "8,24,64".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    for (label, ty, cols, rows) in [
+        ("kda_v Q8_0 8192x4096", GgmlType::Q8_0, 4096usize, 8192usize),
+        ("kda_out Q8_0 4096x8192", GgmlType::Q8_0, 8192, 4096),
+        ("kda_q Q4_K 8192x4096", GgmlType::Q4K, 4096, 8192),
+        ("shexp Q8_0 2048x4096", GgmlType::Q8_0, 4096, 2048),
+    ] {
+        let ws: Vec<QWeight> = (0..4)
+            .map(|_| {
+                let raw = random_blocks(&mut rng, ty, rows * cols);
+                QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+            })
+            .collect();
+        let bytes = ws[0].t.byte_len() as f64;
+        for &m in &rows_list {
+            let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
+            let xb = Tensor::zeros(&ctx, &[m * cols], DType::BF16).unwrap();
+            run(&ctx, |p| to_bf16(&ctx, p, &x, &xb, m * cols).unwrap());
+            let ys: Vec<Tensor> = (0..8).map(|_| zeros(&ctx, m * rows)).collect();
+            let mut best = f64::MAX;
+            for _ in 0..4 {
+                let pass = ctx.begin().unwrap();
+                for (r, y) in ys.iter().enumerate() {
+                    gemm_bx(&ctx, &pass, &ws[r % 4], &xb, y, m).unwrap();
+                }
+                let t = std::time::Instant::now();
+                pass.commit_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64() / 8.0);
+            }
+            println!(
+                "gemm small {label:24} m {m:3}: {:7.1} us {:4.0} GB/s",
+                best * 1e6,
+                bytes / best / 1e9
+            );
+        }
     }
 }

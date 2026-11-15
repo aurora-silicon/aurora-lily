@@ -59,6 +59,19 @@ uint glm53_bf16_bits(float f) {
 #define KERNEL_glm53_gemm_q6_k
 #define GEMM_BX
 #endif
+// The _bx4 forms: four subgroups a threadgroup (128 rows of X, a thread
+// decoding 4 weight rows a step), the same products in the same order:
+// short runs over wide weights (gemm_bx).
+#ifdef KERNEL_glm53_gemm_q8_0_bx4
+#define KERNEL_glm53_gemm_q8_0
+#define GEMM_BX
+#define GM_BX_SG 4
+#endif
+#ifdef KERNEL_glm53_gemm_q4_k_bx4
+#define KERNEL_glm53_gemm_q4_k
+#define GEMM_BX
+#define GM_BX_SG 4
+#endif
 
 // The _r128 expert variants: tiles of up to 128 rows, a subgroup taking 32
 // (moe_group's cap set to match). A row's sums are the same products in
@@ -87,6 +100,9 @@ uint glm53_bf16_bits(float f) {
 #endif
 #ifndef GM_SUB
 #define GM_SUB 16u
+#endif
+#ifndef GM_DOT_ROWS
+#define GM_DOT_ROWS 4u
 #endif
 
 // Gemma 4's block types (glm53_gemm_q4_0, _q5_k, _q6_k, _iq4_nl, _iq2_s):
@@ -276,7 +292,9 @@ void gd_decode8(uint64_t row, uint k, out float w[8]) {
 #define GM_BX_SUB 32u
 // Subgroups a threadgroup: 4 (a thread decodes 8 values of 4 weight rows a
 // step) or 8 (of 2 rows).
+#ifndef GM_BX_SG
 #define GM_BX_SG 8
+#endif
 void main() {
     const uint M = arg_u32(3);
     const uint N = arg_u32(4);
@@ -485,6 +503,8 @@ void main() {
 // SwiGLU of each pair (weights f32 at buffer 7) to Y as bfloat, the down
 // GEMM's operand; its params are 8 N, 9 K, 10 row_bytes, 11 x_shift,
 // 12 limit.
+// The last param (10, or 13 for the fused gate/up) is the most rows a tile
+// takes the register path with (at most GM_DOT_ROWS; 0: none).
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
     defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q4_k) || \
@@ -492,8 +512,10 @@ void main() {
 #ifdef KERNEL_glm53_gemm_moe_gate_up_iq2_xxs
 #define GM_GATE_UP 1
 #define GM_P 8u
+#define GM_DOT_ARG 13u
 #else
 #define GM_P 6u
+#define GM_DOT_ARG 10u
 #endif
 
 // Weights k .. k + 8 (k a multiple of 8) of `row`.
@@ -595,6 +617,48 @@ void main() {
     const uint64_t W = arg(1) + (uint64_t(expert) * N + n0) * row_bytes;
     [[unroll]] for (uint r = 0u; r < 4u; r++) wr[r] = W + uint64_t(min(4u * quad + r, N - 1u - n0)) * row_bytes;
 #endif
+    // An expert of at most GM_DOT_ROWS rows (a short prompt's experts: one
+    // to four rows each) skips the shared tile and the matrix units
+    // (glm53_moe_dot.glsl, a variant per row count); the products are the
+    // f32 weights' (the tile path rounds them to bfloat first).
+    // Only an expert's one tile: the pairs of an expert with more than a
+    // tile of them are split in an arbitrary order (glm53_moe_group), so the
+    // rows of a small last tile would vary from run to run.
+    const bool alone =
+        gl_WorkGroupID.y == 0u || U32(arg(4)).v[3u * (gl_WorkGroupID.y - 1u)] != expert;
+    if (alone && rows <= arg_u32(GM_DOT_ARG)) {
+        // Lanes of a subgroup: four quads by eight k8, so each of a decode's
+        // loads touches four weight rows, not sixteen (moe_grouped_timing,
+        // 24-token density: 1.56 -> 1.33 ms a layer; the tile path's own
+        // layout does not gain from it).
+        const uint dq = tid >> 3u, dk8 = tid & 7u;
+        uint64_t dwr[4];
+#ifdef GM_GATE_UP
+        const uint64_t DW = (dq < 8u ? arg(1) : arg(6)) + (uint64_t(expert) * N + n0) * row_bytes;
+        [[unroll]] for (uint r = 0u; r < 4u; r++) dwr[r] = DW + uint64_t(min(4u * (dq & 7u) + r, N - 1u - n0)) * row_bytes;
+#else
+        const uint64_t DW = arg(1) + (uint64_t(expert) * N + n0) * row_bytes;
+        [[unroll]] for (uint r = 0u; r < 4u; r++) dwr[r] = DW + uint64_t(min(4u * dq + r, N - 1u - n0)) * row_bytes;
+#endif
+        if (rows == 1u) {
+#define GM_DR 1u
+#include "glm53_moe_dot.glsl"
+#undef GM_DR
+        } else if (rows == 2u) {
+#define GM_DR 2u
+#include "glm53_moe_dot.glsl"
+#undef GM_DR
+        } else if (rows == 3u) {
+#define GM_DR 3u
+#include "glm53_moe_dot.glsl"
+#undef GM_DR
+        } else {
+#define GM_DR 4u
+#include "glm53_moe_dot.glsl"
+#undef GM_DR
+        }
+        return;
+    }
     // The subgroup's rows, and its lanes' rows of X, two per 16 (a row
     // past the tile's reads the tile's last and is not stored).
     const uint row0 = GM_SUB * sg;

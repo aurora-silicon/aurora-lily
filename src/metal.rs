@@ -324,6 +324,11 @@ impl MetalContext {
         Ok(buf)
     }
 
+    /// [`Self::new_buffer`]; the Vulkan backend's skips the zero fill.
+    pub fn new_buffer_uninit(&self, len: usize) -> Result<Buffer> {
+        self.new_buffer(len)
+    }
+
     /// Starts recording the buffers [`Self::new_buffer`] allocates (and so
     /// [`Self::new_buffer_with_bytes`] and every tensor constructor), until
     /// [`BufferRecording::finish`] returns the ones still alive. Mapped

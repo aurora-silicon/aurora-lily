@@ -1819,6 +1819,18 @@ impl MetalContext {
         Ok(buf)
     }
 
+    /// [`Self::new_buffer`] without the zero fill: the contents are whatever
+    /// the driver's recycled memory held, for a buffer the GPU writes before
+    /// anything reads it (the zero fill is a host memset: about 10 ms per
+    /// 150 MB).
+    pub fn new_buffer_uninit(&self, len: usize) -> Result<Buffer> {
+        let buf = self.dev.new_buffer(len, false)?;
+        if let Some(recorded) = self.recorded.borrow_mut().as_mut() {
+            recorded.push(Rc::downgrade(&buf));
+        }
+        Ok(buf)
+    }
+
     /// Starts recording the buffers [`Self::new_buffer`] allocates, until
     /// [`BufferRecording::finish`] returns the ones still alive.
     pub fn record_buffers(&self) -> Result<BufferRecording<'_>> {

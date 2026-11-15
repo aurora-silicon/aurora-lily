@@ -391,15 +391,24 @@ pub fn gemm_bx_with(
         l.ldx.is_multiple_of(8) && l.x_batch.is_multiple_of(8),
         "bfloat GEMM input layout"
     );
-    let name = match w.ty {
-        GgmlType::Q8_0 => "glm53_gemm_q8_0_bx",
-        GgmlType::Q4K => "glm53_gemm_q4_k_bx",
-        GgmlType::F16 => "glm53_gemm_f16_bx",
-        GgmlType::Q5K => "glm53_gemm_q5_k_bx",
-        GgmlType::Q6K => "glm53_gemm_q6_k_bx",
-        other => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
+    // Four subgroups a threadgroup for an unbatched short run over at least
+    // 8 192 Q8_0 or Q4_K weight rows: gemm_small_timing (eight calls
+    // overlapping, as a level's do; 2026-11-15), kda_v Q8_0 8192 x 4096 at
+    // 8 / 24 / 64 rows 270 / 276 / 307 -> 186 / 195 / 206 us, kda_q Q4_K
+    // 205 / 193 / 279 -> 182 / 185 / 200; narrower weights (4096 x 8192,
+    // 2048 x 4096) were 10-20% slower. The same products in the same order.
+    let sg4 = m <= 128 && n >= 8192 && l.batches == 1;
+    let (name, rows, threads) = match (w.ty, sg4) {
+        (GgmlType::Q8_0, false) => ("glm53_gemm_q8_0_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q4K, false) => ("glm53_gemm_q4_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q8_0, true) => ("glm53_gemm_q8_0_bx4", 128, 128),
+        (GgmlType::Q4K, true) => ("glm53_gemm_q4_k_bx4", 128, 128),
+        (GgmlType::F16, _) => ("glm53_gemm_f16_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q5K, _) => ("glm53_gemm_q5_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q6K, _) => ("glm53_gemm_q6_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (other, _) => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
     };
-    gemm_any(ctx, pass, w, xb, y, m, n, l, name, GEMM_BX_ROWS, GEMM_BX_THREADS)
+    gemm_any(ctx, pass, w, xb, y, m, n, l, name, rows, threads)
 }
 
 /// Rows of X a threadgroup of the bfloat-input GEMM takes (the kernel's
@@ -609,7 +618,7 @@ pub fn moe_grouped(
     let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
     moe_grouped_with(
         ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true, tiles,
+        experts, limit, true, tiles, 0,
     )
 }
 
@@ -646,7 +655,46 @@ pub fn moe_grouped_tiles(
 ) -> Result<()> {
     moe_grouped_with(
         ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true, tiles,
+        experts, limit, true, tiles, 0,
+    )
+}
+
+/// Most rows an expert's tile computes off the matrix units in
+/// [`moe_grouped_dot`] (the kernels' GM_DOT_ROWS).
+pub const MOE_DOT_ROWS: usize = 4;
+
+/// [`moe_grouped`] where an expert with at most [`MOE_DOT_ROWS`] rows is
+/// computed by register dot products of its decoded f32 weights and the
+/// rows' bfloat values instead of a tile on the matrix units: a short
+/// prompt's experts have one or two rows each, and their tiles cost almost
+/// as much as full ones. moe_grouped_timing (2026-11-15), a layer: 24-token
+/// density 2.46 -> 1.56 ms, 64-token 2.77 -> 1.93, from 256 unchanged; a
+/// cap of 8 rows lost at 256 (3.43 -> 4.68). The values are the same
+/// products up to the weights' bfloat rounding, summed in another order.
+/// GLM 5.3's prefill.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_dot(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    hidden: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+    limit: f32,
+) -> Result<()> {
+    let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
+    moe_grouped_with(
+        ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
+        experts, limit, true, tiles, MOE_DOT_ROWS,
     )
 }
 
@@ -673,7 +721,9 @@ fn moe_grouped_with(
     limit: f32,
     fuse_gate_up: bool,
     tiles: MoeTiles,
+    dot_rows: usize,
 ) -> Result<()> {
+    ensure!(dot_rows <= MOE_DOT_ROWS, "register path for {dot_rows} rows");
     let tile_rows = if tiles == MoeTiles::R64 { 64 } else { 128 };
     let r128 = tiles == MoeTiles::R128;
     let pairs = m * used;
@@ -735,6 +785,7 @@ fn moe_grouped_with(
                     &u32_bytes(w.cols),
                     &u32_bytes(w.row_bytes),
                     &u32_bytes(x_shift),
+                    &u32_bytes(dot_rows),
                 ],
                 Grid::Threadgroups {
                     groups: (n.div_ceil(64), max_tiles, 1),
@@ -782,6 +833,7 @@ fn moe_grouped_with(
                 &u32_bytes(gate.row_bytes),
                 &u32_bytes(shift),
                 &f32_bytes(limit),
+                &u32_bytes(dot_rows),
             ],
             Grid::Threadgroups {
                 groups: (ff / 32, max_tiles, 1),
@@ -1281,6 +1333,19 @@ pub fn add(
         &[a.binding(), b.binding(), out.binding()],
         &[],
         Grid::Threads { grid: (n, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
+/// Zeroes `t` on the GPU (its bytes a multiple of 16).
+pub fn zero(ctx: &MetalContext, pass: &ComputePass<'_>, t: &Tensor) -> Result<()> {
+    let n = t.byte_len();
+    ensure!(n.is_multiple_of(16), "GPU zero fill of {n} bytes");
+    let pipeline = ctx.pipeline("glm53_zero", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[t.binding()],
+        &[&u32_bytes(n / 16)],
+        Grid::Threads { grid: (n / 16, 1, 1), threadgroup: (256, 1, 1) },
     )
 }
 
