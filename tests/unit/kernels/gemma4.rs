@@ -5,6 +5,7 @@ use rand::{Rng, SeedableRng};
 use super::*;
 use crate::cpu_ref::assert_close;
 use crate::gguf::dequantize;
+use crate::refops::{dot, gelu_tanh as gelu, rmsnorm as cpu_rmsnorm, round_f16 as h16};
 
 fn ctx() -> MetalContext {
     MetalContext::new().expect("metal context")
@@ -62,18 +63,6 @@ fn decode(ty: GgmlType, raw: &[u8]) -> Vec<f32> {
     w
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-fn rms(x: &[f32], eps: f32) -> f32 {
-    1.0 / (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt()
-}
-
-fn gelu(x: f32) -> f32 {
-    0.5 * x * (1.0 + (0.797_884_6 * x * (1.0 + 0.044715 * x * x)).tanh())
-}
-
 fn rope(v: &mut [f32], pos: usize, base: f32, ff: Option<&[f32]>) {
     let d = v.len();
     for i in 0..d / 2 {
@@ -87,10 +76,6 @@ fn rope(v: &mut [f32], pos: usize, base: f32, ff: Option<&[f32]>) {
         v[i] = lo * c - hi * s;
         v[i + d / 2] = hi * c + lo * s;
     }
-}
-
-fn h16(x: f32) -> f32 {
-    f16::from_f32(x).to_f32()
 }
 
 /// qkv then attention (decode or prompt path) against the CPU, rows at
@@ -171,10 +156,7 @@ fn attention_case(
         p += n;
     }
     // CPU: normed, rotated, f16-rounded keys and values.
-    let norm = |x: &[f32], w: Option<&[f32]>| -> Vec<f32> {
-        let s = rms(x, eps);
-        x.iter().enumerate().map(|(i, v)| v * s * w.map_or(1.0, |w| w[i])).collect()
-    };
+    let norm = |x: &[f32], w: Option<&[f32]>| cpu_rmsnorm(x, w, eps);
     let ffo = global.then_some(ff.as_slice());
     let mut kk = vec![0f32; total * kw];
     let mut vv = vec![0f32; total * kw];
@@ -387,10 +369,7 @@ fn norms_match_cpu() {
         .unwrap();
         rmsnorm(&ctx, p, &t[0], &tw[4], &o[6], m, n, eps).unwrap();
     });
-    let nrm = |x: &[f32], w: &[f32]| -> Vec<f32> {
-        let s = rms(x, eps);
-        x.iter().zip(w).map(|(v, w)| v * s * w).collect()
-    };
+    let nrm = |x: &[f32], w: &[f32]| cpu_rmsnorm(x, Some(w), eps);
     let mut want: Vec<Vec<f32>> = vec![Vec::new(); 7];
     for i in 0..m {
         let r = |k: usize| &rows[k][i * n..(i + 1) * n];
