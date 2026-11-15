@@ -203,6 +203,43 @@ fn gemv_grouped_matches_cpu() {
     }
 }
 
+/// The routed gate/up over f16 activations (decode rows of DeepSeek V4)
+/// against the f32-activation kernel: six rows of six slots, within f16's
+/// rounding of the activations.
+#[test]
+fn moe_xh_matches_f32_kernel() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(81);
+    let (experts, hidden, ff, used, m) = (12, 512, 256, 6, 6);
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+    let sel: Vec<u32> = (0..m * used).map(|s| ((s * 7 + s / used) % experts) as u32).collect();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+    let (mid, mid_h) = (zeros(&ctx, m * used * ff), zeros(&ctx, m * used * ff));
+    let xh = Tensor::zeros(&ctx, &[m * hidden], DType::F16).unwrap();
+    run(&ctx, |p| {
+        moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid, m, used, 10.0).unwrap();
+        crate::kernels::deepseek4::x_f16_iq2(&ctx, p, &x, &xh, m, hidden).unwrap();
+        p.memory_barrier().unwrap();
+        moe_gate_up_xh(&ctx, p, &gw, &uw, ff, &xh, &tsel, &tw, &mid_h, m, used, 10.0)
+            .unwrap();
+    });
+    let (a, b) = (mid_h.to_f32().unwrap(), mid.to_f32().unwrap());
+    let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
+    for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+        // f16 activations: a half-ulp (2^-12) per product, with cancellation.
+        assert!((x - y).abs() <= 5e-3 * scale + 1e-3 * y.abs(), "mid {k}: {x} vs {y}");
+    }
+}
+
 #[test]
 fn moe_gate_up_and_down_match_cpu() {
     let ctx = ctx();
@@ -1966,27 +2003,32 @@ fn moe_timing() {
     let tw = tensor(&ctx, &vec![0.3f32; used]);
     let mid = zeros(&ctx, used * ff);
     let out = zeros(&ctx, hidden);
-    for (label, part) in [("gate_up", 0), ("down", 1)] {
+    let xh = Tensor::zeros(&ctx, &[hidden], DType::F16).unwrap();
+    run(&ctx, |p| crate::kernels::deepseek4::x_f16_iq2(&ctx, p, &x, &xh, 1, hidden).unwrap());
+    for (label, part) in [("gate_up", 0), ("down", 1), ("gate_up f16 x", 2)] {
         let mut best = f64::MAX;
         for _ in 0..5 {
             let pass = ctx.begin().unwrap();
             for r in 0..repeat {
                 let (g, u, d) = &layers[r % 4];
-                if part == 0 {
-                    moe_gate_up(
+                match part {
+                    0 => moe_gate_up(
                         &ctx, &pass, g, u, ff, &x, &tsel, &tw, &mid, 1, used, 10.0,
                     )
-                    .unwrap();
-                } else {
-                    moe_down(&ctx, &pass, d, hidden, &mid, &tsel, None, &out, 1, used)
-                        .unwrap();
+                    .unwrap(),
+                    1 => moe_down(&ctx, &pass, d, hidden, &mid, &tsel, None, &out, 1, used)
+                        .unwrap(),
+                    _ => moe_gate_up_xh(
+                        &ctx, &pass, g, u, ff, &xh, &tsel, &tw, &mid, 1, used, 10.0,
+                    )
+                    .unwrap(),
                 }
             }
             let t = std::time::Instant::now();
             pass.commit_wait().unwrap();
             best = best.min(t.elapsed().as_secs_f64());
         }
-        let bytes = if part == 0 { 2 * used * ff * 1056 } else { used * hidden * 672 };
+        let bytes = if part % 2 == 0 { 2 * used * ff * 1056 } else { used * hidden * 672 };
         let per = best / repeat as f64;
         println!(
             "moe {label:24} {:8.1} us  {:6.1} GB/s",
@@ -2295,6 +2337,8 @@ fn gemm_bx_matches_gemm() {
         (GgmlType::Q4K, 256, 40, 257),
         (GgmlType::Q4K, 256, 72, 513),
         (GgmlType::Q4K, 512, 136, 1024),
+        (GgmlType::F16, 256, 72, 255),
+        (GgmlType::F16, 512, 100, 513),
     ] {
         let raw = random_blocks(&mut rng, ty, rows * cols);
         let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
@@ -2318,6 +2362,76 @@ fn gemm_bx_matches_gemm() {
             "{ty:?} {rows} x {cols}, {m} rows"
         );
     }
+}
+
+/// The batched layout over a bfloat copy (DeepSeek V4's grouped output
+/// projection) gives the f32-input batched GEMM's results bit for bit.
+#[test]
+fn gemm_bx_batched_matches_gemm_with() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(79);
+    let (heads, per, cols, m) = (4, 128, 256, 300);
+    let raw = random_blocks(&mut rng, GgmlType::Q8_0, heads * per * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, heads * per).unwrap();
+    let x = f32s(&mut rng, m * heads * cols, -1.0, 1.0);
+    let tx = tensor(&ctx, &x);
+    let xb = Tensor::zeros(&ctx, &[m * heads * cols], DType::BF16).unwrap();
+    let (y, yb) = (zeros(&ctx, m * heads * per), zeros(&ctx, m * heads * per));
+    let l = GemmLayout {
+        ldx: heads * cols,
+        ldy: heads * per,
+        batches: heads,
+        x_batch: cols,
+        w_batch: per,
+        y_batch: per,
+    };
+    run(&ctx, |p| {
+        gemm_with(&ctx, p, &w, &tx, &y, m, per, l).unwrap();
+        to_bf16(&ctx, p, &tx, &xb, m * heads * cols).unwrap();
+        p.memory_barrier().unwrap();
+        gemm_bx_with(&ctx, p, &w, &xb, &yb, m, per, l).unwrap();
+    });
+    let (a, b) = (y.to_f32().unwrap(), yb.to_f32().unwrap());
+    assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+}
+
+/// DeepSeek V4's grouped output projection as it runs (a dispatch a group
+/// over offset views of the weights, input and output) gives the batched
+/// grid's results bit for bit: eight groups, 300 rows (a partial 256-row
+/// tile), the last group's last row at the tensors' ends.
+#[test]
+fn gemm_bx_split_groups_match_batched() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(83);
+    let (groups, per, cols, m) = (8, 128, 256, 300);
+    let raw = random_blocks(&mut rng, GgmlType::Q8_0, groups * per * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, groups * per).unwrap();
+    let x = tensor(&ctx, &f32s(&mut rng, m * groups * cols, -1.0, 1.0));
+    let xb = Tensor::zeros(&ctx, &[m * groups * cols], DType::BF16).unwrap();
+    let (y, ys) = (zeros(&ctx, m * groups * per), zeros(&ctx, m * groups * per));
+    let l = GemmLayout {
+        ldx: groups * cols,
+        ldy: groups * per,
+        batches: groups,
+        x_batch: cols,
+        w_batch: per,
+        y_batch: per,
+    };
+    let one = GemmLayout { batches: 1, x_batch: 0, w_batch: 0, y_batch: 0, ..l };
+    run(&ctx, |p| {
+        to_bf16(&ctx, p, &x, &xb, m * groups * cols).unwrap();
+        p.memory_barrier().unwrap();
+        gemm_bx_with(&ctx, p, &w, &xb, &y, m, per, l).unwrap();
+        for g in 0..groups {
+            let t = w.t.view(g * per * w.row_bytes, &[per * w.row_bytes]).unwrap();
+            let wg = QWeight::new(t, GgmlType::Q8_0, cols, per).unwrap();
+            let xv = xb.view(g * cols, &[xb.numel() - g * cols]).unwrap();
+            let yv = ys.view(g * per, &[ys.numel() - g * per]).unwrap();
+            gemm_bx_with(&ctx, p, &wg, &xv, &yv, m, per, one).unwrap();
+        }
+    });
+    let (a, b) = (y.to_f32().unwrap(), ys.to_f32().unwrap());
+    assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
 }
 
 #[test]
@@ -2440,11 +2554,12 @@ fn moe_grouped_timing() {
     let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
     // Rows such that pairs per expert = n * 8 / 288 for prompts of 256, 1K
-    // and 4K tokens.
+    // and 4K tokens; DeepSeek V4's 2K (6 of 256: 48 a expert).
     for (label, m) in [
         ("256-token density", 57),
         ("1K-token density", 228),
         ("4K-token density", 910),
+        ("DS4 2K density", 384),
     ] {
         let sel: Vec<u32> = (0..m)
             .flat_map(|i| {
@@ -2463,7 +2578,7 @@ fn moe_grouped_timing() {
         let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
         let out = zeros(&ctx, m * hidden);
         let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
-        for tile_rows in [64, 128] {
+        for tile_rows in [MoeTiles::R64, MoeTiles::R128] {
             let mut best = f64::MAX;
             for _ in 0..3 {
                 let pass = ctx.begin().unwrap();
@@ -2477,10 +2592,75 @@ fn moe_grouped_timing() {
                 best = best.min(t.elapsed().as_secs_f64());
             }
             println!(
-                "moe grouped {label:20} m {m:4} tiles {tile_rows:3}: {:8.1} us",
+                "moe grouped {label:20} m {m:4} tiles {tile_rows:?}: {:8.1} us",
                 best * 1e6
             );
         }
+    }
+}
+
+/// DeepSeek V4's prompt-run Q8_0 GEMMs over bfloat input at a run of 2 048
+/// rows; the grouped output projection's eight groups as one batched grid
+/// and as a dispatch a group (the model's): best of three passes of four
+/// calls.
+#[test]
+#[ignore = "timing only"]
+fn gemm_bx_timing_ds4() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(80);
+    let m = 2048;
+    for (label, cols, rows, batches, split) in [
+        ("q_a 1024x4096", 4096usize, 1024usize, 1usize, false),
+        ("kv 512x4096", 4096, 512, 1, false),
+        ("q_b 32768x1024", 1024, 32768, 1, false),
+        ("out_a 8 x 1024x4096 batched", 4096, 8192, 8, false),
+        ("out_a 8 dispatches", 4096, 8192, 8, true),
+        ("out_b 4096x8192", 8192, 4096, 1, false),
+        ("shexp gate 2048x4096", 4096, 2048, 1, false),
+        ("shexp down 4096x2048", 2048, 4096, 1, false),
+    ] {
+        let raw = random_blocks(&mut rng, GgmlType::Q8_0, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap();
+        let xcols = cols * batches;
+        let x = tensor(&ctx, &f32s(&mut rng, m * xcols, -1.0, 1.0));
+        let n = rows / batches;
+        let y = zeros(&ctx, m * rows);
+        let xb = Tensor::zeros(&ctx, &[m * xcols], DType::BF16).unwrap();
+        run(&ctx, |p| to_bf16(&ctx, p, &x, &xb, m * xcols).unwrap());
+        let l = GemmLayout {
+            ldx: xcols,
+            ldy: rows,
+            batches,
+            x_batch: cols,
+            w_batch: n,
+            y_batch: n,
+        };
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let pass = ctx.begin().unwrap();
+            for _ in 0..4 {
+                if !split {
+                    gemm_bx_with(&ctx, &pass, &w, &xb, &y, m, n, l).unwrap();
+                    continue;
+                }
+                for b in 0..batches {
+                    let one = GemmLayout { batches: 1, ..l };
+                    let xv = xb.view(b * cols, &[m * xcols - b * cols]).unwrap();
+                    let yv = y.view(b * n, &[m * rows - b * n]).unwrap();
+                    let t = w.t.view(b * n * w.row_bytes, &[n * w.row_bytes]).unwrap();
+                    let wv = QWeight::new(t, GgmlType::Q8_0, cols, n).unwrap();
+                    gemm_bx_with(&ctx, &pass, &wv, &xv, &yv, m, n, one).unwrap();
+                }
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64() / 4.0);
+        }
+        println!(
+            "gemm_bx {label:28} m {m}: {:8.1} us  {:5.1} TFLOP/s",
+            best * 1e6,
+            2.0 * (m * rows * cols) as f64 / best / 1e12
+        );
     }
 }
 
@@ -2566,7 +2746,12 @@ fn moe_grouped_fused_matches_separate() {
     let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
     for limit in [0.0f32, 1e-3, 10.0] {
         let mut got = Vec::new();
-        for (fused, tile_rows) in [(true, 64), (false, 64), (true, 128), (false, 128)] {
+        for (fused, tile_rows) in [
+            (true, MoeTiles::R64),
+            (false, MoeTiles::R64),
+            (true, MoeTiles::R128),
+            (false, MoeTiles::R128),
+        ] {
             let out = zeros(&ctx, m * hidden);
             run(&ctx, |p| {
                 moe_grouped_with(
@@ -2582,6 +2767,60 @@ fn moe_grouped_fused_matches_separate() {
             assert_eq!(bits(&got[0].0), bits(&got[k].0), "mid, limit {limit}, {k}");
             assert_eq!(bits(&got[0].1), bits(&got[k].1), "out, limit {limit}, {k}");
         }
+    }
+}
+
+/// DeepSeek V4's prompt scratch for Q2_K gate/up experts (which its schema
+/// accepts): the model picks the separate route's scratch, and the grouped
+/// experts over it give the per-pair kernels' result; the compact fused
+/// scratch is refused for that route instead of written past.
+#[test]
+fn deepseek4_q2_k_gate_up_scratch() {
+    use crate::deepseek4::model::{moe_group_scratch, separate_gate_up};
+    assert!(separate_gate_up([GgmlType::Iq2Xxs, GgmlType::Q2K]));
+    assert!(!separate_gate_up([GgmlType::Iq2Xxs, GgmlType::Iq2Xxs]));
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(82);
+    let (experts, hidden, ff, used, m) = (12, 512, 256, 6, 40);
+    let mk = |rng: &mut StdRng, cols, rows| {
+        let raw = random_blocks(rng, GgmlType::Q2K, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, GgmlType::Q2K, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, hidden, experts * ff);
+    let uw = mk(&mut rng, hidden, experts * ff);
+    let dw = mk(&mut rng, ff, experts * hidden);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+    let sel: Vec<u32> = (0..m * used).map(|s| ((s * 5 + s / used) % experts) as u32).collect();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+    let dims = (used, experts, ff, hidden);
+    let gs = moe_group_scratch(&ctx, m, dims, separate_gate_up([GgmlType::Q2K])).unwrap();
+    let compact = moe_group_scratch(&ctx, m, dims, false).unwrap();
+    let (out, refused) = (zeros(&ctx, m * hidden), zeros(&ctx, m * hidden));
+    let (mid, want) = (zeros(&ctx, m * used * ff), zeros(&ctx, m * hidden));
+    let mut err = None;
+    run(&ctx, |p| {
+        moe_grouped_tiles(
+            &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m, used,
+            experts, 10.0, MoeTiles::R64,
+        )
+        .unwrap();
+        err = moe_grouped_tiles(
+            &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &refused, &compact, m,
+            used, experts, 10.0, MoeTiles::R64,
+        )
+        .err();
+        moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid, m, used, 10.0).unwrap();
+        p.memory_barrier().unwrap();
+        moe_down(&ctx, p, &dw, hidden, &mid, &tsel, None, &want, m, used).unwrap();
+    });
+    assert!(err.is_some(), "the compact scratch must be refused for Q2_K gate/up");
+    let (a, b) = (out.to_f32().unwrap(), want.to_f32().unwrap());
+    let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
+    for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!((x - y).abs() <= 3e-2 * scale, "element {k}: {x} vs {y}");
     }
 }
 

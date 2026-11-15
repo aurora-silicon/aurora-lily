@@ -446,6 +446,69 @@ void main() {
 }
 #endif
 
+// The IQ2_XXS gate/up over activations given as f16 in the dot's pairing
+// (DeepSeek V4's decode and verify rows; ds4_x_f16_iq2): of each 8 values,
+// word p holds values p and p + 4, so a task's 32 activations are four
+// 16-byte loads where f32 takes eight; products and sums as
+// glm53_dot_iq2_xxs's, in its order. moe_timing at GLM's shape (8 of 288
+// experts, 2048 x 4096): 108.3 -> 91.2 us a layer (2026-11-15); the same
+// for the Q2_K down kernel's activations gained nothing (74.4 -> 73.7).
+#ifdef KERNEL_glm53_moe_gate_up_iq2_xxs_xh
+float glm53_dot_iq2_xxs_xh(uint64_t row, uint t, in uvec4 xh[4]) {
+    const uint bw = (t >> 3u) * 33u;
+    const uint qw = bw + 1u + 4u * (t & 7u);
+    const float d = glm53_h2f(uint(U16(row).v[bw]));
+    const uint aux0 = uint(U16(row).v[qw]) | (uint(U16(row).v[qw + 1u]) << 16u);
+    const uint aux1 = uint(U16(row).v[qw + 2u]) | (uint(U16(row).v[qw + 3u]) << 16u);
+    precise float s = 0.0;
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const uint gi = (aux0 >> (8u * l)) & 0xffu;
+        const uint si = (aux1 >> (7u * l)) & 127u;
+        const uvec4 g = glm53_iq2xxs_grid_h[gi] ^ glm53_iq2xxs_signs_h[si];
+        const vec2 p0 = unpackHalf2x16(g.x), p1 = unpackHalf2x16(g.y);
+        const vec2 p2 = unpackHalf2x16(g.z), p3 = unpackHalf2x16(g.w);
+        const vec2 a0 = unpackHalf2x16(xh[l].x), a1 = unpackHalf2x16(xh[l].y);
+        const vec2 a2 = unpackHalf2x16(xh[l].z), a3 = unpackHalf2x16(xh[l].w);
+        precise float e = ((p0.x * a0.x + p0.y * a0.y) + (p1.x * a1.x + p1.y * a1.y))
+                        + ((p2.x * a2.x + p2.y * a2.y) + (p3.x * a3.x + p3.y * a3.y));
+        s += e;
+    }
+    precise float k = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
+    precise float v = k * s;
+    return v;
+}
+void main() {
+    const uint K = arg_u32(6);
+    const uint F = arg_u32(7);
+    const uint row_bytes = arg_u32(8);
+    const uint used = arg_u32(9);
+    const float limit = arg_f32(10);
+    const uint slot = gl_WorkGroupID.y;
+    const uint i = slot / used;
+    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    if (r >= F) return;
+    const uint e = U32(arg(3)).v[slot];
+    const float we = F32(arg(4)).v[slot];
+    const uint64_t off = (uint64_t(e) * F + r) * row_bytes;
+    const uint64_t gate = arg(0) + off;
+    const uint64_t up = arg(1) + off;
+    U32x4 X = U32x4(arg(2) + 2u * uint64_t(i) * K);
+    const uint tasks = K / GLM53_TASK;
+    float ag = 0.0, au = 0.0;
+    for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
+        uvec4 xh[4];
+        [[unroll]] for (uint q = 0u; q < 4u; q++) xh[q] = X.v[4u * t + q];
+        ag += glm53_dot_iq2_xxs_xh(gate, t, xh);
+        au += glm53_dot_iq2_xxs_xh(up, t, xh);
+    }
+    ag = subgroupAdd(ag);
+    au = subgroupAdd(au);
+    if (gl_SubgroupInvocationID == 0u) {
+        F32(arg(5)).v[slot * F + r] = glm53_moe_act(ag, au, limit, we);
+    }
+}
+#endif
+
 // Two rows (a verify pass) whose selections share experts: the slot of the
 // first row that picked a shared expert computes both rows' values from one
 // decode of its weights, the second row's slot of that expert does nothing.

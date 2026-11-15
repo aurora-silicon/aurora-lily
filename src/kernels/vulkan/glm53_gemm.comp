@@ -44,6 +44,11 @@ uint glm53_bf16_bits(float f) {
 #define KERNEL_glm53_gemm_q4_k
 #define GEMM_BX
 #endif
+// glm53_gemm_f16_bx: F16 weights (DeepSeek V4's compressors and indexer).
+#ifdef KERNEL_glm53_gemm_f16_bx
+#define KERNEL_glm53_gemm_f16
+#define GEMM_BX
+#endif
 
 // The _r128 expert variants: tiles of up to 128 rows, a subgroup taking 32
 // (moe_group's cap set to match). A row's sums are the same products in

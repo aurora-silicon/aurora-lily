@@ -344,13 +344,6 @@ pub fn gemm_bx(
     y: &Tensor,
     m: usize,
 ) -> Result<()> {
-    ensure!(xb.dtype() == DType::BF16, "bfloat GEMM input is {:?}", xb.dtype());
-    ensure!(w.cols.is_multiple_of(8), "bfloat GEMM rows of {} values", w.cols);
-    let name = match w.ty {
-        GgmlType::Q8_0 => "glm53_gemm_q8_0_bx",
-        GgmlType::Q4K => "glm53_gemm_q4_k_bx",
-        other => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
-    };
     let l = GemmLayout {
         ldx: w.cols,
         ldy: w.rows,
@@ -359,7 +352,35 @@ pub fn gemm_bx(
         w_batch: 0,
         y_batch: 0,
     };
-    gemm_any(ctx, pass, w, xb, y, m, w.rows, l, name, GEMM_BX_ROWS, GEMM_BX_THREADS)
+    gemm_bx_with(ctx, pass, w, xb, y, m, w.rows, l)
+}
+
+/// [`gemm_bx`] with [`gemm_with`]'s layout (`ldx` and `x_batch` multiples
+/// of 8); F16 weights too.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_bx_with(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w: &QWeight,
+    xb: &Tensor,
+    y: &Tensor,
+    m: usize,
+    n: usize,
+    l: GemmLayout,
+) -> Result<()> {
+    ensure!(xb.dtype() == DType::BF16, "bfloat GEMM input is {:?}", xb.dtype());
+    ensure!(w.cols.is_multiple_of(8), "bfloat GEMM rows of {} values", w.cols);
+    ensure!(
+        l.ldx.is_multiple_of(8) && l.x_batch.is_multiple_of(8),
+        "bfloat GEMM input layout"
+    );
+    let name = match w.ty {
+        GgmlType::Q8_0 => "glm53_gemm_q8_0_bx",
+        GgmlType::Q4K => "glm53_gemm_q4_k_bx",
+        GgmlType::F16 => "glm53_gemm_f16_bx",
+        other => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
+    };
+    gemm_any(ctx, pass, w, xb, y, m, n, l, name, GEMM_BX_ROWS, GEMM_BX_THREADS)
 }
 
 /// Rows of X a threadgroup of the bfloat-input GEMM takes (the kernel's
@@ -371,6 +392,11 @@ const GEMM_BX_THREADS: usize = 256;
 /// Whether [`gemm_bx`] takes weights of this type.
 pub fn gemm_bx_takes(w: &QWeight) -> bool {
     matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K) && w.cols.is_multiple_of(8)
+}
+
+/// Whether [`gemm_bx_with`] takes weights of this type (F16 too).
+pub fn gemm_bx_with_takes(w: &QWeight) -> bool {
+    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::F16) && w.cols.is_multiple_of(8)
 }
 
 /// `out` = the first `n` values of `x` as bfloat (rounded to nearest even),
@@ -508,6 +534,31 @@ impl MoeGroupScratch {
             down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
         })
     }
+
+    /// For runs of up to `rows` rows of `used` pairs whose IQ2_XXS gate and
+    /// up take the fused GEMM (DeepSeek V4's): no separate gate and up
+    /// outputs, the bfloat input `rows` rows long.
+    pub fn fused(
+        ctx: &MetalContext,
+        rows: usize,
+        used: usize,
+        experts: usize,
+        ff: usize,
+        hidden: usize,
+    ) -> Result<Self> {
+        let pairs = rows * used;
+        let max_tiles = pairs.div_ceil(64) + experts;
+        Ok(Self {
+            pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
+            tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
+            tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
+            xb: Tensor::zeros(ctx, &[rows * hidden], DType::BF16)?,
+            g: Tensor::zeros(ctx, &[1], DType::F32)?,
+            u: Tensor::zeros(ctx, &[1], DType::F32)?,
+            mid: Tensor::zeros(ctx, &[pairs * ff], DType::BF16)?,
+            down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
+        })
+    }
 }
 
 /// Routed experts over a run of `m` rows grouped by expert (prefill): each
@@ -534,17 +585,53 @@ pub fn moe_grouped(
     limit: f32,
 ) -> Result<()> {
     // Tiles of up to 128 rows once an expert averages 48 pairs or more.
-    let tile_rows = if m * used >= 48 * experts { 128 } else { 64 };
+    let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
     moe_grouped_with(
         ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true, tile_rows,
+        experts, limit, true, tiles,
+    )
+}
+
+/// How [`moe_grouped`]'s expert GEMMs tile an expert's rows (the results
+/// are the same bit for bit).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoeTiles {
+    /// Up to 64 rows, four subgroups of 16.
+    R64,
+    /// Up to 128 rows, four subgroups of 32.
+    R128,
+}
+
+/// [`moe_grouped`] with the tiling chosen by the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_tiles(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    hidden: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+    limit: f32,
+    tiles: MoeTiles,
+) -> Result<()> {
+    moe_grouped_with(
+        ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
+        experts, limit, true, tiles,
     )
 }
 
 /// [`moe_grouped`]; `fuse_gate_up` false takes IQ2_XXS experts through the
 /// separate gate and up GEMMs and SwiGLU too (the tests' reference);
-/// `tile_rows` (64 or 128) caps a tile's pairs (the results are the same
-/// either way).
+/// `tiles` caps a tile's pairs (the results are the same either way).
 #[allow(clippy::too_many_arguments)]
 fn moe_grouped_with(
     ctx: &MetalContext,
@@ -564,10 +651,10 @@ fn moe_grouped_with(
     experts: usize,
     limit: f32,
     fuse_gate_up: bool,
-    tile_rows: usize,
+    tiles: MoeTiles,
 ) -> Result<()> {
-    ensure!(tile_rows == 64 || tile_rows == 128, "expert tiles of {tile_rows} rows");
-    let r128 = tile_rows == 128;
+    let tile_rows = if tiles == MoeTiles::R64 { 64 } else { 128 };
+    let r128 = tiles == MoeTiles::R128;
     let pairs = m * used;
     ensure!(
         sc.pairs.numel() >= pairs,
@@ -681,6 +768,10 @@ fn moe_grouped_with(
             },
         )?;
     } else {
+        ensure!(
+            sc.g.numel() >= pairs * ff && sc.u.numel() >= pairs * ff,
+            "grouped MoE scratch without separate gate and up outputs"
+        );
         gemm_moe(gate, &sc.xb, &sc.g, ff, shift)?;
         gemm_moe(up, &sc.xb, &sc.u, ff, shift)?;
         pass.memory_barrier()?;
@@ -765,6 +856,59 @@ pub fn moe_gate_up(
 /// `add` when given: `out[i] = sum_s down_{sel[i][s]} mid[i * used + s]
 /// (+ add[i])`; `out` may be `add`.
 #[allow(clippy::too_many_arguments)]
+/// [`moe_gate_up`] for IQ2_XXS experts over `xh`, the activations as f16
+/// in the dot's pairing (DeepSeek V4's `x_f16_iq2`): half the activation
+/// bytes a task.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gate_up_xh(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    ff: usize,
+    xh: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    mid: &Tensor,
+    m: usize,
+    used: usize,
+    limit: f32,
+) -> Result<()> {
+    check_f32(&[weights, mid])?;
+    ensure!(xh.dtype() == DType::F16, "f16 expert activations");
+    ensure!(
+        gate.ty == GgmlType::Iq2Xxs && up.ty == gate.ty && gate.cols == up.cols && gate.rows == up.rows,
+        "f16-activation gate/up of {:?} experts",
+        gate.ty
+    );
+    ensure!(gate.rows.is_multiple_of(ff) && gate.cols.is_multiple_of(32), "expert shape");
+    ensure!(sel.dtype() == DType::U32 && sel.numel() >= m * used, "selection");
+    ensure!(xh.numel() >= m * gate.cols && mid.numel() >= m * used * ff, "expert buffers");
+    let pipeline = ctx.pipeline("glm53_moe_gate_up_iq2_xxs_xh", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            gate.t.binding(),
+            up.t.binding(),
+            xh.binding(),
+            sel.binding(),
+            weights.binding(),
+            mid.binding(),
+        ],
+        &[
+            &u32_bytes(gate.cols),
+            &u32_bytes(ff),
+            &u32_bytes(gate.row_bytes),
+            &u32_bytes(used),
+            &f32_bytes(limit),
+        ],
+        Grid::Threadgroups {
+            groups: (ff.div_ceil(8), m * used, 1),
+            threadgroup: (256, 1, 1),
+        },
+    )
+}
+
 pub fn moe_down(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,

@@ -93,6 +93,22 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         runs: usize,
     },
+    /// Long-context NLL: BOS and the first `prompt_len` tokens of each text
+    /// as one prompt (runs of the prefill), then the next `n` tokens
+    /// teacher-forced one decode step each; prints the mean NLL per text
+    /// and each position's (`--per-token`) for paired comparisons.
+    Ppl {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, num_args = 1.., required = true)]
+        text: Vec<PathBuf>,
+        #[arg(long, default_value_t = 4096)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 256)]
+        n: usize,
+        #[arg(long)]
+        per_token: bool,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -134,6 +150,9 @@ fn run() -> Result<()> {
         }
         Cmd::Bench { model, text, prompt_len, n, runs } => {
             bench(&model, &text, prompt_len, n, runs)
+        }
+        Cmd::Ppl { model, text, prompt_len, n, per_token } => {
+            ppl(&model, &text, prompt_len, n, per_token)
         }
     }
 }
@@ -437,34 +456,124 @@ fn bench(
     let mut st = model.new_state(&ctx, prompt.len() + n + 8)?;
     for run in 0..runs {
         st.reset();
+        let _ = lily::metal::profile::take();
         let t = Instant::now();
         model.forward(&ctx, &mut st, &sc, &prompt, Logits::Last)?;
         let pf = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("prefill of {} tokens, per prefill:", prompt.len());
+            profile_report(1);
+        }
         let mut next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
         let mut out = Vec::with_capacity(n);
         let mut steps = Vec::with_capacity(n);
+        let mut busy = Vec::with_capacity(n);
         let t = Instant::now();
         for _ in 0..n {
             out.push(next);
             let s = Instant::now();
+            let b0 = lily::metal::gpu_busy_ns();
             model.forward(&ctx, &mut st, &sc, &[next], Logits::Last)?;
+            busy.push((lily::metal::gpu_busy_ns() - b0) as f64 * 1e-6);
             next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
             steps.push(s.elapsed().as_secs_f64() * 1e3);
         }
+        busy.sort_by(f64::total_cmp);
         let dt = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("decode at prompt {}, per step:", prompt.len());
+            profile_report(n);
+        }
         steps.sort_by(f64::total_cmp);
         let digest = out.iter().fold(0xcbf29ce484222325u64, |h, &t| {
             (h ^ u64::from(t)).wrapping_mul(0x100000001b3)
         });
         println!(
-            "run {run}: prompt {} prefill {pf:.2} s ({:.1} tok/s), decode {n} in {dt:.2} s ({:.2} tok/s, median {:.2} ms/step), digest {digest:016x}",
+            "run {run}: prompt {} prefill {pf:.2} s ({:.1} tok/s), decode {n} in {dt:.2} s ({:.2} tok/s, median {:.2} ms/step, p10 {:.2}, min {:.2}; GPU busy median {:.2} ms, p10 {:.2}), digest {digest:016x}",
             prompt.len(),
             prompt.len() as f64 / pf,
             n as f64 / dt,
-            steps[steps.len() / 2]
+            steps[steps.len() / 2],
+            steps[steps.len() / 10],
+            steps[0],
+            busy[busy.len() / 2],
+            busy[busy.len() / 10],
         );
     }
     Ok(())
+}
+
+fn ppl(
+    path: &PathBuf,
+    texts: &[PathBuf],
+    prompt_len: usize,
+    n: usize,
+    per_token: bool,
+) -> Result<()> {
+    anyhow::ensure!(!texts.is_empty() && n > 0, "ppl needs a text and --n of at least 1");
+    let ctx = MetalContext::new()?;
+    let model = Ds4Model::load(&ctx, path)?;
+    let vocab = model.cfg.vocab;
+    let sc = model.new_scratch(&ctx)?;
+    let mut all = Vec::new();
+    for text in texts {
+        let ids = text_tokens(path, text, prompt_len + n)?;
+        let name = text.display();
+        anyhow::ensure!(ids.len() == prompt_len + n + 1, "{name} is too short");
+        let mut st = model.new_state(&ctx, ids.len() + 8)?;
+        model.forward(&ctx, &mut st, &sc, &ids[..=prompt_len], Logits::Last)?;
+        let mut nll = Vec::with_capacity(n);
+        for j in 0..n {
+            let at = prompt_len + 1 + j;
+            let logits = &sc.logits.to_f32()?[..vocab];
+            let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let lse = mx + logits.iter().map(|&v| (v as f64 - mx).exp()).sum::<f64>().ln();
+            nll.push(lse - logits[ids[at] as usize] as f64);
+            if j + 1 < n {
+                model.forward(&ctx, &mut st, &sc, &ids[at..=at], Logits::Last)?;
+            }
+        }
+        let mean = nll.iter().sum::<f64>() / n as f64;
+        println!("ppl {name}: prompt {prompt_len}, {n} tokens, mean NLL {mean:.6}");
+        if per_token {
+            for (j, v) in nll.iter().enumerate() {
+                println!("tok {name} {j} {v:.6}");
+            }
+        }
+        all.extend(nll);
+    }
+    let mean = all.iter().sum::<f64>() / all.len() as f64;
+    println!("ppl total: {} tokens, mean NLL {mean:.6}", all.len());
+    Ok(())
+}
+
+/// With `LILY_KERNEL_PROFILE=1`: GPU time per kernel name per pass (each
+/// dispatch timed alone, so the sum exceeds a real pass).
+fn profile_report(steps: usize) {
+    let passes = lily::metal::profile::take();
+    let mut by: std::collections::HashMap<&str, (usize, f64)> = Default::default();
+    let mut total = 0.0;
+    for p in &passes {
+        for k in &p.kernels {
+            let e = by.entry(k.name).or_default();
+            e.0 += 1;
+            e.1 += k.gpu_secs;
+            total += k.gpu_secs;
+        }
+    }
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+    let n = steps as f64;
+    eprintln!("  ms/step  share  calls/step  kernel");
+    for (name, (calls, secs)) in rows {
+        eprintln!(
+            "  {:7.3}  {:4.1}%  {:9.1}  {name}",
+            secs / n * 1e3,
+            100.0 * secs / total,
+            calls as f64 / n
+        );
+    }
+    eprintln!("  {:7.3}  kernels summed per step", total / n * 1e3);
 }
 
 fn spec(
