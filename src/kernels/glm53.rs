@@ -344,13 +344,6 @@ pub fn gemm_bx(
     y: &Tensor,
     m: usize,
 ) -> Result<()> {
-    ensure!(xb.dtype() == DType::BF16, "bfloat GEMM input is {:?}", xb.dtype());
-    ensure!(w.cols.is_multiple_of(8), "bfloat GEMM rows of {} values", w.cols);
-    let name = match w.ty {
-        GgmlType::Q8_0 => "glm53_gemm_q8_0_bx",
-        GgmlType::Q4K => "glm53_gemm_q4_k_bx",
-        other => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
-    };
     let l = GemmLayout {
         ldx: w.cols,
         ldy: w.rows,
@@ -359,7 +352,35 @@ pub fn gemm_bx(
         w_batch: 0,
         y_batch: 0,
     };
-    gemm_any(ctx, pass, w, xb, y, m, w.rows, l, name, GEMM_BX_ROWS, GEMM_BX_THREADS)
+    gemm_bx_with(ctx, pass, w, xb, y, m, w.rows, l)
+}
+
+/// [`gemm_bx`] with [`gemm_with`]'s layout (`ldx` and `x_batch` multiples
+/// of 8); F16 weights too.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_bx_with(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w: &QWeight,
+    xb: &Tensor,
+    y: &Tensor,
+    m: usize,
+    n: usize,
+    l: GemmLayout,
+) -> Result<()> {
+    ensure!(xb.dtype() == DType::BF16, "bfloat GEMM input is {:?}", xb.dtype());
+    ensure!(w.cols.is_multiple_of(8), "bfloat GEMM rows of {} values", w.cols);
+    ensure!(
+        l.ldx.is_multiple_of(8) && l.x_batch.is_multiple_of(8),
+        "bfloat GEMM input layout"
+    );
+    let name = match w.ty {
+        GgmlType::Q8_0 => "glm53_gemm_q8_0_bx",
+        GgmlType::Q4K => "glm53_gemm_q4_k_bx",
+        GgmlType::F16 => "glm53_gemm_f16_bx",
+        other => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
+    };
+    gemm_any(ctx, pass, w, xb, y, m, n, l, name, GEMM_BX_ROWS, GEMM_BX_THREADS)
 }
 
 /// Rows of X a threadgroup of the bfloat-input GEMM takes (the kernel's
@@ -371,6 +392,11 @@ const GEMM_BX_THREADS: usize = 256;
 /// Whether [`gemm_bx`] takes weights of this type.
 pub fn gemm_bx_takes(w: &QWeight) -> bool {
     matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K) && w.cols.is_multiple_of(8)
+}
+
+/// Whether [`gemm_bx_with`] takes weights of this type (F16 too).
+pub fn gemm_bx_with_takes(w: &QWeight) -> bool {
+    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::F16) && w.cols.is_multiple_of(8)
 }
 
 /// `out` = the first `n` values of `x` as bfloat (rounded to nearest even),

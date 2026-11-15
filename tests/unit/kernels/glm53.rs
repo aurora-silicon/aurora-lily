@@ -2295,6 +2295,8 @@ fn gemm_bx_matches_gemm() {
         (GgmlType::Q4K, 256, 40, 257),
         (GgmlType::Q4K, 256, 72, 513),
         (GgmlType::Q4K, 512, 136, 1024),
+        (GgmlType::F16, 256, 72, 255),
+        (GgmlType::F16, 512, 100, 513),
     ] {
         let raw = random_blocks(&mut rng, ty, rows * cols);
         let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
@@ -2318,6 +2320,37 @@ fn gemm_bx_matches_gemm() {
             "{ty:?} {rows} x {cols}, {m} rows"
         );
     }
+}
+
+/// The batched layout over a bfloat copy (DeepSeek V4's grouped output
+/// projection) gives the f32-input batched GEMM's results bit for bit.
+#[test]
+fn gemm_bx_batched_matches_gemm_with() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(79);
+    let (heads, per, cols, m) = (4, 128, 256, 300);
+    let raw = random_blocks(&mut rng, GgmlType::Q8_0, heads * per * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, heads * per).unwrap();
+    let x = f32s(&mut rng, m * heads * cols, -1.0, 1.0);
+    let tx = tensor(&ctx, &x);
+    let xb = Tensor::zeros(&ctx, &[m * heads * cols], DType::BF16).unwrap();
+    let (y, yb) = (zeros(&ctx, m * heads * per), zeros(&ctx, m * heads * per));
+    let l = GemmLayout {
+        ldx: heads * cols,
+        ldy: heads * per,
+        batches: heads,
+        x_batch: cols,
+        w_batch: per,
+        y_batch: per,
+    };
+    run(&ctx, |p| {
+        gemm_with(&ctx, p, &w, &tx, &y, m, per, l).unwrap();
+        to_bf16(&ctx, p, &tx, &xb, m * heads * cols).unwrap();
+        p.memory_barrier().unwrap();
+        gemm_bx_with(&ctx, p, &w, &xb, &yb, m, per, l).unwrap();
+    });
+    let (a, b) = (y.to_f32().unwrap(), yb.to_f32().unwrap());
+    assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
 }
 
 #[test]
