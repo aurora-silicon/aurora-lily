@@ -314,3 +314,165 @@ fn the_gguf_identity_follows_the_file_and_the_ngram_checkpoint() {
     assert_ne!(ng1, id("a.gguf", Some(&dir.join("ng2"))));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// ds4's published tensor table, the n-gram table aside: name to type and
+/// ggml dimensions (row length first). Checked equal to the file's header.
+fn published_tensors() -> BTreeMap<String, (GgmlType, Vec<u64>)> {
+    use GgmlType::{Bf16, F16, F32, Iq2Xxs, Mxfp4, Q2K, Q4K, Q8_0};
+    let mut t = BTreeMap::new();
+    let mut put = |name: String, ty: GgmlType, dims: &[u64]| {
+        t.insert(name, (ty, dims.to_vec()));
+    };
+    let (h, wide, lr) = (2560, 10240, 320);
+    let hc = |put: &mut dyn FnMut(String, GgmlType, &[u64]), p: &str, inject: bool| {
+        put(format!("{p}_norm.weight"), F32, &[wide]);
+        put(format!("{p}_down.weight"), F16, &[wide, lr]);
+        put(format!("{p}_up.weight"), F16, &[lr, wide]);
+        if inject {
+            put(format!("{p}_inject.weight"), F16, &[wide, 4]);
+        }
+    };
+    put("token_embd.weight".into(), Bf16, &[h, 248320]);
+    put("output.weight".into(), Q8_0, &[h, 248320]);
+    hc(&mut put, "output_hc", false);
+    for il in 0..49 {
+        let b = format!("blk.{il}.");
+        hc(&mut put, &format!("{b}hc_attn"), true);
+        hc(&mut put, &format!("{b}hc_ffn"), true);
+        if il == 48 || il % 4 == 3 {
+            put(format!("{b}attn_q.weight"), Q8_0, &[h, 12288]);
+            put(format!("{b}attn_k.weight"), Q8_0, &[h, 512]);
+            put(format!("{b}attn_v.weight"), Q8_0, &[h, 512]);
+            put(format!("{b}attn_output.weight"), Q8_0, &[6144, h]);
+            put(format!("{b}attn_q_norm.weight"), F32, &[256]);
+            put(format!("{b}attn_k_norm.weight"), F32, &[256]);
+            put(format!("{b}indexer.q_proj.weight"), Q8_0, &[h, 512]);
+            put(format!("{b}indexer.k_proj.weight"), Q8_0, &[h, 128]);
+            put(format!("{b}indexer.q_norm.weight"), F32, &[128]);
+            put(format!("{b}indexer.k_norm.weight"), F32, &[128]);
+        } else {
+            put(format!("{b}attn_qkv.weight"), Q8_0, &[h, wide]);
+            put(format!("{b}attn_gate.weight"), Q8_0, &[h, 6144]);
+            put(format!("{b}ssm_out.weight"), Q8_0, &[6144, h]);
+            put(format!("{b}ssm_alpha.weight"), F32, &[h, 48]);
+            put(format!("{b}ssm_beta.weight"), F32, &[h, 48]);
+            put(format!("{b}ssm_a"), F32, &[48]);
+            put(format!("{b}ssm_dt.bias"), F32, &[48]);
+            put(format!("{b}ssm_norm.weight"), F32, &[128]);
+            put(format!("{b}ssm_conv1d.weight"), F32, &[4, wide]);
+        }
+        let (gate_up, down, down_cols) =
+            if il == 48 { (Q4K, Mxfp4, 640) } else { (Iq2Xxs, Q2K, 768) };
+        put(format!("{b}ffn_gate_inp.weight"), F32, &[h, 512]);
+        put(format!("{b}ffn_gate_exps.weight"), gate_up, &[h, 640, 512]);
+        put(format!("{b}ffn_up_exps.weight"), gate_up, &[h, 640, 512]);
+        put(format!("{b}ffn_down_exps.weight"), down, &[down_cols, h, 512]);
+        put(format!("{b}ffn_gate_shexp.weight"), Q8_0, &[h, 640]);
+        put(format!("{b}ffn_up_shexp.weight"), Q8_0, &[h, 640]);
+        put(format!("{b}ffn_down_shexp.weight"), Q8_0, &[640, h]);
+        put(format!("{b}ffn_gate_inp_shexp.weight"), F32, &[h]);
+        if il == 1 {
+            put(format!("{b}ple_key.weight"), Q8_0, &[h, wide]);
+            put(format!("{b}ple_value.weight"), Q8_0, &[h, h]);
+            for n in ["ple_norm_key", "ple_norm_query", "ple_norm_conv"] {
+                put(format!("{b}{n}.weight"), F32, &[wide]);
+            }
+            put(format!("{b}ple_conv1d.weight"), F32, &[4, wide]);
+        }
+    }
+    let b = "blk.48.nextn.";
+    put(format!("{b}eh_proj.weight"), Q8_0, &[2 * h, h]);
+    put(format!("{b}enorm.weight"), F32, &[h]);
+    put(format!("{b}hnorm.weight"), F32, &[wide]);
+    hc(&mut put, &format!("{b}hc_head"), false);
+    t
+}
+
+fn schema(
+    tensors: &BTreeMap<String, (GgmlType, Vec<u64>)>,
+    c: &Qwen4ExpConfig,
+) -> Result<()> {
+    validate_tensors(
+        &|name| tensors.get(name).cloned().with_context(|| format!("no tensor {name}")),
+        c,
+        true,
+    )
+}
+
+#[test]
+fn the_published_tensor_table_passes_and_wrong_axes_do_not() {
+    let c = config_from_metadata(&published(), 768).unwrap();
+    let tensors = published_tensors();
+    schema(&tensors, &c).unwrap();
+    let with = |name: &str, dims: &[u64]| {
+        let mut t = tensors.clone();
+        t.get_mut(name).unwrap().1 = dims.to_vec();
+        schema(&t, &c).unwrap_err().to_string()
+    };
+    // Equal products, other expert grouping: [hidden, experts, ff].
+    let e = with("blk.5.ffn_gate_exps.weight", &[2560, 512, 640]);
+    assert!(e.contains("blk.5.ffn_gate_exps.weight is [2560, 512, 640]"), "{e}");
+    let e = with("blk.5.ffn_down_exps.weight", &[768, 512, 2560]);
+    assert!(e.contains("blk.5.ffn_down_exps.weight"), "{e}");
+    // A flattened rank.
+    let e = with("blk.48.ffn_up_exps.weight", &[2560, 640 * 512]);
+    assert!(e.contains("blk.48.ffn_up_exps.weight"), "{e}");
+    let e = with("blk.3.attn_q.weight", &[2560, 6144, 2]);
+    assert!(e.contains("blk.3.attn_q.weight"), "{e}");
+    // Transposed.
+    let e = with("blk.0.ssm_out.weight", &[2560, 6144]);
+    assert!(e.contains("blk.0.ssm_out.weight"), "{e}");
+    // Padded down rows past a block.
+    let e = with("blk.5.ffn_down_exps.weight", &[640 + 256, 2560, 512]);
+    assert!(e.contains("blk.5.ffn_down_exps.weight"), "{e}");
+    let mut t = tensors.clone();
+    t.remove("blk.48.nextn.hnorm.weight");
+    assert!(schema(&t, &c).unwrap_err().to_string().contains("hnorm"));
+}
+
+#[test]
+fn compression_ratios_and_rope_scaling_the_graph_does_not_take_are_refused() {
+    let ratios = |f: &dyn Fn(usize) -> u64, n: usize| {
+        Value::Array((0..n).map(|i| Value::U64(f(i))).collect())
+    };
+    let published_ratio = |i: usize| if i == 48 || i % 4 == 3 { 4 } else { 0 };
+    let key = k("attention.compress_ratios");
+    for (m, want) in [
+        // Truncated to the first entry.
+        (with(&key, Value::Array(vec![Value::U64(4)])), "1 compression ratios for 49"),
+        (with(&key, ratios(&published_ratio, 48)), "48 compression ratios for 49"),
+        // Ratio 8 on one later attention layer.
+        (
+            with(&key, ratios(&|i| if i == 7 { 8 } else { published_ratio(i) }, 49)),
+            "layer 7: compression ratio 8, expected 4",
+        ),
+        // A draft head without QSA, a GDN layer with it.
+        (
+            with(&key, ratios(&|i| if i == 48 { 0 } else { published_ratio(i) }, 49)),
+            "layer 48: compression ratio 0, expected 4",
+        ),
+        (
+            with(&key, ratios(&|i| if i == 0 { 4 } else { published_ratio(i) }, 49)),
+            "layer 0: compression ratio 4, expected 0",
+        ),
+        (with(&k("rope.scaling.type"), Value::Str("yarn".into())), "RoPE scaling"),
+        (with(&k("rope.scaling.factor"), Value::F32(4.0)), "RoPE scaling"),
+        (with(&k("rope.scale_linear"), Value::F32(2.0)), "RoPE scaling"),
+        (
+            with(
+                &k("rope.dimension_sections"),
+                Value::Array([24, 20, 20, 0].map(Value::U64).to_vec()),
+            ),
+            "rope.dimension_sections",
+        ),
+    ] {
+        let e = err(&m);
+        assert!(e.contains(want), "{want}: {e}");
+    }
+    // The sections lily implements, as llama.cpp writes them, are accepted.
+    let ok = with(
+        &k("rope.dimension_sections"),
+        Value::Array([11, 11, 10, 0].map(Value::U64).to_vec()),
+    );
+    config_from_metadata(&ok, 768).unwrap();
+}

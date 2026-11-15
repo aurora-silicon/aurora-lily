@@ -78,17 +78,25 @@ pub fn is_qwen_gguf(path: &Path) -> bool {
 /// Metadata to read a config from: a GGUF's, or a map (tests).
 pub trait Meta {
     fn value(&self, key: &str) -> Option<&Value>;
+    /// Every key, sorted.
+    fn keys(&self) -> Box<dyn Iterator<Item = &str> + '_>;
 }
 
 impl Meta for Gguf {
     fn value(&self, key: &str) -> Option<&Value> {
         self.get(key)
     }
+    fn keys(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        Box::new(self.metadata.keys().map(String::as_str))
+    }
 }
 
 impl Meta for std::collections::BTreeMap<String, Value> {
     fn value(&self, key: &str) -> Option<&Value> {
         self.get(key)
+    }
+    fn keys(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        Box::new(self.keys().map(String::as_str))
     }
 }
 
@@ -162,7 +170,8 @@ pub fn config_from_metadata(g: &dyn Meta, down_cols: usize) -> Result<Qwen4ExpCo
         Some(_) => key_max(g, "nextn_predict_layers", 1)?,
     };
     ensure!(nextn < blocks, "{blocks} blocks with {nextn} MTP layers");
-    let mut layers = blocks - nextn;
+    let trunk = blocks - nextn;
+    let mut layers = trunk;
     let mut nextn = nextn;
     // Diagnostic: the first N trunk layers only, without the draft head
     // (a partly downloaded file, a quick run).
@@ -186,14 +195,46 @@ pub fn config_from_metadata(g: &dyn Meta, down_cols: usize) -> Result<Qwen4ExpCo
     ensure!(head_dim == key(g, "attention.value_length")?, "k and v head dims differ");
     let rope_dim = key(g, "rope.dimension_count")?;
     let theta = positive(g, "rope.freq_base")?;
+    // lily's RoPE is plain M-RoPE over its fixed sections, unscaled.
+    if let Some(k) = g.keys().find(|k| {
+        k.strip_prefix(ARCH)
+            .and_then(|r| r.strip_prefix(".rope."))
+            .is_some_and(|r| r.starts_with("scaling.") || r == "scale_linear")
+    }) {
+        bail!("{k}: lily does not implement RoPE scaling");
+    }
+    if g.value(&format!("{ARCH}.rope.dimension_sections")).is_some() {
+        let sections = u64s(g, &format!("{ARCH}.rope.dimension_sections"))?;
+        let ours = super::config::MROPE_SECTION.iter().map(|&s| s as u64);
+        ensure!(
+            sections.iter().copied().eq(ours.chain(std::iter::repeat_n(
+                0,
+                sections.len().saturating_sub(super::config::MROPE_SECTION.len())
+            ))),
+            "rope.dimension_sections {sections:?}; lily takes {:?}",
+            super::config::MROPE_SECTION
+        );
+    }
     let n_k = key(g, "ssm.group_count")?;
     let n_v = key(g, "ssm.time_step_rank")?;
     let d_state = key(g, "ssm.state_size")?;
     ensure!(key(g, "ssm.inner_size")? == n_v * d_state, "GDN inner size");
     let vocab = key(g, "vocab_size")?;
+    // One ratio for every attention layer, the draft head's included (the
+    // graph has one), and none for the GDN layers.
     let ratios = u64s(g, &format!("{ARCH}.attention.compress_ratios"))?;
+    ensure!(
+        ratios.len() == blocks,
+        "{} compression ratios for {blocks} blocks",
+        ratios.len()
+    );
     let ratio = ratios.iter().copied().find(|&r| r > 0).context("no QSA layer")?;
     ensure!(ratio <= 64, "QSA compress ratio {ratio}");
+    for (i, &r) in ratios.iter().enumerate() {
+        let attention = i >= trunk || (i + 1) % interval == 0;
+        let want = if attention { ratio } else { 0 };
+        ensure!(r == want, "layer {i}: compression ratio {r}, expected {want}");
+    }
     let token = |k: &str| -> Result<u32> {
         let id = meta_u64(g, k)?;
         ensure!(id < vocab as u64, "{k} {id} is outside the vocabulary of {vocab}");
@@ -312,27 +353,54 @@ const EXPERT_GATE_UP: &[GgmlType] = &[GgmlType::Iq2Xxs, GgmlType::Q4K];
 const EXPERT_DOWN: &[GgmlType] = &[GgmlType::Q2K, GgmlType::Mxfp4, GgmlType::Q8_0];
 
 /// Checks, before anything is mapped, that every tensor the graph reads is
-/// in the file with a type its kernels take and the shape the config says
-/// (`[rows, row length]`; a routed down row may be padded past the experts'
-/// width by less than a block of 256, ds4's Q2_K rows). The load reads
-/// nothing else and nothing it reads goes past what this checked.
+/// in the file with a type its kernels take and exactly the dimensions the
+/// config says, in ggml order (row length first: `[cols]` for a vector,
+/// `[cols, rows]` for a matrix, `[cols, ff or hidden, experts]` for routed
+/// experts, whose down rows may be padded past the experts' width by less
+/// than a block of 256, ds4's Q2_K rows). The load reads nothing else and
+/// nothing it reads goes past what this checked.
 pub fn validate_schema(g: &Gguf, c: &Qwen4ExpConfig, with_mtp: bool) -> Result<()> {
+    validate_tensors(
+        &|name| {
+            let t = g.require(name)?;
+            Ok((t.ty, t.dims.clone()))
+        },
+        c,
+        with_mtp,
+    )
+}
+
+/// The tensor named `name`: its type and ggml dimensions.
+type TensorLookup<'a> = dyn Fn(&str) -> Result<(GgmlType, Vec<u64>)> + 'a;
+
+/// [`validate_schema`] over `tensor`.
+fn validate_tensors(
+    tensor: &TensorLookup<'_>,
+    c: &Qwen4ExpConfig,
+    with_mtp: bool,
+) -> Result<()> {
     let (h, wide) = (c.hidden_size, c.hc_width());
-    let check = |name: &str,
-                 types: &[GgmlType],
-                 rows: usize,
-                 cols: usize|
-     -> Result<()> {
-        let t = g.require(name)?;
-        ensure!(types.contains(&t.ty), "{name} is {:?}; lily takes {types:?}", t.ty);
+    let typed = |name: &str, types: &[GgmlType]| -> Result<(GgmlType, Vec<u64>)> {
+        let (ty, dims) = tensor(name)?;
+        ensure!(types.contains(&ty), "{name} is {ty:?}; lily takes {types:?}");
+        Ok((ty, dims))
+    };
+    let check_dims = |name: &str, types: &[GgmlType], want: &[usize]| -> Result<()> {
+        let (_, dims) = typed(name, types)?;
         ensure!(
-            t.rows() == rows && t.row_len() == cols,
-            "{name} is [{}, {}], expected [{rows}, {cols}]",
-            t.rows(),
-            t.row_len()
+            dims.iter().copied().eq(want.iter().map(|&d| d as u64)),
+            "{name} is {dims:?}, expected {want:?}"
         );
         Ok(())
     };
+    let check =
+        |name: &str, types: &[GgmlType], rows: usize, cols: usize| -> Result<()> {
+            if rows == 1 {
+                check_dims(name, types, &[cols])
+            } else {
+                check_dims(name, types, &[cols, rows])
+            }
+        };
     let hc = |p: &str, inject: bool| -> Result<()> {
         check(&format!("{p}_norm.weight"), F32, 1, wide)?;
         check(&format!("{p}_down.weight"), DENSE, c.hc_lowrank, wide)?;
@@ -360,25 +428,20 @@ pub fn validate_schema(g: &Gguf, c: &Qwen4ExpConfig, with_mtp: bool) -> Result<(
     };
     let ffn = |b: &str| -> Result<()> {
         check(&format!("{b}ffn_gate_inp.weight"), F32, e, h)?;
-        check(&format!("{b}ffn_gate_exps.weight"), EXPERT_GATE_UP, e * f, h)?;
-        check(&format!("{b}ffn_up_exps.weight"), EXPERT_GATE_UP, e * f, h)?;
-        let gate = g.require(&format!("{b}ffn_gate_exps.weight"))?.ty;
+        check_dims(&format!("{b}ffn_gate_exps.weight"), EXPERT_GATE_UP, &[h, f, e])?;
+        check_dims(&format!("{b}ffn_up_exps.weight"), EXPERT_GATE_UP, &[h, f, e])?;
+        let gate = tensor(&format!("{b}ffn_gate_exps.weight"))?.0;
         ensure!(
-            g.require(&format!("{b}ffn_up_exps.weight"))?.ty == gate,
+            tensor(&format!("{b}ffn_up_exps.weight"))?.0 == gate,
             "{b}: gate and up experts of different types"
         );
-        let down = g.require(&format!("{b}ffn_down_exps.weight"))?;
+        let (ty, dims) = typed(&format!("{b}ffn_down_exps.weight"), EXPERT_DOWN)?;
+        let (h64, e64, f64_) = (h as u64, e as u64, f as u64);
         ensure!(
-            EXPERT_DOWN.contains(&down.ty)
-                && down.rows() == e * h
-                && down.row_len() >= f
-                && down.row_len() - f < 256
+            matches!(dims[..], [cols, hh, ee] if hh == h64 && ee == e64
+                && cols >= f64_ && cols - f64_ < 256)
                 && f.is_multiple_of(32),
-            "{b}ffn_down_exps.weight is {:?} [{}, {}]: lily takes {EXPERT_DOWN:?} [{}, {f} to {}]",
-            down.ty,
-            down.rows(),
-            down.row_len(),
-            e * h,
+            "{b}ffn_down_exps.weight is {ty:?} {dims:?}: lily takes [{f} to {}, {h}, {e}]",
             f + 255
         );
         check(&format!("{b}ffn_gate_shexp.weight"), DENSE, fs, h)?;
@@ -427,11 +490,10 @@ pub fn validate_schema(g: &Gguf, c: &Qwen4ExpConfig, with_mtp: bool) -> Result<(
     if with_mtp && c.mtp.is_some() {
         let b = format!("blk.{}.", c.num_hidden_layers);
         // Its fc_embedding | fc_hidden halves are column views: whole blocks.
-        let eh = g.require(&format!("{b}nextn.eh_proj.weight"))?;
+        let (eh, _) = typed(&format!("{b}nextn.eh_proj.weight"), DENSE)?;
         ensure!(
-            DENSE.contains(&eh.ty) && h.is_multiple_of(eh.ty.block_values()),
-            "{b}nextn.eh_proj.weight is {:?}",
-            eh.ty
+            h.is_multiple_of(eh.block_values()),
+            "{b}nextn.eh_proj.weight is {eh:?}"
         );
         check(&format!("{b}nextn.eh_proj.weight"), DENSE, h, 2 * h)?;
         check(&format!("{b}nextn.enorm.weight"), F32, 1, h)?;
@@ -1025,13 +1087,13 @@ pub fn load(
     validate_schema(&g, config, with_mtp)?;
     let loads_mtp = with_mtp && config.mtp.is_some();
     let first_unused = config.num_hidden_layers + usize::from(loads_mtp);
-    let mapped = Mapped::map(ctx, &g, path, first_unused)?;
-    let l = Load { ctx, g: &g, m: &mapped, cfg: config };
-    let table = match &config.ple {
+    // The n-gram table's checkpoint is checked before anything is mapped.
+    let mut table = match &config.ple {
         Some(p) => Some(ngram_table(&ngram_table_dir(ngram_checkpoint)?, p)?),
         None => None,
     };
-    let mut table = table;
+    let mapped = Mapped::map(ctx, &g, path, first_unused)?;
+    let l = Load { ctx, g: &g, m: &mapped, cfg: config };
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for (il, kind) in config.layer_types.iter().enumerate() {
         let ple = match &config.ple {
