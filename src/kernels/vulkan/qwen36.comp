@@ -784,15 +784,16 @@ void main() {
 }
 #endif
 // ---------------------------------------------------------------------------
-// Routed experts' gate and up at decode (glm53_moe_gate_up_q4_k / _q8_0, the
-// same arithmetic bit for bit) for the model's rows of K = 2048 in less
-// code: no division or clamp by parameters, the task loop rolled (unrolled
-// it was slower: every level fetches its kernel's code cold), a Q4_K
-// block's header (d, dmin, 12 scale bytes) one 16-byte load. mid[slot][r] =
-// glm53_moe_act(gate_r . x, up_r . x, 0, w). One subgroup a row r. Grid
-// (F / 8, m * used), 256 threads. Buffers and params as glm53's: 0 gate,
-// 1 up, 2 x [m][K], 3 sel [m][used], 4 w [m][used], 5 mid; 6 K, 7 F,
-// 8 row_bytes, 9 used.
+// Routed experts' gate and up at decode (glm53_moe_gate_up_q4_k / _q8_0's
+// arithmetic, each sum regrouped) for the model's rows of K = 2048 in less
+// code: no division or clamp by parameters, a Q4_K block's header (d, dmin,
+// 12 scale bytes) one 16-byte load. mid[slot][r] = glm53_moe_act(gate_r .
+// x, up_r . x, 0, w). Each row over two subgroups, one task a lane: twice
+// the threadgroups of a subgroup a row (7.47 -> 7.29 ms a decode step,
+// 2026-11-15); the halves' sums are added in order, so a row's bits do not
+// depend on m. Grid (F / 4, m * used), 256 threads. Buffers and params as
+// glm53's: 0 gate, 1 up, 2 x [m][K], 3 sel [m][used], 4 w [m][used], 5 mid;
+// 6 K, 7 F, 8 row_bytes, 9 used.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_qwen36_moe_gate_up_q4_k_k2048) || defined(KERNEL_qwen36_moe_gate_up_q8_0_k2048)
 // glm53_moe_act (glm53.comp) without the clamp (limit 0): w ((g u) / (1 +
@@ -835,6 +836,8 @@ void qwen36_decode_q4_k(uint64_t row, uint t, out float w[32]) {
         }
     }
 }
+shared float gu_gate[8];
+shared float gu_up[8];
 void main() {
     const uint K = 2048u;
     const uint F = arg_u32(7);
@@ -842,35 +845,35 @@ void main() {
     const uint used = arg_u32(9);
     const uint slot = gl_WorkGroupID.y;
     const uint i = slot / used;
-    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
-    if (r >= F) return;
+    const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint r = gl_WorkGroupID.x * 4u + sg / 2u;
     const uint e = U32(arg(3)).v[slot];
     const float we = F32(arg(4)).v[slot];
-    const uint64_t off = (uint64_t(e) * F + r) * row_bytes;
-    const uint64_t gate = arg(0) + off;
-    const uint64_t up = arg(1) + off;
+    const uint64_t off = (uint64_t(e) * F + min(r, F - 1u)) * row_bytes;
     const uint64_t X = arg(2) + 4u * uint64_t(i) * K;
-    const uint tasks = K / GLM53_TASK;
-    float ag = 0.0, au = 0.0;
-    [[dont_unroll]] for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
-        float w[32];
+    // The row's half (sg & 1): one task a lane.
+    const uint t = (sg & 1u) * 32u + lane;
+    float w[32];
 #ifdef KERNEL_qwen36_moe_gate_up_q4_k_k2048
-        qwen36_decode_q4_k(gate, t, w);
+    qwen36_decode_q4_k(arg(0) + off, t, w);
 #else
-        glm53_decode_q8_0(gate, t, w);
+    glm53_decode_q8_0(arg(0) + off, t, w);
 #endif
-        ag += glm53_task_dot(w, X + 128u * t);
+    const float ag = subgroupAdd(glm53_task_dot(w, X + 128u * t));
 #ifdef KERNEL_qwen36_moe_gate_up_q4_k_k2048
-        qwen36_decode_q4_k(up, t, w);
+    qwen36_decode_q4_k(arg(1) + off, t, w);
 #else
-        glm53_decode_q8_0(up, t, w);
+    glm53_decode_q8_0(arg(1) + off, t, w);
 #endif
-        au += glm53_task_dot(w, X + 128u * t);
+    const float au = subgroupAdd(glm53_task_dot(w, X + 128u * t));
+    if (lane == 0u) {
+        gu_gate[sg] = ag;
+        gu_up[sg] = au;
     }
-    ag = subgroupAdd(ag);
-    au = subgroupAdd(au);
-    if (gl_SubgroupInvocationID == 0u) {
-        F32(arg(5)).v[slot * F + r] = qwen36_moe_act(ag, au, we);
+    barrier();
+    if ((sg & 1u) == 0u && lane == 0u && r < F) {
+        F32(arg(5)).v[slot * F + r] =
+            qwen36_moe_act(gu_gate[sg] + gu_gate[sg + 1u], gu_up[sg] + gu_up[sg + 1u], we);
     }
 }
 #endif

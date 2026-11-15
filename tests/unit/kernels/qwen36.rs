@@ -684,23 +684,38 @@ fn gdn_step_matches_gdn_bitwise() {
     }
 }
 
-/// The K = 2048 gate/up kernels against GLM's: the same bits.
+/// Routed gate/up at rows of 2048 against GLM's kernel: each row over two
+/// subgroups regroups its sums, so both are compared with an f64 reference
+/// (the largest error at most GLM's, doubled). Each activation row of a
+/// multi-row run is the same bits as that row alone (a verify row is a
+/// decode step's).
 #[test]
-fn moe_gate_up_matches_glm53_bitwise() {
+fn moe_gate_up_matches_glm53() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(80);
     let (experts, hidden, ff, used) = (12, 2048, 512, 8);
-    for (ty, m) in [(GgmlType::Q4K, 1), (GgmlType::Q4K, 3), (GgmlType::Q8_0, 2)] {
-        let q = |rng: &mut StdRng| {
+    for (ty, m) in [
+        (GgmlType::Q4K, 1),
+        (GgmlType::Q4K, 3),
+        (GgmlType::Q8_0, 2),
+        (GgmlType::Q8_0, 4),
+    ] {
+        let mut deq = Vec::new();
+        let mut q = |rng: &mut StdRng| {
             let raw = random_blocks(rng, ty, hidden * experts * ff);
+            let mut d = vec![0f32; hidden * experts * ff];
+            dequantize(ty, &raw, &mut d).unwrap();
+            deq.push(d);
             QWeight::from_bytes(&ctx, &raw, ty, hidden, experts * ff).unwrap()
         };
         let (gw, uw) = (q(&mut rng), q(&mut rng));
-        let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+        let xs = f32s(&mut rng, m * hidden, -2.0, 2.0);
+        let x = tensor(&ctx, &xs);
         let sel: Vec<u32> =
             (0..m * used).map(|p| ((p * 5 + 1) % experts) as u32).collect();
         let tsel = u32s(&ctx, &sel);
-        let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+        let ws = f32s(&mut rng, m * used, 0.1, 0.6);
+        let tw = tensor(&ctx, &ws);
         let a = zeros(&ctx, m * used * ff, DType::F32);
         let b = zeros(&ctx, m * used * ff, DType::F32);
         run(&ctx, |p| {
@@ -711,12 +726,44 @@ fn moe_gate_up_matches_glm53_bitwise() {
             .unwrap();
         });
         let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
-        for (k, (u, v)) in a.iter().zip(&b).enumerate() {
-            assert_eq!(
-                u.to_bits(),
-                v.to_bits(),
-                "{ty:?} m {m} element {k}: {u} vs {v}"
-            );
+        let (mut err_a, mut err_b) = (0f64, 0f64);
+        for slot in 0..m * used {
+            let i = slot / used;
+            let xi = &xs[i * hidden..(i + 1) * hidden];
+            let base = sel[slot] as usize * ff;
+            for r in 0..ff {
+                let dot = |w: &[f32]| -> f64 {
+                    let row = &w[(base + r) * hidden..(base + r + 1) * hidden];
+                    row.iter().zip(xi).map(|(&w, &x)| w as f64 * x as f64).sum()
+                };
+                let (g, u) = (dot(&deq[0]), dot(&deq[1]));
+                let want = ws[slot] as f64 * g * u / (1.0 + (-g).exp());
+                err_a = err_a.max((a[slot * ff + r] as f64 - want).abs());
+                err_b = err_b.max((b[slot * ff + r] as f64 - want).abs());
+            }
+        }
+        assert!(
+            err_a <= 2.0 * err_b + 1e-6,
+            "{ty:?} m {m}: error {err_a} vs GLM's {err_b}"
+        );
+        for i in 0..m {
+            let xi = tensor(&ctx, &xs[i * hidden..(i + 1) * hidden]);
+            let si = u32s(&ctx, &sel[i * used..(i + 1) * used]);
+            let wi = tensor(&ctx, &ws[i * used..(i + 1) * used]);
+            let one = zeros(&ctx, used * ff, DType::F32);
+            run(&ctx, |p| {
+                moe_gate_up(&ctx, p, &gw, &uw, ff, &xi, &si, &wi, &one, 1, used)
+                    .unwrap()
+            });
+            let one = one.to_f32().unwrap();
+            let rows = &a[i * used * ff..(i + 1) * used * ff];
+            for (k, (u, v)) in rows.iter().zip(&one).enumerate() {
+                assert_eq!(
+                    u.to_bits(),
+                    v.to_bits(),
+                    "{ty:?} m {m} row {i} element {k}"
+                );
+            }
         }
     }
 }

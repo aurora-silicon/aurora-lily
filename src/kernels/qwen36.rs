@@ -766,9 +766,9 @@ pub fn gdn_step(
 }
 
 /// The routed experts' gate and up at decode (`glm53::moe_gate_up` without
-/// the clamp, the same bits) for rows of 2048 values (the model's hidden
-/// width) over Q4_K or Q8_0 experts, in less code; other widths take GLM's
-/// kernel.
+/// the clamp, each row over two subgroups: the sums regrouped, a row's bits
+/// the same at any `m`) for rows of 2048 values (the model's hidden width)
+/// over Q4_K or Q8_0 experts; other widths take GLM's kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gate_up(
     ctx: &MetalContext,
@@ -827,7 +827,7 @@ pub fn moe_gate_up(
             &u32_bytes(used),
         ],
         Grid::Threadgroups {
-            groups: (ff.div_ceil(8), m * used, 1),
+            groups: (ff.div_ceil(4), m * used, 1),
             threadgroup: (256, 1, 1),
         },
     )
