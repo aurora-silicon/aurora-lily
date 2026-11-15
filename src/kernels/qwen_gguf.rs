@@ -217,7 +217,7 @@ pub fn embed_bf16(
     pass.dispatch_at(
         &pipeline,
         &[table.t.binding(), ids.binding(), out.binding()],
-        &[&u32_bytes(table.cols)],
+        &[&u32_bytes(table.cols), &u32_bytes(table.rows)],
         Grid::Threads { grid: (table.cols, m, 1), threadgroup: (256, 1, 1) },
     )
 }
@@ -265,6 +265,7 @@ pub fn moe_gate_up(
             &u32_bytes(ff),
             &u32_bytes(gate.row_bytes),
             &u32_bytes(used),
+            &u32_bytes(gate.rows / ff),
         ],
         Grid::Threadgroups {
             groups: (ff.div_ceil(8), m * used, 1),
@@ -352,6 +353,7 @@ pub fn moe_down(
             &u32_bytes(down.row_bytes),
             &u32_bytes(used),
             &u32_bytes(flags),
+            &u32_bytes(down.rows / hidden),
         ],
         Grid::Threadgroups {
             groups: (hidden.div_ceil(8), m, 1),
@@ -454,7 +456,7 @@ pub fn moe_grouped(
     // (GLM's rule; the sums are the same either way).
     let r128 = pairs >= 48 * experts;
     let tile_rows = if r128 { 128 } else { 64 };
-    let group = ctx.pipeline("glm53_moe_group", SOURCE, MslVersion::V3_1)?;
+    let group = ctx.pipeline("qg_moe_group", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &group,
         &[

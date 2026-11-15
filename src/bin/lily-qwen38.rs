@@ -155,6 +155,10 @@ impl Runner {
         mut f: impl FnMut(usize, &[f32]) -> Result<()>,
     ) -> Result<(f64, f64)> {
         ensure!(split >= 1 && split <= ids.len(), "split {split} of {} ids", ids.len());
+        let vocab = LanguageModel::vocab_size(&self.model);
+        if let Some(&bad) = ids.iter().find(|&&t| t as usize >= vocab) {
+            anyhow::bail!("token id {bad} is outside the vocabulary of {vocab}");
+        }
         let (m, ctx) = (&self.model, &self.ctx);
         let n = ids.len() + extra;
         let mut state = LanguageModel::new_state(m, ctx, n + 1)?;

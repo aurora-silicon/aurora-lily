@@ -271,7 +271,9 @@ void main() {
 
 // ---------------------------------------------------------------------------
 // out[r][i] = table[ids[r]][i]: rows of a BF16 embedding table. Grid (H, m).
-// Buffers: 0 table, 1 ids (u32), 2 out. Params: 3 H.
+// An id past the table reads its last row (the host checks ids first; this
+// keeps a bad one inside the buffer). Buffers: 0 table, 1 ids (u32), 2 out.
+// Params: 3 H, 4 rows of the table.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_qg_embed_bf16
 void main() {
@@ -279,7 +281,7 @@ void main() {
     const uint H = arg_u32(3);
     const uint i = gl_GlobalInvocationID.x;
     const uint r = gl_GlobalInvocationID.y;
-    const uint id = U32(arg(1)).v[r];
+    const uint id = min(U32(arg(1)).v[r], arg_u32(4) - 1u);
     U16(arg(2)).v[r * H + i] = U16(arg(0) + 2u * (uint64_t(id) * H)).v[i];
 }
 #endif
@@ -290,9 +292,12 @@ void main() {
 // act[i * used + s][r] = bf16(silu(g) * u) with g and u, rows r of the
 // expert's gate and up, rounded to bfloat16 first. One subgroup per row r.
 // Grid (ceil(F / 8), m * used), 256 threads.
+// An expert id past E (the router's sentinel for a row of NaN
+// probabilities) reads expert E - 1: the row is garbage either way, the
+// address stays inside the stack.
 // Buffers: 0 gate experts, 1 up experts, 2 x bf16 [m][K], 3 sel u32
 // [m * used], 4 act bf16 [m * used][F]. Params: 5 K, 6 F, 7 row_bytes,
-// 8 used.
+// 8 used, 9 E.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_qg_moe_gate_up_iq2_xxs) || defined(KERNEL_qg_moe_gate_up_q4_k)
 void main() {
@@ -304,7 +309,7 @@ void main() {
     const uint i = slot / used;
     const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
     if (r >= F) return;
-    const uint e = U32(arg(3)).v[slot];
+    const uint e = min(U32(arg(3)).v[slot], arg_u32(9) - 1u);
     const uint64_t off = (uint64_t(e) * F + r) * row_bytes;
     const uint64_t gate = arg(0) + off;
     const uint64_t up = arg(1) + off;
@@ -348,7 +353,8 @@ void main() {
 // Buffers: 0 down experts, 1 act bf16 [m * used][F], 2 sel, 3 scores f32
 // [m * used], 4 shared bf16 [m][H], 5 shared gate [m] (f32, or bf16 when
 // param 11 has bit 1), 6 out bf16 [m][H]. Params: 7 F, 8 H, 9 row_bytes,
-// 10 used, 11 bit 0: add the shared expert, bit 1: its gate is bf16.
+// 10 used, 11 bit 0: add the shared expert, bit 1: its gate is bf16, 12 E
+// (an expert id past it reads expert E - 1, as the gate/up kernels do).
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_qg_moe_down_q2_k) || defined(KERNEL_qg_moe_down_mxfp4) || \
     defined(KERNEL_qg_moe_down_q8_0)
@@ -372,7 +378,7 @@ void main() {
     precise float combined = 0.0;
     for (uint s = 0u; s < used; s++) {
         const uint slot = i * used + s;
-        const uint e = U32(arg(2)).v[slot];
+        const uint e = min(U32(arg(2)).v[slot], arg_u32(12) - 1u);
         const uint64_t row = arg(0) + (uint64_t(e) * H + r) * row_bytes;
         const uint64_t X = arg(1) + 2u * uint64_t(slot) * F;
         float acc = 0.0;

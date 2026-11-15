@@ -75,8 +75,37 @@ pub fn is_qwen_gguf(path: &Path) -> bool {
         && Gguf::open(path).is_ok_and(|g| g.architecture().is_ok_and(|a| a == ARCH))
 }
 
-fn u64s(g: &Gguf, key: &str) -> Result<Vec<u64>> {
-    match g.get(key) {
+/// Metadata to read a config from: a GGUF's, or a map (tests).
+pub trait Meta {
+    fn value(&self, key: &str) -> Option<&Value>;
+}
+
+impl Meta for Gguf {
+    fn value(&self, key: &str) -> Option<&Value> {
+        self.get(key)
+    }
+}
+
+impl Meta for std::collections::BTreeMap<String, Value> {
+    fn value(&self, key: &str) -> Option<&Value> {
+        self.get(key)
+    }
+}
+
+fn meta_u64(g: &dyn Meta, key: &str) -> Result<u64> {
+    g.value(key)
+        .and_then(Value::as_u64)
+        .with_context(|| format!("GGUF metadata {key} missing or not an integer"))
+}
+
+fn meta_f32(g: &dyn Meta, key: &str) -> Result<f32> {
+    g.value(key)
+        .and_then(Value::as_f32)
+        .with_context(|| format!("GGUF metadata {key} missing or not a float"))
+}
+
+fn u64s(g: &dyn Meta, key: &str) -> Result<Vec<u64>> {
+    match g.value(key) {
         Some(Value::Array(v)) => v
             .iter()
             .map(|x| x.as_u64().context("non-integer entry"))
@@ -86,17 +115,53 @@ fn u64s(g: &Gguf, key: &str) -> Result<Vec<u64>> {
     }
 }
 
-fn key(g: &Gguf, k: &str) -> Result<usize> {
-    Ok(usize::try_from(g.u64(&format!("{ARCH}.{k}"))?)?)
+/// The largest value a dimension key may hold before anything is sized from
+/// it (the exact shape is checked after, by `validate_flash_next`).
+const MAX_DIM: u64 = 1 << 20;
+
+/// An integer key of the architecture, at most `max`.
+fn key_max(g: &dyn Meta, k: &str, max: u64) -> Result<usize> {
+    let key = format!("{ARCH}.{k}");
+    let v = meta_u64(g, &key)?;
+    ensure!(v <= max, "GGUF metadata {key} = {v} exceeds {max}");
+    Ok(usize::try_from(v)?)
 }
 
-/// The model's configuration from the file's metadata. Qwen3.8-Flash-Next
-/// facts the schema has no key for (the M-RoPE sections, the sigmoid GDN
-/// gate, the renormalized top-k) are its HF config's.
+/// A dimension key: at most [`MAX_DIM`].
+fn key(g: &dyn Meta, k: &str) -> Result<usize> {
+    key_max(g, k, MAX_DIM)
+}
+
+/// A positive finite float key.
+fn positive(g: &dyn Meta, k: &str) -> Result<f32> {
+    let v = meta_f32(g, &format!("{ARCH}.{k}"))?;
+    ensure!(v.is_finite() && v > 0.0, "GGUF metadata {ARCH}.{k} = {v} is not positive");
+    Ok(v)
+}
+
+/// The model's configuration from the file's metadata
+/// ([`config_from_metadata`]), the routed down rows' stored width from the
+/// tensor table.
 pub fn config_from_gguf(g: &Gguf) -> Result<Qwen4ExpConfig> {
-    ensure!(g.architecture()? == ARCH, "not a {ARCH} GGUF");
-    let blocks = key(g, "block_count")?;
-    let nextn = key(g, "nextn_predict_layers").unwrap_or(0);
+    config_from_metadata(g, g.require("blk.0.ffn_down_exps.weight")?.row_len())
+}
+
+/// The model's configuration from metadata (a GGUF's, or a map in the
+/// tests), `down_cols` the routed down rows' stored width. Every count is
+/// bounded before anything is sized from it; the exact shape the kernels
+/// take is checked last (`validate_flash_next`). Qwen3.8-Flash-Next facts
+/// the schema has no key for (the M-RoPE sections, the sigmoid GDN gate,
+/// the renormalized top-k) are its HF config's.
+pub fn config_from_metadata(g: &dyn Meta, down_cols: usize) -> Result<Qwen4ExpConfig> {
+    let arch = g.value("general.architecture").and_then(Value::as_str);
+    ensure!(arch == Some(ARCH), "not a {ARCH} GGUF");
+    // Every count bounded before a vector is sized from it.
+    let blocks = key_max(g, "block_count", 256)?;
+    let nextn = match g.value(&format!("{ARCH}.nextn_predict_layers")) {
+        None => 0,
+        Some(_) => key_max(g, "nextn_predict_layers", 1)?,
+    };
+    ensure!(nextn < blocks, "{blocks} blocks with {nextn} MTP layers");
     let mut layers = blocks - nextn;
     let mut nextn = nextn;
     // Diagnostic: the first N trunk layers only, without the draft head
@@ -106,7 +171,8 @@ pub fn config_from_gguf(g: &Gguf) -> Result<Qwen4ExpConfig> {
         layers = layers.min(n);
         nextn = 0;
     }
-    let interval = key(g, "full_attention_interval")?;
+    let interval = key_max(g, "full_attention_interval", 256)?;
+    ensure!(interval > 0, "full attention interval 0");
     let layer_types = (0..layers)
         .map(|i| {
             if (i + 1) % interval == 0 {
@@ -119,32 +185,61 @@ pub fn config_from_gguf(g: &Gguf) -> Result<Qwen4ExpConfig> {
     let head_dim = key(g, "attention.key_length")?;
     ensure!(head_dim == key(g, "attention.value_length")?, "k and v head dims differ");
     let rope_dim = key(g, "rope.dimension_count")?;
-    let theta = g.f32(&format!("{ARCH}.rope.freq_base"))?;
+    let theta = positive(g, "rope.freq_base")?;
     let n_k = key(g, "ssm.group_count")?;
     let n_v = key(g, "ssm.time_step_rank")?;
     let d_state = key(g, "ssm.state_size")?;
     ensure!(key(g, "ssm.inner_size")? == n_v * d_state, "GDN inner size");
+    let vocab = key(g, "vocab_size")?;
     let ratios = u64s(g, &format!("{ARCH}.attention.compress_ratios"))?;
     let ratio = ratios.iter().copied().find(|&r| r > 0).context("no QSA layer")?;
-    let tok_eos = usize::try_from(g.u64("tokenizer.ggml.eos_token_id")?)? as u32;
+    ensure!(ratio <= 64, "QSA compress ratio {ratio}");
+    let token = |k: &str| -> Result<u32> {
+        let id = meta_u64(g, k)?;
+        ensure!(id < vocab as u64, "{k} {id} is outside the vocabulary of {vocab}");
+        Ok(id as u32)
+    };
+    let tok_eos = token("tokenizer.ggml.eos_token_id")?;
     let ple_layers = u64s(g, &format!("{ARCH}.ple.layers"))?;
     let ple = match ple_layers.as_slice() {
         [] => None,
         &[layer] => {
-            let heads_per = key(g, "ple.heads_per_ngram")?;
-            let ngram = key(g, "ple.ngram_size")?;
-            let dim = key(g, "embedding_length_per_layer_input")?;
+            let heads_per = key_max(g, "ple.heads_per_ngram", 64)?;
+            let ngram = key_max(g, "ple.ngram_size", 8)?;
+            ensure!(
+                ngram >= 2 && heads_per > 0,
+                "PLE n-gram {ngram}, {heads_per} heads each"
+            );
+            let dim = key_max(g, "embedding_length_per_layer_input", 4096)?;
+            let heads = (ngram - 1) * heads_per;
+            let multipliers = u64s(g, &format!("{ARCH}.ple.layer_multipliers"))?;
+            let sizes = u64s(g, &format!("{ARCH}.ple.head_vocab_sizes"))?;
+            let offsets = u64s(g, &format!("{ARCH}.ple.head_offsets"))?;
+            ensure!(
+                multipliers.len() == ngram
+                    && sizes.len() == heads
+                    && offsets.len() == heads,
+                "PLE hashing constants: {} multipliers, {} sizes, {} offsets for {heads} heads",
+                multipliers.len(),
+                sizes.len(),
+                offsets.len()
+            );
+            ensure!(layer < layers as u64, "PLE layer {layer} of {layers}");
             Some(PleConfig {
                 layer: usize::try_from(layer)?,
-                embed_dim: dim * (ngram - 1) * heads_per,
-                conv_kernel_size: key(g, "ple.conv_kernel")?,
+                embed_dim: dim * heads,
+                conv_kernel_size: key_max(g, "ple.conv_kernel", 16)?,
                 ngram_size: ngram,
                 heads_per_ngram: heads_per,
-                eos_token_id: key(g, "ple.eos_token_id")? as u32,
-                layer_multipliers: u64s(g, &format!("{ARCH}.ple.layer_multipliers"))?,
-                head_vocab_sizes: u64s(g, &format!("{ARCH}.ple.head_vocab_sizes"))?,
-                head_offsets: u64s(g, &format!("{ARCH}.ple.head_offsets"))?,
-                padded_vocab_size: key(g, "ple.row_count")?,
+                eos_token_id: {
+                    let id = key(g, "ple.eos_token_id")?;
+                    ensure!(id < vocab, "PLE eos {id} is outside the vocabulary");
+                    id as u32
+                },
+                layer_multipliers: multipliers,
+                head_vocab_sizes: sizes,
+                head_offsets: offsets,
+                padded_vocab_size: key_max(g, "ple.row_count", u32::MAX.into())?,
                 // The table this loader pages: lily's q4-xl one (checked
                 // against its own config at load).
                 table_shards: 0,
@@ -153,24 +248,19 @@ pub fn config_from_gguf(g: &Gguf) -> Result<Qwen4ExpConfig> {
         }
         more => bail!("only one PLE layer is supported, got {more:?}"),
     };
-    let pad = g
-        .get("tokenizer.ggml.padding_token_id")
-        .and_then(Value::as_u64)
-        .map(|v| v as u32);
     let mut eos = vec![tok_eos];
     if let Some(p) = &ple
         && p.eos_token_id != tok_eos
     {
         eos.push(p.eos_token_id);
     }
-    let _ = pad;
     let config = Qwen4ExpConfig {
         hidden_size: key(g, "embedding_length")?,
         num_hidden_layers: layers,
         layer_types,
-        vocab_size: key(g, "vocab_size")?,
-        rms_norm_eps: g.f32(&format!("{ARCH}.attention.layer_norm_rms_epsilon"))?,
-        max_position_embeddings: key(g, "context_length")?,
+        vocab_size: vocab,
+        rms_norm_eps: positive(g, "attention.layer_norm_rms_epsilon")?,
+        max_position_embeddings: key_max(g, "context_length", 1 << 24)?,
         eos_token_id: EosTokenIds::Many(eos),
         num_experts: key(g, "expert_count")?,
         num_experts_per_tok: key(g, "expert_used_count")?,
@@ -205,10 +295,154 @@ pub fn config_from_gguf(g: &Gguf) -> Result<Qwen4ExpConfig> {
         storage: StoragePolicy::Q4,
         mtp: (nextn > 0).then_some(MtpConfig { layers: nextn, rope_theta: theta }),
         vision: None,
-        gguf_down_cols: Some(g.require("blk.0.ffn_down_exps.weight")?.row_len()),
+        gguf_down_cols: Some(down_cols),
     };
     config.validate_flash_next()?;
     Ok(config)
+}
+
+/// Projection types every path takes: the GEMVs (decode, verify) and the
+/// dequantization of the staged prefill GEMM.
+const DENSE: &[GgmlType] =
+    &[GgmlType::Q8_0, GgmlType::F16, GgmlType::F32, GgmlType::Bf16];
+const F32: &[GgmlType] = &[GgmlType::F32];
+/// Routed experts: the gathers' types (the grouped prefill GEMMs take
+/// IQ2_XXS gate/up with Q2_K down, the rest the gathers).
+const EXPERT_GATE_UP: &[GgmlType] = &[GgmlType::Iq2Xxs, GgmlType::Q4K];
+const EXPERT_DOWN: &[GgmlType] = &[GgmlType::Q2K, GgmlType::Mxfp4, GgmlType::Q8_0];
+
+/// Checks, before anything is mapped, that every tensor the graph reads is
+/// in the file with a type its kernels take and the shape the config says
+/// (`[rows, row length]`; a routed down row may be padded past the experts'
+/// width by less than a block of 256, ds4's Q2_K rows). The load reads
+/// nothing else and nothing it reads goes past what this checked.
+pub fn validate_schema(g: &Gguf, c: &Qwen4ExpConfig, with_mtp: bool) -> Result<()> {
+    let (h, wide) = (c.hidden_size, c.hc_width());
+    let check = |name: &str,
+                 types: &[GgmlType],
+                 rows: usize,
+                 cols: usize|
+     -> Result<()> {
+        let t = g.require(name)?;
+        ensure!(types.contains(&t.ty), "{name} is {:?}; lily takes {types:?}", t.ty);
+        ensure!(
+            t.rows() == rows && t.row_len() == cols,
+            "{name} is [{}, {}], expected [{rows}, {cols}]",
+            t.rows(),
+            t.row_len()
+        );
+        Ok(())
+    };
+    let hc = |p: &str, inject: bool| -> Result<()> {
+        check(&format!("{p}_norm.weight"), F32, 1, wide)?;
+        check(&format!("{p}_down.weight"), DENSE, c.hc_lowrank, wide)?;
+        check(&format!("{p}_up.weight"), DENSE, wide, c.hc_lowrank)?;
+        if inject {
+            check(&format!("{p}_inject.weight"), DENSE, c.hc_count, wide)?;
+        }
+        Ok(())
+    };
+    let (e, f, fs) =
+        (c.num_experts, c.moe_intermediate_size, c.shared_expert_intermediate_size);
+    let (nq, nkv, hd) = (c.num_attention_heads, c.num_key_value_heads, c.head_dim);
+    let (ih, id) = (c.indexer.n_heads, c.indexer.head_dim);
+    let attn = |b: &str| -> Result<()> {
+        check(&format!("{b}attn_q.weight"), DENSE, 2 * nq * hd, h)?;
+        check(&format!("{b}attn_k.weight"), DENSE, nkv * hd, h)?;
+        check(&format!("{b}attn_v.weight"), DENSE, nkv * hd, h)?;
+        check(&format!("{b}attn_output.weight"), DENSE, h, nq * hd)?;
+        check(&format!("{b}attn_q_norm.weight"), F32, 1, hd)?;
+        check(&format!("{b}attn_k_norm.weight"), F32, 1, hd)?;
+        check(&format!("{b}indexer.q_proj.weight"), DENSE, ih * id, h)?;
+        check(&format!("{b}indexer.k_proj.weight"), DENSE, id, h)?;
+        check(&format!("{b}indexer.q_norm.weight"), F32, 1, id)?;
+        check(&format!("{b}indexer.k_norm.weight"), F32, 1, id)
+    };
+    let ffn = |b: &str| -> Result<()> {
+        check(&format!("{b}ffn_gate_inp.weight"), F32, e, h)?;
+        check(&format!("{b}ffn_gate_exps.weight"), EXPERT_GATE_UP, e * f, h)?;
+        check(&format!("{b}ffn_up_exps.weight"), EXPERT_GATE_UP, e * f, h)?;
+        let gate = g.require(&format!("{b}ffn_gate_exps.weight"))?.ty;
+        ensure!(
+            g.require(&format!("{b}ffn_up_exps.weight"))?.ty == gate,
+            "{b}: gate and up experts of different types"
+        );
+        let down = g.require(&format!("{b}ffn_down_exps.weight"))?;
+        ensure!(
+            EXPERT_DOWN.contains(&down.ty)
+                && down.rows() == e * h
+                && down.row_len() >= f
+                && down.row_len() - f < 256
+                && f.is_multiple_of(32),
+            "{b}ffn_down_exps.weight is {:?} [{}, {}]: lily takes {EXPERT_DOWN:?} [{}, {f} to {}]",
+            down.ty,
+            down.rows(),
+            down.row_len(),
+            e * h,
+            f + 255
+        );
+        check(&format!("{b}ffn_gate_shexp.weight"), DENSE, fs, h)?;
+        check(&format!("{b}ffn_up_shexp.weight"), DENSE, fs, h)?;
+        check(&format!("{b}ffn_down_shexp.weight"), DENSE, h, fs)?;
+        check(&format!("{b}ffn_gate_inp_shexp.weight"), F32, 1, h)
+    };
+    let (n_v, dv) = (c.linear_num_value_heads, c.linear_value_head_dim);
+    for (il, kind) in c.layer_types.iter().enumerate() {
+        let b = format!("blk.{il}.");
+        hc(&format!("{b}hc_attn"), true)?;
+        hc(&format!("{b}hc_ffn"), true)?;
+        match kind {
+            LayerType::LinearAttention => {
+                let conv = c.gdn_conv_channels();
+                check(&format!("{b}attn_qkv.weight"), DENSE, conv, h)?;
+                check(&format!("{b}attn_gate.weight"), DENSE, n_v * dv, h)?;
+                check(&format!("{b}ssm_out.weight"), DENSE, h, n_v * dv)?;
+                check(&format!("{b}ssm_alpha.weight"), F32, n_v, h)?;
+                check(&format!("{b}ssm_beta.weight"), F32, n_v, h)?;
+                check(&format!("{b}ssm_a"), F32, 1, n_v)?;
+                check(&format!("{b}ssm_dt.bias"), F32, 1, n_v)?;
+                check(&format!("{b}ssm_norm.weight"), F32, 1, dv)?;
+                check(
+                    &format!("{b}ssm_conv1d.weight"),
+                    F32,
+                    conv,
+                    c.linear_conv_kernel_dim,
+                )?;
+            }
+            LayerType::FullAttention => attn(&b)?,
+        }
+        ffn(&b)?;
+        if let Some(p) = c.ple.as_ref().filter(|p| p.layer == il) {
+            check(&format!("{b}ple_key.weight"), DENSE, wide, p.embed_dim)?;
+            check(&format!("{b}ple_value.weight"), DENSE, h, p.embed_dim)?;
+            for n in ["ple_norm_key", "ple_norm_query", "ple_norm_conv"] {
+                check(&format!("{b}{n}.weight"), F32, 1, wide)?;
+            }
+            check(&format!("{b}ple_conv1d.weight"), F32, wide, p.conv_kernel_size)?;
+        }
+    }
+    check("token_embd.weight", &[GgmlType::Bf16], c.vocab_size, h)?;
+    check("output.weight", DENSE, c.vocab_size, h)?;
+    hc("output_hc", false)?;
+    if with_mtp && c.mtp.is_some() {
+        let b = format!("blk.{}.", c.num_hidden_layers);
+        // Its fc_embedding | fc_hidden halves are column views: whole blocks.
+        let eh = g.require(&format!("{b}nextn.eh_proj.weight"))?;
+        ensure!(
+            DENSE.contains(&eh.ty) && h.is_multiple_of(eh.ty.block_values()),
+            "{b}nextn.eh_proj.weight is {:?}",
+            eh.ty
+        );
+        check(&format!("{b}nextn.eh_proj.weight"), DENSE, h, 2 * h)?;
+        check(&format!("{b}nextn.enorm.weight"), F32, 1, h)?;
+        check(&format!("{b}nextn.hnorm.weight"), F32, 1, wide)?;
+        hc(&format!("{b}nextn.hc_head"), false)?;
+        hc(&format!("{b}hc_attn"), true)?;
+        hc(&format!("{b}hc_ffn"), true)?;
+        attn(&b)?;
+        ffn(&b)?;
+    }
+    Ok(())
 }
 
 /// The file's tensors in mapped regions (all but the n-gram table and the
@@ -738,6 +972,7 @@ pub fn load(
     crate::instance::acquire()?;
     let recording = ctx.record_buffers()?;
     let g = Gguf::open(path)?;
+    validate_schema(&g, config, with_mtp)?;
     let loads_mtp = with_mtp && config.mtp.is_some();
     let first_unused = config.num_hidden_layers + usize::from(loads_mtp);
     let mapped = Mapped::map(ctx, &g, path, first_unused)?;
@@ -786,3 +1021,7 @@ pub fn load(
         session_reserve: None,
     })
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/qwen4exp/gguf.rs"]
+mod tests;

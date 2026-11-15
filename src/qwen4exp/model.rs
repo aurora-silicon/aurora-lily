@@ -344,7 +344,19 @@ pub struct Qwen4ExpModel {
     /// Which checkpoint this is ([`super::config::checkpoint_identity`]),
     /// part of the disk tier's key.
     checkpoint_id: String,
+    /// The longest request context served: the checkpoint's, less the
+    /// speculative lookahead under the attention kernel's limit, or what
+    /// `--memory-limit-gb` fits ([`Self::fit_context`]).
+    context_cap: usize,
+    /// Scratch with its full prefill chunk from the start (a fitted
+    /// `--memory-limit-gb`, [`Self::fit_context`]).
+    prefill_upfront: bool,
 }
+
+/// Cache rows a session needs past its request's tokens: a verify pass of
+/// `MAX_DRAFTS + 1` rows and the `MAX_DRAFTS` the speculative step reserves
+/// beyond them (`spec.rs`).
+pub const LOOKAHEAD: usize = 2 * MAX_DRAFTS + 2;
 
 pub(super) enum LayerState {
     Gdn {
@@ -1700,6 +1712,9 @@ impl Qwen4ExpModel {
         };
         let attn_scale = 1.0 / (config.head_dim as f32).sqrt();
         let gdn_scale = 1.0 / (config.linear_key_head_dim as f32).sqrt();
+        // The served context: the checkpoint's, with the speculative
+        // lookahead's rows under the attention kernel's limit.
+        let context_cap = config.max_position_embeddings.min(MAX_SEQ - LOOKAHEAD);
         let prefill_chunk = std::env::var("LILY_PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -1716,7 +1731,74 @@ impl Qwen4ExpModel {
             ngram_ahead: true,
             kv_format: kv_format_from_env()?.unwrap_or_default(),
             checkpoint_id,
+            context_cap,
+            prefill_upfront: false,
         })
+    }
+
+    /// Under `--memory-limit-gb` (a GGUF load: there is no expert cache to
+    /// plan): the longest context whose session, with the server's
+    /// checkpoints, growth to its full capacity and the speculative
+    /// lookahead, fits what `limit` leaves after the weights and a scratch
+    /// as the server allocates it (made here to measure it, with a full
+    /// prefill chunk's); [`LanguageModel::max_position_embeddings`] becomes
+    /// it, so the server caps `--max-seq` there and refuses longer requests.
+    pub fn fit_context(&mut self, ctx: &MetalContext, limit: u64) -> Result<usize> {
+        let mtp = self.weights.mtp.is_some();
+        let checkpoints = crate::serve::CHECKPOINTS_PER_SESSION
+            + crate::serve::DECODE_CHECKPOINTS_PER_SESSION;
+        let fits = |model: &Self, context: usize, allocated: u64| -> Result<bool> {
+            let capacity = (context + LOOKAHEAD).min(MAX_SEQ);
+            let session =
+                session_bytes(&model.config, mtp, model.kv_format, capacity, checkpoints)?;
+            Ok(allocated + session <= limit)
+        };
+        self.prefill_upfront = true;
+        let measure = |model: &Self, capacity: usize| -> Result<u64> {
+            let before = ctx.current_allocated();
+            let s = model.new_scratch_with_capacity(ctx, capacity)?;
+            let scratch = ctx.current_allocated().saturating_sub(before);
+            drop(s);
+            Ok((before + scratch) as u64)
+        };
+        let longest = |model: &Self, allocated: u64| -> Result<usize> {
+            let mut context = model.context_cap;
+            while context > 4096 && !fits(model, context, allocated)? {
+                // The next smaller capacity step, less the lookahead.
+                let capacity = round_capacity(context + LOOKAHEAD)?;
+                context = capacity.saturating_sub(CAPACITY_STEP + LOOKAHEAD);
+            }
+            Ok(context)
+        };
+        // The prefill chunk's scratch (about 0.55 GB per 1024 rows) against
+        // the context: a smaller chunk where the full one leaves less than
+        // 32K tokens.
+        let (mut allocated, mut context);
+        loop {
+            allocated = measure(self, self.context_cap.min(32768))?;
+            context = longest(self, allocated)?;
+            if context >= 32768 || self.prefill_chunk <= 1024 {
+                break;
+            }
+            let smaller = self.prefill_chunk / 2;
+            self.set_prefill_chunk(smaller)?;
+        }
+        // The scratch grows a little with the capacity: measured again at
+        // the context found.
+        if context > 32768 {
+            allocated = measure(self, context)?;
+            context = longest(self, allocated)?;
+        }
+        ensure!(
+            context > 4096 || fits(self, context, allocated)?,
+            "--memory-limit-gb {:.1} leaves {:.2} GB after {:.1} GB of weights and scratch: not \
+             even a 4096-token session fits",
+            limit as f64 / (1u64 << 30) as f64,
+            limit.saturating_sub(allocated) as f64 / 1e9,
+            allocated as f64 / 1e9
+        );
+        self.context_cap = context;
+        Ok(context)
     }
 
     /// Runs the vision tower over one preprocessed image and returns its
@@ -2470,7 +2552,7 @@ impl Qwen4ExpModel {
         .into_iter()
         .max()
         .unwrap_or(0);
-        Ok(Scratch {
+        let mut scratch = Scratch {
             sync: StepSync::new(ctx)?,
             x: Tensor::zeros(ctx, &[h], bf)?,
             hyper: Tensor::zeros(ctx, &[wide], bf)?,
@@ -2522,7 +2604,14 @@ impl Qwen4ExpModel {
                 .as_ref()
                 .map(|_| SpecScratch::new(ctx, cfg))
                 .transpose()?,
-        })
+        };
+        // Under a memory limit the prefill scratch is there from the start,
+        // at its full chunk, so what the server sees allocated after its
+        // warm-up is the footprint a long prompt reaches.
+        if self.prefill_upfront {
+            self.ensure_prefill_scratch(ctx, &mut scratch, self.prefill_chunk)?;
+        }
+        Ok(scratch)
     }
 
     /// Makes sure `s.prefill` can hold chunks of `needed` rows.
@@ -2582,6 +2671,11 @@ impl Qwen4ExpModel {
         s: &Scratch,
         token: u32,
     ) -> Result<()> {
+        ensure!(
+            (token as usize) < self.config.vocab_size,
+            "token id {token} is outside the vocabulary of {}",
+            self.config.vocab_size
+        );
         if let (Some(pst), Some(p)) = (&mut state.ple, &s.ple) {
             let w = self
                 .weights
@@ -2660,6 +2754,11 @@ impl Qwen4ExpModel {
     ) -> Result<usize> {
         ensure!(!tokens.is_empty(), "empty prompt");
         ensure!(state.spec.is_none(), "prefill during a pending speculative step");
+        // The embedding gathers index the table by id: none past it.
+        let vocab = self.config.vocab_size;
+        if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= vocab) {
+            anyhow::bail!("token id {bad} is outside the vocabulary of {vocab}");
+        }
         let h = self.config.hidden_size;
         if let Some(v) = vision {
             let n = v.positions.len();
@@ -5028,9 +5127,34 @@ impl LanguageModel for Qwen4ExpModel {
             session_context,
             options.ngram_checkpoint.as_deref(),
         )
-        .map(|mut model| {
+        .and_then(|mut model| {
             model.set_kv_format(kv_format);
-            model
+            // A GGUF load under --memory-limit-gb fits its context to it.
+            if let (Some(limit), Some(_)) =
+                (options.memory_limit, model.config.gguf_down_cols)
+            {
+                let context = model.fit_context(ctx, limit)?;
+                let mtp = model.weights.mtp.is_some();
+                let checkpoints = crate::serve::CHECKPOINTS_PER_SESSION
+                    + crate::serve::DECODE_CHECKPOINTS_PER_SESSION;
+                eprintln!(
+                    "qwen3.8: --memory-limit-gb {:.1} ({:.1} GB): contexts of up to {context} tokens \
+                     (one session of {:.2} GB with {checkpoints} snapshots), prefill chunks of {} \
+                     rows; --max-seq is capped there",
+                    limit as f64 / (1u64 << 30) as f64,
+                    limit as f64 / 1e9,
+                    session_bytes(
+                        &model.config,
+                        mtp,
+                        model.kv_format,
+                        (context + LOOKAHEAD).min(MAX_SEQ),
+                        checkpoints
+                    )? as f64
+                        / 1e9,
+                    model.prefill_chunk
+                );
+            }
+            Ok(model)
         })
     }
 
@@ -5072,7 +5196,7 @@ impl LanguageModel for Qwen4ExpModel {
     }
 
     fn max_position_embeddings(&self) -> usize {
-        self.config.max_position_embeddings
+        self.context_cap
     }
 
     fn eos_token_ids(&self) -> Vec<u32> {

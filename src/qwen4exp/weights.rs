@@ -52,8 +52,8 @@ pub struct HcWeights {
 }
 
 impl HcWeights {
-    /// The single-tensor GGUF down, up and inject projections, when the
-    /// mixer is a GGUF's.
+    /// The single-tensor F16 GGUF down, up and inject projections (the fused
+    /// read's), when the mixer is a GGUF's with F16 mixers.
     pub fn gguf_parts(
         &self,
     ) -> Option<(
@@ -63,7 +63,11 @@ impl HcWeights {
     )> {
         fn one(w: &LinearWeights) -> Option<&crate::kernels::qwen_gguf::QWeight> {
             match w.gguf() {
-                Some(g) if g.parts.len() == 1 => Some(&g.parts[0]),
+                Some(g)
+                    if g.parts.len() == 1 && g.parts[0].ty == crate::gguf::GgmlType::F16 =>
+                {
+                    Some(&g.parts[0])
+                }
                 _ => None,
             }
         }

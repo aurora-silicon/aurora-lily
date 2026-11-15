@@ -498,3 +498,82 @@ fn fused_hc_read_matches_cpu() {
         assert_close(&mixed.to_f32().unwrap(), &e_mix, 1e-3, 1.6e-2);
     }
 }
+
+/// Ids past their tables stay inside them: an embedding id past the
+/// vocabulary reads the last row, and the router's sentinel expert id (a
+/// row of NaN probabilities) reads the last expert, in the gathers and the
+/// grouped GEMMs alike (no out-of-bounds address, no out-of-bounds count).
+#[test]
+fn out_of_range_ids_stay_inside_their_tables() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(45);
+    let (cols, rows) = (2560usize, 8usize);
+    let raw = random_blocks(&mut rng, GgmlType::Bf16, rows * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Bf16, cols, rows).unwrap();
+    let ids = [u32::MAX, 8, 7];
+    let tid =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[3], DType::U32).unwrap();
+    let out = Tensor::zeros(&ctx, &[3, cols], DType::BF16).unwrap();
+    run(&ctx, |p| embed_bf16(&ctx, p, &w, &tid, &out, 3).unwrap());
+    let last = decode(GgmlType::Bf16, &raw)[7 * cols..].to_vec();
+    let got = out.to_f32().unwrap();
+    for r in 0..3 {
+        assert_eq!(got[r * cols..(r + 1) * cols], last[..], "row {r}");
+    }
+
+    let (h, ff, d_cols, experts, used) =
+        (2560usize, 640usize, 768usize, 4usize, 10usize);
+    let raw_g = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * h);
+    let raw_u = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * h);
+    let raw_d = random_blocks(&mut rng, GgmlType::Q2K, experts * h * d_cols);
+    let wg =
+        QWeight::from_bytes(&ctx, &raw_g, GgmlType::Iq2Xxs, h, experts * ff).unwrap();
+    let wu =
+        QWeight::from_bytes(&ctx, &raw_u, GgmlType::Iq2Xxs, h, experts * ff).unwrap();
+    let wd =
+        QWeight::from_bytes(&ctx, &raw_d, GgmlType::Q2K, d_cols, experts * h).unwrap();
+    let m = 20usize;
+    let (_, tx) = bf16_input(&ctx, &mut rng, m * h);
+    let (_, tso) = bf16_input(&ctx, &mut rng, m * h);
+    let tsg = Tensor::from_f32_as_bf16(&ctx, &vec![0.5; m], &[m]).unwrap();
+    let scores = vec![0.1f32; m * used];
+    let tsc = Tensor::from_f32(&ctx, &scores, &[m * used]).unwrap();
+    let outputs = |sel: &[u32]| -> (Vec<f32>, Vec<f32>) {
+        let tsel = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(sel),
+            &[sel.len()],
+            DType::U32,
+        )
+        .unwrap();
+        let act = Tensor::zeros(&ctx, &[m * used * ff], DType::BF16).unwrap();
+        let gathered = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
+        let grouped = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
+        let sc = MoeGroupScratch::new(&ctx, m * used, experts, d_cols, h).unwrap();
+        run(&ctx, |p| {
+            moe_gate_up(&ctx, p, &wg, &wu, ff, &tx, &tsel, &act, m, used).unwrap();
+            p.memory_barrier().unwrap();
+            let shared = Some(SharedAdd { out: &tso, gate: &tsg });
+            moe_down(
+                &ctx, p, &wd, ff, h, &act, &tsel, &tsc, shared, &gathered, m, used,
+            )
+            .unwrap();
+            let shared = SharedAdd { out: &tso, gate: &tsg };
+            moe_grouped(
+                &ctx, p, &wg, &wu, &wd, ff, h, &tx, &tsel, &tsc, shared, &grouped, &sc,
+                m, used, experts,
+            )
+            .unwrap();
+        });
+        (gathered.to_f32().unwrap(), grouped.to_f32().unwrap())
+    };
+    // Row 0 entirely the sentinel; the others valid.
+    let sel: Vec<u32> = (0..m * used)
+        .map(|i| if i < used { u32::MAX } else { (i % experts) as u32 })
+        .collect();
+    let clamped: Vec<u32> = sel.iter().map(|&e| e.min(experts as u32 - 1)).collect();
+    let (a, b) = outputs(&sel);
+    let (ca, cb) = outputs(&clamped);
+    assert_eq!(a, ca, "gathers");
+    assert_eq!(b, cb, "grouped");
+}
