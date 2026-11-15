@@ -1099,23 +1099,43 @@ impl Qwen36Model {
             dt_bias: &w.dt_bias,
             norm: &w.norm,
         };
-        k::gdn(
-            ctx,
-            pass,
-            &p,
-            st,
-            snap,
-            &sc.qkv,
-            &sc.ga,
-            &sc.gb,
-            &sc.z,
-            &sc.c,
-            &sc.o,
-            &sc.y,
-            m,
-            cfg.gdn_k_heads,
-            cfg.rms_eps,
-        )?;
+        // Decode and verify rows: the conv, the delta rule and the gated
+        // norm in one level (a threadgroup a value head).
+        if m <= MAX_ROWS {
+            k::gdn_step(
+                ctx,
+                pass,
+                &p,
+                st,
+                snap,
+                &sc.qkv,
+                &sc.ga,
+                &sc.gb,
+                &sc.z,
+                &sc.y,
+                m,
+                cfg.gdn_k_heads,
+                cfg.rms_eps,
+            )?;
+        } else {
+            k::gdn(
+                ctx,
+                pass,
+                &p,
+                st,
+                snap,
+                &sc.qkv,
+                &sc.ga,
+                &sc.gb,
+                &sc.z,
+                &sc.c,
+                &sc.o,
+                &sc.y,
+                m,
+                cfg.gdn_k_heads,
+                cfg.rms_eps,
+            )?;
+        }
         pass.memory_barrier()?;
         let xb = self.bf16_input(ctx, pass, sc, &sc.y, cfg.gdn_inner(), m)?;
         self.proj(ctx, pass, &[(&w.out, &sc.mix)], &sc.y, xb, m)?;

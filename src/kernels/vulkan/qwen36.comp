@@ -664,3 +664,132 @@ void main() {
     st.v[2u * C + ch] = c;
 }
 #endif
+// ---------------------------------------------------------------------------
+// The GDN of up to 4 rows (decode and verify) in one level: qwen36_gdn_conv,
+// qwen36_gdn_scan and qwen36_gdn_out fused, their arithmetic bit for bit.
+// One threadgroup of 1024 a value head h. Threads 0..383 run the conv of the
+// channels the head reads (q and k of key head h % HK, v of h) into shared
+// memory; the window of q and k channels is written back by head h < HK
+// (whose key head is h), of v channels by h. Then 32 subgroups of 4 state
+// columns run the delta rule into shared o, then the first 128 threads the
+// gated RMSNorm. Grid (H).
+// Buffers: 0 qkv [m][C], 1 conv w [C][4], 2 conv window [3][C], 3 window
+// snapshot, 4 alpha [m][H], 5 b [m][H], 6 ssm_a [H], 7 dt_bias [H], 8 state
+// [H][128][128], 9 state snapshot, 10 z [m][H][128], 11 norm w [128], 12 y
+// [m][H][128]. Params: 13 HK, 14 H, 15 m (<= 4), 16 snap_row, 17 eps.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_qwen36_gdn_step
+#define COLS 4u
+shared float gs_c[4][384];
+shared float gs_o[4][128];
+shared float gs_part[4][4];
+void main() {
+    const uint D = 128u;
+    const uint HK = arg_u32(13);
+    const uint H = arg_u32(14);
+    const uint m = arg_u32(15);
+    const uint snap_row = arg_u32(16);
+    const float eps = arg_f32(17);
+    const uint h = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint kh = h % HK;
+    const uint C = (2u * HK + H) * D;
+    if (tid < 384u) {
+        const uint part = tid / 128u, at = tid % 128u;
+        const uint ch = part == 0u ? kh * D + at : (part == 1u ? (HK + kh) * D + at : (2u * HK + h) * D + at);
+        const bool owner = part == 2u || h < HK;
+        const vec4 w = F32x4(arg(1)).v[ch];
+        F32 st = F32(arg(2));
+        float x0 = st.v[ch], x1 = st.v[C + ch], x2 = st.v[2u * C + ch];
+        F32 in_rows = F32(arg(0));
+        [[dont_unroll]] for (uint t = 0u; t < m; t++) {
+            const float xn = in_rows.v[t * C + ch];
+            precise float acc = x0 * w.x;
+            acc += x1 * w.y;
+            acc += x2 * w.z;
+            acc += xn * w.w;
+            gs_c[t][tid] = qwen36_silu(acc);
+            x0 = x1;
+            x1 = x2;
+            x2 = xn;
+            if (t == snap_row && owner) {
+                F32 sn = F32(arg(3));
+                sn.v[ch] = x0;
+                sn.v[C + ch] = x1;
+                sn.v[2u * C + ch] = x2;
+            }
+        }
+        if (owner) {
+            st.v[ch] = x0;
+            st.v[C + ch] = x1;
+            st.v[2u * C + ch] = x2;
+        }
+    }
+    barrier();
+    {
+        const uint lane = gl_SubgroupInvocationID;
+        const uint j0 = gl_SubgroupID * COLS;
+        const float a_h = F32(arg(6)).v[h];
+        const float dt_h = F32(arg(7)).v[h];
+        const uint64_t state = arg(8) + 4u * ((uint64_t(h) * D + j0) * D + 4u * lane);
+        vec4 s[COLS];
+        [[unroll]] for (uint c = 0u; c < COLS; c++) s[c] = F32x4(state + 4u * c * D).v[0];
+        const float scale = inversesqrt(float(D));
+        [[dont_unroll]] for (uint t = 0u; t < m; t++) {
+            vec4 q = vec4(gs_c[t][4u * lane], gs_c[t][4u * lane + 1u], gs_c[t][4u * lane + 2u], gs_c[t][4u * lane + 3u]);
+            vec4 k = vec4(gs_c[t][128u + 4u * lane], gs_c[t][129u + 4u * lane], gs_c[t][130u + 4u * lane], gs_c[t][131u + 4u * lane]);
+            const float alpha = F32(arg(4)).v[t * H + h];
+            const float braw = F32(arg(5)).v[t * H + h];
+            const float qq = subgroupAdd(dot(q, q));
+            const float kk = subgroupAdd(dot(k, k));
+            q *= inversesqrt(qq + eps);
+            k *= inversesqrt(kk + eps);
+            const float x = alpha + dt_h;
+            const float sp = x > 20.0 ? x : log(1.0 + exp(x));
+            const float decay = exp(sp * a_h);
+            const float beta = qwen36_sigmoid(braw);
+            float o[COLS];
+            [[unroll]] for (uint c = 0u; c < COLS; c++) {
+                const float v = gs_c[t][256u + j0 + c];
+                s[c] *= decay;
+                const float kv = subgroupAdd(dot(s[c], k));
+                const float d = (v - kv) * beta;
+                s[c] = fma(k, vec4(d), s[c]);
+                o[c] = subgroupAdd(dot(s[c], q)) * scale;
+            }
+            if (lane < COLS) {
+                float mine = o[0];
+                [[unroll]] for (uint c = 1u; c < COLS; c++) {
+                    if (lane == c) mine = o[c];
+                }
+                gs_o[t][j0 + lane] = mine;
+            }
+            if (t == snap_row) {
+                const uint64_t sn = arg(9) + 4u * ((uint64_t(h) * D + j0) * D + 4u * lane);
+                [[unroll]] for (uint c = 0u; c < COLS; c++) F32x4(sn + 4u * c * D).v[0] = s[c];
+            }
+        }
+        [[unroll]] for (uint c = 0u; c < COLS; c++) F32x4(state + 4u * c * D).v[0] = s[c];
+    }
+    barrier();
+    if (tid < D) {
+        for (uint t = 0u; t < m; t++) {
+            const float o = gs_o[t][tid];
+            const float sum = subgroupAdd(o * o);
+            if (gl_SubgroupInvocationID == 0u) gs_part[t][gl_SubgroupID] = sum;
+        }
+    }
+    barrier();
+    if (tid < D) {
+        for (uint t = 0u; t < m; t++) {
+            const uint i = (t * H + h) * D + tid;
+            const float o = gs_o[t][tid];
+            const float total = (gs_part[t][0] + gs_part[t][1]) + (gs_part[t][2] + gs_part[t][3]);
+            const float scale = inversesqrt(total / float(D) + eps);
+            precise float y = o * scale * F32(arg(11)).v[tid];
+            y = y * qwen36_silu(F32(arg(10)).v[i]);
+            F32(arg(12)).v[i] = y;
+        }
+    }
+}
+#endif

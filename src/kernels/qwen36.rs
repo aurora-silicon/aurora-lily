@@ -647,6 +647,80 @@ pub fn rmsnorm(
     )
 }
 
+/// [`gdn`] of up to 4 rows (decode and verify) in one dispatch and level
+/// (`qwen36_gdn_step`: the conv, the delta rule and the gated norm of a
+/// value head in one threadgroup), the same bits; no `c` or `o` written.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_step(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    p: &GdnParams<'_>,
+    st: &GdnState<'_>,
+    snap: Option<&GdnSnapshot<'_>>,
+    qkv: &Tensor,
+    alpha: &Tensor,
+    beta: &Tensor,
+    z: &Tensor,
+    y: &Tensor,
+    m: usize,
+    k_heads: usize,
+    eps: f32,
+) -> Result<()> {
+    let h = p.ssm_a.numel();
+    ensure!((1..=4).contains(&m), "a GDN step of {m} rows");
+    ensure!(k_heads > 0 && h.is_multiple_of(k_heads), "{h} value heads over {k_heads}");
+    let ch = (2 * k_heads + h) * GDN_DIM;
+    for t in [qkv, alpha, beta, z, y, p.conv_w, p.ssm_a, p.dt_bias, p.norm] {
+        check(&[(t, DType::F32)])?;
+    }
+    check(&[(st.conv, DType::F32), (st.s, DType::F32)])?;
+    ensure!(qkv.numel() >= m * ch, "GDN qkv of {m} rows");
+    ensure!(alpha.numel() >= m * h && beta.numel() >= m * h, "GDN gates of {m} rows");
+    let inner = h * GDN_DIM;
+    ensure!(
+        z.numel() >= m * inner && y.numel() >= m * inner,
+        "GDN outputs of {m} rows"
+    );
+    ensure!(p.conv_w.numel() == 4 * ch && st.conv.numel() == 3 * ch, "GDN conv shapes");
+    ensure!(st.s.numel() == h * GDN_DIM * GDN_DIM, "GDN state of {}", st.s.numel());
+    ensure!(p.norm.numel() == GDN_DIM, "GDN norm of {}", p.norm.numel());
+    let snap_row = snap.map_or(NO_SNAPSHOT, |s| s.row as u32);
+    if let Some(s) = snap {
+        ensure!(s.row < m, "snapshot after row {} of {m}", s.row);
+        ensure!(
+            s.conv.numel() == st.conv.numel() && s.s.numel() == st.s.numel(),
+            "snapshot shapes"
+        );
+    }
+    let pipeline = ctx.pipeline("qwen36_gdn_step", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            qkv.binding(),
+            p.conv_w.binding(),
+            st.conv.binding(),
+            snap.map_or(st.conv, |s| s.conv).binding(),
+            alpha.binding(),
+            beta.binding(),
+            p.ssm_a.binding(),
+            p.dt_bias.binding(),
+            st.s.binding(),
+            snap.map_or(st.s, |s| s.s).binding(),
+            z.binding(),
+            p.norm.binding(),
+            y.binding(),
+        ],
+        &[
+            &u32_bytes(k_heads),
+            &u32_bytes(h),
+            &u32_bytes(m),
+            &snap_row.to_ne_bytes(),
+            &f32_bytes(eps),
+        ],
+        Grid::Threadgroups { groups: (h, 1, 1), threadgroup: (1024, 1, 1) },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/qwen36.rs"]
 mod tests;
