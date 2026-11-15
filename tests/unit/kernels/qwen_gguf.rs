@@ -968,8 +968,8 @@ fn hc_read_and_experts_rows_equal_one_row_calls() {
             assert_eq!(mixed[i * h..(i + 1) * h], ones[i].2[..], "hc mixed m {m} row {i}");
         }
     }
-    // Routed experts: many inputs, each row at every place of a three-row
-    // call (a slot's dot is rounded to bfloat before it is combined, which
+    // Routed experts: many inputs, each row at every place of a two- to
+    // four-row call (a slot's dot is rounded to bfloat before it is combined, which
     // hides most f32 differences: a position-dependent sum shows only now
     // and then, so the test needs volume).
     let (ff, d_cols, experts, used) = (640usize, 768usize, 12usize, 10usize);
@@ -1043,6 +1043,141 @@ fn hc_read_and_experts_rows_equal_one_row_calls() {
                         ones[k].1[..],
                         "trial {trial}: expert out m {m} input {k} at row {i}"
                     );
+                }
+            }
+        }
+    }
+}
+
+/// The narrow embedding gather: ids below `low` read their rows, ids from
+/// `spec` on read the rows after them, an id between (or past the table)
+/// reads zeros.
+#[test]
+fn narrow_embedding_reads_its_rows_and_zeros_between() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(85);
+    let (h, low, spec, vocab) = (64usize, 10usize, 30usize, 36usize);
+    let n = low + (vocab - spec);
+    let raw = random_blocks(&mut rng, GgmlType::Bf16, n * h);
+    let table = QWeight::from_bytes(&ctx, &raw, GgmlType::Bf16, h, n).unwrap();
+    let cw = decode(GgmlType::Bf16, &raw);
+    let ids: Vec<u32> = vec![0, 9, 10, 29, 30, 35, 36, 5];
+    let tids = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[ids.len()], DType::U32).unwrap();
+    let out = Tensor::zeros(&ctx, &[ids.len() * h], DType::BF16).unwrap();
+    run(&ctx, |p| embed_narrow_bf16(&ctx, p, &table, low, spec, &tids, &out, ids.len()).unwrap());
+    let got = out.to_f32().unwrap();
+    for (r, &id) in ids.iter().enumerate() {
+        let id = id as usize;
+        let row = if id < low { Some(id) } else if id >= spec && id < vocab { Some(low + id - spec) } else { None };
+        let want: Vec<f32> = match row {
+            Some(k) => cw[k * h..(k + 1) * h].to_vec(),
+            None => vec![0.0; h],
+        };
+        assert_eq!(got[r * h..(r + 1) * h], want[..], "id {id}");
+    }
+}
+
+/// The draft pass's draws: a draw equal to the next input takes that
+/// input's staged row (also when the narrow table lacks it), any other
+/// draw (the last row's always) its narrow row or zeros.
+#[test]
+fn draws_take_the_next_inputs_staged_row_or_their_narrow_row() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(87);
+    let (h, low, spec, vocab) = (64usize, 10usize, 30usize, 36usize);
+    let n = low + (vocab - spec);
+    let raw = random_blocks(&mut rng, GgmlType::Bf16, n * h);
+    let table = QWeight::from_bytes(&ctx, &raw, GgmlType::Bf16, h, n).unwrap();
+    let cw = decode(GgmlType::Bf16, &raw);
+    let inputs: Vec<u32> = vec![3, 20, 31, 7];
+    let draws: Vec<u32> = vec![20, 31, 8, 21];
+    let m = inputs.len();
+    let staged_rows: Vec<f32> =
+        (0..m * h).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0)).to_f32()).collect();
+    let staged = Tensor::from_f32_as_bf16(&ctx, &staged_rows, &[m, h]).unwrap();
+    let u32s = |v: &[u32]| Tensor::from_bytes(&ctx, bytemuck::cast_slice(v), &[v.len()], DType::U32).unwrap();
+    let (tdraws, tinputs) = (u32s(&draws), u32s(&inputs));
+    let out = Tensor::zeros(&ctx, &[m, h], DType::BF16).unwrap();
+    run(&ctx, |p| {
+        embed_draws_bf16(&ctx, p, &table, low, spec, &tdraws, &tinputs, &staged, &out, m).unwrap()
+    });
+    let got = out.to_f32().unwrap();
+    let narrow = |id: usize| match id {
+        _ if id < low => cw[id * h..(id + 1) * h].to_vec(),
+        _ if id >= spec && id < vocab => cw[(low + id - spec) * h..(low + id - spec + 1) * h].to_vec(),
+        _ => vec![0.0; h],
+    };
+    // Rows 0 and 1 are accepted drafts (20 is outside the narrow rows);
+    // row 2 is not; row 3 is the last.
+    let want = [
+        staged_rows[h..2 * h].to_vec(),
+        staged_rows[2 * h..3 * h].to_vec(),
+        narrow(8),
+        narrow(21),
+    ];
+    for (r, w) in want.iter().enumerate() {
+        assert_eq!(got[r * h..(r + 1) * h], w[..], "row {r}");
+    }
+}
+
+/// The packed down kernel (`m <= 4`, 640 activations) gives a row the same
+/// bits wherever it sits in a call, for every down type it takes (the Q2
+/// file's Q2_K, the draft head's MXFP4, Q8_0) and for slot counts that end
+/// a row's last round with one, two or three slots: each row of an m-row
+/// call against the one-row call of that row, eight inputs each.
+#[test]
+fn packed_down_rows_equal_one_row_calls_for_every_tail_and_type() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(86);
+    let (h, ff, experts) = (2560usize, 640usize, 12usize);
+    let bits = |t: &Tensor| t.to_f32().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for (dty, d_cols) in [(GgmlType::Q2K, 768usize), (GgmlType::Mxfp4, 640), (GgmlType::Q8_0, 640)] {
+        let raw = random_blocks(&mut rng, dty, experts * h * d_cols);
+        let wd = QWeight::from_bytes(&ctx, &raw, dty, d_cols, experts * h).unwrap();
+        for used in [1usize, 2, 3, 5, 10] {
+            for _ in 0..8 {
+                let act: Vec<f32> = (0..4 * used * ff)
+                    .map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0)).to_f32())
+                    .collect();
+                let so: Vec<f32> =
+                    (0..4 * h).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0)).to_f32()).collect();
+                let sel: Vec<u32> = (0..4 * used).map(|_| rng.gen_range(0..experts as u32)).collect();
+                let scores: Vec<f32> = (0..4 * used).map(|_| rng.gen_range(0.0..0.3)).collect();
+                let sg: Vec<f32> = (0..4).map(|_| rng.gen_range(-2.0..2.0)).collect();
+                let down = |rows: &[usize]| {
+                    let m = rows.len();
+                    let pick = |v: &[f32], w: usize| -> Vec<f32> {
+                        rows.iter().flat_map(|&k| v[k * w..(k + 1) * w].to_vec()).collect()
+                    };
+                    let sel_m: Vec<u32> =
+                        rows.iter().flat_map(|&k| sel[k * used..(k + 1) * used].to_vec()).collect();
+                    let tact = Tensor::from_f32_as_bf16(&ctx, &pick(&act, used * ff), &[m * used * ff]).unwrap();
+                    let tso = Tensor::from_f32_as_bf16(&ctx, &pick(&so, h), &[m * h]).unwrap();
+                    let tsel = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel_m), &[m * used], DType::U32)
+                        .unwrap();
+                    let tsc = Tensor::from_f32(&ctx, &pick(&scores, used), &[m * used]).unwrap();
+                    let tsg = Tensor::from_f32(&ctx, &pick(&sg, 1), &[m]).unwrap();
+                    let out = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
+                    run(&ctx, |p| {
+                        let shared = Some(SharedAdd { out: &tso, gate: &tsg });
+                        moe_down(&ctx, p, &wd, ff, h, &tact, &tsel, &tsc, shared, &out, m, used)
+                            .unwrap();
+                    });
+                    bits(&out)
+                };
+                let ones: Vec<Vec<u32>> = (0..4).map(|k| down(&[k])).collect();
+                for m in 1..=4usize {
+                    for shift in 0..m {
+                        let rows: Vec<usize> = (0..m).map(|i| (i + shift) % m).collect();
+                        let out = down(&rows);
+                        for (i, &k) in rows.iter().enumerate() {
+                            assert_eq!(
+                                out[i * h..(i + 1) * h],
+                                ones[k][..],
+                                "{dty:?} used {used} m {m}: input {k} at row {i}"
+                            );
+                        }
+                    }
                 }
             }
         }

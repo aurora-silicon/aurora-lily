@@ -1123,6 +1123,9 @@ pub struct Scratch {
     /// slots so the pipelined loop can host-read step N's token while the
     /// in-flight step N+1 writes the other slot.
     pub next_token: Tensor,
+    /// bf16 `[H]`: the decode step's token row from a paged embedding
+    /// (`super::embed`), staged by [`Qwen4ExpModel::prepare_step_inputs`].
+    embed_row: Option<Tensor>,
     /// Prefill staging for the largest quantized projection.
     pub(super) dequant: Tensor,
     moe: MoeScratch,
@@ -1409,6 +1412,9 @@ pub(super) struct PrefillScratch {
     /// window. Vulkan only.
     #[cfg(target_os = "linux")]
     attn_rows_split: Tensor,
+    /// The paged token embedding (`super::embed`): [`Self::chunk`] stages a
+    /// chunk's rows into `x` from it.
+    embed: Option<std::sync::Arc<super::embed::PagedEmbed>>,
 }
 
 struct GdnStageScratch {
@@ -1472,6 +1478,7 @@ impl PrefillScratch {
         table: Option<&NgramTable>,
         with_mtp: bool,
         kv_format: KvFormat,
+        embed: Option<std::sync::Arc<super::embed::PagedEmbed>>,
     ) -> Result<Self> {
         ensure!(capacity > 0, "prefill scratch capacity must be nonzero");
         let m = capacity;
@@ -1555,6 +1562,7 @@ impl PrefillScratch {
                     ])
                 }
             },
+            embed,
         })
     }
 
@@ -1563,6 +1571,11 @@ impl PrefillScratch {
     pub(super) fn chunk(&self, tokens: &[u32]) -> Result<Self> {
         let chunk = self.rows(tokens.len())?;
         chunk.ids.write_bytes(bytemuck::cast_slice(tokens))?;
+        // A paged embedding: the trunk's rows for these tokens, from the
+        // file (the trunk's embedding level then reads `x` as staged).
+        if let Some(e) = &self.embed {
+            e.fill(tokens, &chunk.x)?;
+        }
         Ok(chunk)
     }
 
@@ -1637,6 +1650,7 @@ impl PrefillScratch {
                     ])
                 })
                 .transpose()?,
+            embed: self.embed.clone(),
         })
     }
 }
@@ -2639,6 +2653,12 @@ impl Qwen4ExpModel {
             sdpa_stats: Tensor::zeros(ctx, &[nq, splits, 2], DType::F32)?,
             sampler: SamplerScratch::new(ctx, cfg.vocab_size)?,
             next_token: Tensor::zeros(ctx, &[2], DType::U32)?,
+            embed_row: self
+                .weights
+                .embed_paged
+                .as_ref()
+                .map(|_| Tensor::zeros(ctx, &[h], bf))
+                .transpose()?,
             dequant: Tensor::zeros(ctx, &[dequant_numel], bf)?,
             moe: MoeScratch::new(ctx, &moe_dims(cfg))?,
             prefill: None,
@@ -2684,6 +2704,7 @@ impl Qwen4ExpModel {
                 self.ple_table(),
                 self.weights.mtp.is_some(),
                 self.kv_format,
+                self.weights.embed_paged.clone(),
             )?);
         }
         Ok(())
@@ -2713,6 +2734,80 @@ impl Qwen4ExpModel {
         pass.end()
     }
 
+    /// The draft head's embedding of `ids` (GPU-written token ids) into
+    /// `out`: the table, or with a paged embedding its resident narrow rows,
+    /// which embed an id outside the draft head's narrow LM head as zeros
+    /// (`super::embed`; the trunk never reads these).
+    pub(super) fn embed_draft_rows(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        ids: &Tensor,
+        out: &Tensor,
+    ) -> Result<()> {
+        if self.weights.embed_paged.is_none() {
+            return embed_rows(ctx, pass, &self.weights.embed_tokens, ids, out);
+        }
+        crate::kernels::qwen_gguf::embed_narrow_bf16(
+            ctx,
+            pass,
+            self.narrow_embed()?,
+            super::spec::DRAFT_LOW_ROWS,
+            super::spec::DRAFT_SPECIAL_FROM,
+            ids,
+            out,
+            ids.numel(),
+        )
+    }
+
+    /// With a paged embedding, the draft pass's embedding of a verify pass's
+    /// `draws` into `ps.x`, which holds the rows of the pass's `inputs`: a
+    /// draw equal to the next input (an accepted draft) takes that input's
+    /// exact row, any other its narrow row. Uses `ps.branch_out`; `ps.x` is
+    /// ordered by the head's input.
+    pub(super) fn embed_draws_staged(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        draws: &Tensor,
+        inputs: &Tensor,
+        ps: &PrefillScratch,
+    ) -> Result<()> {
+        crate::kernels::qwen_gguf::embed_draws_bf16(
+            ctx,
+            pass,
+            self.narrow_embed()?,
+            super::spec::DRAFT_LOW_ROWS,
+            super::spec::DRAFT_SPECIAL_FROM,
+            draws,
+            inputs,
+            &ps.x,
+            &ps.branch_out,
+            ps.m,
+        )?;
+        pass.level_barrier(&[&ps.branch_out])?;
+        copy_words(ctx, pass, &ps.branch_out, &ps.x)
+    }
+
+    /// With a paged embedding, writes the rows of `ids` into the prefill
+    /// scratch's x for a host-driven draft pass's catch-up over them. The
+    /// GPU must not be using the prefill scratch.
+    pub(super) fn stage_draft_rows(&self, s: &Scratch, ids: &[u32]) -> Result<()> {
+        if let (Some(e), Some(ps)) = (&self.weights.embed_paged, &s.prefill) {
+            e.fill(ids, &ps.x)?;
+        }
+        Ok(())
+    }
+
+    /// The draft head's resident narrow rows of a paged embedding.
+    fn narrow_embed(&self) -> Result<&crate::kernels::qwen_gguf::QWeight> {
+        self.weights
+            .embed_tokens
+            .gguf()
+            .and_then(|g| g.parts.first())
+            .ok_or_else(|| anyhow::anyhow!("a paged embedding without its narrow rows"))
+    }
+
     /// Host work for the step consuming `token`: stage its n-gram rows and
     /// advance the hash history.
     pub fn prepare_step_inputs(
@@ -2735,6 +2830,9 @@ impl Qwen4ExpModel {
                 .expect("PLE state without weights");
             self.stage_ngram(w, p, &[token], pst.hist)?;
             pst.hist = NgramHasher::advance(pst.hist, &[token]);
+        }
+        if let (Some(e), Some(row)) = (&self.weights.embed_paged, &s.embed_row) {
+            e.fill(&[token], row)?;
         }
         Ok(())
     }
@@ -2871,7 +2969,11 @@ impl Qwen4ExpModel {
             if stop.is_some_and(|stop| stop()) {
                 return Ok(fed);
             }
+            // The ids, and with a paged embedding the chunk's rows from the
+            // file (on the critical path: counted with the staging).
+            let embed_started = std::time::Instant::now();
             let mut ps = capacity.chunk(chunk)?;
+            let embed_secs = embed_started.elapsed().as_secs_f64();
             ps.ple = capacity
                 .ple
                 .as_ref()
@@ -2947,7 +3049,7 @@ impl Qwen4ExpModel {
             let encode_secs = (encoded_at - started).as_secs_f64();
             crate::stats::record(|c| {
                 c.prefill.chunks += 1;
-                c.prefill.ngram_secs += ngram_secs + ahead_exposed;
+                c.prefill.ngram_secs += ngram_secs + ahead_exposed + embed_secs;
                 c.gather.hidden_secs += ahead_hidden;
                 c.prefill.encode_secs += encode_secs;
                 c.prefill.gpu_secs += gpu_secs;
@@ -2956,13 +3058,14 @@ impl Qwen4ExpModel {
             });
             if profile {
                 eprintln!(
-                    "profile prefill m={}: encode {:.2} ms, gpu {:.2} ms, total {:.2} ms, ngram {:.2} ms exposed, {:.2} ms ahead",
+                    "profile prefill m={}: encode {:.2} ms, gpu {:.2} ms, total {:.2} ms, ngram {:.2} ms exposed, {:.2} ms ahead, ids/embedding {:.2} ms",
                     chunk.len(),
                     encode_secs * 1e3,
                     gpu_secs * 1e3,
                     started.elapsed().as_secs_f64() * 1e3,
                     (ngram_secs + ahead_exposed) * 1e3,
-                    ahead_hidden * 1e3
+                    ahead_hidden * 1e3,
+                    embed_secs * 1e3
                 );
             }
             state.pos += chunk.len();
@@ -3051,7 +3154,11 @@ impl Qwen4ExpModel {
             None => Rope::Delta(state.rope_delta),
         };
 
-        embed_rows(ctx, &pass, &self.weights.embed_tokens, &ps.ids, &ps.x)?;
+        // A paged embedding's rows were staged into `x` with the ids
+        // (`PrefillScratch::chunk`).
+        if self.weights.embed_paged.is_none() {
+            embed_rows(ctx, &pass, &self.weights.embed_tokens, &ps.ids, &ps.x)?;
+        }
         if let Some(v) = vision {
             // The images' merged rows replace the placeholders' embeddings
             // before the streams are initialised from them (the reference's
@@ -3996,8 +4103,22 @@ impl Qwen4ExpModel {
             pass.level_barrier(&[hidden_in])?;
             let ps_rows = ps.rows(rows)?;
             let hidden = hidden_in.view(0, &[rows, wide])?;
+            // With a paged embedding the chunk's x holds its own tokens'
+            // rows (staged for the trunk, which read them at the pass's
+            // start): they are the catch-up's ids, shifted by one in the
+            // first chunk, so the draft head embeds them exactly instead of
+            // from its narrow rows.
+            let x_staged = self.weights.embed_paged.is_some();
+            if x_staged && pos == 0 {
+                let h = self.config.hidden_size;
+                let shifted = ps.branch_out.view(0, &[rows, h])?;
+                copy_words(ctx, pass, &ps.x.view(h, &[rows, h])?, &shifted)?;
+                pass.level_barrier(&[&shifted])?;
+                copy_words(ctx, pass, &shifted, &ps_rows.x)?;
+            }
             self.mtp_block_caches(
                 ctx, pass, mtp, mst, &hidden, &ids, pos0, s, &ps_rows, rope, &overrides,
+                x_staged,
             )?;
         }
         // The chunk's last trunk hidden pairs with the next token, whenever
@@ -4012,7 +4133,8 @@ impl Qwen4ExpModel {
     /// them) become the head's residual in `ps.mtp_hyper`, and the block runs
     /// at head positions `pos0..pos0+rows` against the head's caches, roped
     /// by `rope`; `overrides` are the image rows standing in for placeholder
-    /// ids among `ids`. Leaves `ps.mtp_hyper` ordered.
+    /// ids among `ids`; with `x_staged`, `ps.x` already holds the ids' rows.
+    /// Leaves `ps.mtp_hyper` ordered.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn mtp_block(
         &self,
@@ -4027,10 +4149,12 @@ impl Qwen4ExpModel {
         ps: &PrefillScratch,
         rope: Rope<'_>,
         overrides: &[RowOverride],
+        x_staged: bool,
     ) -> Result<()> {
         let cfg = &self.config;
         let (h, g) = (cfg.hidden_size, cfg.hc_count);
-        let hyper = self.mtp_input(ctx, pass, mtp, hidden, ids, s, ps, overrides)?;
+        let hyper =
+            self.mtp_input(ctx, pass, mtp, hidden, ids, s, ps, overrides, x_staged)?;
         let theta = self.mtp_theta();
 
         // The block itself: a trunk-style attention layer with its own RoPE base.
@@ -4093,6 +4217,7 @@ impl Qwen4ExpModel {
         s: &Scratch,
         ps: &'p PrefillScratch,
         overrides: &[RowOverride],
+        x_staged: bool,
     ) -> Result<&'p Tensor> {
         let cfg = &self.config;
         let (h, g, eps) = (cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps);
@@ -4118,7 +4243,11 @@ impl Qwen4ExpModel {
             eps,
             NORM_WEIGHT_BIAS,
         )?;
-        embed_rows(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
+        // `x_staged`: `ps.x` already holds these ids' rows (a paged
+        // embedding's rows staged by the host or picked from them).
+        if !x_staged {
+            self.embed_draft_rows(ctx, pass, ids, &ps.x)?;
+        }
         if !overrides.is_empty() {
             pass.level_barrier(&[&ps.x])?;
             override_rows(ctx, pass, &ps.x, overrides, h)?;
@@ -4161,7 +4290,7 @@ impl Qwen4ExpModel {
     /// the block's input, not its output, so only a catch-up, which never
     /// reads it, may call this.
     #[allow(clippy::too_many_arguments)]
-    fn mtp_block_caches(
+    pub(super) fn mtp_block_caches(
         &self,
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
@@ -4174,8 +4303,10 @@ impl Qwen4ExpModel {
         ps: &PrefillScratch,
         rope: Rope<'_>,
         overrides: &[RowOverride],
+        x_staged: bool,
     ) -> Result<()> {
-        let hyper = self.mtp_input(ctx, pass, mtp, hidden, ids, s, ps, overrides)?;
+        let hyper =
+            self.mtp_input(ctx, pass, mtp, hidden, ids, s, ps, overrides, x_staged)?;
         let Mixer::Attn(w) = &mtp.layer.mixer else {
             anyhow::bail!("draft head block is not attention")
         };
@@ -4309,7 +4440,18 @@ impl Qwen4ExpModel {
         self.set_cache_position(Some(state.pos));
 
         let ids = s.next_token.view(slot_in, &[1])?;
-        embed_rows(ctx, pass, &self.weights.embed_tokens, &ids, &s.x)?;
+        match &s.embed_row {
+            // A paged embedding: the host stages the token's row once it has
+            // read the token, so a parked step waits for its release here,
+            // before the first level, rather than before the n-gram gather.
+            Some(row) => {
+                if let Some(value) = park {
+                    s.sync.encode_wait(pass, value)?;
+                }
+                copy_words(ctx, pass, row, &s.x)?;
+            }
+            None => embed_rows(ctx, pass, &self.weights.embed_tokens, &ids, &s.x)?,
+        }
         pass.level_barrier(&[&s.x])?;
         hc_broadcast_bf16(ctx, pass, &s.x, &s.hyper, h, g)?;
         pass.level_barrier(&[&s.hyper])?;
@@ -4320,7 +4462,7 @@ impl Qwen4ExpModel {
             if let (Some(ple_w), Some(ple_s), Some(pst)) =
                 (&layer.ple, &s.ple, &state.ple)
             {
-                if let Some(value) = park {
+                if let Some(value) = park.filter(|_| s.embed_row.is_none()) {
                     // First use of host-staged data: the n-gram rows. The
                     // embedding and the layers above ran while the host
                     // read the token and staged them.

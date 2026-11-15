@@ -53,12 +53,47 @@ the fit leaves out), and its session cache keeps that largest session free befor
 each request allocates: the other sessions go to the disk tier first, and a fork
 that would not fit beside its source rewinds the source instead. Where a 4096-row
 prefill chunk leaves less than 32K tokens the chunk halves (about 5% slower prefill
-at 2048). With the draft head, q8 K/V:
+at 2048). With the draft head, q8 K/V, the token embedding paged (below):
 
 | `--memory-limit-gb` | context | prefill chunk | allocated | session cache (kept free) |
 |---|---:|---:|---:|---:|
-| 44.7 (48.0 GB) | 32 760 | 2048 | 46.3 GB | 1.7 GB (1.57 GB) |
-| 48 (51.5 GB) | 163 832 | 4096 | 47.3 GB | 4.2 GB (4.16 GB) |
+| 44.7 (48.0 GB) | 73 720 | 2048 | 45.5 GB | 2.5 GB (2.38 GB) |
+| 48 (51.5 GB) | 204 792 | 4096 | 46.6 GB | 5.0 GB (4.96 GB) |
+
+Without the draft head (`--mtp-drafts 0`), 44.7 GiB fits 163 832 tokens. Before
+the embedding was paged (2026-11-14): 32 760 tokens at 44.7 with the draft head.
+
+### The token embedding, read from the file
+
+Under `--memory-limit-gb` the token embedding (`token_embd`, BF16, 1 271 398 400
+bytes) is not mapped for the GPU (`src/qwen4exp/embed.rs`):
+
+- The trunk embeds only tokens the host knows before a pass reads them, and their
+  rows are read from the file: a prompt chunk's and a verify pass's into the
+  chunk's rows before its pass is committed, a decode step's into a one-row
+  staging before the step runs (a parked decode step waits for the host before
+  its first level). The trunk's embeddings are the mapped table's bit for bit.
+- The draft head embeds every token the host has staged from the exact rows: a
+  prompt chunk's tokens and a verify pass's inputs (an accepted draft is the
+  next input). Tokens the GPU draws within a draft pass, the step's new draw and
+  the head's own proposals, come from a resident copy of its narrow LM head's
+  rows (ids below 98 304 and the tokenizer's added tokens: 98 580 rows,
+  504 729 600 bytes), where any other id embeds as zeros; a new draw outside
+  them has its row in the head's cache rewritten from the file by the next
+  draft pass, when it is the pending token (to within one row's rounding).
+  Output is identical paged and mapped; draft acceptance can be lower on text
+  with many tokens outside the resident rows: Italian 61/134 -> 57/142 drafts
+  accepted on the bench text, English unchanged.
+- Net, with the draft head: 766 668 800 bytes less on the GPU; without it the
+  narrow rows are not kept and the whole table stays off the GPU.
+- Host time: a warm 4096-token chunk's rows take ~2.7 ms (counted in the prefill's
+  staging time, `prefill_phases.ngram_ms`), a decode step's row is part of its
+  ~0.5 ms host preparation; rows not in the page cache are read from disk (a
+  cold 4096-token chunk took ~0.3 s). Prefill and plain decode measured the same
+  paged and mapped.
+- Batched decoding would embed GPU-drawn tokens for the trunk and refuses a paged
+  table (a memory-limited load serves one request at a time anyway).
+  `LILY_EMBED_PAGED=0` maps the table whole.
 
 Persisted sessions (the disk tier) are keyed by the file's identity: a hash of its
 header and tensor table, sampled blocks of its tensor data, and the n-gram
@@ -84,6 +119,4 @@ it beside the GPU's allocation.
 
 - The file's own BF16 n-gram table (a complete ds4 download still needs a lily
   checkpoint's table).
-- The token embedding (1.27 GB) stays on the GPU; paging it from the file would
-  lower the footprint further.
 - Vision (ds4's separate mmproj file).

@@ -508,6 +508,12 @@ impl Qwen4ExpModel {
             [row] => Some(row.state.pos),
             _ => None,
         });
+        // Batched rows embed GPU-written ids: they need the mapped table (a
+        // paged one serves only a memory-limited load, which batches none).
+        ensure!(
+            self.weights.embed_paged.is_none(),
+            "batched decode over a paged token embedding"
+        );
         embed_rows(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
         pass.level_barrier(&[&ps.x])?;
         hc_broadcast_bf16(ctx, pass, &ps.x, &ps.hyper, h, g)?;
@@ -1136,7 +1142,7 @@ impl Qwen4ExpModel {
             eps,
             NORM_WEIGHT_BIAS,
         )?;
-        embed_rows(ctx, pass, &self.weights.embed_tokens, ids, &ps.x)?;
+        self.embed_draft_rows(ctx, pass, ids, &ps.x)?;
         pass.level_barrier(&[&ps.hc.hn, &ps.x])?;
         let hn_streams = ps.hc.hn.view(0, &[m * g, h])?;
         let hyper_streams = hyper.view(0, &[m * g, h])?;

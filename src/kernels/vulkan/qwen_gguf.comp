@@ -291,6 +291,48 @@ void main() {
 // keeps a bad one inside the buffer). Buffers: 0 table, 1 ids (u32), 2 out.
 // Params: 3 H, 4 rows of the table.
 // ---------------------------------------------------------------------------
+// qg_embed_narrow_bf16: out[r] from a table that holds only ids below LOW
+// (rows 0..LOW) and ids from SPEC on (rows LOW..): the draft head's
+// resident rows when the full table is paged from the file. An id between
+// them reads as zeros. Grid (H, m). Buffers: 0 table, 1 ids, 2 out.
+// Params: 3 H, 4 LOW, 5 SPEC, 6 rows of the table.
+#ifdef KERNEL_qg_embed_narrow_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint H = arg_u32(3), low = arg_u32(4), spec = arg_u32(5), rows = arg_u32(6);
+    const uint i = gl_GlobalInvocationID.x;
+    const uint r = gl_GlobalInvocationID.y;
+    const uint id = U32(arg(1)).v[r];
+    const bool held = id < low || (id >= spec && low + (id - spec) < rows);
+    const uint row = id < low ? id : low + (id - spec);
+    U16(arg(2)).v[r * H + i] = held ? U16(arg(0) + 2u * (uint64_t(row) * H)).v[i] : uint16_t(0u);
+}
+#endif
+
+// qg_embed_draws_bf16: the draft head's rows for draws[r] of a verify pass
+// whose inputs' rows are staged: draw r is input r + 1 (an accepted draft)
+// takes that input's staged row, any other draw its narrow row as in
+// qg_embed_narrow_bf16. Grid (H, m). Buffers: 0 table, 1 draws, 2 out,
+// 3 inputs, 4 staged rows (not out). Params: 5 H, 6 LOW, 7 SPEC, 8 rows of
+// the table, 9 m.
+#ifdef KERNEL_qg_embed_draws_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint H = arg_u32(5), low = arg_u32(6), spec = arg_u32(7), rows = arg_u32(8);
+    const uint m = arg_u32(9);
+    const uint i = gl_GlobalInvocationID.x;
+    const uint r = gl_GlobalInvocationID.y;
+    const uint id = U32(arg(1)).v[r];
+    if (r + 1u < m && id == U32(arg(3)).v[r + 1u]) {
+        U16(arg(2)).v[r * H + i] = U16(arg(4)).v[(r + 1u) * H + i];
+        return;
+    }
+    const bool held = id < low || (id >= spec && low + (id - spec) < rows);
+    const uint row = id < low ? id : low + (id - spec);
+    U16(arg(2)).v[r * H + i] = held ? U16(arg(0) + 2u * (uint64_t(row) * H)).v[i] : uint16_t(0u);
+}
+#endif
+
 #ifdef KERNEL_qg_embed_bf16
 void main() {
     if (!LILY_THREAD_IN_GRID) return;

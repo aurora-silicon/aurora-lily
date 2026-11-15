@@ -104,7 +104,7 @@ Speculative output equals plain greedy decoding up to rounding ties.
 | 32 GB | Qwen3.6 Q4_K_M, `--memory-limit-gb 22` | 23.6 GB | 52 088 |
 | 32 GB | Gemma 4 UD-Q5_K_M, `--memory-limit-gb 22` | 23.6 GB | 55 296 |
 | 64 GB | Qwen3.6 Q8_0, `--memory-limit-gb 44` | 47.2 GB | 262 144 |
-| 64 GB | Qwen3.8-Flash-Next Q2, `--memory-limit-gb 44.7` | 48.0 GB | 32 760 |
+| 64 GB | Qwen3.8-Flash-Next Q2, `--memory-limit-gb 44.7` | 48.0 GB | 73 720 (163 832 without drafts) |
 | 128 GB | Qwen3.8-Flash-Next q4-xl | 75 GB, plus the 32 GB n-gram table paged | 131 072 |
 | 128 GB | GLM 5.3 Flash Q2 | 100 GB | 65 536 |
 | 128 GB | DeepSeek V4 Flash Q2 | 95 GB | 65 536 |

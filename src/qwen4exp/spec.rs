@@ -78,9 +78,9 @@ static DRAFT_GPU_END: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None
 /// greedy output is unchanged; under a sampler, speculative sampling still
 /// draws from the trunk's distribution, but with other proposals a given
 /// seed may draw other tokens.
-const DRAFT_LOW_ROWS: usize = 98_304;
-const DRAFT_SPECIAL_FROM: usize = 248_044;
-const QWEN38_VOCAB: usize = 248_320;
+pub(super) const DRAFT_LOW_ROWS: usize = 98_304;
+pub(super) const DRAFT_SPECIAL_FROM: usize = 248_044;
+pub(super) const QWEN38_VOCAB: usize = 248_320;
 /// Positions after a fed token outside the narrow head during which drafts
 /// take the whole LM head: text in another script keeps drafting at full
 /// acceptance.
@@ -372,6 +372,7 @@ impl Qwen4ExpModel {
                 state,
                 s,
                 pos_before,
+                pending,
                 m,
                 chain,
                 params,
@@ -674,6 +675,7 @@ impl Qwen4ExpModel {
         )?;
         let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("no spec scratch"))?;
         sp.mtp_ids.view(0, &[1])?.write_bytes(bytemuck::cast_slice(&[first]))?;
+        self.stage_draft_rows(s, &[first])?;
         let done = encoded.commit()?.wait_retain_polled()?;
         if profiling() {
             let t = done.timing()?;
@@ -734,7 +736,7 @@ impl Qwen4ExpModel {
     }
 
     /// Encodes the draft pass that follows a verify pass of `m` rows at
-    /// `pos0`, without committing. Nothing about the accepted count is known
+    /// `pos0` (its first input `pending`), without committing. Nothing about the accepted count is known
     /// on the host: the pass decides it (`spec_accept`) and its dispatches
     /// read the control words. It rolls the recurrent state back to the
     /// accepted prefix, sets the head's hidden to the accepted row's trunk
@@ -748,6 +750,7 @@ impl Qwen4ExpModel {
         state: &DecodeState,
         s: &Scratch,
         pos0: usize,
+        pending: u32,
         m: usize,
         chain: usize,
         params: &SamplingParams,
@@ -844,6 +847,33 @@ impl Qwen4ExpModel {
             pass.level_barrier(&[])?;
         }
 
+        // With a paged embedding the head's row before this pass pairs its
+        // input hidden with the pending token, the previous step's new draw,
+        // which it embedded from its narrow rows: a token outside them took
+        // zeros, so that row is rewritten from the pending token's staged row
+        // before the hidden moves on. (One row rounds a little differently
+        // from the catch-up's rows: inside them the row stays as written.)
+        let rope = Rope::Delta(state.rope_delta);
+        let x_staged = self.weights.embed_paged.is_some();
+        if x_staged && !in_narrow_head(pending) {
+            ensure!(pos0 > 0, "a verify pass at position 0");
+            self.mtp_block_caches(
+                ctx,
+                &pass,
+                mtp,
+                mst,
+                &mst.hidden.view(0, &[1, wide])?,
+                &capacity.ids.view(0, &[1])?,
+                pos0 - 1,
+                s,
+                &capacity.rows(1)?,
+                rope,
+                &[],
+                true,
+            )?;
+            pass.level_barrier(&[])?;
+        }
+
         // The head's next input: the trunk hidden of the accepted row.
         let hidden = capacity.hyper.view(0, &[m, wide])?;
         copy_row(ctx, &pass, &hidden, Arg::Gpu(&accepted), &mst.hidden)?;
@@ -852,8 +882,19 @@ impl Qwen4ExpModel {
         // chain (and by the next step) before anything valid reads them.
         // Every row here is a generated token: its rotary position is the
         // sequence index plus the prompt's delta, and no image row applies.
-        let rope = Rope::Delta(state.rope_delta);
         let ps = capacity.rows(m)?;
+        // With a paged embedding an accepted draw is the next verify input,
+        // whose exact row the pass staged; only the others take the head's
+        // narrow rows (the new draw's row is rewritten by the next pass).
+        if x_staged {
+            self.embed_draws_staged(
+                ctx,
+                &pass,
+                &draws,
+                &capacity.ids.view(0, &[m])?,
+                &ps,
+            )?;
+        }
         self.mtp_block(
             ctx,
             &pass,
@@ -866,6 +907,7 @@ impl Qwen4ExpModel {
             &ps,
             rope,
             &[],
+            x_staged,
         )?;
         if chain > 0 {
             let hyper = ps
@@ -928,6 +970,7 @@ impl Qwen4ExpModel {
                         &ps1,
                         rope,
                         &[],
+                        false,
                     )?;
                     last = hyper.view(0, &[1, wide])?;
                 }
@@ -940,7 +983,9 @@ impl Qwen4ExpModel {
     /// Encodes a host-driven draft pass without committing: optional rollback
     /// of the recurrent state to `accepted` of `m` verified rows, the head's
     /// catch-up over `rows` rows (`hidden` rows paired with the ids in the
-    /// spec scratch's `mtp_ids`, head positions from `pos0`), `keep` copied
+    /// spec scratch's `mtp_ids`, head positions from `pos0`; with a paged
+    /// embedding the caller also stages their rows, see
+    /// [`Self::stage_draft_rows`]), `keep` copied
     /// into the state's hidden, and `drafts` chained proposals from the
     /// residual of catch-up row `chain_row` (chain positions follow it) into
     /// the spec scratch. Used for the
@@ -1043,6 +1088,7 @@ impl Qwen4ExpModel {
                 &ps,
                 rope,
                 &[],
+                self.weights.embed_paged.is_some(),
             )?;
             if drafts > 0 {
                 let hyper = ps.mtp_hyper.as_ref().expect("draft head scratch");
@@ -1089,6 +1135,7 @@ impl Qwen4ExpModel {
                             &ps1,
                             rope,
                             &[],
+                            false,
                         )?;
                         last = hyper.view(0, &[1, wide])?;
                     }
