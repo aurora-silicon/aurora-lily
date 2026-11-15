@@ -902,6 +902,71 @@ pub fn gemv_q8_0_k4096(
     )
 }
 
+/// Whether [`gemv_k2048`] takes `w`: F32 or Q8_0 rows of 2048 values.
+pub fn gemv_k2048_takes(w: &QWeight) -> bool {
+    w.cols == 2048
+        && match w.ty {
+            GgmlType::F32 => w.row_bytes == 2048 * 4,
+            GgmlType::Q8_0 => w.row_bytes == 64 * 34,
+            _ => false,
+        }
+}
+
+/// `y_s[i] = w_s x[i]` for one to four weights of rows of 2048 values, each
+/// F32 or Q8_0, over `m` rows of x (1 to 4) in one dispatch
+/// (`qwen36_gemv_k2048_m<m>`): each row over two subgroups (the sum
+/// regrouped against `glm53::gemv_sets`; a row's sums are the same bits at
+/// any `m`, so a verify row is a decode step's).
+pub fn gemv_k2048(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    sets: &[(&QWeight, &Tensor)],
+    x: &Tensor,
+    m: usize,
+) -> Result<()> {
+    ensure!((1..=4).contains(&sets.len()), "K = 2048 GEMV of {} sets", sets.len());
+    ensure!((1..=4).contains(&m), "K = 2048 GEMV of {m} rows");
+    check(&[(x, DType::F32)])?;
+    ensure!(x.numel() >= m * 2048, "K = 2048 GEMV input of {}", x.numel());
+    let mut groups = 0;
+    let mut f32_sets = 0;
+    for (s, &(w, y)) in sets.iter().enumerate() {
+        ensure!(
+            gemv_k2048_takes(w),
+            "no K = 2048 GEMV over {:?} rows of {}",
+            w.ty,
+            w.cols
+        );
+        check(&[(y, DType::F32)])?;
+        ensure!(y.numel() >= m * w.rows, "K = 2048 GEMV output of {}", y.numel());
+        groups += w.rows.div_ceil(4);
+        if w.ty == GgmlType::F32 {
+            f32_sets |= 1 << s;
+        }
+    }
+    let name = [
+        "qwen36_gemv_k2048_m1",
+        "qwen36_gemv_k2048_m2",
+        "qwen36_gemv_k2048_m3",
+        "qwen36_gemv_k2048_m4",
+    ][m - 1];
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    let mut bindings = vec![x.binding()];
+    for s in 0..4 {
+        bindings.push(sets.get(s).map_or(x.binding(), |(w, _)| w.t.binding()));
+    }
+    for s in 0..4 {
+        bindings.push(sets.get(s).map_or(x.binding(), |(_, y)| y.binding()));
+    }
+    let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
+    pass.dispatch_at(
+        &pipeline,
+        &bindings,
+        &[&rows(0), &rows(1), &rows(2), &rows(3), &u32_bytes(f32_sets)],
+        Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/qwen36.rs"]
 mod tests;

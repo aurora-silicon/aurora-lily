@@ -952,3 +952,130 @@ fn router_sg_rejects_malformed_tensors() {
     }
     pass.commit_wait().unwrap();
 }
+
+/// The K = 2048 GEMV against `glm53::gemv_sets`: each row over two
+/// subgroups regroups its sums, so both are compared with an f64 reference
+/// (the largest error at most GLM's, doubled), F32 and Q8_0 sets in one
+/// dispatch, padded rows included (509, 1). Each activation row of a
+/// multi-row run is the same bits as that row alone.
+#[test]
+fn gemv_k2048_matches_gemv_sets() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(89);
+    let cols = 2048;
+    let (f, q) = (GgmlType::F32, GgmlType::Q8_0);
+    let shapes: [&[(GgmlType, usize)]; 2] = [
+        &[(f, 256), (f, 1), (q, 509), (q, 512)],
+        &[(q, 8192), (q, 4096), (q, 32), (q, 32)],
+    ];
+    for shape in shapes {
+        let mut deq = Vec::new();
+        let ws: Vec<_> = shape
+            .iter()
+            .map(|&(ty, rows)| {
+                let raw: Vec<u8> = if ty == f {
+                    f32s(&mut rng, rows * cols, -0.1, 0.1)
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect()
+                } else {
+                    random_blocks(&mut rng, ty, rows * cols)
+                };
+                let mut d = vec![0f32; rows * cols];
+                dequantize(ty, &raw, &mut d).unwrap();
+                deq.push(d);
+                QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+            })
+            .collect();
+        let xs = f32s(&mut rng, 4 * cols, -2.0, 2.0);
+        let one: Vec<Vec<Vec<f32>>> = (0..4)
+            .map(|i| {
+                let x = tensor(&ctx, &xs[i * cols..(i + 1) * cols]);
+                let ys: Vec<_> =
+                    ws.iter().map(|w| zeros(&ctx, w.rows, DType::F32)).collect();
+                run(&ctx, |p| {
+                    let sets: Vec<_> = ws.iter().zip(&ys).collect();
+                    gemv_k2048(&ctx, p, &sets, &x, 1).unwrap();
+                });
+                ys.iter().map(|y| y.to_f32().unwrap()).collect()
+            })
+            .collect();
+        for m in 1..=4 {
+            let x = tensor(&ctx, &xs[..m * cols]);
+            let ys: Vec<_> =
+                ws.iter().map(|w| zeros(&ctx, m * w.rows, DType::F32)).collect();
+            let refs: Vec<_> =
+                ws.iter().map(|w| zeros(&ctx, m * w.rows, DType::F32)).collect();
+            run(&ctx, |p| {
+                let sets: Vec<_> = ws.iter().zip(&ys).collect();
+                gemv_k2048(&ctx, p, &sets, &x, m).unwrap();
+                for (w, r) in ws.iter().zip(&refs) {
+                    crate::kernels::glm53::gemv_sets(&ctx, p, &[(w, r)], &x, m)
+                        .unwrap();
+                }
+            });
+            for (s, ((y, r), d)) in ys.iter().zip(&refs).zip(&deq).enumerate() {
+                let (y, r) = (y.to_f32().unwrap(), r.to_f32().unwrap());
+                let rows = ws[s].rows;
+                let (mut err_y, mut err_r) = (0f64, 0f64);
+                for i in 0..m {
+                    let xi = &xs[i * cols..(i + 1) * cols];
+                    for n in 0..rows {
+                        let want: f64 = d[n * cols..(n + 1) * cols]
+                            .iter()
+                            .zip(xi)
+                            .map(|(&w, &x)| w as f64 * x as f64)
+                            .sum();
+                        err_y = err_y.max((y[i * rows + n] as f64 - want).abs());
+                        err_r = err_r.max((r[i * rows + n] as f64 - want).abs());
+                    }
+                    let got = &y[i * rows..(i + 1) * rows];
+                    for (k, (u, v)) in got.iter().zip(&one[i][s]).enumerate() {
+                        assert_eq!(
+                            u.to_bits(),
+                            v.to_bits(),
+                            "{shape:?} m {m} row {i} set {s} output {k}"
+                        );
+                    }
+                }
+                assert!(
+                    err_y <= 2.0 * err_r + 1e-6,
+                    "{shape:?} m {m} set {s}: error {err_y} vs GLM's {err_r}"
+                );
+            }
+        }
+    }
+}
+
+/// The K = 2048 GEMV refuses other types and widths, short outputs and row
+/// or set counts outside 1-4.
+#[test]
+fn gemv_k2048_rejects_malformed() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(90);
+    let cols = 2048;
+    let q = |rng: &mut StdRng, ty: GgmlType, cols: usize| {
+        QWeight::from_bytes(&ctx, &random_blocks(rng, ty, 8 * cols), ty, cols, 8)
+            .unwrap()
+    };
+    let q8 = q(&mut rng, GgmlType::Q8_0, cols);
+    let q4 = q(&mut rng, GgmlType::Q4K, cols);
+    let wide = q(&mut rng, GgmlType::Q8_0, 4096);
+    assert!(
+        gemv_k2048_takes(&q8) && !gemv_k2048_takes(&q4) && !gemv_k2048_takes(&wide)
+    );
+    let x = zeros(&ctx, 4 * 4096, DType::F32);
+    let y = zeros(&ctx, 4 * 8, DType::F32);
+    let short = zeros(&ctx, 2 * 8 - 1, DType::F32);
+    let shortx = zeros(&ctx, 2 * cols - 1, DType::F32);
+    run(&ctx, |p| {
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &y)], &x, 2).is_ok());
+        assert!(gemv_k2048(&ctx, p, &[(&q4, &y)], &x, 2).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&wide, &y)], &x, 2).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &short)], &x, 2).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &y)], &shortx, 2).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &y)], &x, 5).is_err());
+        assert!(gemv_k2048(&ctx, p, &[], &x, 1).is_err());
+        assert!(gemv_k2048(&ctx, p, &[(&q8, &y); 5], &x, 1).is_err());
+    });
+}

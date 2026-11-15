@@ -1005,3 +1005,79 @@ void main() {
     }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Up to four GEMVs over one x at decode and verify rows (1-4: the kernel's
+// _m<rows>), rows of K = 2048, each set F32 or Q8_0 (the GDN input
+// projections, the attention's q, k and v, the shared expert's gate and
+// up): glm53_gemv's per-task arithmetic for the set's type, each row over
+// two subgroups of a threadgroup, one task a lane (glm53_gemv: a subgroup a
+// row, two tasks a lane; 7.34-7.43 -> 7.26-7.30 ms a decode step,
+// 2026-11-15). The halves' sums are added in order, so a row's bits do not
+// depend on m. A threadgroup's set, and so its type, is uniform.
+// Threadgroups of 256 (4 rows). Buffers: 0 x [m][K], 1-4 W, 5-8 y
+// [m][rows_s]. Params: 9-12 rows of each set (0: unused), 13 the F32 sets
+// (bit s).
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qwen36_gemv_k2048_m1) || defined(KERNEL_qwen36_gemv_k2048_m2) || \
+    defined(KERNEL_qwen36_gemv_k2048_m3) || defined(KERNEL_qwen36_gemv_k2048_m4)
+#if defined(KERNEL_qwen36_gemv_k2048_m2)
+#define KM 2u
+#elif defined(KERNEL_qwen36_gemv_k2048_m3)
+#define KM 3u
+#elif defined(KERNEL_qwen36_gemv_k2048_m4)
+#define KM 4u
+#else
+#define KM 1u
+#endif
+shared float k2_part[KM][8];
+void main() {
+    const uint64_t X = arg(0);
+    const uint K = 2048u;
+    const uint tasks = K / GLM53_TASK;
+    // The threadgroup's set.
+    uint tg = gl_WorkGroupID.x;
+    uint set = 0u;
+    uint N = arg_u32(9);
+    [[unroll]] for (uint s = 0u; s < 3u; s++) {
+        const uint tgs = (N + 3u) / 4u;
+        if (set == s && tg >= tgs) {
+            tg -= tgs;
+            set = s + 1u;
+            N = arg_u32(10u + s);
+        }
+    }
+    const bool f32w = ((arg_u32(13) >> set) & 1u) != 0u;
+    const uint row_bytes = f32w ? K * 4u : tasks * 34u;
+    const uint64_t Y = arg(5u + set);
+    const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint n = tg * 4u + sg / 2u;
+    const uint t = (sg & 1u) * 32u + lane;
+    const uint64_t row = arg(1u + set) + uint64_t(min(n, N - 1u)) * row_bytes;
+    const uint64_t xt = X + 4u * uint64_t(t * GLM53_TASK);
+    float w[32];
+    float d = 1.0;
+    if (f32w) {
+        glm53_decode_f32(row, t, w);
+    } else {
+        const uint64_t b = row + uint64_t(t) * 34u;
+        d = glm53_h2f(uint(U16(b).v[0]));
+        [[unroll]] for (uint i = 0u; i < 16u; i++) {
+            const uint pair = uint(U16(b + 2u).v[i]);
+            w[2u * i] = float(int(pair << 24) >> 24);
+            w[2u * i + 1u] = float(int(pair << 16) >> 24);
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < KM; i++) {
+        const float dot = glm53_task_dot(w, xt + 4u * uint64_t(i) * K);
+        const float sum = subgroupAdd(f32w ? dot : d * dot);
+        if (lane == 0u) k2_part[i][sg] = sum;
+    }
+    barrier();
+    if ((sg & 1u) == 0u && lane == 0u && n < N) {
+        [[unroll]] for (uint i = 0u; i < KM; i++) {
+            F32(Y).v[i * N + n] = k2_part[i][sg] + k2_part[i][sg + 1u];
+        }
+    }
+}
+#endif
