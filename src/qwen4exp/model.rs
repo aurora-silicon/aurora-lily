@@ -1783,12 +1783,12 @@ impl Qwen4ExpModel {
         };
         // The prefill chunk's scratch (about 0.55 GB per 1024 rows) against
         // the context: a smaller chunk where the full one leaves less than
-        // 32K tokens.
+        // 32K tokens (of capacity: the context and its lookahead).
         let (mut allocated, mut context);
         loop {
             allocated = measure(self, self.context_cap.min(32768))?;
             context = longest(self, allocated)?;
-            if context >= 32768 || self.prefill_chunk <= 1024 {
+            if context + LOOKAHEAD >= 32768 || self.prefill_chunk <= 1024 {
                 break;
             }
             let smaller = self.prefill_chunk / 2;
