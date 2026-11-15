@@ -764,73 +764,94 @@ fn gemv_q8_0_k4096_matches_glm53() {
     assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-5, 1e-5);
 }
 
-/// Attention decode in splits of 64 keys against the default route.
+/// Attention decode in splits of 64 keys against the default route: at the
+/// split boundaries (64, 65, 128, 129 keys), longer contexts, and with the
+/// production scratch (128 splits) at 8192 keys (the last it takes) and
+/// 8193 (where it falls back), cache rows past the context poisoned with
+/// NaN (a read past the context would show).
 #[test]
 fn sdpa_decode_split64_matches_sdpa_decode() {
     use crate::kernels::attention::{
-        KvCache, KvFormat, scatter_kv, sdpa_decode, sdpa_decode_split64,
+        KvCache, KvFormat, MAX_SEQ, scatter_kv, sdpa_decode, sdpa_decode_split64,
+        sdpa_split_scratch_splits,
     };
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(88);
-    let (nq, kvh, d, cap) = (16, 2, 256, 2048);
-    let splits = crate::kernels::attention::sdpa_split_scratch_splits(cap);
-    let partials = zeros(&ctx, nq * splits * 4 * d, DType::F32);
-    let stats = zeros(&ctx, nq * splits * 4 * 2, DType::F32);
-    for len in [65, 300, 1100, 2000] {
+    let (nq, kvh, d) = (16, 2, 256);
+    // The model's scratch: splits for MAX_SEQ.
+    let splits = sdpa_split_scratch_splits(MAX_SEQ);
+    let partials = zeros(&ctx, nq * splits * d, DType::F32);
+    let stats = zeros(&ctx, nq * splits * 2, DType::F32);
+    for (cap, lens) in
+        [(2048, vec![64, 65, 128, 129, 300, 1100, 2000]), (8196, vec![8192, 8193])]
+    {
         let kc = KvCache::zeros(&ctx, KvFormat::Bf16, kvh, cap, d).unwrap();
         let vc = KvCache::zeros(&ctx, KvFormat::Bf16, kvh, cap, d).unwrap();
-        let kr = Tensor::from_f32_as_bf16(
+        let nan = Tensor::from_f32_as_bf16(
             &ctx,
-            &f32s(&mut rng, len * kvh * d, -1.0, 1.0),
-            &[len, kvh, d],
+            &vec![f32::NAN; cap * kvh * d],
+            &[cap, kvh, d],
         )
         .unwrap();
-        let vr = Tensor::from_f32_as_bf16(
-            &ctx,
-            &f32s(&mut rng, len * kvh * d, -1.0, 1.0),
-            &[len, kvh, d],
-        )
-        .unwrap();
-        let q = Tensor::from_f32_as_bf16(
-            &ctx,
-            &f32s(&mut rng, nq * d, -1.0, 1.0),
-            &[nq, d],
-        )
-        .unwrap();
-        let a = zeros(&ctx, nq * d, DType::BF16);
-        let b = zeros(&ctx, nq * d, DType::BF16);
-        run(&ctx, |p| {
-            scatter_kv(&ctx, p, &kc, &kr, 0).unwrap();
-            scatter_kv(&ctx, p, &vc, &vr, 0).unwrap();
-            p.memory_barrier().unwrap();
-            sdpa_decode_split64(
+        for len in lens {
+            let kr = Tensor::from_f32_as_bf16(
                 &ctx,
-                p,
-                &q,
-                &kc,
-                &vc,
-                &a,
-                len,
-                0.0625,
-                (&partials, &stats),
+                &f32s(&mut rng, len * kvh * d, -1.0, 1.0),
+                &[len, kvh, d],
             )
             .unwrap();
-            p.memory_barrier().unwrap();
-            sdpa_decode(
+            let vr = Tensor::from_f32_as_bf16(
                 &ctx,
-                p,
-                &q,
-                &kc,
-                &vc,
-                &b,
-                len,
-                0.0625,
-                Some((&partials, &stats)),
+                &f32s(&mut rng, len * kvh * d, -1.0, 1.0),
+                &[len, kvh, d],
             )
             .unwrap();
-        });
-        // bfloat outputs.
-        assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-2, 1e-2);
+            let q = Tensor::from_f32_as_bf16(
+                &ctx,
+                &f32s(&mut rng, nq * d, -1.0, 1.0),
+                &[nq, d],
+            )
+            .unwrap();
+            let a = zeros(&ctx, nq * d, DType::BF16);
+            let b = zeros(&ctx, nq * d, DType::BF16);
+            run(&ctx, |p| {
+                scatter_kv(&ctx, p, &kc, &nan, 0).unwrap();
+                scatter_kv(&ctx, p, &vc, &nan, 0).unwrap();
+                p.memory_barrier().unwrap();
+                scatter_kv(&ctx, p, &kc, &kr, 0).unwrap();
+                scatter_kv(&ctx, p, &vc, &vr, 0).unwrap();
+                p.memory_barrier().unwrap();
+                sdpa_decode_split64(
+                    &ctx,
+                    p,
+                    &q,
+                    &kc,
+                    &vc,
+                    &a,
+                    len,
+                    0.0625,
+                    (&partials, &stats),
+                )
+                .unwrap();
+                p.memory_barrier().unwrap();
+                sdpa_decode(
+                    &ctx,
+                    p,
+                    &q,
+                    &kc,
+                    &vc,
+                    &b,
+                    len,
+                    0.0625,
+                    Some((&partials, &stats)),
+                )
+                .unwrap();
+            });
+            let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+            assert!(a.iter().all(|v| v.is_finite()), "{len} keys: a non-finite output");
+            // bfloat outputs.
+            assert_close(&a, &b, 1e-2, 1e-2);
+        }
     }
 }
 
