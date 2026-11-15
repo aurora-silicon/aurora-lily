@@ -69,6 +69,22 @@ impl QWeight {
     }
 }
 
+/// The two-weight-rows Q8_0 GEMV of `m` (1 to 8) activation rows.
+fn gemv_r2_name(m: usize) -> Result<&'static str> {
+    const NAMES: [&str; 8] = [
+        "glm53_gemv_q8_0_r2_m1",
+        "glm53_gemv_q8_0_r2_m2",
+        "glm53_gemv_q8_0_r2_m3",
+        "glm53_gemv_q8_0_r2_m4",
+        "glm53_gemv_q8_0_r2_m5",
+        "glm53_gemv_q8_0_r2_m6",
+        "glm53_gemv_q8_0_r2_m7",
+        "glm53_gemv_q8_0_r2_m8",
+    ];
+    ensure!((1..=8).contains(&m), "two-row GEMV of {m} rows");
+    Ok(NAMES[m - 1])
+}
+
 /// The GEMV kernel of a type and row count (`m` in 1..=4: the count is a
 /// compile-time constant of each kernel).
 fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
@@ -230,7 +246,7 @@ pub fn gemv_with(
     m: usize,
     l: GemvLayout,
 ) -> Result<()> {
-    gemv_dispatch(ctx, pass, &[(w, y)], x, m, l)
+    gemv_dispatch(ctx, pass, &[(w, y)], x, m, l, false)
 }
 
 /// One dispatch of up to four GEMVs of one weight type and width over the
@@ -247,7 +263,37 @@ pub fn gemv_sets(
     let rows = sets.iter().map(|(w, _)| w.rows).max().unwrap_or(0);
     let cols = sets.first().map_or(0, |(w, _)| w.cols);
     let l = GemvLayout { x_group: rows.max(1), x_row_stride: cols, y_row_stride: 0 };
-    gemv_dispatch(ctx, pass, sets, x, m, l)
+    gemv_dispatch(ctx, pass, sets, x, m, l, false)
+}
+
+/// [`gemv_sets`], taking for Q8_0 weights of rows of 1 024 values the
+/// kernel with two weight rows a subgroup (each
+/// activation load serves both; DeepSeek V4's verify and draft rows, and
+/// its decode rows so that a row computes the same in any run).
+pub fn gemv_sets_r2(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    sets: &[(&QWeight, &Tensor)],
+    x: &Tensor,
+    m: usize,
+) -> Result<()> {
+    let rows = sets.iter().map(|(w, _)| w.rows).max().unwrap_or(0);
+    let cols = sets.first().map_or(0, |(w, _)| w.cols);
+    let l = GemvLayout { x_group: rows.max(1), x_row_stride: cols, y_row_stride: 0 };
+    gemv_dispatch(ctx, pass, sets, x, m, l, true)
+}
+
+/// [`gemv_with`] with [`gemv_sets_r2`]'s kernel choice.
+pub fn gemv_with_r2(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w: &QWeight,
+    x: &Tensor,
+    y: &Tensor,
+    m: usize,
+    l: GemvLayout,
+) -> Result<()> {
+    gemv_dispatch(ctx, pass, &[(w, y)], x, m, l, true)
 }
 
 fn gemv_dispatch(
@@ -257,6 +303,7 @@ fn gemv_dispatch(
     x: &Tensor,
     m: usize,
     l: GemvLayout,
+    r2: bool,
 ) -> Result<()> {
     ensure!((1..=4).contains(&sets.len()), "GEMV of {} sets", sets.len());
     let w0 = sets[0].0;
@@ -270,9 +317,22 @@ fn gemv_dispatch(
     );
     let max_rows = sets.iter().map(|(w, _)| w.rows).max().unwrap_or(0);
     let g16 = g16_gemv_name(ctx, w0.ty, w0.cols, m, l.x_group, l.x_row_stride);
+    // DeepSeek V4's two-weight-rows Q8_0 kernel (`r2`: gemv_sets_r2,
+    // gemv_with_r2), for any activation row count so that a row computes
+    // the same in any run: rows of 1 024 values, a lane one task, sixteen
+    // rows a threadgroup (gemv_timing m = 6, 2026-11-15: 32768 x 1024
+    // 125 -> 110 us). Longer rows lost: the two rows' registers across the
+    // loop (4096 x 8192 163 -> 204 us), and with each pair's tasks split
+    // over two subgroups (155 us at six rows) plain decoding paid 1.5%.
+    // Pairs of weight rows lie inside one input group.
+    let r2 = r2
+        && g16.is_none()
+        && w0.ty == GgmlType::Q8_0
+        && tasks == 32
+        && l.x_group.is_multiple_of(2);
     // Two rows a subgroup share one input row, so grouped inputs (GLM's
     // per-head attn_k_b) take one; the G16 kernels set their own rows.
-    let r = if g16.is_none() && l.x_group >= max_rows {
+    let r = if !r2 && g16.is_none() && l.x_group >= max_rows {
         gemv_rows_per_subgroup(w0.ty, m, max_rows)
     } else {
         1
@@ -281,7 +341,7 @@ fn gemv_dispatch(
         Some((_, rows)) => rows,
         None => 32 / tasks.min(32),
     };
-    let rows_per_tg = 8 * per_sg * r;
+    let rows_per_tg = if r2 { 16 } else { 8 * per_sg * r };
     let mut groups = 0;
     for &(w, y) in sets {
         ensure!(
@@ -309,6 +369,7 @@ fn gemv_dispatch(
     let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
     let name = match g16 {
         Some((name, _)) => name,
+        None if r2 => gemv_r2_name(m)?,
         None if r == 2 => "glm53_gemv_q5_k_m1_r2",
         None => gemv_name(w0.ty, m)?,
     };

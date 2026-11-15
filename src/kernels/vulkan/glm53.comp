@@ -400,6 +400,107 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
+// The Q8_0 GEMV of 1 to 8 activation rows with two weight rows a subgroup
+// (DeepSeek V4's decode, verify and draft rows; one row too, so a row's
+// values are the same whatever the run): each task's activations are loaded
+// once for both weight rows, where glm53_gemv_q8_0_m* loads them once per
+// weight row (at six rows the activations are ~24 bytes per weight byte).
+// Each output is computed as glm53_gemv_q8_0_m*'s: block scale times the
+// task's dot, tasks in the same order, then the subgroup sum (the compiler
+// associates each dot differently: equal to rounding). Rows of 1 024 values
+// (32 tasks: a lane one task); 16 rows a threadgroup.
+// Buffers and params as the GEMV's.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_glm53_gemv_q8_0_r2_m1)
+#define R2_M 1u
+#elif defined(KERNEL_glm53_gemv_q8_0_r2_m2)
+#define R2_M 2u
+#elif defined(KERNEL_glm53_gemv_q8_0_r2_m3)
+#define R2_M 3u
+#elif defined(KERNEL_glm53_gemv_q8_0_r2_m4)
+#define R2_M 4u
+#elif defined(KERNEL_glm53_gemv_q8_0_r2_m5)
+#define R2_M 5u
+#elif defined(KERNEL_glm53_gemv_q8_0_r2_m6)
+#define R2_M 6u
+#elif defined(KERNEL_glm53_gemv_q8_0_r2_m7)
+#define R2_M 7u
+#elif defined(KERNEL_glm53_gemv_q8_0_r2_m8)
+#define R2_M 8u
+#endif
+#ifdef R2_M
+void main() {
+    const uint64_t X = arg(0);
+    const uint K = arg_u32(9);
+    const uint row_bytes = arg_u32(11);
+    const uint x_group = arg_u32(16);
+    const uint x_row_stride = arg_u32(17);
+    const uint y_stride_param = arg_u32(18);
+    const uint tasks = K / GLM53_TASK;
+    uint tg = gl_WorkGroupID.x;
+    uint set = 0u;
+    uint N = arg_u32(12);
+    [[unroll]] for (uint s = 0u; s < 3u; s++) {
+        const uint tgs = (N + 15u) / 16u;
+        if (set == s && tg >= tgs) {
+            tg -= tgs;
+            set = s + 1u;
+            N = arg_u32(13u + s);
+        }
+    }
+    const uint64_t W = arg(1u + set);
+    const uint64_t Y = arg(5u + set);
+    const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint n0 = (tg * 8u + gl_SubgroupID) * 2u;
+    if (n0 >= N) return;
+    const bool live1 = n0 + 1u < N;
+    const uint64_t row0 = W + uint64_t(n0) * row_bytes;
+    const uint64_t row1 = W + uint64_t(live1 ? n0 + 1u : n0) * row_bytes;
+    const uint g = n0 / x_group;
+    float a0[R2_M], a1[R2_M];
+    [[unroll]] for (uint r = 0u; r < R2_M; r++) {
+        a0[r] = 0.0;
+        a1[r] = 0.0;
+    }
+    for (uint t = lane; t < tasks; t += 32u) {
+        const uint64_t b0 = row0 + uint64_t(t) * 34u, b1 = row1 + uint64_t(t) * 34u;
+        const float d0 = glm53_h2f(uint(U16(b0).v[0])), d1 = glm53_h2f(uint(U16(b1).v[0]));
+        float w0[32], w1[32];
+        [[unroll]] for (uint i = 0u; i < 16u; i++) {
+            const uint p0 = uint(U16(b0 + 2u).v[i]), p1 = uint(U16(b1 + 2u).v[i]);
+            w0[2u * i] = float(int(p0 << 24) >> 24);
+            w0[2u * i + 1u] = float(int(p0 << 16) >> 24);
+            w1[2u * i] = float(int(p1 << 24) >> 24);
+            w1[2u * i + 1u] = float(int(p1 << 16) >> 24);
+        }
+        const uint64_t xt = X + 4u * (uint64_t(g) * K + t * GLM53_TASK);
+        [[unroll]] for (uint r = 0u; r < R2_M; r++) {
+            const uint64_t xr = xt + 4u * uint64_t(r) * x_row_stride;
+            float s0 = 0.0, s1 = 0.0;
+            [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                const vec4 v = F32x4(xr + 16u * q).v[0];
+                s0 += w0[4u * q] * v.x + w0[4u * q + 1u] * v.y + w0[4u * q + 2u] * v.z + w0[4u * q + 3u] * v.w;
+                s1 += w1[4u * q] * v.x + w1[4u * q + 1u] * v.y + w1[4u * q + 2u] * v.z + w1[4u * q + 3u] * v.w;
+            }
+            a0[r] += d0 * s0;
+            a1[r] += d1 * s1;
+        }
+    }
+    [[unroll]] for (uint r = 0u; r < R2_M; r++) {
+        a0[r] = subgroupAdd(a0[r]);
+        a1[r] = subgroupAdd(a1[r]);
+    }
+    if (lane == 0u) {
+        [[unroll]] for (uint r = 0u; r < R2_M; r++) {
+            F32(Y).v[r * y_row_stride + n0] = a0[r];
+            if (live1) F32(Y).v[r * y_row_stride + n0 + 1u] = a1[r];
+        }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Routed experts, gate and up with the clamped SwiGLU: for slot s of row i
 // (expert sel[i][s], weight w[i][s]), mid[i * used + s][r] = w * silu(min(g,
 // L)) * clamp(u, -L, L), g and u rows r of the expert's gate and up. One

@@ -328,6 +328,53 @@ fn moe_xh_rows_match_one_row_exactly() {
     }
 }
 
+/// The Q8_0 GEMV with two weight rows a subgroup (DeepSeek V4's verify
+/// rows) against the one-row-a-subgroup kernel: 2 to 8 activation rows,
+/// sets of different heights (one odd), and the grouped layout of the
+/// attention's output projection. The same products in the same task
+/// order, but the compiler associates each task's dot differently in the
+/// two kernels: equal to rounding.
+#[test]
+fn gemv_r2_matches_gemv() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(87);
+    gemv_r2_case(&ctx, &mut rng, 1024, 1e-5);
+}
+
+fn gemv_r2_case(ctx: &MetalContext, rng: &mut StdRng, cols: usize, atol: f32) {
+    let mk = |rng: &mut StdRng, rows: usize| {
+        let raw = random_blocks(rng, GgmlType::Q8_0, rows * cols);
+        QWeight::from_bytes(ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap()
+    };
+    let (wa, wb) = (mk(&mut *rng, 96), mk(&mut *rng, 37));
+    let close = |a: &Tensor, b: &Tensor| {
+        assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), atol, 1e-5);
+    };
+    for m in 1..=8 {
+        let x = tensor(ctx, &f32s(&mut *rng, m * cols, -2.0, 2.0));
+        let (ya, yb) = (zeros(ctx, m * 96), zeros(ctx, m * 37));
+        let (za, zb) = (zeros(ctx, m * 96), zeros(ctx, m * 37));
+        run(ctx, |p| {
+            gemv_sets(ctx, p, &[(&wa, &ya), (&wb, &yb)], &x, m).unwrap();
+            gemv_sets_r2(ctx, p, &[(&wa, &za), (&wb, &zb)], &x, m).unwrap();
+        });
+        close(&za, &ya);
+        close(&zb, &yb);
+    }
+    // Grouped: 4 groups of 32 weight rows, each over its own 1024 inputs.
+    let (groups, per) = (4, 32);
+    let wg = mk(&mut *rng, groups * per);
+    let m = 6;
+    let x = tensor(ctx, &f32s(&mut *rng, m * groups * cols, -2.0, 2.0));
+    let l = GemvLayout { x_group: per, x_row_stride: groups * cols, y_row_stride: groups * per };
+    let (y, z) = (zeros(ctx, m * groups * per), zeros(ctx, m * groups * per));
+    run(ctx, |p| {
+        gemv_with(ctx, p, &wg, &x, &y, m, l).unwrap();
+        gemv_with_r2(ctx, p, &wg, &x, &z, m, l).unwrap();
+    });
+    close(&z, &y);
+}
+
 #[test]
 fn moe_gate_up_and_down_match_cpu() {
     let ctx = ctx();
@@ -2046,7 +2093,12 @@ fn gemv_timing() {
         ("q_a Q8_0 1536x4096", GgmlType::Q8_0, 4096, 1536, 1),
         ("f_b Q8_0 8192x128", GgmlType::Q8_0, 128, 8192, 1),
         ("attn_out Q8_0 4096x16384", GgmlType::Q8_0, 16384, 4096, 1),
+        ("ds4 q_b Q8_0 32768x1024", GgmlType::Q8_0, 1024, 32768, 1),
+        ("ds4 out_b Q8_0 4096x8192 m=6", GgmlType::Q8_0, 8192, 4096, 6),
+        ("ds4 q_b Q8_0 m=6", GgmlType::Q8_0, 1024, 32768, 6),
+        ("ds4 sh_down Q8_0 4096x2048", GgmlType::Q8_0, 2048, 4096, 1),
     ];
+    let r2 = std::env::var_os("LILY_GEMV_R2").is_some();
     for (label, ty, cols, rows, m) in shapes {
         let copies = if rows > 100_000 { 1 } else { 4 };
         let ws: Vec<QWeight> = (0..copies)
@@ -2061,7 +2113,11 @@ fn gemv_timing() {
         for _ in 0..5 {
             let pass = ctx.begin().unwrap();
             for r in 0..repeat {
-                gemv(&ctx, &pass, &ws[r % copies], &x, &y, m).unwrap();
+                if r2 {
+                    gemv_sets_r2(&ctx, &pass, &[(&ws[r % copies], &y)], &x, m).unwrap();
+                } else {
+                    gemv(&ctx, &pass, &ws[r % copies], &x, &y, m).unwrap();
+                }
             }
             let t = std::time::Instant::now();
             pass.commit_wait().unwrap();
@@ -2089,7 +2145,8 @@ fn moe_timing() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(16);
-    let (experts, hidden, ff, used) = (16, 4096, 2048, 8);
+    let used: usize = std::env::var("LILY_MOE_USED").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let (experts, hidden, ff) = (16, 4096, 2048);
     let mk = |rng: &mut StdRng, ty, cols, rows| {
         let raw = random_blocks(rng, ty, rows * cols);
         QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
