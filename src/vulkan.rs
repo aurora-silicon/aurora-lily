@@ -105,8 +105,8 @@ const PARAM_ALIGN: usize = 16;
 /// First arena chunk; a pass that outgrows it gets a larger one appended.
 const ARENA_CHUNK: usize = 1 << 20;
 
-/// The push constants of every kernel (`common.glsl`): the thread grid, the
-/// mask of the arguments that are values, and the arguments.
+/// The push constants of every kernel (`common.glsl`): the thread grid, a
+/// reserved word (zero), and the arguments.
 const PUSH_HEADER: usize = 16;
 const PUSH_BYTES: u32 = (PUSH_HEADER + 8 * MAX_BUFFER_BINDINGS) as u32;
 
