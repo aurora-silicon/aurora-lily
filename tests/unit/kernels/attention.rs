@@ -326,7 +326,16 @@ fn check_sdpa_prefill(
     base_len: usize,
     seed: u64,
 ) {
-    check_sdpa_prefill_with(SDPA_PREFILL_KERNEL, m, nq, kvh, d, max_seq, base_len, seed);
+    check_sdpa_prefill_with(
+        SDPA_PREFILL_KERNEL,
+        m,
+        nq,
+        kvh,
+        d,
+        max_seq,
+        base_len,
+        seed,
+    );
     // And the kernel sdpa_prefill dispatches on this device, if another.
     let ctx = MetalContext::new().expect("metal context");
     let chosen = sdpa_prefill_kernel(&ctx);
@@ -383,8 +392,18 @@ fn check_sdpa_prefill_with(
         sdpa_rows_split(&ctx, &pass, &tq, &tk, &tv, &out, base_len, scale, &scratch)
             .expect("sdpa");
     } else {
-        sdpa_prefill_with(&ctx, &pass, kernel, &tq, &tk, &tv, &out, base_len.into(), scale)
-            .expect("sdpa");
+        sdpa_prefill_with(
+            &ctx,
+            &pass,
+            kernel,
+            &tq,
+            &tk,
+            &tv,
+            &out,
+            base_len.into(),
+            scale,
+        )
+        .expect("sdpa");
     }
     #[cfg(not(target_os = "linux"))]
     sdpa_prefill_with(&ctx, &pass, kernel, &tq, &tk, &tv, &out, base_len.into(), scale)
@@ -554,7 +573,9 @@ const SDPA_PREFILL_CM2: [&str; 2] = ["sdpa_prefill_cm2", "sdpa_prefill_cm2_split
 fn cm2_offered(ctx: &MetalContext, test: &str) -> bool {
     let offered = ctx.cooperative_matrix_register_ops();
     if !offered {
-        eprintln!("{test}: skipped, the device lacks VK_NV_cooperative_matrix2's register operations");
+        eprintln!(
+            "{test}: skipped, the device lacks VK_NV_cooperative_matrix2's register operations"
+        );
     }
     offered
 }
@@ -581,7 +602,10 @@ fn sdpa_prefill_kernel_follows_device() {
 #[cfg(target_os = "linux")]
 #[test]
 fn sdpa_prefill_cm2_matches_cpu_causal() {
-    if !cm2_offered(&MetalContext::new().expect("metal context"), "sdpa_prefill_cm2_matches_cpu_causal") {
+    if !cm2_offered(
+        &MetalContext::new().expect("metal context"),
+        "sdpa_prefill_cm2_matches_cpu_causal",
+    ) {
         return;
     }
     for kernel in SDPA_PREFILL_CM2 {
@@ -611,10 +635,12 @@ fn sdpa_prefill_cm2_timing() {
     let fill = |n: usize, rng: &mut StdRng| -> Vec<f32> {
         (0..n).map(|_| rng.gen_range(-1.0f32..1.0)).collect()
     };
-    let k = Tensor::from_f32_as_bf16(&ctx, &fill(kvh * cap * d, &mut rng), &[kvh, cap, d])
-        .expect("k");
-    let v = Tensor::from_f32_as_bf16(&ctx, &fill(kvh * cap * d, &mut rng), &[kvh, cap, d])
-        .expect("v");
+    let k =
+        Tensor::from_f32_as_bf16(&ctx, &fill(kvh * cap * d, &mut rng), &[kvh, cap, d])
+            .expect("k");
+    let v =
+        Tensor::from_f32_as_bf16(&ctx, &fill(kvh * cap * d, &mut rng), &[kvh, cap, d])
+            .expect("v");
     let kernels = [SDPA_PREFILL_KERNEL, SDPA_PREFILL_CM2[0], SDPA_PREFILL_CM2[1]];
     for (m, len, layers) in [
         (2048usize, 2048usize, 4usize),
@@ -624,8 +650,9 @@ fn sdpa_prefill_cm2_timing() {
         (3, 2048, 24),
         (3, 4096, 24),
     ] {
-        let q = Tensor::from_f32_as_bf16(&ctx, &fill(m * nq * d, &mut rng), &[m, nq, d])
-            .expect("q");
+        let q =
+            Tensor::from_f32_as_bf16(&ctx, &fill(m * nq * d, &mut rng), &[m, nq, d])
+                .expect("q");
         let out: Vec<Tensor> = kernels
             .iter()
             .map(|_| Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out"))
@@ -635,14 +662,25 @@ fn sdpa_prefill_cm2_timing() {
             for (i, kernel) in kernels.iter().enumerate() {
                 let pass = ctx.begin().expect("pass");
                 for _ in 0..layers {
-                    sdpa_prefill_with(&ctx, &pass, kernel, &q, &k, &v, &out[i], (len - m).into(), 0.0625)
-                        .expect(kernel);
+                    sdpa_prefill_with(
+                        &ctx,
+                        &pass,
+                        kernel,
+                        &q,
+                        &k,
+                        &v,
+                        &out[i],
+                        (len - m).into(),
+                        0.0625,
+                    )
+                    .expect(kernel);
                     pass.level_barrier(&[&out[i]]).expect("barrier");
                 }
                 let done = pass.commit().expect("commit").wait_retain().expect("wait");
                 let t = done.timing().expect("timing");
                 if round > 0 {
-                    best[i] = best[i].min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
+                    best[i] = best[i]
+                        .min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
                 }
             }
         }
@@ -650,7 +688,11 @@ fn sdpa_prefill_cm2_timing() {
         let mut line = format!("sdpa prefill m={m} len={len}:");
         for (i, kernel) in kernels.iter().enumerate() {
             let other = out[i].to_f32().expect("read");
-            let diff = first.iter().zip(&other).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let diff = first
+                .iter()
+                .zip(&other)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
             line += &format!(
                 " {kernel} {:.1} us ({:.2}x, max |diff| {diff:.4});",
                 best[i] * 1e6,
@@ -1095,7 +1137,8 @@ fn cm2_register_ops_are_exact() {
     let at = |r: usize, c: usize| x[r * 16 + c];
     let tx = Tensor::from_f32(&ctx, &x, &[256]).expect("x");
     let out = Tensor::zeros(&ctx, &[11 * 256], DType::F32).expect("out");
-    let pipeline = ctx.pipeline("cm2_ops_test", SOURCE, MslVersion::V4_0).expect("pipeline");
+    let pipeline =
+        ctx.pipeline("cm2_ops_test", SOURCE, MslVersion::V4_0).expect("pipeline");
     let pass = ctx.begin().expect("pass");
     pass.dispatch_with(
         &pipeline,
@@ -1129,13 +1172,24 @@ fn cm2_register_ops_are_exact() {
     }
     for r in 0..8 {
         for c in 0..8 {
-            want[4 * 256 + r * 8 + c] =
-                at(2 * r, 2 * c) + at(2 * r, 2 * c + 1) + at(2 * r + 1, 2 * c) + at(2 * r + 1, 2 * c + 1);
+            want[4 * 256 + r * 8 + c] = at(2 * r, 2 * c)
+                + at(2 * r, 2 * c + 1)
+                + at(2 * r + 1, 2 * c)
+                + at(2 * r + 1, 2 * c + 1);
         }
     }
     let names = [
-        "row sum", "row max", "column sum", "max", "2x2 sum", "per-element (row, col)",
-        "per-element with a matrix", "to A", "to B", "transposed to B", "to half A",
+        "row sum",
+        "row max",
+        "column sum",
+        "max",
+        "2x2 sum",
+        "per-element (row, col)",
+        "per-element with a matrix",
+        "to A",
+        "to B",
+        "transposed to B",
+        "to half A",
     ];
     let mut bad = Vec::new();
     for (i, name) in names.iter().enumerate() {
@@ -1169,8 +1223,9 @@ fn cm2_converted_operand_times_tensor_load_is_exact() {
     let tx = Tensor::from_f32(&ctx, &x, &[16 * 64]).expect("x");
     let ty = Tensor::from_f32_as_bf16(&ctx, &y, &[64 * 16]).expect("y");
     let out = Tensor::zeros(&ctx, &[256], DType::F32).expect("out");
-    let pipeline =
-        ctx.pipeline("cm2_convert_pairing_test", SOURCE, MslVersion::V4_0).expect("pipeline");
+    let pipeline = ctx
+        .pipeline("cm2_convert_pairing_test", SOURCE, MslVersion::V4_0)
+        .expect("pipeline");
     let pass = ctx.begin().expect("pass");
     pass.dispatch_with(
         &pipeline,

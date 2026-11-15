@@ -718,7 +718,15 @@ void main() {
 #endif
 
 // Split-K decode emits local softmax statistics and weighted-V partials.
+// sdpa_decode_split64_bf16 (Qwen3.6's decode) takes splits of 64 keys: a
+// split's subgroups walk 8 keys each where 256 make them walk 32 rounds of
+// dependent loads, and short contexts get 4x the threadgroups.
+#ifdef KERNEL_sdpa_decode_split64_bf16
+#define SDPA_SPLIT 64
+#define KERNEL_sdpa_decode_split_bf16
+#else
 #define SDPA_SPLIT 256
+#endif
 
 // sdpa_decode_split_t<CPT, STRIDED>.
 #ifdef KERNEL_sdpa_decode_split_bf16

@@ -957,6 +957,76 @@ fn sdpa_decode_inner<'c>(
     )
 }
 
+/// Keys a split of [`sdpa_decode_split64`] takes.
+pub const SDPA_SPLIT64: usize = 64;
+
+/// [`sdpa_decode`] over bf16 caches through the per-head split kernel with
+/// splits of [`SDPA_SPLIT64`] keys (`sdpa_decode_split64_bf16`, then the
+/// combine), for any context past one split whose partials fit the scratch;
+/// other cases take [`sdpa_decode`]. Qwen3.6's decode: a 256-key split's
+/// subgroups walk 32 rounds of dependent loads, ~40 us a level at any
+/// context.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_split64<'c>(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    k_cache: impl Into<Kv<'c>>,
+    v_cache: impl Into<Kv<'c>>,
+    out: &Tensor,
+    len: usize,
+    scale: f32,
+    split_scratch: (&Tensor, &Tensor),
+) -> Result<()> {
+    let (k_kv, v_kv) = (k_cache.into(), v_cache.into());
+    let format = Kv::pair_format(&k_kv, &v_kv)?;
+    let (kvh, max_seq, d) = k_kv.shape();
+    let nq = q.numel() / d;
+    let splits = len.div_ceil(SDPA_SPLIT64);
+    let (partials, stats) = split_scratch;
+    let fits = partials.numel() >= nq * splits * d && stats.numel() >= nq * splits * 2;
+    if format != KvFormat::Bf16 || len <= SDPA_SPLIT64 || !fits || d > 256 {
+        return sdpa_decode(ctx, pass, q, k_kv, v_kv, out, len, scale, Some(split_scratch));
+    }
+    ensure!(q.numel() == nq * d && out.numel() == nq * d, "q/out shape mismatch");
+    ensure!(nq.is_multiple_of(kvh), "NQ {nq} not a multiple of KVH {kvh}");
+    ensure!(len <= max_seq && max_seq <= MAX_SEQ, "len {len} exceeds kernel MAX_SEQ");
+    ensure!(
+        partials.dtype() == DType::F32 && stats.dtype() == DType::F32,
+        "split scratch of {:?}",
+        partials.dtype()
+    );
+    let group = nq / kvh;
+    let stage1 = ctx.pipeline("sdpa_decode_split64_bf16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &stage1,
+        &[
+            q.binding(),
+            k_kv.values.binding(),
+            v_kv.values.binding(),
+            partials.binding(),
+            stats.binding(),
+        ],
+        &[
+            &u32_bytes(d),
+            &u32_bytes(max_seq),
+            &u32_bytes(len),
+            &u32_bytes(splits),
+            &u32_bytes(group),
+            &scale.to_ne_bytes(),
+        ],
+        Grid::Threadgroups { groups: (nq, splits, 1), threadgroup: (256, 1, 1) },
+    )?;
+    pass.level_barrier(&[partials, stats])?;
+    let stage2 = ctx.pipeline("sdpa_decode_combine", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &stage2,
+        &[partials.binding(), stats.binding(), out.binding()],
+        &[&u32_bytes(d), &u32_bytes(splits)],
+        Grid::Threadgroups { groups: (nq, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 /// [`sdpa_decode`] over a q8 cache: the per-head split kernel for every
 /// length (one split up to 256 positions), then the combine.
 #[allow(clippy::too_many_arguments)]
