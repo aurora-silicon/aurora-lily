@@ -757,10 +757,15 @@ void main() {
 // ds4_attend's attention for prompt runs on the matrix units: a threadgroup
 // takes 16 heads of step row i (they see the same keys), the row's keys in
 // steps of 128 (subgroup g scores keys 16 g .. of the step, then owns output
-// dims 64 g .. of all 16 heads), an online softmax per head. Q, keys and the
-// softmax weights are f16 on the matrix units with f32 accumulators (ds4's
-// prefill attention is f16 the same way); the scores take K 64 at a time in
-// MAT_K64's order, Q staged in that order at the A operand's places. Grid
+// dims 64 g .. of all 16 heads), an online softmax per head. Q and the keys
+// are f16 operands with f32 score accumulators; maxima, exponentials, the
+// denominator and the output sums are f32, and each weight is rounded to f16
+// only as the P V operand (the denominator sums the unrounded weights). ds4's
+// prefill attention (flash_attn_ext, FA_NONVEC_TYPES) also takes Q, K and V
+// in half but keeps the softmax weights in f32 for P V: the f16 weights are
+// this kernel's own approximation (attention_mu_sharp_scores bounds it). The
+// scores take K 64 at a time in MAT_K64's order, Q staged in that order at
+// the A operand's places. Grid
 // (heads / 16, m), 256 threads. Buffers 0-7 as ds4_attend's, 8 the RoPE
 // table. Params: 9 pos0, 10 ratio, 11 use_sel, 12 S, 13 scale, 14 window,
 // 15 raw_lo, 16 table row of row 0, 17 flags, 18 eps. Flags bit 0: Q as

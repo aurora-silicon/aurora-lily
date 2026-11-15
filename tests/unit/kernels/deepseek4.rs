@@ -507,6 +507,119 @@ fn attend_fused_case(m: usize, prompt: bool) {
     }
 }
 
+/// The matrix-unit attention with sharp scores: each head's query lies
+/// along a +-1 direction and a few keys are copies of some heads'
+/// directions (scores about 11 against noise of about 0.3), in the first
+/// 128-key block and in the second, so the online maximum jumps between
+/// blocks and the other weights fall to ~1e-5 (f16's subnormal range).
+/// Against an oracle of the kernel's arithmetic (f16 queries, blocks of 128
+/// keys, each weight rounded to f16 for P V only, f32 elsewhere) and against
+/// the f32 reference.
+#[test]
+fn attention_mu_sharp_scores() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(412);
+    let (heads, pos0, m, ratio) = (64usize, 200usize, 10usize, 4usize);
+    let total = pos0 + m;
+    let sign = |rng: &mut StdRng| -> Vec<f32> {
+        (0..512).map(|_| if rng.gen_bool(0.5) { 1.0 } else { -1.0 }).collect()
+    };
+    let dirs: Vec<Vec<f32>> = (0..heads).map(|_| sign(&mut rng)).collect();
+    let noise = |rng: &mut StdRng| -> Vec<f32> {
+        f32s(rng, 512, -1.0, 1.0).iter().map(|&v| round_f16(v)).collect()
+    };
+    let mut rows: Vec<Vec<f32>> = (0..total).map(|_| noise(&mut rng)).collect();
+    let n_comp = total / ratio;
+    let mut comp: Vec<Vec<f32>> = (0..n_comp).map(|_| noise(&mut rng)).collect();
+    // Second block (compressed rows come after the 128 raw ones): head 0 at
+    // full strength, head 1 weaker; first block (raw rows): head 2.
+    comp[5] = dirs[0].clone();
+    comp[7] = dirs[1].iter().map(|&v| round_f16(0.6 * v)).collect();
+    rows[pos0 - 20] = dirs[2].iter().map(|&v| round_f16(0.8 * v)).collect();
+    let ring: Vec<f32> = (0..128)
+        .flat_map(|slot| {
+            (0..pos0).rev().find(|p| p % 128 == slot).map_or(vec![0.0; 512], |p| rows[p].clone())
+        })
+        .collect();
+    let mut q = vec![0f32; m * heads * 512];
+    for i in 0..m {
+        for h in 0..heads {
+            for (d, v) in dirs[h].iter().enumerate() {
+                q[(i * heads + h) * 512 + d] = 0.5 * v + rng.gen_range(-0.05..0.05);
+            }
+        }
+    }
+    let sinks = f32s(&mut rng, heads, -1.0, 2.0);
+    let (tq, ts) = (tensor(&ctx, &q), tensor(&ctx, &sinks));
+    let (tring, trun) = (f16_tensor(&ctx, &ring), f16_tensor(&ctx, &rows[pos0..].concat()));
+    let tcomp = f16_tensor(&ctx, &comp.concat());
+    let out = zeros(&ctx, m * heads * 512, DType::F32);
+    let rows_arg = CompRows::All { cache: &tcomp, ratio };
+    run(&ctx, |p| {
+        let raw = RawWindow::MODEL;
+        attend_with(&ctx, p, &tq, &trun, &tring, rows_arg, &ts, &out, m, heads, pos0, raw, true)
+            .unwrap()
+    });
+    let got = out.to_f32().unwrap();
+    let scale = 1.0 / (512f64).sqrt();
+    let (mut err_half, mut err_f32) = (0f32, 0f32);
+    for i in 0..m {
+        let p = pos0 + i;
+        // The kernel's key order: the raw window by position, then the
+        // compressed rows.
+        let mut keys: Vec<&[f32]> = (p + 1 - 128..=p).map(|x| rows[x].as_slice()).collect();
+        keys.extend(comp.iter().take((p + 1) / ratio).map(|c| c.as_slice()));
+        for h in 0..heads {
+            let qh = &q[(i * heads + h) * 512..(i * heads + h + 1) * 512];
+            let q16: Vec<f32> = qh.iter().map(|&v| round_f16(v)).collect();
+            let sc: Vec<f32> = keys
+                .iter()
+                .map(|k| (q16.iter().zip(*k).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum::<f64>() * scale) as f32)
+                .collect();
+            let (mut mx, mut l) = (-1e30f32, 0f32);
+            let mut o = vec![0f64; 512];
+            for b0 in (0..keys.len()).step_by(128) {
+                let blk = b0..(b0 + 128).min(keys.len());
+                let n = sc[blk.clone()].iter().copied().fold(mx, f32::max);
+                let f = (mx - n).exp();
+                l *= f;
+                for v in &mut o {
+                    *v *= f64::from(f);
+                }
+                for r in blk {
+                    let w = (sc[r] - n).exp();
+                    l += w;
+                    let wh = f64::from(round_f16(w));
+                    for (d, v) in o.iter_mut().enumerate() {
+                        *v += wh * f64::from(keys[r][d]);
+                    }
+                }
+                mx = n;
+            }
+            let sink = sinks[h];
+            let big = mx.max(sink);
+            let g = (mx - big).exp() / (l * (mx - big).exp() + (sink - big).exp());
+            let want_half: Vec<f32> = o.iter().map(|&v| (v * f64::from(g)) as f32).collect();
+            let want_f32 = r::sink_attention(qh, &keys, &sinks[h..=h], 512);
+            let row = &got[(i * heads + h) * 512..(i * heads + h + 1) * 512];
+            for d in 0..512 {
+                err_half = err_half.max((row[d] - want_half[d]).abs());
+                err_f32 = err_f32.max((row[d] - want_f32[d]).abs());
+            }
+        }
+    }
+    // The scores are sharp: the spiked heads' outputs are their spike keys.
+    for (h, key) in [(0usize, &comp[5]), (2, &rows[pos0 - 20])] {
+        let row = &got[h * 512..(h + 1) * 512];
+        let off = row.iter().zip(key.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(off < 0.05, "head {h} is not dominated by its spike ({off})");
+    }
+    // Measured 2026-11-15: 6.3e-6 and 4.6e-5.
+    eprintln!("sharp attention: max |error| against the half-P oracle {err_half:e}, against f32 {err_f32:e}");
+    assert!(err_half <= 2e-5, "against the half-P oracle: {err_half}");
+    assert!(err_f32 <= 2e-4, "against the f32 reference: {err_f32}");
+}
+
 fn attention_case(
     seed: u64,
     matrix: bool,

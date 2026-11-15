@@ -97,9 +97,12 @@ guaranteed.
 
 - Prompt-run GEMMs round both operands to bfloat16 (f32 accumulators); the
   hyper-connection control projection stays in f32 (in bfloat16 it cost 6 of
-  100 first tokens on ds4's fixture). Prompt-run attention takes queries,
-  keys and softmax weights in f16 (as ds4's prefill attention does), the
-  indexer's scores f16 operands (exact: FP4 values times powers of two).
+  100 first tokens on ds4's fixture). Prompt-run attention takes queries
+  and keys in f16 (as ds4's prefill attention does) with f32 scores and
+  softmax, and rounds each softmax weight to f16 for the weighted sum of
+  the values, where ds4 keeps the weights in f32 (the denominator stays the
+  f32 weights' sum); the indexer's scores take f16 operands (exact: FP4
+  values times powers of two).
   Decode works on f32 activations, except the routed gate/up's, rounded
   to f16.
 - E4M3 and E2M1 rounding is computed in closed form instead of ds4's table
