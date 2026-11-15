@@ -282,7 +282,6 @@ pub struct Scratch {
     partial: Tensor,
     /// The partials' capacity in key chunks.
     chunks: usize,
-    hidden_norm: Tensor,
     pub logits: Tensor,
     /// The last (or only) row's logits: `logits[0..vocab]`.
     pub logits_last: Tensor,
@@ -331,7 +330,6 @@ impl Scratch {
             emid: f(m * cfg.n_expert_used * cfg.ff_expert)?,
             partial: f(partial)?,
             chunks,
-            hidden_norm: f(MAX_ROWS * h)?,
             logits,
             sampler: SamplerScratch::new(ctx, cfg.vocab)?,
             next_token: Tensor::zeros(ctx, &[2], DType::U32)?,
@@ -498,6 +496,11 @@ impl Gemma4Model {
                 (cfg.hidden as f32).sqrt(),
             )?;
             pass.memory_barrier()?;
+            // The first layer's input; each layer's FFN end writes the next
+            // one's (and the last layer's the head's).
+            let w = &self.layers[0].attn_norm;
+            g4::rmsnorm(ctx, pass, &sc.x, w, &sc.h, m, cfg.hidden, cfg.rms_eps)?;
+            pass.memory_barrier()?;
         }
         for il in layers.clone() {
             self.encode_layer(ctx, pass, st, sc, il, m)?;
@@ -508,6 +511,9 @@ impl Gemma4Model {
         Ok(())
     }
 
+    /// One layer of a step, from its input `sc.h` (rmsnorm(x) attn_norm)
+    /// and the residual `sc.x` to the next layer's.
+    #[allow(clippy::too_many_arguments)]
     fn encode_layer(
         &self,
         ctx: &MetalContext,
@@ -523,8 +529,6 @@ impl Gemma4Model {
         let (h, eps) = (cfg.hidden, cfg.rms_eps);
         let pos0 = st.pos;
         // Attention.
-        k::rmsnorm(ctx, pass, &sc.x, Some(&l.attn_norm), &sc.h, m, h, eps)?;
-        pass.memory_barrier()?;
         let kw = cfg.kv_width(il);
         match &l.v {
             Some(v) => self.proj(
@@ -584,12 +588,14 @@ impl Gemma4Model {
         pass.memory_barrier()?;
         self.proj(ctx, pass, &[(&l.o, &sc.attn)], &sc.heads, m)?;
         pass.memory_barrier()?;
-        g4::norm_add(ctx, pass, &sc.attn, &l.post_attn_norm, &sc.x, &sc.r, m, h, eps)?;
-        pass.memory_barrier()?;
-        // The dense MLP and the routed experts.
-        g4::norm3(
+        // The residual, and the inputs of the dense MLP, the routed
+        // experts and the router.
+        g4::post_attn(
             ctx,
             pass,
+            &sc.attn,
+            &l.post_attn_norm,
+            &sc.x,
             &sc.r,
             [&l.ffn_norm, &l.pre_ffw_norm_2, &l.router_w],
             [&sc.n1, &sc.n2, &sc.t],
@@ -640,6 +646,8 @@ impl Gemma4Model {
             cfg.n_expert_used,
         )?;
         pass.memory_barrier()?;
+        // The FFN's end, with the next layer's input norm (or the head's).
+        let next = self.layers.get(il + 1).map_or(&self.output_norm, |n| &n.attn_norm);
         g4::ffn_out(
             ctx,
             pass,
@@ -649,6 +657,7 @@ impl Gemma4Model {
             &sc.r,
             &l.out_scale,
             &sc.x,
+            Some((next, &sc.h)),
             m,
             h,
             eps,
@@ -669,19 +678,9 @@ impl Gemma4Model {
             return Ok(());
         }
         let (first, rows) = if logits == Logits::All { (0, m) } else { (m - 1, 1) };
-        let x = sc.x.view(first * cfg.hidden, &[rows * cfg.hidden])?;
-        k::rmsnorm(
-            ctx,
-            pass,
-            &x,
-            Some(&self.output_norm),
-            &sc.hidden_norm,
-            rows,
-            cfg.hidden,
-            cfg.rms_eps,
-        )?;
-        pass.memory_barrier()?;
-        k::gemv(ctx, pass, &self.embed, &sc.hidden_norm, &sc.logits, rows)?;
+        // The last layer's FFN end left rmsnorm(x) output_norm in sc.h.
+        let hn = sc.h.view(first * cfg.hidden, &[rows * cfg.hidden])?;
+        k::gemv(ctx, pass, &self.embed, &hn, &sc.logits, rows)?;
         pass.memory_barrier()?;
         if cfg.softcap > 0.0 {
             g4::softcap(ctx, pass, &sc.logits, rows * cfg.vocab, cfg.softcap)?;

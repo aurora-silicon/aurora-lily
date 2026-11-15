@@ -81,6 +81,22 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         checkpoints: usize,
     },
+    /// Speed: a user turn holding the first tokens of a text file, cut to
+    /// `prompt_len` tokens and prefilled, then `n` greedy decode steps;
+    /// `runs` times on fresh states. LILY_KERNEL_PROFILE=1 adds the
+    /// per-kernel tables.
+    Bench {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, default_value_t = 1024)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        #[arg(long, default_value_t = 2)]
+        runs: usize,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -115,6 +131,9 @@ fn run() -> Result<()> {
             state_check(&model, &cases, n, steps)
         }
         Cmd::Mem { model, ctx, checkpoints } => mem(&model, ctx, checkpoints),
+        Cmd::Bench { model, text, prompt_len, n, runs } => {
+            bench(&model, &text, prompt_len, n, runs)
+        }
     }
 }
 
@@ -381,5 +400,82 @@ fn mem(path: &PathBuf, tokens: usize, checkpoints: usize) -> Result<()> {
         gb(total)
     );
     drop((snaps, sc));
+    Ok(())
+}
+
+fn profile_report(steps: usize) {
+    let passes = lily::metal::profile::take();
+    let mut by: std::collections::HashMap<&str, (usize, f64)> = Default::default();
+    let mut total = 0.0;
+    for p in &passes {
+        for k in &p.kernels {
+            let e = by.entry(k.name).or_default();
+            e.0 += 1;
+            e.1 += k.gpu_secs;
+            total += k.gpu_secs;
+        }
+    }
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+    let n = steps as f64;
+    eprintln!("  ms/step  share  calls/step  kernel");
+    for (name, (calls, secs)) in rows {
+        eprintln!(
+            "  {:7.3}  {:4.1}%  {:9.1}  {name}",
+            secs / n * 1e3,
+            100.0 * secs / total,
+            calls as f64 / n
+        );
+    }
+    eprintln!("  {:7.3}  kernels summed per step", total / n * 1e3);
+}
+
+fn bench(path: &PathBuf, text: &PathBuf, prompt_len: usize, n: usize, runs: usize) -> Result<()> {
+    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
+    let text = std::fs::read_to_string(text)?;
+    let mut ids = vec![2u32];
+    ids.extend(tok.encode("<|turn>user\nContinue this text.\n\n")?);
+    let body = tok.encode(&text)?;
+    ensure!(body.len() + ids.len() >= prompt_len, "text has {} tokens", body.len());
+    ids.extend_from_slice(&body[..prompt_len - ids.len()]);
+    let ctx = MetalContext::new()?;
+    let model = Gemma4Model::load(&ctx, path)?;
+    let vocab = model.cfg.vocab;
+    let sc = model.new_scratch(&ctx, prompt_len + n + 8)?;
+    for run in 0..runs {
+        let mut st = model.new_state(&ctx, prompt_len + n + 8)?;
+        let _ = lily::metal::profile::take();
+        let t = Instant::now();
+        model.prefill(&ctx, &mut st, &sc, &ids)?;
+        let pf = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("prefill of {prompt_len} tokens:");
+            profile_report(1);
+        }
+        let mut next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+        let t = Instant::now();
+        let mut steps = Vec::with_capacity(n);
+        let mut digest = 0xcbf29ce484222325u64;
+        for _ in 0..n {
+            let s = Instant::now();
+            model.forward(&ctx, &mut st, &sc, &[next], Logits::Last)?;
+            steps.push(s.elapsed().as_secs_f64() * 1e3);
+            next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+            digest = (digest ^ u64::from(next)).wrapping_mul(0x100000001b3);
+        }
+        let dt = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("decode at prompt {prompt_len}, per step:");
+            profile_report(n);
+        }
+        steps.sort_by(f64::total_cmp);
+        println!(
+            "run {run}: prompt {prompt_len}: prefill {pf:.2} s = {:.1} tok/s; decode {n} tokens {dt:.2} s = {:.2} tok/s; step median {:.2} ms p10 {:.2} ms; digest {digest:016x}",
+            prompt_len as f64 / pf,
+            n as f64 / dt,
+            steps[n / 2],
+            steps[n / 10],
+        );
+    }
     Ok(())
 }

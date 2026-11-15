@@ -343,59 +343,70 @@ fn norms_match_cpu() {
     let mut rng = StdRng::seed_from_u64(11);
     let (m, n, eps) = (3, 2816, 1e-6);
     let rows: Vec<Vec<f32>> =
-        (0..6).map(|_| f32s(&mut rng, m * n, -2.0, 2.0)).collect();
-    let ws: Vec<Vec<f32>> = (0..3).map(|_| f32s(&mut rng, n, 0.1, 3.0)).collect();
+        (0..5).map(|_| f32s(&mut rng, m * n, -2.0, 2.0)).collect();
+    let ws: Vec<Vec<f32>> = (0..5).map(|_| f32s(&mut rng, n, 0.1, 3.0)).collect();
     let t: Vec<Tensor> = rows.iter().map(|r| tensor(&ctx, r)).collect();
     let tw: Vec<Tensor> = ws.iter().map(|w| tensor(&ctx, w)).collect();
     let ls = tensor(&ctx, &[0.7]);
-    let o: Vec<Tensor> = (0..5).map(|_| zeros(&ctx, m * n)).collect();
+    let o: Vec<Tensor> = (0..7).map(|_| zeros(&ctx, m * n)).collect();
     run(&ctx, |p| {
-        norm3(
+        // r = rmsnorm(a) w0 + x; o_j = rmsnorm(r) w_{j+1}.
+        post_attn(
             &ctx,
             p,
             &t[0],
-            [&tw[0], &tw[1], &tw[2]],
-            [&o[0], &o[1], &o[2]],
+            &tw[0],
+            &t[1],
+            &o[0],
+            [&tw[1], &tw[2], &tw[3]],
+            [&o[1], &o[2], &o[3]],
             m,
             n,
             eps,
         )
         .unwrap();
-        norm_add(&ctx, p, &t[1], &tw[0], &t[2], &o[3], m, n, eps).unwrap();
         ffn_out(
             &ctx,
             p,
+            &t[2],
             &t[3],
-            &t[4],
             [&tw[0], &tw[1], &tw[2]],
-            &t[5],
+            &t[4],
             &ls,
             &o[4],
+            Some((&tw[3], &o[5])),
             m,
             n,
             eps,
         )
         .unwrap();
+        rmsnorm(&ctx, p, &t[0], &tw[4], &o[6], m, n, eps).unwrap();
     });
     let nrm = |x: &[f32], w: &[f32]| -> Vec<f32> {
         let s = rms(x, eps);
         x.iter().zip(w).map(|(v, w)| v * s * w).collect()
     };
-    let mut want: Vec<Vec<f32>> = vec![Vec::new(); 5];
+    let mut want: Vec<Vec<f32>> = vec![Vec::new(); 7];
     for i in 0..m {
         let r = |k: usize| &rows[k][i * n..(i + 1) * n];
+        let res: Vec<f32> =
+            nrm(r(0), &ws[0]).iter().zip(r(1)).map(|(a, b)| a + b).collect();
         for j in 0..3 {
-            want[j].extend(nrm(r(0), &ws[j]));
+            want[j + 1].extend(nrm(&res, &ws[j + 1]));
         }
-        want[3].extend(nrm(r(1), &ws[0]).iter().zip(r(2)).map(|(a, b)| a + b));
-        let s: Vec<f32> = nrm(r(3), &ws[0])
+        want[0].extend(res);
+        let s: Vec<f32> = nrm(r(2), &ws[0])
             .iter()
-            .zip(nrm(r(4), &ws[1]))
+            .zip(nrm(r(3), &ws[1]))
             .map(|(a, b)| a + b)
             .collect();
-        want[4].extend(nrm(&s, &ws[2]).iter().zip(r(5)).map(|(a, b)| (a + b) * 0.7));
+        let x: Vec<f32> =
+            nrm(&s, &ws[2]).iter().zip(r(4)).map(|(a, b)| (a + b) * 0.7).collect();
+        want[5].extend(nrm(&x, &ws[3]));
+        want[4].extend(x);
+        want[6].extend(nrm(r(0), &ws[4]));
     }
-    for j in 0..5 {
+    for j in 0..7 {
         assert_close(&o[j].to_f32().unwrap(), &want[j], 1e-5, 1e-5);
     }
 }

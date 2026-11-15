@@ -151,6 +151,17 @@ void glm53_decode_q4_0(uint64_t row, uint t, out float w[32]) {
     }
 }
 
+// (dot, sum) of 32 values with 32 f32 activations at `x` (16-byte aligned).
+vec2 glm53_task_dot_sum(in float w[32], uint64_t x) {
+    float acc = 0.0, sx = 0.0;
+    [[unroll]] for (uint q = 0u; q < 8u; q++) {
+        const vec4 v = F32x4(x + 16u * q).v[0];
+        acc += w[4u * q] * v.x + w[4u * q + 1u] * v.y + w[4u * q + 2u] * v.z + w[4u * q + 3u] * v.w;
+        sx += (v.x + v.y) + (v.z + v.w);
+    }
+    return vec2(acc, sx);
+}
+
 // The IQ4_NL code value (ggml's kvalues_iq4nl): a select tree, not a dynamically indexed array
 // (which the compiler copies to per-thread scratch).
 float glm53_iq4nl_value(uint c) {

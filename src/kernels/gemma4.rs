@@ -267,7 +267,10 @@ pub fn attention(
         &pipeline,
         &[q.binding(), a.k_cache.binding(), a.v_cache.binding(), partial.binding()],
         &params,
-        Grid::Threadgroups { groups: (chunks, a.heads / 2, m), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups {
+            groups: (chunks, a.heads / 2, m),
+            threadgroup: (256, 1, 1),
+        },
     )?;
     pass.memory_barrier()?;
     let combine = ctx.pipeline("gemma4_attn_combine", SOURCE, MslVersion::V3_1)?;
@@ -429,25 +432,42 @@ pub fn moe_down(
     )
 }
 
-/// `o_j = rmsnorm(x) * w_j` for three weights, `m` rows of `n`.
+/// Threads of a row kernel: four values a thread.
+fn row_threads(n: usize) -> Result<usize> {
+    ensure!(n.is_multiple_of(4) && n <= 4096, "row of {n} values");
+    Ok(n / 4)
+}
+
+/// The attention sublayer's end and the FFN's inputs, `m` rows of `n`:
+/// `r = rmsnorm(a) w_post + x`, `o_j = rmsnorm(r) w_j`.
 #[allow(clippy::too_many_arguments)]
-pub fn norm3(
+pub fn post_attn(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
+    a: &Tensor,
+    w_post: &Tensor,
     x: &Tensor,
+    r: &Tensor,
     w: [&Tensor; 3],
     o: [&Tensor; 3],
     m: usize,
     n: usize,
     eps: f32,
 ) -> Result<()> {
-    check_f32(&[x, w[0], w[1], w[2], o[0], o[1], o[2]])?;
-    ensure!(x.numel() >= m * n && o.iter().all(|t| t.numel() >= m * n), "norm3 sizes");
-    let pipeline = ctx.pipeline("gemma4_norm3", SOURCE, MslVersion::V3_1)?;
+    check_f32(&[a, w_post, x, r, w[0], w[1], w[2], o[0], o[1], o[2]])?;
+    ensure!(
+        [a, x, r, o[0], o[1], o[2]].iter().all(|t| t.numel() >= m * n),
+        "post_attn of {m} x {n}"
+    );
+    let threads = row_threads(n)?;
+    let pipeline = ctx.pipeline("gemma4_post_attn", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[
+            a.binding(),
+            w_post.binding(),
             x.binding(),
+            r.binding(),
             w[0].binding(),
             w[1].binding(),
             w[2].binding(),
@@ -456,39 +476,13 @@ pub fn norm3(
             o[2].binding(),
         ],
         &[&u32_bytes(n), &f32_bytes(eps)],
-        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (threads, 1, 1) },
     )
 }
 
-/// `out = rmsnorm(x) * w + add`, `m` rows of `n`.
-#[allow(clippy::too_many_arguments)]
-pub fn norm_add(
-    ctx: &MetalContext,
-    pass: &ComputePass<'_>,
-    x: &Tensor,
-    w: &Tensor,
-    add: &Tensor,
-    out: &Tensor,
-    m: usize,
-    n: usize,
-    eps: f32,
-) -> Result<()> {
-    check_f32(&[x, w, add, out])?;
-    ensure!(
-        x.numel() >= m * n && out.numel() >= m * n && add.numel() >= m * n,
-        "norm_add"
-    );
-    let pipeline = ctx.pipeline("gemma4_norm_add", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
-        &pipeline,
-        &[x.binding(), w.binding(), add.binding(), out.binding()],
-        &[&u32_bytes(n), &f32_bytes(eps)],
-        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (256, 1, 1) },
-    )
-}
-
-/// The FFN's end: `out = (rmsnorm(rmsnorm(m1) w1 + rmsnorm(m2) w2) w + r)
-/// * layer_scale[0]`, `m` rows of `n` (at most 4096).
+/// The FFN's end, `m` rows of `n`: `x = (rmsnorm(rmsnorm(m1) w1 +
+/// rmsnorm(m2) w2) w + r) * layer_scale[0]`, and with `next = (w, h)`
+/// also `h = rmsnorm(x) w` (the next layer's input, or the head's).
 #[allow(clippy::too_many_arguments)]
 pub fn ffn_out(
     ctx: &MetalContext,
@@ -498,13 +492,20 @@ pub fn ffn_out(
     w: [&Tensor; 3],
     r: &Tensor,
     layer_scale: &Tensor,
-    out: &Tensor,
+    x: &Tensor,
+    next: Option<(&Tensor, &Tensor)>,
     m: usize,
     n: usize,
     eps: f32,
 ) -> Result<()> {
-    check_f32(&[m1, m2, w[0], w[1], w[2], r, layer_scale, out])?;
-    ensure!(n <= 4096 && out.numel() >= m * n, "ffn_out of {m} x {n}");
+    check_f32(&[m1, m2, w[0], w[1], w[2], r, layer_scale, x])?;
+    ensure!([m1, m2, r, x].iter().all(|t| t.numel() >= m * n), "ffn_out of {m} x {n}");
+    if let Some((wn, h)) = next {
+        check_f32(&[wn, h])?;
+        ensure!(h.numel() >= m * n, "ffn_out's next input");
+    }
+    let threads = row_threads(n)?;
+    let (wn, h) = next.unwrap_or((x, x));
     let pipeline = ctx.pipeline("gemma4_ffn_out", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -516,10 +517,36 @@ pub fn ffn_out(
             w[2].binding(),
             r.binding(),
             layer_scale.binding(),
-            out.binding(),
+            x.binding(),
+            wn.binding(),
+            h.binding(),
         ],
+        &[&u32_bytes(n), &f32_bytes(eps), &u32_bytes(usize::from(next.is_some()))],
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (threads, 1, 1) },
+    )
+}
+
+/// `h = rmsnorm(x) w`, `m` rows of `n`.
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    w: &Tensor,
+    h: &Tensor,
+    m: usize,
+    n: usize,
+    eps: f32,
+) -> Result<()> {
+    check_f32(&[x, w, h])?;
+    ensure!(x.numel() >= m * n && h.numel() >= m * n, "rmsnorm of {m} x {n}");
+    let threads = row_threads(n)?;
+    let pipeline = ctx.pipeline("gemma4_rmsnorm", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[x.binding(), w.binding(), h.binding()],
         &[&u32_bytes(n), &f32_bytes(eps)],
-        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (threads, 1, 1) },
     )
 }
 
