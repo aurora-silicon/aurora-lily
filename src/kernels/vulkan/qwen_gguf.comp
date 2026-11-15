@@ -444,8 +444,14 @@ void main() {
     const uint grp = lane / QG_D3_LANES, j = lane % QG_D3_LANES;
     const uint slots = m * used;
     precise float combined[4] = float[4](0.0, 0.0, 0.0, 0.0);
-    for (uint k0 = 0u; k0 < slots; k0 += QG_D3_GROUPS) {
-        const uint slot = min(k0 + grp, slots - 1u);
+    // Rounds over each row's slots: a slot's lane group is its index in its
+    // row mod 3 whatever the row's place in the pass, so a verify row sums
+    // exactly as a one-row call does.
+    const uint rounds = (used + QG_D3_GROUPS - 1u) / QG_D3_GROUPS;
+    for (uint q = 0u; q < m * rounds; q++) {
+        const uint ri = q / rounds, s0 = (q % rounds) * QG_D3_GROUPS;
+        const uint k0 = ri * used + s0;
+        const uint slot = ri * used + min(s0 + grp, used - 1u);
         const uint e = min(U32(arg(2)).v[slot], arg_u32(12) - 1u);
         const uint64_t row = arg(0) + (uint64_t(e) * H + r) * row_bytes;
         const uint64_t X = arg(1) + 2u * uint64_t(slot) * F;
@@ -503,11 +509,10 @@ void main() {
         [[unroll]] for (uint g = 0u; g < QG_D3_GROUPS; g++) {
             const float sum = subgroupAdd(grp == g ? acc : 0.0);
             const uint k = k0 + g;
-            if (k < slots) {
+            if (s0 + g < used) {
                 const float v = F32(arg(3)).v[k] * float(bfloat16_t(sum));
-                const uint ki = k / used;
                 [[unroll]] for (uint ii = 0u; ii < 4u; ii++) {
-                    if (ii == ki) combined[ii] += v;
+                    if (ii == ri) combined[ii] += v;
                 }
             }
         }

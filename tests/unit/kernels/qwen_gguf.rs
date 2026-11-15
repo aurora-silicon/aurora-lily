@@ -968,7 +968,10 @@ fn hc_read_and_experts_rows_equal_one_row_calls() {
             assert_eq!(mixed[i * h..(i + 1) * h], ones[i].2[..], "hc mixed m {m} row {i}");
         }
     }
-    // Routed experts.
+    // Routed experts: many inputs, each row at every place of a three-row
+    // call (a slot's dot is rounded to bfloat before it is combined, which
+    // hides most f32 differences: a position-dependent sum shows only now
+    // and then, so the test needs volume).
     let (ff, d_cols, experts, used) = (640usize, 768usize, 12usize, 10usize);
     let q = |rng: &mut StdRng, ty, cols, rows| {
         let raw = random_blocks(rng, ty, rows * cols);
@@ -977,18 +980,14 @@ fn hc_read_and_experts_rows_equal_one_row_calls() {
     let wg = q(&mut rng, GgmlType::Iq2Xxs, h, experts * ff);
     let wup = q(&mut rng, GgmlType::Iq2Xxs, h, experts * ff);
     let wdn = q(&mut rng, GgmlType::Q2K, d_cols, experts * h);
-    let (_, x) = bf16_input(&ctx, &mut rng, 4 * h);
-    let (_, so) = bf16_input(&ctx, &mut rng, 4 * h);
-    let sel: Vec<u32> = (0..4 * used).map(|k| ((k * 5 + k / used) % experts) as u32).collect();
-    let scores: Vec<f32> = (0..4 * used).map(|_| rng.gen_range(0.0..0.3)).collect();
-    let sg: Vec<f32> = (0..4).map(|_| rng.gen_range(-2.0..2.0)).collect();
-    let moe = |m: usize, row0: usize| {
-        let t_u32 = |v: &[u32]| Tensor::from_bytes(&ctx, bytemuck::cast_slice(v), &[v.len()], DType::U32).unwrap();
-        let tsel = t_u32(&sel[row0 * used..(row0 + m) * used]);
-        let tsc = Tensor::from_f32(&ctx, &scores[row0 * used..(row0 + m) * used], &[m * used]).unwrap();
-        let tsg = Tensor::from_f32(&ctx, &sg[row0..row0 + m], &[m]).unwrap();
-        let xv = x.view(row0 * h, &[m * h]).unwrap();
-        let sov = so.view(row0 * h, &[m * h]).unwrap();
+    let t_u32 = |v: &[u32]| {
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(v), &[v.len()], DType::U32).unwrap()
+    };
+    let moe = |m: usize, x: &[f32], so: &[f32], sel: &[u32], scores: &[f32], sg: &[f32]| {
+        let xv = Tensor::from_f32_as_bf16(&ctx, x, &[m * h]).unwrap();
+        let sov = Tensor::from_f32_as_bf16(&ctx, so, &[m * h]).unwrap();
+        let (tsel, tsc) = (t_u32(sel), Tensor::from_f32(&ctx, scores, &[m * used]).unwrap());
+        let tsg = Tensor::from_f32(&ctx, sg, &[m]).unwrap();
         let act = Tensor::zeros(&ctx, &[m * used * ff], DType::BF16).unwrap();
         let out = Tensor::zeros(&ctx, &[m * h], DType::BF16).unwrap();
         run(&ctx, |p| {
@@ -999,12 +998,53 @@ fn hc_read_and_experts_rows_equal_one_row_calls() {
         });
         (bits(&act), bits(&out))
     };
-    let ones: Vec<_> = (0..4).map(|i| moe(1, i)).collect();
-    for m in 2..=4usize {
-        let (act, out) = moe(m, 0);
-        for i in 0..m {
-            assert_eq!(act[i * used * ff..(i + 1) * used * ff], ones[i].0[..], "expert act m {m} row {i}");
-            assert_eq!(out[i * h..(i + 1) * h], ones[i].1[..], "expert out m {m} row {i}");
+    let rows = |rng: &mut StdRng, n: usize| -> Vec<f32> {
+        (0..n).map(|_| bf16::from_f32(rng.gen_range(-1.0..1.0)).to_f32()).collect()
+    };
+    for trial in 0..16 {
+        let (x, so) = (rows(&mut rng, 4 * h), rows(&mut rng, 4 * h));
+        let sel: Vec<u32> = (0..4 * used).map(|_| rng.gen_range(0..experts as u32)).collect();
+        let scores: Vec<f32> = (0..4 * used).map(|_| rng.gen_range(0.0..0.3)).collect();
+        let sg: Vec<f32> = (0..4).map(|_| rng.gen_range(-2.0..2.0)).collect();
+        let row = |i: usize| {
+            (
+                &x[i * h..(i + 1) * h],
+                &so[i * h..(i + 1) * h],
+                &sel[i * used..(i + 1) * used],
+                &scores[i * used..(i + 1) * used],
+                sg[i],
+            )
+        };
+        let ones: Vec<_> = (0..4)
+            .map(|i| {
+                let (xi, si, ei, ci, gi) = row(i);
+                moe(1, xi, si, ei, ci, &[gi])
+            })
+            .collect();
+        for m in 2..=4usize {
+            for shift in 0..m {
+                // Row i of the call is input (i + shift) % m.
+                let order: Vec<usize> = (0..m).map(|i| (i + shift) % m).collect();
+                let cat = |f: &dyn Fn(usize) -> Vec<f32>| order.iter().flat_map(|&k| f(k)).collect::<Vec<f32>>();
+                let xs = cat(&|k| row(k).0.to_vec());
+                let sos = cat(&|k| row(k).1.to_vec());
+                let sels: Vec<u32> = order.iter().flat_map(|&k| row(k).2.to_vec()).collect();
+                let scs = cat(&|k| row(k).3.to_vec());
+                let sgs = cat(&|k| vec![row(k).4]);
+                let (act, out) = moe(m, &xs, &sos, &sels, &scs, &sgs);
+                for (i, &k) in order.iter().enumerate() {
+                    assert_eq!(
+                        act[i * used * ff..(i + 1) * used * ff],
+                        ones[k].0[..],
+                        "trial {trial}: expert act m {m} input {k} at row {i}"
+                    );
+                    assert_eq!(
+                        out[i * h..(i + 1) * h],
+                        ones[k].1[..],
+                        "trial {trial}: expert out m {m} input {k} at row {i}"
+                    );
+                }
+            }
         }
     }
 }
