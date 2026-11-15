@@ -46,15 +46,20 @@ pub(crate) fn gguf_gemv_sets(
             off += p.rows;
         }
     }
+    // Rows of a part's output apart: its stack's width, or (0) its own rows,
+    // which parts of different widths can share in one dispatch.
+    let stride_of = |it: &(&qwen_gguf::QWeight, Tensor, usize)| {
+        if it.2 == it.0.rows { 0 } else { it.2 }
+    };
     while !items.is_empty() {
-        let (ty, cols, stride) = (items[0].0.ty, items[0].0.cols, items[0].2);
+        let (ty, cols, stride) = (items[0].0.ty, items[0].0.cols, stride_of(&items[0]));
         let mut group = Vec::new();
         let mut rest = Vec::new();
         for it in items {
             if group.len() < 4
                 && it.0.ty == ty
                 && it.0.cols == cols
-                && (m == 1 || it.2 == stride)
+                && (m == 1 || stride_of(&it) == stride)
             {
                 group.push(it);
             } else {
@@ -63,7 +68,8 @@ pub(crate) fn gguf_gemv_sets(
         }
         let pairs: Vec<(&qwen_gguf::QWeight, &Tensor)> =
             group.iter().map(|(w, y, _)| (*w, y)).collect();
-        qwen_gguf::gemv_sets(ctx, pass, x, &pairs, m, cols, Some(stride))?;
+        let y_stride = (stride != 0).then_some(stride);
+        qwen_gguf::gemv_sets(ctx, pass, x, &pairs, m, cols, y_stride)?;
         items = rest;
     }
     Ok(())
@@ -105,6 +111,32 @@ pub(crate) fn linear_gemv_sets(
         })
         .collect::<Result<_>>()?;
     gguf_gemv_sets(ctx, pass, x, &gguf, 1)
+}
+
+/// Up to [`qwen_gguf::GEMV_MAX_ROWS`] rows of `a` through GGUF layers that
+/// read it, by the GEMV in as few dispatches as their types and widths
+/// allow (dispatches of one level run one after another here); `false`,
+/// with nothing encoded, for more rows or affine weights (the caller then
+/// projects them one by one).
+pub(crate) fn gguf_project_sets(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    sets: &[(&LinearWeights, &Tensor)],
+) -> Result<bool> {
+    let m = a.shape()[0];
+    if m > qwen_gguf::GEMV_MAX_ROWS {
+        return Ok(false);
+    }
+    let Some(gguf) = sets
+        .iter()
+        .map(|(w, y)| w.gguf().map(|g| (g, *y)))
+        .collect::<Option<Vec<(&GgufLinear, &Tensor)>>>()
+    else {
+        return Ok(false);
+    };
+    gguf_gemv_sets(ctx, pass, a, &gguf, m)?;
+    Ok(true)
 }
 
 /// Projects `a` `[m, K]` through an already-stacked weight group as one
@@ -195,6 +227,9 @@ pub(crate) fn project_stack_or_slices<const N: usize>(
     scratch: &Tensor,
 ) -> Result<()> {
     let m = a.shape()[0];
+    if gguf_project_sets(ctx, pass, a, &projections)? {
+        return Ok(());
+    }
     let widths: [usize; N] = std::array::from_fn(|i| projections[i].1.numel() / m);
     if skinny::stack_as_slices(m)
         && stack_fused_view(a, stack_w, stack_c, &widths)?.is_some()
@@ -1097,10 +1132,23 @@ fn gguf_prefill_moe(
     let m = io.x.shape()[0];
     let (inter, k) = (dims.moe_intermediate, dims.top_k);
     let shared = &moe_w.shared;
-    router_project_rows(ctx, pass, &moe_w.gate, io.x, &ms.router_logits, io.dequant)?;
-    project_mat(ctx, pass, io.x, &shared.gate_proj, io.mlp_gate, io.dequant)?;
-    project_mat(ctx, pass, io.x, &shared.up_proj, io.mlp_up, io.dequant)?;
-    project_mat(ctx, pass, io.x, &moe_w.shared_gate, &ms.shared_gate, io.dequant)?;
+    let grouped = gguf_project_sets(
+        ctx,
+        pass,
+        io.x,
+        &[
+            (&moe_w.gate, &ms.router_logits),
+            (&shared.gate_proj, io.mlp_gate),
+            (&shared.up_proj, io.mlp_up),
+            (&moe_w.shared_gate, &ms.shared_gate),
+        ],
+    )?;
+    if !grouped {
+        router_project_rows(ctx, pass, &moe_w.gate, io.x, &ms.router_logits, io.dequant)?;
+        project_mat(ctx, pass, io.x, &shared.gate_proj, io.mlp_gate, io.dequant)?;
+        project_mat(ctx, pass, io.x, &shared.up_proj, io.mlp_up, io.dequant)?;
+        project_mat(ctx, pass, io.x, &moe_w.shared_gate, &ms.shared_gate, io.dequant)?;
+    }
     pass.level_barrier(&[&ms.router_logits, io.mlp_gate, io.mlp_up, &ms.shared_gate])?;
     router_select_rows(ctx, pass, dims, &ms.router_logits, &ms.indices, &ms.scores)?;
     silu_mul_bf16(ctx, pass, io.mlp_gate, io.mlp_up, io.mlp_act)?;

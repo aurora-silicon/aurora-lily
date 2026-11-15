@@ -3644,23 +3644,37 @@ impl Qwen4ExpModel {
         let (nq, hd) = (cfg.num_attention_heads, cfg.head_dim);
         let pos = at.pos;
 
-        project_stack_or_slices(
+        // GGUF weights: the four projections in as few GEMVs as they allow.
+        let grouped = crate::moe_ffn::gguf_project_sets(
             ctx,
             pass,
             &ps.hc.mixed,
-            &w.qkv_proj,
-            &ps.stack,
-            [(&w.q_proj, &ps.qg), (&w.k_proj, &ps.k_new), (&w.v_proj, &ps.v_new)],
-            &s.dequant,
+            &[
+                (&w.q_proj, &ps.qg),
+                (&w.k_proj, &ps.k_new),
+                (&w.v_proj, &ps.v_new),
+                (&w.indexer.qk_proj, &ps.idx_qk),
+            ],
         )?;
-        project_mat(
-            ctx,
-            pass,
-            &ps.hc.mixed,
-            &w.indexer.qk_proj,
-            &ps.idx_qk,
-            &s.dequant,
-        )?;
+        if !grouped {
+            project_stack_or_slices(
+                ctx,
+                pass,
+                &ps.hc.mixed,
+                &w.qkv_proj,
+                &ps.stack,
+                [(&w.q_proj, &ps.qg), (&w.k_proj, &ps.k_new), (&w.v_proj, &ps.v_new)],
+                &s.dequant,
+            )?;
+            project_mat(
+                ctx,
+                pass,
+                &ps.hc.mixed,
+                &w.indexer.qk_proj,
+                &ps.idx_qk,
+                &s.dequant,
+            )?;
+        }
         pass.level_barrier(&[&ps.qg, &ps.k_new, &ps.v_new, &ps.idx_qk])?;
         split_q_gate(ctx, pass, &ps.qg, &ps.q, &ps.gate)?;
         rmsnorm_bf16(
@@ -4180,16 +4194,28 @@ impl Qwen4ExpModel {
             anyhow::bail!("draft head state is not attention")
         };
 
-        project_mat(ctx, pass, &ps.hc.mixed, &w.k_proj, &ps.k_new, &s.dequant)?;
-        project_mat(ctx, pass, &ps.hc.mixed, &w.v_proj, &ps.v_new, &s.dequant)?;
-        project_mat(
+        let grouped = crate::moe_ffn::gguf_project_sets(
             ctx,
             pass,
             &ps.hc.mixed,
-            &w.indexer.qk_proj,
-            &ps.idx_qk,
-            &s.dequant,
+            &[
+                (&w.k_proj, &ps.k_new),
+                (&w.v_proj, &ps.v_new),
+                (&w.indexer.qk_proj, &ps.idx_qk),
+            ],
         )?;
+        if !grouped {
+            project_mat(ctx, pass, &ps.hc.mixed, &w.k_proj, &ps.k_new, &s.dequant)?;
+            project_mat(ctx, pass, &ps.hc.mixed, &w.v_proj, &ps.v_new, &s.dequant)?;
+            project_mat(
+                ctx,
+                pass,
+                &ps.hc.mixed,
+                &w.indexer.qk_proj,
+                &ps.idx_qk,
+                &s.dequant,
+            )?;
+        }
         pass.level_barrier(&[&ps.k_new, &ps.v_new, &ps.idx_qk])?;
         rmsnorm_bf16(
             ctx,
