@@ -1559,14 +1559,11 @@ fn producers_write_the_int8_quant_q8x_writes() {
         a.to_f32().unwrap()[..len] == b.to_f32().unwrap()[..len]
     };
     // The f32 output of each producer, plain and with int8, then
-    // quant_q8x of the plain one.
-    // post_attn writes n1 (mask bit 0), n2 (bit 1) or both as int8; with
-    // both, n1 and n2 share the edge weight and their int8 forms match.
-    let cases = ["rmsnorm", "post_attn", "post_attn_n2", "post_attn_both", "ffn_out"];
-    for name in cases {
+    // quant_q8x of the plain one (post_attn: its own test below).
+    for name in ["rmsnorm", "ffn_out"] {
         let k = n;
         let (plain, with) = (zeros(&ctx, m * n), zeros(&ctx, m * n));
-        let ((c1, d1), (c2, d2), (c3, d3)) = (q8(), q8(), q8());
+        let ((c1, d1), (c2, d2)) = (q8(), q8());
         let o: Vec<Tensor> = (0..6).map(|_| zeros(&ctx, m * n)).collect();
         run(&ctx, |p| {
             match name {
@@ -1582,29 +1579,6 @@ fn producers_write_the_int8_quant_q8x_writes() {
                         n,
                         eps,
                         Some((&c1, &d1)),
-                    )
-                    .unwrap();
-                }
-                "post_attn" | "post_attn_n2" | "post_attn_both" => {
-                    // The edge weight on the output under test.
-                    let (w, q8s) = match name {
-                        "post_attn" => {
-                            ([&sw, &tw[2], &tw[3]], [Some((&c1, &d1)), None])
-                        }
-                        "post_attn_n2" => {
-                            ([&tw[1], &sw, &tw[3]], [None, Some((&c1, &d1))])
-                        }
-                        _ => ([&sw, &sw, &tw[3]], [Some((&c3, &d3)), Some((&c1, &d1))]),
-                    };
-                    let j = usize::from(name == "post_attn_n2");
-                    let mut po = [&o[0], &o[1], &o[2]];
-                    po[j] = &plain;
-                    let mut wo = [&o[3], &o[4], &o[5]];
-                    wo[j] = &with;
-                    post_attn(&ctx, p, &t[0], &tw[0], &t[1], &o[0], w, po, m, n, eps)
-                        .unwrap();
-                    post_attn_q8x(
-                        &ctx, p, &t[0], &tw[0], &t[1], &o[3], w, wo, m, n, eps, q8s,
                     )
                     .unwrap();
                 }
@@ -1658,16 +1632,6 @@ fn producers_write_the_int8_quant_q8x_writes() {
         let scales: Vec<f32> = ds[..m * k / 16].iter().step_by(2).copied().collect();
         assert!(scales.iter().any(|d| d.is_nan()), "{name}: no nonfinite block");
         assert!(scales.iter().any(|&d| d == 0.0), "{name}: no zero block");
-        if name == "post_attn_both" {
-            assert!(same_codes(&c3, &c2, m * k), "{name}: n1 codes");
-            assert!(
-                same(
-                    &d3.view(0, &[m * k / 16]).unwrap(),
-                    &d2.view(0, &[m * k / 16]).unwrap()
-                ),
-                "{name}: n1 scales"
-            );
-        }
     }
     // The attention merge: heads of 16 x 256 a row.
     let (d, kvh, heads, pos) = (256, 8, 16, 700);
@@ -1917,25 +1881,38 @@ fn int8_gemv_sets_match_one_set_and_the_block_layout() {
 /// The routed experts' Q5_K gate/up over int8 x: each row equals its
 /// one-row dispatch bit for bit (a verify pass decodes as a plain step),
 /// and gelu(g) u follows the products of the codes with independently
-/// decoded weights.
+/// of the codes with independently decoded weights.
 #[test]
 fn moe_gate_up_q8x_matches_int8_products() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(84);
-    let (hid, ff, ne, used, m) = (1024, 72, 6, 3, 3);
+    let (hid, ff, ne, used) = (2816, 72, 6, 3);
     let raw = random_blocks(&mut rng, GgmlType::Q5K, ne * 2 * ff * hid);
     let gu = QWeight::from_bytes(&ctx, &raw, GgmlType::Q5K, hid, ne * 2 * ff).unwrap();
     let w = q5_k_values(&raw);
-    let x = tensor(&ctx, &f32s(&mut rng, m * hid, -1.0, 1.0));
-    let sel: Vec<u32> = vec![0, 4, 2, 5, 4, 1, 3, 0, 5];
-    let ts = u32s(&ctx, &sel);
-    let codes = Tensor::zeros(&ctx, &[m * hid], DType::I8).unwrap();
-    let ds = zeros(&ctx, m * hid / 16);
-    let mid = zeros(&ctx, m * used * ff);
-    run(&ctx, |p| {
-        quant_q8x(&ctx, p, &x, &codes, &ds, m, hid).unwrap();
-        p.memory_barrier().unwrap();
-        moe_gate_up_q8x(&ctx, p, &gu, ff, &x, &ts, &mid, m, used, Some((&codes, &ds)))
+    for m in 1..=4 {
+        let x = tensor(&ctx, &f32s(&mut rng, m * hid, -1.0, 1.0));
+        let sel: Vec<u32> =
+            (0..m * used).map(|_| rng.gen_range(0..ne as u32)).collect();
+        let ts = u32s(&ctx, &sel);
+        let codes = Tensor::zeros(&ctx, &[m * hid], DType::I8).unwrap();
+        let ds = zeros(&ctx, m * hid / 16);
+        let mid = zeros(&ctx, m * used * ff);
+        run(&ctx, |p| {
+            quant_q8x(&ctx, p, &x, &codes, &ds, m, hid).unwrap();
+            p.memory_barrier().unwrap();
+            moe_gate_up_q8x(
+                &ctx,
+                p,
+                &gu,
+                ff,
+                &x,
+                &ts,
+                &mid,
+                m,
+                used,
+                Some((&codes, &ds)),
+            )
             .unwrap();
     });
     let got = mid.to_f32().unwrap();
@@ -1980,4 +1957,98 @@ fn moe_gate_up_q8x_matches_int8_products() {
     // Q5_K's sums of scale and min terms cancel to ~1e-4 of their size with
     // these random blocks (as in moe_matches_cpu).
     assert_close(&got, &want, 1e-3, 1e-3);
+    }
+}
+/// subnormal, NaN, overflow, infinite).
+#[test]
+fn post_attn_writes_its_int8_outputs() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(85);
+    let (m, n, eps) = (3, 2816, 1e-6);
+    let a = tensor(&ctx, &f32s(&mut rng, m * n, -2.0, 2.0));
+    let x = tensor(&ctx, &f32s(&mut rng, m * n, -2.0, 2.0));
+    let w_post = tensor(&ctx, &f32s(&mut rng, n, 0.1, 3.0));
+    let edges = |rng: &mut StdRng, at: usize| {
+        let mut w = f32s(rng, n, 0.1, 3.0);
+        for e in 0..32 {
+            w[at + e] = 0.0;
+            w[at + 32 + e] = 1e-40;
+            w[at + 96 + e] = f32::MAX;
+            w[at + 128 + e] = f32::INFINITY;
+        }
+        w[at + 64 + 7] = f32::NAN;
+        tensor(&ctx, &w)
+    };
+    let (w1, w2) = (edges(&mut rng, 0), edges(&mut rng, 640));
+    let w3 = tensor(&ctx, &f32s(&mut rng, n, 0.1, 3.0));
+    let bits = |t: &Tensor| {
+        t.to_f32().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    };
+    let q8 =
+        || (Tensor::zeros(&ctx, &[m * n], DType::I8).unwrap(), zeros(&ctx, m * n / 16));
+    let (rp, op) = (zeros(&ctx, m * n), [0; 3].map(|_| zeros(&ctx, m * n)));
+    run(&ctx, |p| {
+        post_attn(
+            &ctx,
+            p,
+            &a,
+            &w_post,
+            &x,
+            &rp,
+            [&w1, &w2, &w3],
+            [&op[0], &op[1], &op[2]],
+            m,
+            n,
+            eps,
+        )
+        .unwrap()
+    });
+    // quant_q8x of the plain n1 and n2.
+    let want: Vec<(Tensor, Tensor)> = (0..2).map(|_| q8()).collect();
+    run(&ctx, |p| {
+        for j in 0..2 {
+            quant_q8x(&ctx, p, &op[j], &want[j].0, &want[j].1, m, n).unwrap();
+        }
+    });
+    for mask in 1..4u32 {
+        let pairs = [q8(), q8()];
+        let (rq, oq) = (zeros(&ctx, m * n), [0; 3].map(|_| zeros(&ctx, m * n)));
+        let q8s = [0, 1]
+            .map(|j| (mask & (1 << j) != 0).then_some((&pairs[j].0, &pairs[j].1)));
+        run(&ctx, |p| {
+            post_attn_q8x(
+                &ctx,
+                p,
+                &a,
+                &w_post,
+                &x,
+                &rq,
+                [&w1, &w2, &w3],
+                [&oq[0], &oq[1], &oq[2]],
+                m,
+                n,
+                eps,
+                q8s,
+            )
+            .unwrap()
+        });
+        assert_eq!(bits(&rq), bits(&rp), "mask {mask}: residual");
+        for j in 0..3 {
+            assert_eq!(bits(&oq[j]), bits(&op[j]), "mask {mask}: output {j}");
+        }
+        for j in 0..2 {
+            if mask & (1 << j) != 0 {
+                assert_eq!(
+                    pairs[j].0.to_f32().unwrap(),
+                    want[j].0.to_f32().unwrap(),
+                    "mask {mask}: codes {j}"
+                );
+                assert_eq!(
+                    bits(&pairs[j].1),
+                    bits(&want[j].1),
+                    "mask {mask}: scales {j}"
+                );
+            }
+        }
+    }
 }
