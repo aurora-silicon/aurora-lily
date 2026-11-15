@@ -416,6 +416,93 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
+// ds4_indexer_scores for prompt runs on the matrix units: a threadgroup
+// takes step row i, its 64 queries staged transposed in threadgroup memory
+// as f16 (their FP4 values times a power of two: exact), and subgroup g
+// the keys 16 g, 16 g + 128, ..: S (16 keys x 64 heads) = keys . Q^T with
+// f32 accumulators, then each key's sum over heads of max(S, 0) w_h scale.
+// Grid (m), 256 threads; buffers and params as ds4_indexer_scores' (heads
+// 64).
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_ds4_indexer_scores_mu
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#include "matmul.glsl"
+#define MatAh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MatBh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define DS4_HLO(w) uint16BitsToHalf(uint16_t(w))
+// Row stride of Q^T ([dim][head]), in f16.
+#define DS4_QT 72u
+shared float16_t qt[128u * DS4_QT];
+shared float ws[64];
+void main() {
+    const uint cap = arg_u32(4);
+    const uint pos0 = arg_u32(5);
+    const float scale = arg_f32(6);
+    const uint i = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    const uint n = min((pos0 + i + 1u) / 4u, cap);
+    {
+        const uint h = tid >> 2u, d0 = (tid & 3u) * 32u;
+        const uint64_t Q = arg(0) + 4u * ((uint64_t(i) * 64u + h) * 128u + d0);
+        vec4 v[8];
+        [[unroll]] for (uint u = 0u; u < 8u; u++) v[u] = F32x4(Q + 16u * u).v[0];
+        [[unroll]] for (uint u = 0u; u < 8u; u++) {
+            [[unroll]] for (uint e = 0u; e < 4u; e++) qt[(d0 + 4u * u + e) * DS4_QT + h] = float16_t(v[u][e]);
+        }
+        if (tid < 64u) ws[tid] = F32(arg(1) + 4u * uint64_t(i) * 64u).v[tid] * scale;
+    }
+    barrier();
+    const uint lrow = mat_lane_row(), lcol = mat_lane_col();
+    const uint a_half = mat_a_half(), odd16 = 16u * mat_a_odd();
+    float wl[16];
+    [[unroll]] for (uint hb = 0u; hb < 4u; hb++) {
+        [[unroll]] for (uint c = 0u; c < 4u; c++) wl[4u * hb + c] = ws[16u * hb + lcol + c];
+    }
+    const uint64_t SC = arg(3) + 4u * uint64_t(i) * cap;
+    for (uint kb = 16u * sg; kb < n; kb += 128u) {
+        // The lane's two key rows (clamped: rows past n are not stored).
+        U32x4 k0 = U32x4(arg(2) + 256u * uint64_t(min(kb + lrow, n - 1u)));
+        U32x4 k1 = U32x4(arg(2) + 256u * uint64_t(min(kb + lrow + 1u, n - 1u)));
+        uvec4 v0[8], v1[8];
+        [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            v0[j] = k0.v[2u * j + a_half];
+            v1[j] = k1.v[2u * j + a_half];
+        }
+        MatC acc[4];
+        [[unroll]] for (uint hb = 0u; hb < 4u; hb++) acc[hb] = MatC(0.0);
+        [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            MatAh a;
+            const uvec4 x0 = v0[j] >> odd16, x1 = v1[j] >> odd16;
+            a[0] = DS4_HLO(x0[0]); a[1] = DS4_HLO(x0[1]); a[2] = DS4_HLO(x0[2]); a[3] = DS4_HLO(x0[3]);
+            a[4] = DS4_HLO(x1[0]); a[5] = DS4_HLO(x1[1]); a[6] = DS4_HLO(x1[2]); a[7] = DS4_HLO(x1[3]);
+            [[unroll]] for (uint hb = 0u; hb < 4u; hb++) {
+                MatBh b;
+                coopMatLoad(b, qt, 16u * j * DS4_QT + 16u * hb, DS4_QT, gl_CooperativeMatrixLayoutRowMajor);
+                acc[hb] = coopMatMulAdd(a, b, acc[hb]);
+            }
+        }
+        float s0 = 0.0, s1 = 0.0;
+        [[unroll]] for (uint hb = 0u; hb < 4u; hb++) {
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                s0 += max(acc[hb][c], 0.0) * wl[4u * hb + c];
+                s1 += max(acc[hb][4u + c], 0.0) * wl[4u * hb + c];
+            }
+        }
+        s0 += subgroupShuffleXor(s0, 1u);
+        s1 += subgroupShuffleXor(s1, 1u);
+        s0 += subgroupShuffleXor(s0, 8u);
+        s1 += subgroupShuffleXor(s1, 8u);
+        if ((lane & 9u) == 0u) {
+            if (kb + lrow < n) F32(SC).v[kb + lrow] = s0;
+            if (kb + lrow + 1u < n) F32(SC).v[kb + lrow + 1u] = s1;
+        }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // The indexer's selection of step row i: the k best of its n = (pos0 + i +
 // 1) / 4 scores (ties to the lower row), in ascending row order; all n
 // rows when n <= k. count[i] gets the number kept. A radix select of the

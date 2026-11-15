@@ -334,11 +334,16 @@ fn compressor_matches_cpu_across_steps() {
 /// selection.
 #[test]
 fn indexer_matches_cpu() {
+    // A decode-sized run, and a prompt run (the matrix-unit scores).
+    indexer_case(407, 2400, 3);
+    indexer_case(411, 2100, 40);
+}
+
+fn indexer_case(seed: u64, pos0: usize, m: usize) {
     let ctx = ctx();
     let c = Config::deepseek4_flash();
-    let mut rng = StdRng::seed_from_u64(407);
+    let mut rng = StdRng::seed_from_u64(seed);
     let heads = 64;
-    let (pos0, m) = (2400usize, 3usize);
     let rope = c.rope(2);
     let table = tensor(&ctx, &rope_table(&rope, pos0, m));
     let q = f32s(&mut rng, m * heads * 128, -1.0, 1.0);

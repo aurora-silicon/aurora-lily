@@ -351,6 +351,16 @@ pub fn indexer_scores(
     let n = (pos0 + m) / 4;
     ensure!(n <= cap && scores.numel() >= m * cap, "indexer scores of {cap}");
     ensure!(keys.numel() >= n * 128, "indexer keys");
+    if m > ATTEND_MU_ABOVE && heads == 64 {
+        // A prompt run: the matrix-unit kernel, a threadgroup a row.
+        let pipeline = ctx.pipeline("ds4_indexer_scores_mu", SOURCE, MslVersion::V3_1)?;
+        return pass.dispatch_at(
+            &pipeline,
+            &[q.binding(), w.binding(), keys.binding(), scores.binding()],
+            &[&u32_bytes(cap), &u32_bytes(pos0), &f32_bytes(scale), &u32_bytes(heads)],
+            Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (256, 1, 1) },
+        );
+    }
     let pipeline = ctx.pipeline("ds4_indexer_scores", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
