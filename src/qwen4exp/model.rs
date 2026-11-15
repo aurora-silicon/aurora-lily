@@ -448,6 +448,9 @@ pub struct DecodeState {
     /// The next verify pass encoded ahead and what it needs (`spec.rs`).
     #[cfg(target_os = "linux")]
     pub(super) ahead: super::spec::SpecAhead,
+    /// Draft passes still to take the draft head's whole LM head after a
+    /// token outside its narrow one was drawn (`spec.rs`, `DRAFT_LOW_ROWS`).
+    pub(super) wide_drafts: usize,
     kv_format: KvFormat,
     kv_heads: usize,
     head_dim: usize,
@@ -778,6 +781,7 @@ impl DecodeState {
             mtp.hidden.zero_fill();
         }
         self.spec = None;
+        self.wide_drafts = 0;
         self.pos = 0;
         self.rope_delta = 0;
         self.conv_slot = 0;
@@ -1241,6 +1245,9 @@ pub(super) struct SpecScratch {
     pub(super) ple_conv_in: Option<Tensor>,
     /// F32 `[MAX_DRAFTS + 1, vocab]`.
     pub(super) logits: Tensor,
+    /// F32 `[vocab]`: the draft head's logits from its narrow LM head
+    /// (`spec.rs`, `DRAFT_LOW_ROWS`); the ids it leaves out stay -inf.
+    pub(super) draft_logits: Option<Tensor>,
     /// U32 `[MAX_DRAFTS + 1]`: the trunk's draw per verified row.
     pub(super) verify_tokens: Tensor,
     /// U32 `[MAX_DRAFTS]`: the draft head's proposals.
@@ -1286,6 +1293,15 @@ impl SpecScratch {
                 .map(|_| Tensor::zeros(ctx, &[rows, cfg.hc_width()], DType::BF16))
                 .transpose()?,
             logits: Tensor::zeros(ctx, &[rows, cfg.vocab_size], DType::F32)?,
+            draft_logits: super::spec::narrow_draft_head(cfg)
+                .then(|| {
+                    Tensor::from_f32(
+                        ctx,
+                        &vec![f32::NEG_INFINITY; cfg.vocab_size],
+                        &[cfg.vocab_size],
+                    )
+                })
+                .transpose()?,
             verify_tokens: Tensor::zeros(ctx, &[rows], DType::U32)?,
             draft_tokens: Tensor::zeros(ctx, &[MAX_DRAFTS], DType::U32)?,
             dists: DraftDists::new(ctx, MAX_DRAFTS)?,
@@ -1996,6 +2012,7 @@ impl Qwen4ExpModel {
             spec: None,
             #[cfg(target_os = "linux")]
             ahead: Default::default(),
+            wide_drafts: 0,
             kv_format: self.kv_format,
             kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
@@ -2771,6 +2788,7 @@ impl Qwen4ExpModel {
         if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= vocab) {
             anyhow::bail!("token id {bad} is outside the vocabulary of {vocab}");
         }
+        super::spec::note_prompt(state, tokens);
         let h = self.config.hidden_size;
         if let Some(v) = vision {
             let n = v.positions.len();

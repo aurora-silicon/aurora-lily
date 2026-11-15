@@ -228,6 +228,7 @@ fn synthetic_state(
         spec: None,
         #[cfg(target_os = "linux")]
         ahead: Default::default(),
+        wide_drafts: 0,
         kv_format: format,
         kv_heads: HEADS,
         head_dim: HEAD_DIM,

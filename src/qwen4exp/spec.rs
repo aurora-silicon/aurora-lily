@@ -52,6 +52,7 @@ use crate::metal::DetachedPass;
 use crate::metal::{EncodedPass, MetalContext, PendingPass};
 use crate::moe_ffn::{prefix_rows, project_mat};
 use crate::tensor::Tensor;
+use crate::weights::{GgufLinear, LinearWeights};
 
 use super::model::{
     AttnPos, BatchMode, DecodeState, LayerState, MAX_DRAFTS, Qwen4ExpModel, Scratch,
@@ -61,6 +62,61 @@ use super::ngram::NgramHasher;
 
 fn profiling() -> bool {
     std::env::var_os("LILY_PROFILE").is_some()
+}
+
+/// The draft head's narrow LM head: Qwen3.8's ids below this and from
+/// [`DRAFT_SPECIAL_FROM`] on (the tokenizer's added tokens: turn, tool and
+/// thinking markers). On English prose, code and lily's own sources 99.8 to
+/// 100% of the tokens are among them (2026-11-15); its multilingual ids
+/// (151 643 up) are not, and Italian text draws 14% of its tokens there.
+/// The rows read per proposal drop from 248 320 to 98 580 (Q2 file: 1.2 to
+/// 0.5 ms). Outputs stay exact: the trunk draws every emitted token, the
+/// proposals only decide how many rows a verify pass confirms.
+const DRAFT_LOW_ROWS: usize = 98_304;
+const DRAFT_SPECIAL_FROM: usize = 248_044;
+const QWEN38_VOCAB: usize = 248_320;
+/// Draft passes that take the whole LM head after a drawn token outside the
+/// narrow one: text in another script keeps drafting at full acceptance.
+const WIDE_DRAFT_STEPS: usize = 32;
+
+/// Whether the draft head drafts over the narrow LM head (Qwen3.8's
+/// vocabulary; `LILY_DRAFT_HEAD=full` turns it off).
+pub(super) fn narrow_draft_head(cfg: &super::config::Qwen4ExpConfig) -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg.vocab_size == QWEN38_VOCAB
+        && !*FULL.get_or_init(|| {
+            std::env::var("LILY_DRAFT_HEAD").is_ok_and(|v| v == "full")
+        })
+}
+
+fn in_narrow_head(token: u32) -> bool {
+    let t = token as usize;
+    t < DRAFT_LOW_ROWS || t >= DRAFT_SPECIAL_FROM
+}
+
+/// Prompt tokens fed: the draft head drafts the reply over the whole LM
+/// head when the prompt's tail has a token outside the narrow one (a prompt
+/// in another script is answered in it), else over the narrow head.
+pub(super) fn note_prompt(state: &mut DecodeState, tokens: &[u32]) {
+    let tail = &tokens[tokens.len().saturating_sub(256)..];
+    state.wide_drafts =
+        if tail.iter().all(|&t| in_narrow_head(t)) { 0 } else { WIDE_DRAFT_STEPS };
+}
+
+/// `w`'s rows `[start, start + rows)`.
+fn head_rows(w: &LinearWeights, start: usize, rows: usize) -> Result<LinearWeights> {
+    Ok(match w {
+        LinearWeights::Affine(q) => LinearWeights::Affine(q.view_rows(start, rows)?),
+        LinearWeights::Gguf(g) => {
+            ensure!(g.parts.len() == 1, "an LM head of {} parts", g.parts.len());
+            let p = &g.parts[0];
+            ensure!(start + rows <= p.rows, "rows past the LM head");
+            let mut v = p.clone();
+            v.t = p.t.view(start * p.row_bytes, &[rows * p.row_bytes])?;
+            v.rows = rows;
+            LinearWeights::Gguf(GgufLinear { parts: vec![v] })
+        }
+    })
 }
 
 /// A point of the step's host work in the backend's trace (`LILY_VK_TRACE`).
@@ -198,6 +254,7 @@ impl Qwen4ExpModel {
                 step0 + m,
             )?
             .commit()?;
+        state.wide_drafts = state.wide_drafts.saturating_sub(1);
         mark("committed");
         let done = committed.wait_retain_polled()?;
         let verify_gpu_end = if profiling() {
@@ -257,6 +314,9 @@ impl Qwen4ExpModel {
             "accepted {accepted} rows but only {gpu_accepted} drafts were confirmed"
         );
         let chain = pending.chain;
+        if pending.sampled[..=accepted].iter().any(|&t| !in_narrow_head(t)) {
+            state.wide_drafts = WIDE_DRAFT_STEPS;
+        }
 
         // Host-side rollback: position, hash history, penalty counts of the
         // rejected rows' draws. (The running draft pass never touches the
@@ -392,6 +452,55 @@ impl Qwen4ExpModel {
         Ok(())
     }
 
+    /// The draft head's logits `[vocab]` of its mixed row `x`, ordered after
+    /// on return: the whole LM head into the spec scratch's first logits
+    /// row, or (`wide` false, the narrow head in use) the narrow head's rows
+    /// into `draft_logits`, whose other ids hold -inf.
+    #[allow(clippy::too_many_arguments)]
+    fn draft_head_logits(
+        &self,
+        ctx: &MetalContext,
+        pass: &crate::metal::ComputePass<'_>,
+        mtp: &super::weights::MtpWeights,
+        x: &Tensor,
+        sp: &super::model::SpecScratch,
+        s: &Scratch,
+        wide: bool,
+    ) -> Result<Tensor> {
+        let vocab = self.config.vocab_size;
+        let head = mtp.head(&self.weights.lm_head);
+        let narrow = sp.draft_logits.as_ref().filter(|_| !wide);
+        let Some(out) = narrow else {
+            let logits = sp.logits.view(0, &[1, vocab])?;
+            project_mat(ctx, pass, x, head, &logits, &s.dequant)?;
+            pass.level_barrier(&[&logits])?;
+            return logits.view(0, &[vocab]);
+        };
+        let low = head_rows(head, 0, DRAFT_LOW_ROWS)?;
+        let special = head_rows(head, DRAFT_SPECIAL_FROM, vocab - DRAFT_SPECIAL_FROM)?;
+        let low_out = out.view(0, &[1, DRAFT_LOW_ROWS])?;
+        let special_out =
+            out.view(DRAFT_SPECIAL_FROM, &[1, vocab - DRAFT_SPECIAL_FROM])?;
+        match (&low, &special) {
+            // One dispatch: the GEMV takes both row ranges as sets.
+            (LinearWeights::Gguf(l), LinearWeights::Gguf(h)) => {
+                crate::moe_ffn::gguf_gemv_sets(
+                    ctx,
+                    pass,
+                    x,
+                    &[(l, &low_out), (h, &special_out)],
+                    1,
+                )?;
+            }
+            _ => {
+                project_mat(ctx, pass, x, &special, &special_out, &s.dequant)?;
+                project_mat(ctx, pass, x, &low, &low_out, &s.dequant)?;
+            }
+        }
+        pass.level_barrier(&[out])?;
+        Ok(out.clone())
+    }
+
     /// See [`crate::engine::LanguageModel::draft_initial`].
     #[allow(clippy::too_many_arguments)]
     pub fn draft_initial(
@@ -411,6 +520,9 @@ impl Qwen4ExpModel {
         ensure!(state.pos > 0, "draft_initial before any token was fed");
         let wide = self.config.hc_width();
         let drafts = drafts.min(MAX_DRAFTS);
+        if !in_narrow_head(first) {
+            state.wide_drafts = WIDE_DRAFT_STEPS;
+        }
         self.ensure_room(ctx, state, s, 1 + drafts)?;
         let hidden = state
             .mtp
@@ -631,21 +743,21 @@ impl Qwen4ExpModel {
                 // Head: mixer over the last residual row, the head's LM head
                 // (the trunk's, or its 4-bit copy), argmax.
                 self.hc_read_batched(ctx, &pass, &mtp.mixer, &last, s, &ps1)?;
-                let logits = sp.logits.view(0, &[1, cfg.vocab_size])?;
-                project_mat(
+                let logits =
+                    self.draft_head_logits(
                     ctx,
                     &pass,
+                    mtp,
                     &ps1.hc.mixed,
-                    mtp.head(&self.weights.lm_head),
-                    &logits,
-                    &s.dequant,
+                    sp,
+                    s,
+                    state.wide_drafts > 0,
                 )?;
-                pass.level_barrier(&[&logits])?;
                 let out = sp.draft_tokens.view(i, &[1])?;
                 sample_draft_f32(
                     ctx,
                     &pass,
-                    &logits.view(0, &[cfg.vocab_size])?,
+                    &logits,
                     &s.sampler,
                     &head_params,
                     draft_step(draw0 + i),
@@ -795,21 +907,20 @@ impl Qwen4ExpModel {
                     // Head: mixer over the last residual row, the head's LM
                     // head (the trunk's, or its 4-bit copy), argmax.
                     self.hc_read_batched(ctx, &pass, &mtp.mixer, &last, s, &ps1)?;
-                    let logits = sp.logits.view(0, &[1, cfg.vocab_size])?;
-                    project_mat(
+                    let logits = self.draft_head_logits(
                         ctx,
                         &pass,
+                        mtp,
                         &ps1.hc.mixed,
-                        mtp.head(&self.weights.lm_head),
-                        &logits,
-                        &s.dequant,
+                        sp,
+                        s,
+                        state.wide_drafts > 0,
                     )?;
-                    pass.level_barrier(&[&logits])?;
                     let out = sp.draft_tokens.view(i, &[1])?;
                     sample_draft_f32(
                         ctx,
                         &pass,
-                        &logits.view(0, &[cfg.vocab_size])?,
+                        &logits,
                         &s.sampler,
                         &head_params,
                         draft_step(draw0 + i),
