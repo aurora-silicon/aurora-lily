@@ -299,6 +299,14 @@ impl Config {
             self.swa.len(),
             self.n_head_kv.len()
         );
+        for il in 0..self.n_layer {
+            let half = self.head_dim_of(il) / 2;
+            let r = self.k_rot[il];
+            ensure!(
+                r == half || (r > 0 && r < half && r.is_multiple_of(64)),
+                "layer {il}: a K cache of {r} RoPE pairs of {half}"
+            );
+        }
         ensure!(
             (1..=MAX_VOCAB).contains(&self.vocab),
             "a vocabulary of {}",
@@ -428,30 +436,41 @@ impl Config {
     }
 }
 
-/// [`Config::k_rot`] of each layer of the model in `g`: in a global layer
-/// without its own V projection (V = rmsnorm(k), K = rope(V k_norm)) whose
-/// rope_freqs leave every pair from some R on unturned (a factor above
-/// 1e20, as the qkv kernel takes it) with R a multiple of 64 (the prompt
-/// attention's 64-value steps), R; else d / 2 (the whole head).
+/// [`Config::k_rot`] of each layer of the model in `g` ([`k_rot_of`] with
+/// the file's rope_freqs and whether the layer has its own V projection).
 fn k_rot_pairs(g: &Gguf, c: &Config) -> Result<Vec<usize>> {
     let ff = match g.tensor("rope_freqs.weight") {
-        Some(t) if t.ty == crate::gguf::GgmlType::F32 && t.row_len() == c.head_dim / 2 && t.rows() == 1 => {
+        Some(t)
+            if t.ty == crate::gguf::GgmlType::F32
+                && t.row_len() == c.head_dim / 2
+                && t.rows() == 1 =>
+        {
             Some(g.read_rows_f32(t, 0..1)?)
         }
         _ => None,
     };
     Ok((0..c.n_layer)
         .map(|il| {
-            let half = c.head_dim_of(il) / 2;
-            let k_eq_v = g.tensor(&format!("blk.{il}.attn_v.weight")).is_none();
-            let Some(ff) = ff.as_ref().filter(|_| k_eq_v && !c.swa[il]) else { return half };
-            // As the qkv kernel takes a factor: a pair turns below 1e20.
-            let still = |f: f32| f >= 1e20 || f.is_nan();
-            let r = ff.iter().position(|&f| still(f)).unwrap_or(half);
-            let rest_still = ff[r..].iter().all(|&f| still(f));
-            if rest_still && r.is_multiple_of(64) && r < half { r } else { half }
+            let own_v = g.tensor(&format!("blk.{il}.attn_v.weight")).is_some();
+            let ff = ff.as_deref().filter(|_| !c.swa[il] && !own_v);
+            k_rot_of(c.head_dim_of(il), ff)
         })
         .collect())
+}
+
+/// The RoPE pairs a K cache keeps for a head of `d` values: with `ff`, the
+/// frequency factors of a layer whose V is its K projection, the pairs
+/// before a suffix that does not turn (a factor of 1e20 or more, as the
+/// qkv kernel takes it), when there is at least one and the count is a
+/// multiple of 64 (the prompt attention's 64-value steps); else all
+/// `d / 2`.
+pub(crate) fn k_rot_of(d: usize, ff: Option<&[f32]>) -> usize {
+    let half = d / 2;
+    let Some(ff) = ff.filter(|f| f.len() == half) else { return half };
+    let still = |f: f32| f >= 1e20 || f.is_nan();
+    let r = ff.iter().position(|&f| still(f)).unwrap_or(half);
+    let rest_still = ff[r..].iter().all(|&f| still(f));
+    if r > 0 && r < half && r.is_multiple_of(64) && rest_still { r } else { half }
 }
 
 #[cfg(test)]
