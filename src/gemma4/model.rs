@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result, ensure};
 
 use super::config::Config;
-use crate::gguf::{GgmlType, Gguf};
+use crate::gguf::Gguf;
 use crate::glm53::model::Mapped;
 use crate::kernels::gemma4::{self as g4, AttnShape};
 use crate::kernels::glm53::{self as k, QWeight};
@@ -106,50 +106,6 @@ pub struct Gemma4Model {
     pub acquire_reserve: Option<u64>,
 }
 
-/// Block types of the dense projections: those with both a GEMV (decode,
-/// verify) and a matrix-unit GEMM (prompt runs).
-pub(crate) const DENSE_TYPES: [GgmlType; 10] = [
-    GgmlType::Q8_0,
-    GgmlType::Q4K,
-    GgmlType::Bf16,
-    GgmlType::F32,
-    GgmlType::F16,
-    GgmlType::Q4_0,
-    GgmlType::Q5K,
-    GgmlType::Q6K,
-    GgmlType::Iq4Nl,
-    GgmlType::Iq2S,
-];
-/// The embedding (also the head, through the GEMVs).
-const EMBED_TYPES: [GgmlType; 4] =
-    [GgmlType::Q8_0, GgmlType::Q5K, GgmlType::Q6K, GgmlType::Q4K];
-/// The routed experts' gate/up: the decode kernel's types that the grouped
-/// prompt GEMM also takes.
-const GATE_UP_TYPES: [GgmlType; 4] =
-    [GgmlType::Q8_0, GgmlType::Q5K, GgmlType::Iq2Xxs, GgmlType::Iq2S];
-/// The routed experts' down projection, likewise.
-const DOWN_TYPES: [GgmlType; 2] = [GgmlType::Q8_0, GgmlType::Iq4Nl];
-
-pub(crate) fn check_w(name: &str, w: &QWeight, cols: usize, rows: usize) -> Result<()> {
-    ensure!(
-        w.cols == cols && w.rows == rows,
-        "{name} is {} x {}, Gemma needs {cols} x {rows}",
-        w.cols,
-        w.rows
-    );
-    Ok(())
-}
-
-/// Fails unless `w` is of one of the block types its kernels take.
-pub(crate) fn check_type(name: &str, w: &QWeight, types: &[GgmlType]) -> Result<()> {
-    ensure!(
-        types.contains(&w.ty),
-        "{name} is {:?}; lily's Gemma kernels take {types:?} there",
-        w.ty
-    );
-    Ok(())
-}
-
 impl Gemma4Model {
     /// Opens and maps `path` (the GGUF file), after taking the instance
     /// lock (one model on this machine at a time).
@@ -165,23 +121,23 @@ impl Gemma4Model {
         lock()?;
         let gguf = Gguf::open(path)?;
         let cfg = Config::from_gguf(&gguf)?;
+        ensure!(
+            gguf.tensor("output.weight").is_none(),
+            "an untied output.weight (lily ties the head to token_embd as Gemma does)"
+        );
+        super::schema::validate_gguf(&super::schema::target(&cfg), &gguf)?;
         let mapped = Mapped::map(ctx, &gguf)?;
         let h = cfg.hidden;
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for il in 0..cfg.n_layer {
             let n = |s: &str| format!("blk.{il}.{s}");
             let q = |s: &str| mapped.q(&n(s));
+            // Shapes and types as the schema checked them.
             let f = |s: &str, len: usize| -> Result<Tensor> {
                 let t = mapped.f32(&n(s))?;
-                ensure!(
-                    t.numel() == len,
-                    "{} has {} values, not {len}",
-                    n(s),
-                    t.numel()
-                );
+                debug_assert_eq!(t.numel(), len, "{}", n(s));
                 Ok(t)
             };
-            let (qw, kw) = (cfg.q_width(il), cfg.kv_width(il));
             let d = cfg.head_dim_of(il);
             let l = LayerW {
                 attn_norm: f("attn_norm.weight", h)?,
@@ -216,65 +172,11 @@ impl Gemma4Model {
                 post_ffw_norm: f("post_ffw_norm.weight", h)?,
                 out_scale: f("layer_output_scale.weight", 1)?,
             };
-            for (name, w) in [
-                ("attn_q", &l.q),
-                ("attn_k", &l.k),
-                ("attn_output", &l.o),
-                ("ffn_gate", &l.gate),
-                ("ffn_up", &l.up),
-                ("ffn_down", &l.down),
-            ]
-            .into_iter()
-            .chain(l.v.as_ref().map(|v| ("attn_v", v)))
-            {
-                check_type(&n(name), w, &DENSE_TYPES)?;
-            }
-            check_type(&n("ffn_gate_up_exps"), &l.gate_up_exps, &GATE_UP_TYPES)?;
-            check_type(&n("ffn_down_exps"), &l.down_exps, &DOWN_TYPES)?;
-            check_w(&n("attn_q"), &l.q, h, qw)?;
-            check_w(&n("attn_k"), &l.k, h, kw)?;
-            if let Some(v) = &l.v {
-                check_w(&n("attn_v"), v, h, kw)?;
-            }
-            ensure!(
-                l.v.is_some() || !cfg.swa[il],
-                "layer {il}: a sliding-window layer without attn_v"
-            );
-            check_w(&n("attn_output"), &l.o, qw, h)?;
-            check_w(&n("ffn_gate"), &l.gate, h, cfg.ff)?;
-            check_w(&n("ffn_up"), &l.up, h, cfg.ff)?;
-            check_w(&n("ffn_down"), &l.down, cfg.ff, h)?;
-            check_w(&n("ffn_gate_inp"), &l.router, h, cfg.n_expert)?;
-            ensure!(l.router.ty == GgmlType::F32, "router of {:?}", l.router.ty);
-            check_w(
-                &n("ffn_gate_up_exps"),
-                &l.gate_up_exps,
-                h,
-                2 * cfg.ff_expert * cfg.n_expert,
-            )?;
-            check_w(
-                &n("ffn_down_exps"),
-                &l.down_exps,
-                cfg.ff_expert,
-                h * cfg.n_expert,
-            )?;
             layers.push(l);
         }
         let embed = mapped.q("token_embd.weight")?;
-        check_type("token_embd", &embed, &EMBED_TYPES)?;
-        check_w("token_embd", &embed, h, cfg.vocab)?;
-        ensure!(
-            gguf.tensor("output.weight").is_none(),
-            "an untied output.weight (lily ties the head to token_embd as Gemma does)"
-        );
         let output_norm = mapped.f32("output_norm.weight")?;
-        ensure!(output_norm.numel() == h, "output_norm of {}", output_norm.numel());
         let rope_freqs = mapped.f32("rope_freqs.weight")?;
-        ensure!(
-            rope_freqs.numel() == cfg.head_dim / 2,
-            "rope_freqs of {}",
-            rope_freqs.numel()
-        );
         Ok(Self {
             gguf,
             mapped,

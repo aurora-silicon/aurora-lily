@@ -523,13 +523,20 @@ fn moe_timing() {
     }
 }
 
-/// The grouped experts of a prompt run against the per-row kernels: the
-/// same sums with both operands rounded to bfloat.
+/// The grouped experts of a prompt run against a CPU reference that rounds
+/// as the kernels do: weights to bfloat to nearest with ties away from zero,
+/// the input and the weighted GeGLU output to nearest even, f32 sums. Each
+/// output is within one bfloat ulp of every down-projection input it sums
+/// (a rounding the two summation orders can tip) plus the f32 sums' order.
+/// 140 rows over 12 experts: each expert's pairs fill more than one 64-row
+/// tile.
 #[test]
-fn moe_grouped_matches_the_row_kernels() {
+fn moe_grouped_matches_a_bf16_reference() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(21);
-    let (hid, ff, ne, used, m) = (512, 128, 12, 8, 37);
+    let (hid, ff, ne, used, m) = (512, 128, 12, 8, 140);
+    let bfw = |v: f32| f32::from_bits((v.to_bits() + 0x8000) & 0xffff_0000);
+    let bf = |v: f32| half::bf16::from_f32(v).to_f32();
     for (gt, dt) in
         [(GgmlType::Iq2Xxs, GgmlType::Iq4Nl), (GgmlType::Q5K, GgmlType::Q8_0)]
     {
@@ -537,29 +544,63 @@ fn moe_grouped_matches_the_row_kernels() {
         let dn_raw = random_blocks(&mut rng, dt, ne * hid * ff);
         let gu = QWeight::from_bytes(&ctx, &gu_raw, gt, hid, ne * 2 * ff).unwrap();
         let dn = QWeight::from_bytes(&ctx, &dn_raw, dt, ff, ne * hid).unwrap();
-        // Small activations keep the bfloat rounding's share small.
-        let x = f32s(&mut rng, m * hid, -0.1, 0.1);
+        let guw: Vec<f32> = decode(gt, &gu_raw).into_iter().map(bfw).collect();
+        let dnw: Vec<f32> = decode(dt, &dn_raw).into_iter().map(bfw).collect();
+        let x = f32s(&mut rng, m * hid, -1.0, 1.0);
         let sel: Vec<u32> =
             (0..m * used).map(|i| ((i * 7 + i / used) % ne) as u32).collect();
         let wts = f32s(&mut rng, m * used, 0.05, 0.2);
         let (tx, ts, tw) = (tensor(&ctx, &x), u32s(&ctx, &sel), tensor(&ctx, &wts));
-        let mid = zeros(&ctx, m * used * ff);
-        let rows = zeros(&ctx, m * hid);
         let grouped = zeros(&ctx, m * hid);
         let sc = MoeGroupScratch::new(&ctx, m, used, ne, ff, hid).unwrap();
         run(&ctx, |p| {
-            moe_gate_up(&ctx, p, &gu, ff, &tx, &ts, &mid, m, used).unwrap();
-            p.memory_barrier().unwrap();
-            moe_down(&ctx, p, &dn, hid, &mid, &ts, &tw, &rows, m, used).unwrap();
-            p.memory_barrier().unwrap();
             moe_grouped(
                 &ctx, p, &gu, &dn, ff, &tx, &ts, &tw, &grouped, &sc, m, used, ne,
             )
-            .unwrap();
+            .unwrap()
         });
-        let (a, b) = (grouped.to_f32().unwrap(), rows.to_f32().unwrap());
-        let scale = b.iter().fold(0f32, |s, v| s.max(v.abs()));
-        let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-        assert!(worst <= 0.02 * scale, "{gt:?}/{dt:?}: worst {worst} of {scale}");
+        let got = grouped.to_f32().unwrap();
+        let mut counts = vec![0usize; ne];
+        sel.iter().for_each(|&e| counts[e as usize] += 1);
+        assert!(counts.iter().all(|&c| c > 64), "{counts:?}");
+        let (mut worst, mut mean) = (0f64, 0f64);
+        for i in 0..m {
+            let xb: Vec<f32> =
+                x[i * hid..(i + 1) * hid].iter().map(|&v| bf(v)).collect();
+            let (mut want, mut bound) = (vec![0f32; hid], vec![0f32; hid]);
+            for s in 0..used {
+                let e = sel[i * used + s] as usize;
+                let w = &guw[e * 2 * ff * hid..(e + 1) * 2 * ff * hid];
+                let v: Vec<f32> = (0..ff)
+                    .map(|j| {
+                        let g = dot(&w[j * hid..(j + 1) * hid], &xb);
+                        let u = dot(&w[(ff + j) * hid..(ff + j + 1) * hid], &xb);
+                        bf(wts[i * used + s] * (gelu(g) * u))
+                    })
+                    .collect();
+                for r in 0..hid {
+                    let d = &dnw[(e * hid + r) * ff..(e * hid + r + 1) * ff];
+                    want[r] += dot(d, &v);
+                    bound[r] +=
+                        d.iter().zip(&v).map(|(a, b)| (a * b).abs()).sum::<f32>();
+                }
+            }
+            for r in 0..hid {
+                let err = (got[i * hid + r] - want[r]).abs();
+                let tol = bound[r] * (2f32.powi(-7) + 1e-5) + 1e-7;
+                assert!(
+                    err <= tol,
+                    "{gt:?}/{dt:?} row {i} col {r}: {} vs {} (bound {tol})",
+                    got[i * hid + r],
+                    want[r]
+                );
+                worst = worst.max((err / tol) as f64);
+                mean += err as f64 / bound[r].max(1e-30) as f64;
+            }
+        }
+        eprintln!(
+            "{gt:?}/{dt:?}: worst error {worst:.3} of the bound, mean {:.2e} of the inputs' magnitude",
+            mean / (m * hid) as f64
+        );
     }
 }

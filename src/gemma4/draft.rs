@@ -16,9 +16,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result, ensure};
 
 use super::config::Config as TargetConfig;
-use super::model::{
-    DENSE_TYPES, Gemma4Model, Gemma4State, MAX_ROWS, Scratch, check_type, check_w,
-};
+use super::model::{Gemma4Model, Gemma4State, MAX_ROWS, Scratch};
 use crate::gguf::Gguf;
 use crate::glm53::model::Mapped;
 use crate::kernels::gemma4::{self as g4, AttnShape};
@@ -181,43 +179,37 @@ impl Gemma4Draft {
             (m.f("rope.freq_base")?, m.f("rope.freq_base_swa")?);
         ensure!(eps > 0.0 && eps < 1.0, "draft rms epsilon {eps}");
         ensure!(rope_base > 1.0 && rope_base_swa > 1.0, "draft RoPE bases");
+        super::schema::validate_gguf(
+            &super::schema::draft(target, hidden, ff, &swa),
+            &gguf,
+        )?;
         let mapped = Mapped::map(ctx, &gguf)?;
-        let f32_of = |name: &str, len: usize| -> Result<Tensor> {
-            let t = mapped.f32(name)?;
-            ensure!(t.numel() == len, "{name} has {} values, not {len}", t.numel());
-            Ok(t)
-        };
-        let q_of = |name: &str, cols: usize, rows: usize| -> Result<QWeight> {
-            let w = mapped.q(name)?;
-            check_type(name, &w, &DENSE_TYPES)?;
-            check_w(name, &w, cols, rows)?;
-            Ok(w)
-        };
+        // Shapes and types as the schema checked them.
         let mut layers = Vec::with_capacity(n_layer);
         for (il, &swa) in swa.iter().enumerate() {
             let n = |s: &str| format!("blk.{il}.{s}");
             let d = if swa { dh_swa } else { dh };
             layers.push(LayerW {
-                attn_norm: f32_of(&n("attn_norm.weight"), hidden)?,
-                q: q_of(&n("attn_q.weight"), hidden, heads * d)?,
-                q_norm: f32_of(&n("attn_q_norm.weight"), d)?,
-                o: q_of(&n("attn_output.weight"), heads * d, hidden)?,
-                post_attn_norm: f32_of(&n("post_attention_norm.weight"), hidden)?,
-                ffn_norm: f32_of(&n("ffn_norm.weight"), hidden)?,
-                gate: q_of(&n("ffn_gate.weight"), hidden, ff)?,
-                up: q_of(&n("ffn_up.weight"), hidden, ff)?,
-                down: q_of(&n("ffn_down.weight"), ff, hidden)?,
-                post_ffw_norm: f32_of(&n("post_ffw_norm.weight"), hidden)?,
-                out_scale: f32_of(&n("layer_output_scale.weight"), 1)?,
+                attn_norm: mapped.f32(&n("attn_norm.weight"))?,
+                q: mapped.q(&n("attn_q.weight"))?,
+                q_norm: mapped.f32(&n("attn_q_norm.weight"))?,
+                o: mapped.q(&n("attn_output.weight"))?,
+                post_attn_norm: mapped.f32(&n("post_attention_norm.weight"))?,
+                ffn_norm: mapped.f32(&n("ffn_norm.weight"))?,
+                gate: mapped.q(&n("ffn_gate.weight"))?,
+                up: mapped.q(&n("ffn_up.weight"))?,
+                down: mapped.q(&n("ffn_down.weight"))?,
+                post_ffw_norm: mapped.f32(&n("post_ffw_norm.weight"))?,
+                out_scale: mapped.f32(&n("layer_output_scale.weight"))?,
                 swa,
                 head_dim: d,
             });
         }
-        let pre_proj = q_of("nextn.pre_projection.weight", 2 * target.hidden, hidden)?;
-        let post_proj = q_of("nextn.post_projection.weight", hidden, target.hidden)?;
-        let embed = q_of("token_embd.weight", hidden, target.vocab)?;
-        let output_norm = f32_of("output_norm.weight", hidden)?;
-        let rope_freqs = f32_of("rope_freqs.weight", dh / 2)?;
+        let pre_proj = mapped.q("nextn.pre_projection.weight")?;
+        let post_proj = mapped.q("nextn.post_projection.weight")?;
+        let embed = mapped.q("token_embd.weight")?;
+        let output_norm = mapped.f32("output_norm.weight")?;
+        let rope_freqs = mapped.f32("rope_freqs.weight")?;
         let z = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let qw = heads * dh.max(dh_swa);
         let sc = DraftScratch {

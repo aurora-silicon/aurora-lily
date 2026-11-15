@@ -6,6 +6,7 @@ pub mod config;
 pub mod draft;
 pub mod engine;
 pub mod model;
+pub mod schema;
 pub mod tokenizer;
 
 pub use config::Config;
