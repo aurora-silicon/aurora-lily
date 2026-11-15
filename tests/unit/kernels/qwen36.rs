@@ -1428,3 +1428,69 @@ fn gdn_chunked_long_weak_decay_matches_cpu() {
         );
     }
 }
+
+/// Qwen3.6's grouped experts with gate, up and the SwiGLU in one GEMM
+/// (`glm53::moe_grouped_fused`) against the separate GEMMs and SwiGLU
+/// (`glm53::moe_grouped`): the same bits, mid and out, for Q4_K and Q8_0
+/// experts, with tiles of 64 rows and of 128 (the density decides): experts
+/// with 16, 32, 48, 64, 65, 100 and 129 pairs, small ones, unused ones.
+#[test]
+fn moe_grouped_fused_matches_separate_q4_k_q8_0() {
+    use crate::kernels::glm53::{MoeGroupScratch, moe_grouped, moe_grouped_fused};
+    let ctx = ctx();
+    if !ctx.matrix_units() {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(98);
+    let (experts, hidden, ff, used) = (12, 2048, 512, 8);
+    let counts = [16usize, 32, 48, 64, 65, 0, 129, 100, 16, 10, 0, 0];
+    let pairs: usize = counts.iter().sum();
+    let m = pairs / used;
+    let mut sel: Vec<u32> = counts
+        .iter()
+        .enumerate()
+        .flat_map(|(e, &c)| std::iter::repeat_n(e as u32, c))
+        .collect();
+    for i in (1..sel.len()).rev() {
+        sel.swap(i, rng.gen_range(0..=i));
+    }
+    let tsel = u32s(&ctx, &sel);
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+    for ty in [GgmlType::Q4K, GgmlType::Q8_0] {
+        let mk = |rng: &mut StdRng, cols: usize, rows: usize| {
+            QWeight::from_bytes(
+                &ctx,
+                &random_blocks(rng, ty, rows * cols),
+                ty,
+                cols,
+                rows,
+            )
+            .unwrap()
+        };
+        let (gw, uw, dw) = (
+            mk(&mut rng, hidden, experts * ff),
+            mk(&mut rng, hidden, experts * ff),
+            mk(&mut rng, ff, experts * hidden),
+        );
+        // Two scratch sets: the separate route's g and u, the fused route's none.
+        let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+        let mut got = Vec::new();
+        for fused in [false, true] {
+            let out = zeros(&ctx, m * hidden, DType::F32);
+            run(&ctx, |p| {
+                let f = if fused { moe_grouped_fused } else { moe_grouped };
+                f(
+                    &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m,
+                    used, experts, 0.0,
+                )
+                .unwrap()
+            });
+            got.push((gs.mid.to_f32().unwrap(), out.to_f32().unwrap()));
+        }
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&got[0].0), bits(&got[1].0), "{ty:?}: mid");
+        assert_eq!(bits(&got[0].1), bits(&got[1].1), "{ty:?}: out");
+        assert!(got[1].1.iter().all(|v| v.is_finite()), "{ty:?}: a non-finite output");
+    }
+}

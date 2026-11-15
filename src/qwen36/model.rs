@@ -1321,7 +1321,8 @@ impl Qwen36Model {
             pass.memory_barrier()?;
             k::shared_gate(ctx, pass, &sc.sout, &sc.shg, &sc.moe_out, m, cfg.hidden)?;
             pass.memory_barrier()?;
-            g::moe_grouped(
+            // Q4_K and Q8_0 experts' gate, up and SwiGLU in one GEMM.
+            g::moe_grouped_fused(
                 ctx,
                 pass,
                 &f.gate,
