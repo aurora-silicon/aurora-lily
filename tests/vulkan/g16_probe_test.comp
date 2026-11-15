@@ -1,0 +1,23 @@
+#version 460
+// Read bandwidth probe (gemv_g16 tuning): threadgroups of 256 threads read
+// 16-byte words; KERNEL_g16_read_bw: thread t of the grid reads words t,
+// t + T, .. (T the grid's threads), U at a time. Buffers: 0 src, 1 out.
+// Params: 2 words.
+#include "common.glsl"
+#ifdef KERNEL_g16_read_bw
+void main() {
+    const uint64_t S = arg(0);
+    const uint words = arg_u32(2);
+    const uint T = gl_NumWorkGroups.x * 256u;
+    uint t = gl_WorkGroupID.x * 256u + gl_LocalInvocationIndex;
+    uvec4 a = uvec4(0u);
+    for (; t + 3u * T < words; t += 4u * T) {
+        const uvec4 v0 = U32x4(S).v[t], v1 = U32x4(S).v[t + T];
+        const uvec4 v2 = U32x4(S).v[t + 2u * T], v3 = U32x4(S).v[t + 3u * T];
+        a ^= (v0 ^ v1) ^ (v2 ^ v3);
+    }
+    for (; t < words; t += T) a ^= U32x4(S).v[t];
+    const uint r = a.x ^ a.y ^ a.z ^ a.w;
+    if (r == 0x12345678u) U32(arg(1)).v[0] = r;
+}
+#endif

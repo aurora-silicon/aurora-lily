@@ -16,6 +16,11 @@ use crate::tensor::{DType, Tensor};
 /// GLSL only (see `kernels::glm53`).
 const SOURCE: &str = "";
 
+/// Output rows a subgroup of the G16 routed-expert kernels takes, gate/up
+/// and down (`G16_GR` and `G16_DR` in gemma4.comp).
+const G16_GATE_UP_ROWS: usize = 4;
+const G16_DOWN_ROWS: usize = 2;
+
 /// Keys a threadgroup of the decode attention takes.
 pub const ATTN_CHUNK: usize = 256;
 
@@ -419,6 +424,12 @@ pub fn moe_gate_up(
         GgmlType::Iq2S => "gemma4_moe_gate_up_iq2_s",
         other => anyhow::bail!("no Gemma expert gate/up over {other:?}"),
     };
+    // On a G16 GPU (an M4) IQ2_XXS takes the G16 kernel.
+    let (name, rows) = if ctx.g16() && gate_up.ty == GgmlType::Iq2Xxs {
+        ("g16_moe_gate_up_iq2_xxs", G16_GATE_UP_ROWS)
+    } else {
+        (name, 1)
+    };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -430,7 +441,7 @@ pub fn moe_gate_up(
             &u32_bytes(used),
         ],
         Grid::Threadgroups {
-            groups: (ff.div_ceil(8), m * used, 1),
+            groups: (ff.div_ceil(8 * rows), m * used, 1),
             threadgroup: (256, 1, 1),
         },
     )
@@ -470,6 +481,11 @@ pub fn moe_down(
         "expert down rows of {} values, {used} used",
         down.cols
     );
+    let (name, rows) = if ctx.g16() && down.ty == GgmlType::Iq4Nl {
+        ("g16_moe_down_iq4_nl", G16_DOWN_ROWS)
+    } else {
+        (name, 1)
+    };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -487,7 +503,7 @@ pub fn moe_down(
             &u32_bytes(used),
         ],
         Grid::Threadgroups {
-            groups: (hidden.div_ceil(8), m, 1),
+            groups: (hidden.div_ceil(8 * rows), m, 1),
             threadgroup: (256, 1, 1),
         },
     )

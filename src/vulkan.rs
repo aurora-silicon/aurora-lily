@@ -404,6 +404,9 @@ struct Dev {
     /// per-element operations are enabled (the operations on a matrix in
     /// registers that the `_cm2` kernels use).
     cooperative_matrix_register_ops: bool,
+    /// Whether the GPU is an Apple G16 (the M4's, "Apple M4 (G16G B0)"):
+    /// its decode GEMVs take the G16 kernels (`gemv_g16.comp`).
+    g16: bool,
     /// VK_KHR_calibrated_timestamps, enabled for the trace ([`trace`]).
     calibrated: Option<ash::khr::calibrated_timestamps::Device>,
 }
@@ -690,6 +693,11 @@ impl Dev {
             };
             let priority = prioritize
                 .then(|| ash::ext::pageable_device_local_memory::Device::new(&instance, &device));
+            let g16 = instance
+                .get_physical_device_properties(physical)
+                .device_name_as_c_str()
+                .is_ok_and(|name| name.to_bytes().windows(4).any(|w| w == b"(G16"))
+                && std::env::var_os("LILY_G16_KERNELS").is_none_or(|v| v != "0");
             let calibrated = calibrate
                 .then(|| ash::khr::calibrated_timestamps::Device::new(&instance, &device));
 
@@ -712,6 +720,7 @@ impl Dev {
                 priority,
                 matrix_units,
                 cooperative_matrix_register_ops,
+                g16,
                 calibrated,
             }))
         }
@@ -1952,6 +1961,12 @@ impl MetalContext {
     /// `_cm2` kernels need all three.
     pub fn cooperative_matrix_register_ops(&self) -> bool {
         self.dev.cooperative_matrix_register_ops
+    }
+
+    /// Whether the GPU is an Apple G16 (an M4): the decode GEMVs of some
+    /// types take kernels tuned for it (`LILY_G16_KERNELS=0` turns them off).
+    pub fn g16(&self) -> bool {
+        self.dev.g16
     }
 
     /// Whether kernel `name` was built into the crate (one that needs a
