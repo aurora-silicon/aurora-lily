@@ -521,6 +521,54 @@ pub fn attend_prompt(
     )
 }
 
+/// [`attend`] of a run whose rows are at their own positions, with the
+/// queries as projected (their per-head norm and RoPE applied as they
+/// load) and the output's inverse RoPE applied: [`attend_prompt`] for a
+/// prompt run (into a BF16 `out`), the f32 kernel otherwise (F32 `out`).
+#[allow(clippy::too_many_arguments)]
+pub fn attend_fused(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    kv_run: &Tensor,
+    ring: &Tensor,
+    comp: CompRows<'_>,
+    sinks: &Tensor,
+    out: &Tensor,
+    m: usize,
+    heads: usize,
+    pos0: usize,
+    fuse: PromptFuse<'_>,
+) -> Result<()> {
+    let raw = RawWindow::MODEL;
+    attend_fused_raw(ctx, pass, q, kv_run, ring, comp, sinks, out, m, heads, pos0, raw, fuse)
+}
+
+/// [`attend_fused`] with the raw rows `raw` says (DSpark's block: every
+/// row attending as the block's last, each query rotated at its own
+/// position).
+#[allow(clippy::too_many_arguments)]
+pub fn attend_fused_raw(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    kv_run: &Tensor,
+    ring: &Tensor,
+    comp: CompRows<'_>,
+    sinks: &Tensor,
+    out: &Tensor,
+    m: usize,
+    heads: usize,
+    pos0: usize,
+    raw: RawWindow,
+    fuse: PromptFuse<'_>,
+) -> Result<()> {
+    let matrix = m > ATTEND_MU_ABOVE && raw.at.is_none() && heads.is_multiple_of(16);
+    attend_inner(
+        ctx, pass, q, kv_run, ring, comp, sinks, out, m, heads, pos0, raw, matrix, Some(fuse),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attend_inner(
     ctx: &MetalContext,
@@ -543,7 +591,7 @@ fn attend_inner(
         "matrix attention of {heads} heads"
     );
     check(&[q, sinks], DType::F32)?;
-    check(&[out], if fuse.is_some() { DType::BF16 } else { DType::F32 })?;
+    check(&[out], if matrix && fuse.is_some() { DType::BF16 } else { DType::F32 })?;
     if let Some(f) = fuse {
         check(&[f.table], DType::F32)?;
         ensure!(f.table.numel() >= (f.t0 + m) * 64, "RoPE table of {}", f.table.numel());
@@ -573,10 +621,10 @@ fn attend_inner(
     };
     check(&[cache], DType::F16)?;
     let scale = 1.0 / (KV_DIM as f32).sqrt();
+    let (table, t0, eps) = fuse.map_or((q, 0, 0.0), |f| (f.table, f.t0, f.eps));
+    let flags = if fuse.is_some() { 3 } else { 0 };
     if matrix {
         let pipeline = ctx.pipeline("ds4_attend_mu", SOURCE, MslVersion::V3_1)?;
-        let (table, t0, eps) = fuse.map_or((q, 0, 0.0), |f| (f.table, f.t0, f.eps));
-        let flags = if fuse.is_some() { 3 } else { 0 };
         return pass.dispatch_at(
             &pipeline,
             &[
@@ -617,6 +665,7 @@ fn attend_inner(
             count.unwrap_or(q).binding(),
             sinks.binding(),
             out.binding(),
+            table.binding(),
         ],
         &[
             &u32_bytes(pos0),
@@ -627,6 +676,9 @@ fn attend_inner(
             &u32_bytes(raw.at.map_or(0, |p| p + 1)),
             &u32_bytes(raw.window),
             &u32_bytes(raw.lo),
+            &u32_bytes(t0),
+            &u32_bytes(flags),
+            &f32_bytes(eps),
         ],
         Grid::Threadgroups { groups: (heads, m, 1), threadgroup: (256, 1, 1) },
     )

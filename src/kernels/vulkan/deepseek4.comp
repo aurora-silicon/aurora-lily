@@ -617,28 +617,32 @@ void main() {
 // at the end. Grid (heads, m), 256 threads. Buffers: 0 q f32 [m][heads][512],
 // 1 kv_run f16 [m][512], 2 ring f16 [128][512], 3 comp f16 [cap][512], 4 sel
 // u32 [m][S], 5 count u32 [m], 6 sinks f32 [heads], 7 out f32
-// [m][heads][512]. Params: 8 pos0, 9 ratio, 10 use_sel, 11 S, 12 scale, 13
-// p_last (0: each row at its own position; else every row at position
-// p_last - 1, DSpark's non-causal block), 14 window (raw rows a row sees at
-// most, 128 for the model), 15 raw_lo (the first position whose raw row is
-// valid).
+// [m][heads][512], 8 RoPE table. Params: 9 pos0, 10 ratio, 11 use_sel, 12
+// S, 13 scale, 14 p_last (0: each row at its own position; else every row
+// at position p_last - 1, DSpark's non-causal block), 15 window (raw rows a
+// row sees at most, 128 for the model), 16 raw_lo (the first position whose
+// raw row is valid), 17 table row of row 0, 18 flags, 19 eps. Flags bit 0:
+// Q as projected, its per-head norm and RoPE (ds4_head_norm_rope's
+// NormRope) applied as it loads; bit 1: the output's inverse RoPE applied.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_ds4_attend
 shared float sm_m[8];
 shared float sm_l[8];
 shared float sm_acc[8 * 512];
 void main() {
-    const uint pos0 = arg_u32(8);
-    const uint ratio = arg_u32(9);
-    const bool use_sel = arg_u32(10) != 0u;
-    const uint S = arg_u32(11);
-    const float scale = arg_f32(12);
+    const uint pos0 = arg_u32(9);
+    const uint ratio = arg_u32(10);
+    const bool use_sel = arg_u32(11) != 0u;
+    const uint S = arg_u32(12);
+    const float scale = arg_f32(13);
     const uint h = gl_WorkGroupID.x;
     const uint i = gl_WorkGroupID.y;
     const uint heads = gl_NumWorkGroups.x;
-    const uint p_last = arg_u32(13);
-    const uint window = arg_u32(14);
-    const uint raw_lo = arg_u32(15);
+    const uint p_last = arg_u32(14);
+    const uint window = arg_u32(15);
+    const uint raw_lo = arg_u32(16);
+    const uint t0 = arg_u32(17);
+    const uint flags = arg_u32(18);
     const uint p = p_last != 0u ? p_last - 1u : pos0 + i;
     const uint lane = gl_SubgroupInvocationID;
     const uint sg = gl_SubgroupID;
@@ -649,6 +653,22 @@ void main() {
     const uint64_t Q = arg(0) + 4u * ((uint64_t(i) * heads + h) * 512u + 16u * lane);
     vec4 q[4];
     [[unroll]] for (uint c = 0u; c < 4u; c++) q[c] = F32x4(Q + 16u * c).v[0];
+    if ((flags & 1u) != 0u) {
+        // Every subgroup holds the whole head (16 dims a lane).
+        float ss = 0.0;
+        [[unroll]] for (uint c = 0u; c < 4u; c++) ss += dot(q[c], q[c]);
+        const float norm = inversesqrt(subgroupAdd(ss) / 512.0 + arg_f32(19));
+        [[unroll]] for (uint c = 0u; c < 4u; c++) q[c] *= norm;
+        if (lane >= 28u) {
+            // Dims 16 lane .. + 16: rotated pairs 8 (lane - 28) ...
+            const uint64_t T = arg(8) + 8u * (uint64_t(t0 + i) * 32u + 8u * (lane - 28u));
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                const vec4 cs = F32x4(T + 16u * c).v[0];
+                q[c].xy = ds4_rotate(q[c].xy, cs.xy, false);
+                q[c].zw = ds4_rotate(q[c].zw, cs.zw, false);
+            }
+        }
+    }
     float m = DS4_NEG_INF, l = 0.0;
     vec4 acc[4];
     [[unroll]] for (uint c = 0u; c < 4u; c++) acc[c] = vec4(0.0);
@@ -699,12 +719,18 @@ void main() {
     }
     const uint tid = gl_LocalInvocationIndex;
     const uint64_t O = arg(7) + 4u * (uint64_t(i) * heads + h) * 512u;
+    vec2 o = vec2(0.0);
     [[unroll]] for (uint e = 0u; e < 2u; e++) {
         const uint dd = 2u * tid + e;
-        float o = 0.0;
-        [[unroll]] for (uint s = 0u; s < 8u; s++) o += sm_acc[s * 512u + dd] * fs[s];
-        F32(O).v[dd] = o / L;
+        [[unroll]] for (uint s = 0u; s < 8u; s++) o[e] += sm_acc[s * 512u + dd] * fs[s];
     }
+    o /= L;
+    if ((flags & 2u) != 0u && tid >= 224u) {
+        const uint64_t T = arg(8) + 8u * (uint64_t(t0 + i) * 32u + tid - 224u);
+        o = ds4_rotate(o, vec2(F32(T).v[0], F32(T).v[1]), true);
+    }
+    F32(O).v[2u * tid] = o.x;
+    F32(O).v[2u * tid + 1u] = o.y;
 }
 #endif
 

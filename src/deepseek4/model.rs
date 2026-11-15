@@ -1098,10 +1098,10 @@ impl Ds4Model {
             }
         }
         pass.memory_barrier()?;
-        // A prompt run's attention normalizes and rotates its queries as it
-        // loads them and rotates its output back into the grouped output's
-        // bfloat operand (a traced run keeps every step).
-        let fused = m > EXACT_ROWS && !r.traced;
+        // The attention normalizes and rotates its queries as it loads them
+        // and rotates its output back (a prompt run's into the grouped
+        // output's bfloat operand); a traced run keeps every step.
+        let fused = !r.traced;
         // Level 4: query norm and rotation; indexer queries.
         if !fused {
             d::head_norm_rope(
@@ -1121,7 +1121,9 @@ impl Ds4Model {
         if sparse {
             d::indexer_q(ctx, pass, &sc.iq, &st.rope_yarn, t0, m, cfg.indexer_heads)?;
         }
-        pass.memory_barrier()?;
+        if !fused || sparse {
+            pass.memory_barrier()?;
+        }
         let rows = if sparse {
             let index = ls.index.as_ref().expect("indexer state");
             let scale = 1.0 / ((cfg.indexer_dim * cfg.indexer_heads) as f32).sqrt();
@@ -1165,7 +1167,8 @@ impl Ds4Model {
         };
         if fused {
             let fuse = d::PromptFuse { table, t0, eps: cfg.rms_eps };
-            d::attend_prompt(
+            let out = if m > EXACT_ROWS { &sc.headsb } else { &sc.heads };
+            d::attend_fused(
                 ctx,
                 pass,
                 &sc.q,
@@ -1173,7 +1176,7 @@ impl Ds4Model {
                 &ls.ring,
                 rows,
                 &l.sinks,
-                &sc.headsb,
+                out,
                 m,
                 cfg.n_head,
                 pos0,
@@ -1196,7 +1199,7 @@ impl Ds4Model {
             )?;
         }
         pass.memory_barrier()?;
-        // Rotate back; the ring takes the run's rows.
+        // Rotate back.
         if !fused {
             d::head_norm_rope(
                 ctx,
@@ -1212,11 +1215,15 @@ impl Ds4Model {
                 HeadOp::InverseRope,
             )?;
         }
+        // The ring takes the run's rows beside the grouped output (which
+        // reads only the heads).
         if !r.defer {
             d::ring_store(ctx, pass, b.kv_run, &ls.ring, pos0, m)?;
         }
-        pass.memory_barrier()?;
-        self.grouped_out(ctx, pass, sc, l, m, fused)
+        if !fused {
+            pass.memory_barrier()?;
+        }
+        self.grouped_out(ctx, pass, sc, l, m, fused && m > EXACT_ROWS)
     }
 
     /// The grouped output projection from `sc.heads` (`sc.headsb` when

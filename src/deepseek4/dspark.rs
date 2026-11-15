@@ -33,7 +33,7 @@ use super::{
 };
 use crate::deepseek4::schema::{DsparkMeta, validate_dspark};
 use crate::gguf::Gguf;
-use crate::kernels::deepseek4::{CompRows, CompressorGpu, HeadOp, RawWindow};
+use crate::kernels::deepseek4::{CompRows, CompressorGpu, RawWindow};
 use crate::kernels::glm53::QWeight;
 use crate::kernels::sample::{SamplingParams, sample_f32};
 use crate::metal::{ComputePass, MetalContext};
@@ -489,22 +489,11 @@ impl Ds4Model {
         self.proj(ctx, pass, &[(&l.q_b, &sc.q)], &sc.qr, n)?;
         d::kv_store(ctx, pass, &sc.kv, &sc.kv_run, table, pos0, n)?;
         pass.memory_barrier()?;
-        d::head_norm_rope(
-            ctx,
-            pass,
-            &sc.q,
-            table,
-            pos0,
-            n,
-            cfg.n_head,
-            cfg.head_dim,
-            cfg.n_rot,
-            cfg.rms_eps,
-            HeadOp::NormRope,
-        )?;
-        pass.memory_barrier()?;
+        // The query norm and RoPE and the output's inverse RoPE in the
+        // attention kernel, as the model's.
         let raw = RawWindow { at: Some(pos0 + n - 1), window: d::WINDOW + n, lo };
-        d::attend(
+        let fuse = d::PromptFuse { table, t0: pos0, eps: cfg.rms_eps };
+        d::attend_fused_raw(
             ctx,
             pass,
             &sc.q,
@@ -517,20 +506,7 @@ impl Ds4Model {
             cfg.n_head,
             pos0,
             raw,
-        )?;
-        pass.memory_barrier()?;
-        d::head_norm_rope(
-            ctx,
-            pass,
-            &sc.heads,
-            table,
-            pos0,
-            n,
-            cfg.n_head,
-            cfg.head_dim,
-            cfg.n_rot,
-            0.0,
-            HeadOp::InverseRope,
+            fuse,
         )?;
         pass.memory_barrier()?;
         self.grouped_out(ctx, pass, sc, l, n, false)
