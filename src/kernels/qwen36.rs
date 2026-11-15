@@ -132,20 +132,45 @@ pub fn gdn(
             "snapshot shapes"
         );
     }
-    let conv = ctx.pipeline("qwen36_gdn_conv", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
-        &conv,
-        &[
-            qkv.binding(),
-            p.conv_w.binding(),
-            st.conv.binding(),
-            c.binding(),
-            snap.map_or(st.conv, |s| s.conv).binding(),
-        ],
-        &[&u32_bytes(ch), &u32_bytes(m), &snap_row.to_ne_bytes()],
-        Grid::Threads { grid: (ch, 1, 1), threadgroup: (128, 1, 1) },
-    )?;
+    let conv_bindings = [
+        qkv.binding(),
+        p.conv_w.binding(),
+        st.conv.binding(),
+        c.binding(),
+        snap.map_or(st.conv, |s| s.conv).binding(),
+    ];
+    let conv_params: [&[u8]; 3] =
+        [&u32_bytes(ch), &u32_bytes(m), &snap_row.to_ne_bytes()];
+    // Prompt runs: the conv row-parallel, its window moved beside the scan.
+    let rows = m > 4;
+    if rows {
+        let conv = ctx.pipeline("qwen36_gdn_conv_rows", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &conv,
+            &conv_bindings,
+            &conv_params,
+            Grid::Threads { grid: (ch, m, 1), threadgroup: (256, 1, 1) },
+        )?;
+    } else {
+        let conv = ctx.pipeline("qwen36_gdn_conv", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &conv,
+            &conv_bindings,
+            &conv_params,
+            Grid::Threads { grid: (ch, 1, 1), threadgroup: (128, 1, 1) },
+        )?;
+    }
     pass.memory_barrier()?;
+    if rows {
+        let window =
+            ctx.pipeline("qwen36_gdn_conv_window", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &window,
+            &conv_bindings,
+            &conv_params,
+            Grid::Threads { grid: (ch, 1, 1), threadgroup: (256, 1, 1) },
+        )?;
+    }
     let scan = ctx.pipeline("qwen36_gdn_scan", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &scan,

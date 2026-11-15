@@ -603,3 +603,64 @@ void main() {
     }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// qwen36_gdn_conv for a prompt run, row-parallel: one thread an output
+// (channel, row), the same sums (rows before the run from the window), then
+// qwen36_gdn_conv_window (after a barrier) moves the window and writes the
+// snapshot (each thread its own channel's window, read before written).
+// qwen36_gdn_conv walked the rows in one thread a channel (8192 threads;
+// 10.2 of a 1024-token prompt's 305 ms).
+// Grid threads (C, m) / (C). Buffers and params as qwen36_gdn_conv.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_qwen36_gdn_conv_rows) || defined(KERNEL_qwen36_gdn_conv_window)
+// Value k of the run's sequence: rows of `in` from 0, the window's 3 before.
+float qwen36_conv_x(F32 in_rows, F32 st, uint C, uint ch, int k) {
+    return k >= 0 ? in_rows.v[uint(k) * C + ch] : st.v[uint(3 + k) * C + ch];
+}
+#endif
+#ifdef KERNEL_qwen36_gdn_conv_rows
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint ch = gl_GlobalInvocationID.x;
+    const uint t = gl_GlobalInvocationID.y;
+    const uint C = arg_u32(5);
+    const vec4 w = F32x4(arg(1)).v[ch];
+    F32 st = F32(arg(2));
+    F32 in_rows = F32(arg(0));
+    const int ti = int(t);
+    const float x0 = qwen36_conv_x(in_rows, st, C, ch, ti - 3);
+    const float x1 = qwen36_conv_x(in_rows, st, C, ch, ti - 2);
+    const float x2 = qwen36_conv_x(in_rows, st, C, ch, ti - 1);
+    const float xn = in_rows.v[t * C + ch];
+    precise float acc = x0 * w.x;
+    acc += x1 * w.y;
+    acc += x2 * w.z;
+    acc += xn * w.w;
+    F32(arg(3)).v[t * C + ch] = qwen36_silu(acc);
+}
+#endif
+#ifdef KERNEL_qwen36_gdn_conv_window
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint ch = gl_GlobalInvocationID.x;
+    const uint C = arg_u32(5);
+    const int m = int(arg_u32(6));
+    const uint snap_row = arg_u32(7);
+    F32 st = F32(arg(2));
+    F32 in_rows = F32(arg(0));
+    const float a = qwen36_conv_x(in_rows, st, C, ch, m - 3);
+    const float b = qwen36_conv_x(in_rows, st, C, ch, m - 2);
+    const float c = qwen36_conv_x(in_rows, st, C, ch, m - 1);
+    if (snap_row != 0xFFFFFFFFu) {
+        const int s = int(snap_row);
+        F32 sn = F32(arg(4));
+        sn.v[ch] = qwen36_conv_x(in_rows, st, C, ch, s - 2);
+        sn.v[C + ch] = qwen36_conv_x(in_rows, st, C, ch, s - 1);
+        sn.v[2u * C + ch] = qwen36_conv_x(in_rows, st, C, ch, s);
+    }
+    st.v[ch] = a;
+    st.v[C + ch] = b;
+    st.v[2u * C + ch] = c;
+}
+#endif
