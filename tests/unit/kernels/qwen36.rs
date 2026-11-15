@@ -749,3 +749,73 @@ fn gemv_q8_0_k4096_matches_glm53() {
     });
     assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-5, 1e-5);
 }
+
+/// Attention decode in splits of 64 keys against the default route.
+#[test]
+fn sdpa_decode_split64_matches_sdpa_decode() {
+    use crate::kernels::attention::{
+        KvCache, KvFormat, scatter_kv, sdpa_decode, sdpa_decode_split64,
+    };
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(88);
+    let (nq, kvh, d, cap) = (16, 2, 256, 2048);
+    let splits = crate::kernels::attention::sdpa_split_scratch_splits(cap);
+    let partials = zeros(&ctx, nq * splits * 4 * d, DType::F32);
+    let stats = zeros(&ctx, nq * splits * 4 * 2, DType::F32);
+    for len in [65, 300, 1100, 2000] {
+        let kc = KvCache::zeros(&ctx, KvFormat::Bf16, kvh, cap, d).unwrap();
+        let vc = KvCache::zeros(&ctx, KvFormat::Bf16, kvh, cap, d).unwrap();
+        let kr = Tensor::from_f32_as_bf16(
+            &ctx,
+            &f32s(&mut rng, len * kvh * d, -1.0, 1.0),
+            &[len, kvh, d],
+        )
+        .unwrap();
+        let vr = Tensor::from_f32_as_bf16(
+            &ctx,
+            &f32s(&mut rng, len * kvh * d, -1.0, 1.0),
+            &[len, kvh, d],
+        )
+        .unwrap();
+        let q = Tensor::from_f32_as_bf16(
+            &ctx,
+            &f32s(&mut rng, nq * d, -1.0, 1.0),
+            &[nq, d],
+        )
+        .unwrap();
+        let a = zeros(&ctx, nq * d, DType::BF16);
+        let b = zeros(&ctx, nq * d, DType::BF16);
+        run(&ctx, |p| {
+            scatter_kv(&ctx, p, &kc, &kr, 0).unwrap();
+            scatter_kv(&ctx, p, &vc, &vr, 0).unwrap();
+            p.memory_barrier().unwrap();
+            sdpa_decode_split64(
+                &ctx,
+                p,
+                &q,
+                &kc,
+                &vc,
+                &a,
+                len,
+                0.0625,
+                (&partials, &stats),
+            )
+            .unwrap();
+            p.memory_barrier().unwrap();
+            sdpa_decode(
+                &ctx,
+                p,
+                &q,
+                &kc,
+                &vc,
+                &b,
+                len,
+                0.0625,
+                Some((&partials, &stats)),
+            )
+            .unwrap();
+        });
+        // bfloat outputs.
+        assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-2, 1e-2);
+    }
+}

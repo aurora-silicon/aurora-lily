@@ -1202,7 +1202,7 @@ impl Qwen36Model {
                 }
                 let qr = sc.qb.view(r * nq * d, &[nq, d])?;
                 let or = sc.attn.view(r * nq * d, &[nq, d])?;
-                attn::sdpa_decode(
+                attn::sdpa_decode_split64(
                     ctx,
                     pass,
                     &qr,
@@ -1211,7 +1211,7 @@ impl Qwen36Model {
                     &or,
                     pos0 + r + 1,
                     scale,
-                    Some((&sc.split_partials, &sc.split_stats)),
+                    (&sc.split_partials, &sc.split_stats),
                 )?;
             }
         } else {
