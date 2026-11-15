@@ -98,6 +98,19 @@ uint glm53_bf16_bits(float f) {
 #define KERNEL_glm53_gemm_moe_q8_0
 #define GM_SUB 32u
 #endif
+// Qwen3.6's fused gate/up over its Q4_K or Q8_0 experts: the IQ2_XXS fused
+// kernel's tiles and SwiGLU epilogue, with the type's decode.
+#ifdef KERNEL_glm53_gemm_moe_gate_up_q4_k_r128
+#define KERNEL_glm53_gemm_moe_gate_up_q4_k
+#define GM_SUB 32u
+#endif
+#ifdef KERNEL_glm53_gemm_moe_gate_up_q8_0_r128
+#define KERNEL_glm53_gemm_moe_gate_up_q8_0
+#define GM_SUB 32u
+#endif
+#if defined(KERNEL_glm53_gemm_moe_gate_up_q4_k) || defined(KERNEL_glm53_gemm_moe_gate_up_q8_0)
+#define GM_GATE_UP_Q 1
+#endif
 #ifndef GM_SUB
 #define GM_SUB 16u
 #endif
@@ -119,7 +132,7 @@ uint glm53_bf16_bits(float f) {
     defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32) || \
     defined(KERNEL_glm53_gemm_f16) || defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
     defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q4_k) || \
-    defined(KERNEL_glm53_gemm_moe_q8_0) || \
+    defined(KERNEL_glm53_gemm_moe_q8_0) || defined(GM_GATE_UP_Q) || \
     defined(GEMM_GENERIC)
 #define GM_STEP 64u
 // Vector (k - k0) / 2 * 16 + n / 4 of a step's tile holds weights k and
@@ -508,8 +521,8 @@ void main() {
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
     defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q4_k) || \
-    defined(KERNEL_glm53_gemm_moe_q8_0)
-#ifdef KERNEL_glm53_gemm_moe_gate_up_iq2_xxs
+    defined(KERNEL_glm53_gemm_moe_q8_0) || defined(GM_GATE_UP_Q)
+#if defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs) || defined(GM_GATE_UP_Q)
 #define GM_GATE_UP 1
 #define GM_P 8u
 #define GM_DOT_ARG 13u
@@ -520,7 +533,7 @@ void main() {
 
 // Weights k .. k + 8 (k a multiple of 8) of `row`.
 void gm_decode8(uint64_t row, uint k, out float w[8]) {
-#if defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(GM_GATE_UP)
+#if defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs)
     const uint t = k >> 5u, l = (k >> 3u) & 3u;
     const uint bw = (t >> 3u) * 33u;
     const uint qw = bw + 1u + 4u * (t & 7u);
@@ -536,7 +549,7 @@ void gm_decode8(uint64_t row, uint k, out float w[8]) {
         w[p] = scale * v.x;
         w[p + 4u] = scale * v.y;
     }
-#elif defined(KERNEL_glm53_gemm_moe_q4_k)
+#elif defined(KERNEL_glm53_gemm_moe_q4_k) || defined(KERNEL_glm53_gemm_moe_gate_up_q4_k)
     // Qwen3.6's experts. Block k / 256, sub-block j: its 6-bit scale and
     // min, the low (even j) or high nibbles of bytes l .. l + 8 of the
     // pair's 32 (glm53_decode_q4_k's values).
@@ -563,7 +576,7 @@ void gm_decode8(uint64_t row, uint k, out float w[8]) {
     [[unroll]] for (uint i = 0u; i < 8u; i++) {
         w[i] = scale * float((q[i >> 2u] >> (8u * (i & 3u) + shift)) & 0xfu) - minv;
     }
-#elif defined(KERNEL_glm53_gemm_moe_q8_0)
+#elif defined(KERNEL_glm53_gemm_moe_q8_0) || defined(KERNEL_glm53_gemm_moe_gate_up_q8_0)
     // Block k / 32 (34 bytes, 2-byte aligned), bytes k % 32 .. + 8.
     const uint64_t b = row + uint64_t(k >> 5u) * 34u;
     const float d = glm53_h2f(uint(U16(b).v[0]));

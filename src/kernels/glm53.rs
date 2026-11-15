@@ -746,7 +746,7 @@ pub fn moe_grouped(
     let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
     moe_grouped_with(
         ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true, tiles, 0,
+        experts, limit, true, false, tiles, 0,
     )
 }
 
@@ -783,7 +783,7 @@ pub fn moe_grouped_tiles(
 ) -> Result<()> {
     moe_grouped_with(
         ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true, tiles, 0,
+        experts, limit, true, false, tiles, 0,
     )
 }
 
@@ -822,12 +822,43 @@ pub fn moe_grouped_dot(
     let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
     moe_grouped_with(
         ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true, tiles, MOE_DOT_ROWS,
+        experts, limit, true, false, tiles, MOE_DOT_ROWS,
+    )
+}
+
+/// [`moe_grouped`] with Q4_K or Q8_0 experts' gate, up and SwiGLU in one
+/// GEMM as IQ2_XXS experts' are (`glm53_gemm_moe_gate_up_q4_k` /
+/// `_q8_0`): no f32 gate and up outputs and no SwiGLU pass. Qwen3.6's
+/// prefill (other types: [`moe_grouped`]).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_fused(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    hidden: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+    limit: f32,
+) -> Result<()> {
+    let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
+    moe_grouped_with(
+        ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
+        experts, limit, true, true, tiles, 0,
     )
 }
 
 /// [`moe_grouped`]; `fuse_gate_up` false takes IQ2_XXS experts through the
 /// separate gate and up GEMMs and SwiGLU too (the tests' reference);
+/// `fuse_q` fuses Q4_K and Q8_0 experts' too ([`moe_grouped_fused`]);
 /// `tiles` caps a tile's pairs (the results are the same either way).
 #[allow(clippy::too_many_arguments)]
 fn moe_grouped_with(
@@ -848,6 +879,7 @@ fn moe_grouped_with(
     experts: usize,
     limit: f32,
     fuse_gate_up: bool,
+    fuse_q: bool,
     tiles: MoeTiles,
     dot_rows: usize,
 ) -> Result<()> {
@@ -929,7 +961,8 @@ fn moe_grouped_with(
     } else {
         0x8000_0000 | used
     };
-    if gate.ty == GgmlType::Iq2Xxs && fuse_gate_up {
+    let fused_q = fuse_q && matches!(gate.ty, GgmlType::Q4K | GgmlType::Q8_0);
+    if (gate.ty == GgmlType::Iq2Xxs && fuse_gate_up) || fused_q {
         // Gate, up and the SwiGLU in one GEMM: a tile is 32 columns of
         // each, written as the down GEMM's bfloat operand.
         ensure!(
@@ -937,10 +970,13 @@ fn moe_grouped_with(
             "grouped expert GEMM of {ff} x {}",
             gate.cols
         );
-        let name = if r128 {
-            "glm53_gemm_moe_gate_up_iq2_xxs_r128"
-        } else {
-            "glm53_gemm_moe_gate_up_iq2_xxs"
+        let name = match (gate.ty, r128) {
+            (GgmlType::Q4K, false) => "glm53_gemm_moe_gate_up_q4_k",
+            (GgmlType::Q4K, true) => "glm53_gemm_moe_gate_up_q4_k_r128",
+            (GgmlType::Q8_0, false) => "glm53_gemm_moe_gate_up_q8_0",
+            (GgmlType::Q8_0, true) => "glm53_gemm_moe_gate_up_q8_0_r128",
+            (_, false) => "glm53_gemm_moe_gate_up_iq2_xxs",
+            (_, true) => "glm53_gemm_moe_gate_up_iq2_xxs_r128",
         };
         let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
         pass.dispatch_at(

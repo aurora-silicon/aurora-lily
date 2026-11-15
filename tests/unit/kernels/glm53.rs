@@ -2975,7 +2975,7 @@ fn moe_grouped_dot_route_boundaries() {
                 run(&ctx, |p| {
                     moe_grouped_with(
                         &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs,
-                        m, used, experts, limit, true, tiles, dot,
+                        m, used, experts, limit, true, false, tiles, dot,
                     )
                     .unwrap()
                 });
@@ -3149,7 +3149,7 @@ fn moe_grouped_timing() {
                 for _ in 0..4 {
                     moe_grouped_with(
                         &ctx, &pass, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out,
-                        &gs, m, used, experts, 10.0, true, tile_rows, dot,
+                        &gs, m, used, experts, 10.0, true, false, tile_rows, dot,
                     )
                     .unwrap();
                     pass.memory_barrier().unwrap();
@@ -3328,7 +3328,7 @@ fn moe_grouped_fused_matches_separate() {
             run(&ctx, |p| {
                 moe_grouped_with(
                     &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m,
-                    used, experts, limit, fused, tile_rows, 0,
+                    used, experts, limit, fused, false, tile_rows, 0,
                 )
                 .unwrap()
             });

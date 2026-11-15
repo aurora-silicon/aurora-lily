@@ -181,7 +181,37 @@ pub fn gdn(
         [&u32_bytes(ch), &u32_bytes(m), &snap_row.to_ne_bytes()];
     // Prompt runs: the conv row-parallel, its window moved beside the scan.
     let rows = m > 4;
-    if rows {
+    let chunk = chunk.filter(|_| {
+        rows && snap.is_none() && m >= GDN_CHUNK_MIN_ROWS && ctx.matrix_units()
+    });
+    let m_main = m - m % GDN_CHUNK;
+    if let Some(chunk) = chunk {
+        for (t, (n, ty)) in [chunk.qkv, chunk.w, chunk.u, chunk.p, chunk.g]
+            .into_iter()
+            .zip(gdn_chunk_shapes(m, k_heads, h))
+        {
+            ensure!(t.numel() >= n && t.dtype() == ty, "GDN chunk staging of {m} rows");
+        }
+        // The conv with the chunked passes' bf16 operands; c for the tail.
+        let conv = ctx.pipeline("qwen36_gdn_conv_rows_prep", SOURCE, MslVersion::V3_1)?;
+        let mut bindings = conv_bindings.to_vec();
+        bindings.push(chunk.qkv.binding());
+        pass.dispatch_at(
+            &conv,
+            &bindings,
+            &[
+                &u32_bytes(ch),
+                &u32_bytes(k_heads),
+                &u32_bytes(h),
+                &f32_bytes(eps),
+                &u32_bytes(m_main),
+            ],
+            Grid::Threadgroups {
+                groups: ((2 * k_heads + h).div_ceil(8), m, 1),
+                threadgroup: (256, 1, 1),
+            },
+        )?;
+    } else if rows {
         let conv = ctx.pipeline("qwen36_gdn_conv_rows", SOURCE, MslVersion::V3_1)?;
         pass.dispatch_at(
             &conv,
@@ -209,9 +239,6 @@ pub fn gdn(
             Grid::Threads { grid: (ch, 1, 1), threadgroup: (256, 1, 1) },
         )?;
     }
-    let chunk = chunk.filter(|_| {
-        rows && snap.is_none() && m >= GDN_CHUNK_MIN_ROWS && ctx.matrix_units()
-    });
     // The token-serial scan of rows `t0..m`.
     let serial = |t0: usize| -> Result<()> {
         let n = m - t0;
@@ -248,25 +275,7 @@ pub fn gdn(
         )
     };
     if let Some(chunk) = chunk {
-        for (t, (n, ty)) in [chunk.qkv, chunk.w, chunk.u, chunk.p, chunk.g]
-            .into_iter()
-            .zip(gdn_chunk_shapes(m, k_heads, h))
-        {
-            ensure!(t.numel() >= n && t.dtype() == ty, "GDN chunk staging of {m} rows");
-        }
-        // Beside the window move: the bf16 operands.
-        let prep = ctx.pipeline("qwen36_gdn_chunk_prep", SOURCE, MslVersion::V3_1)?;
-        pass.dispatch_at(
-            &prep,
-            &[c.binding(), chunk.qkv.binding()],
-            &[&u32_bytes(k_heads), &u32_bytes(h), &f32_bytes(eps)],
-            Grid::Threadgroups {
-                groups: (2 * k_heads + h, m, 1),
-                threadgroup: (GDN_DIM, 1, 1),
-            },
-        )?;
-        pass.memory_barrier()?;
-        let m_main = m - m % GDN_CHUNK;
+        // Beside the window move: the WY pass.
         let vpk = h / k_heads;
         let wy = ctx.pipeline("gdn_chunk_wy3_q36", SOURCE, MslVersion::V3_1)?;
         ensure!(
