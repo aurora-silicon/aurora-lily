@@ -156,6 +156,66 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
     }
 }
 
+/// The MTP draft head's requantization: a Q8_0 block as Q4_0 reads back
+/// (the GGUF reader's Q4_0) within half a Q4_0 step of the Q8_0 values (a
+/// whole step for values the format clamps); an all-zero block stays zero.
+#[test]
+fn q8_0_blocks_requantize_to_q4_0() {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(83);
+    let mut blocks: Vec<[u8; 34]> = Vec::new();
+    for b in 0..200 {
+        let mut blk = [0u8; 34];
+        let d = half::f16::from_f32(rng.gen_range(1e-4f32..2e-2));
+        blk[..2].copy_from_slice(&d.to_le_bytes());
+        for i in 0..32 {
+            let q: i8 = match b % 4 {
+                0 => rng.gen_range(-127..=127),
+                1 => rng.gen_range(-10..=10),
+                2 => {
+                    if i == 7 {
+                        -127
+                    } else {
+                        rng.gen_range(-60..=60)
+                    }
+                }
+                _ => {
+                    if i == 31 {
+                        127
+                    } else {
+                        rng.gen_range(-127..=127)
+                    }
+                }
+            };
+            blk[2 + i] = q as u8;
+        }
+        blocks.push(blk);
+    }
+    blocks.push([0u8; 34]);
+    for blk in &blocks {
+        let mut x = [0f32; 32];
+        crate::gguf::dequantize(crate::gguf::GgmlType::Q8_0, blk, &mut x).unwrap();
+        let mut q4 = [0u8; 18];
+        q8_0_to_q4_0(blk, &mut q4);
+        let mut y = [0f32; 32];
+        crate::gguf::dequantize(crate::gguf::GgmlType::Q4_0, &q4, &mut y).unwrap();
+        let max =
+            x.iter().copied().fold(0f32, |m, v| if v.abs() > m.abs() { v } else { m });
+        let step = max.abs() / 8.0;
+        for (i, (a, b)) in x.iter().zip(&y).enumerate() {
+            // Q4_0 holds -8 .. 7 steps with the largest magnitude at -8:
+            // half a step, a whole one for values of the other sign past
+            // 7.5 steps (clamped), plus the f16 rounding of the scale.
+            let clamped = a * max < 0.0 && a.abs() > 7.5 * step;
+            let tol = if clamped { 1.0 } else { 0.5 } * step + 8.0 * step * 1e-3 + 1e-9;
+            assert!((a - b).abs() <= tol, "value {i}: {a} vs {b}");
+        }
+        if max == 0.0 {
+            assert!(y.iter().all(|&v| v == 0.0));
+        }
+    }
+}
+
 /// Every staging path the engine uses fits the scratch it writes, at every
 /// row count it is called with: a verify pass (1 or 2 rows, up to
 /// MAX_ROWS), a decode step, a prefill run up to PREFILL_ROWS, the MTP

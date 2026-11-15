@@ -204,6 +204,10 @@ pub struct Glm53Model {
     nextn: NextnW,
     embed: QWeight,
     output: QWeight,
+    /// The output head requantized to Q4_0 (half the bytes) for the MTP
+    /// draft only ([`Self::build_draft_head`]): what is emitted is decided
+    /// by the full head of the verify pass.
+    draft_head: Option<QWeight>,
     output_norm: Tensor,
     /// Whether the engine speculates with the MTP block (`--mtp-drafts`).
     pub mtp: bool,
@@ -335,10 +339,48 @@ impl Glm53Model {
             nextn,
             embed,
             output,
+            draft_head: None,
             output_norm,
             mtp: false,
             draft_min_prob: 0.0,
         })
+    }
+
+    /// Builds the MTP draft's Q4_0 output head from the Q8_0 head (each
+    /// block's 32 values requantized as llama.cpp's Q4_0: the scale is the
+    /// largest magnitude's signed value over -8). A draft step reads 0.36
+    /// instead of 0.67 GB of head. No-op for a head that is not Q8_0.
+    pub fn build_draft_head(&mut self, ctx: &MetalContext) -> Result<()> {
+        let w = &self.output;
+        if w.ty != crate::gguf::GgmlType::Q8_0 {
+            return Ok(());
+        }
+        ensure!(w.cols.is_multiple_of(32), "head rows of {} values", w.cols);
+        let src = w.t.contents();
+        let blocks = w.rows * w.cols / 32;
+        ensure!(src.len() >= blocks * 34, "Q8_0 head of {} bytes", src.len());
+        let mut dst = vec![0u8; blocks * 18];
+        let threads =
+            std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let per = blocks.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (t, out) in dst.chunks_mut(per * 18).enumerate() {
+                let src = &src[t * per * 34..];
+                scope.spawn(move || {
+                    for (b, o) in out.chunks_mut(18).enumerate() {
+                        q8_0_to_q4_0(&src[b * 34..b * 34 + 34], o);
+                    }
+                });
+            }
+        });
+        self.draft_head = Some(QWeight::from_bytes(
+            ctx,
+            &dst,
+            crate::gguf::GgmlType::Q4_0,
+            w.cols,
+            w.rows,
+        )?);
+        Ok(())
     }
 
     /// The buffers holding the mapped file.
@@ -484,6 +526,23 @@ impl Glm53State {
                 std::mem::swap(s, s_alt);
             }
         }
+    }
+}
+
+/// One Q8_0 block (f16 scale, 32 int8) as a Q4_0 block (f16 scale, 16
+/// bytes of nibbles: value j low, j + 16 high), as llama.cpp's
+/// `quantize_row_q4_0_ref` quantizes the block's values.
+fn q8_0_to_q4_0(b: &[u8], out: &mut [u8]) {
+    let d8 = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
+    let x: [f32; 32] = std::array::from_fn(|i| d8 * f32::from(b[2 + i] as i8));
+    let max =
+        x.iter().copied().fold(0f32, |m, v| if v.abs() > m.abs() { v } else { m });
+    let d = max / -8.0;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    out[..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+    let q = |v: f32| ((v * id + 8.5) as i32).clamp(0, 15) as u8;
+    for j in 0..16 {
+        out[2 + j] = q(x[j]) | (q(x[j + 16]) << 4);
     }
 }
 
@@ -1276,7 +1335,8 @@ impl Glm53Model {
             cfg.rms_eps,
         )?;
         pass.memory_barrier()?;
-        k::gemv(ctx, pass, &self.output, &sc.hidden_norm, &sc.logits, 1)?;
+        let head = self.draft_head.as_ref().unwrap_or(&self.output);
+        k::gemv(ctx, pass, head, &sc.hidden_norm, &sc.logits, 1)?;
         pass.memory_barrier()?;
         let out = sc.mtp_io.view(1, &[1])?;
         crate::kernels::sample::sample_f32(

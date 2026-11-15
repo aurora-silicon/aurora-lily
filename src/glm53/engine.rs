@@ -316,6 +316,9 @@ impl LanguageModel for Glm53Model {
     fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
         let mut model = Glm53Model::load(ctx, path)?;
         model.mtp = options.mtp_drafts > 0;
+        if model.mtp {
+            model.build_draft_head(ctx)?;
+        }
         model.draft_min_prob = DRAFT_MIN_PROB;
         Ok(model)
     }
