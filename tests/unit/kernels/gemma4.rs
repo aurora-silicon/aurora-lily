@@ -38,7 +38,9 @@ fn run(ctx: &MetalContext, f: impl FnOnce(&ComputePass<'_>)) {
 /// IQ2_XXS, IQ2_S; F32 values in -0.1..0.1).
 fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
     if ty == GgmlType::F32 {
-        return (0..values).flat_map(|_| rng.gen_range(-0.1f32..0.1).to_le_bytes()).collect();
+        return (0..values)
+            .flat_map(|_| rng.gen_range(-0.1f32..0.1).to_le_bytes())
+            .collect();
     }
     let nb = values / ty.block_values();
     let bb = ty.block_bytes();
@@ -1042,7 +1044,8 @@ fn gemv_rows_timing() {
     use crate::kernels::glm53::gemv_sets;
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(71);
-    let m: usize = std::env::var("LILY_GEMV_M").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let m: usize =
+        std::env::var("LILY_GEMV_M").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     let shapes: [(&str, GgmlType, usize, &[usize]); 7] = [
         ("local q/k/v Q5_K", GgmlType::Q5K, 2816, &[4096, 2048, 2048]),
         ("local o Q5_K", GgmlType::Q5K, 4096, &[2816]),
@@ -1237,7 +1240,10 @@ fn read_bandwidth_probe() {
                     &pipeline,
                     &[src.binding(), out.binding()],
                     &[&u32_bytes(bytes / 16)],
-                    Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
+                    Grid::Threadgroups {
+                        groups: (groups, 1, 1),
+                        threadgroup: (256, 1, 1),
+                    },
                 )
                 .unwrap();
             }

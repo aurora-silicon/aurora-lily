@@ -1112,7 +1112,9 @@ fn instruction_cost_probe() {
 fn fma_peak_probe() {
     let ctx = MetalContext::new().expect("metal context");
     let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
-    for (name, per_round) in [("pk_fma_f32", 32usize), ("pk_fma_f16", 32), ("pk_fma_f16w", 64)] {
+    for (name, per_round) in
+        [("pk_fma_f32", 32usize), ("pk_fma_f16", 32), ("pk_fma_f16w", 64)]
+    {
         let kernel = ctx.pipeline(name, "", MslVersion::V3_1).expect("kernel");
         for groups in [64usize, 256, 1024] {
             let rounds = 2048usize;
@@ -1123,7 +1125,10 @@ fn fma_peak_probe() {
                     &kernel,
                     &[out.binding()],
                     &[&u32_bytes(rounds)],
-                    Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
+                    Grid::Threadgroups {
+                        groups: (groups, 1, 1),
+                        threadgroup: (256, 1, 1),
+                    },
                 )
                 .expect("dispatch");
                 let done = pass.commit().expect("commit").wait_retain().expect("wait");
@@ -1212,7 +1217,10 @@ fn shared_stride_probe() {
             best = best.min(t.gpu_end_secs - t.gpu_start_secs);
         }
         let steps = (groups * 256 * rounds * 8) as f64;
-        eprintln!("stride {stride:>2}: {:.3} TFLOPS of FMAs", 2.0 * steps * 32.0 / best / 1e12);
+        eprintln!(
+            "stride {stride:>2}: {:.3} TFLOPS of FMAs",
+            2.0 * steps * 32.0 / best / 1e12
+        );
     }
 }
 
@@ -1226,7 +1234,9 @@ fn shared_stride_probe() {
 fn shared_shape_probe() {
     let ctx = MetalContext::new().expect("metal context");
     let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
-    for (name, rows) in [("pb_lds8", 8usize), ("pb_lds12", 12), ("pb_bc8", 8), ("pb_bc12", 12)] {
+    for (name, rows) in
+        [("pb_lds8", 8usize), ("pb_lds12", 12), ("pb_bc8", 8), ("pb_bc12", 12)]
+    {
         let kernel = ctx.pipeline(name, "", MslVersion::V3_1).expect("kernel");
         let (groups, rounds) = (1024usize, 256usize);
         let mut best = f64::INFINITY;
