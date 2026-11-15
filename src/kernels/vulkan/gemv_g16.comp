@@ -17,7 +17,8 @@
 // high-bit bytes and the block header, each one 16-byte load, the code
 // bytes of a group's lanes contiguous. A sub-block's scale and min multiply
 // its sums of code times x and of x. K a multiple of 256, x_group a
-// multiple of G16_R (a subgroup's rows share their input).
+// multiple of G16_R (a subgroup's rows share their input), x_row_stride a
+// multiple of 4 (the step between rows is x_row_stride / 4 vec4s).
 // Buffers: 0 x, 1-4 W, 5-8 y. Params: 9 K, 10 m, 11 row_bytes, 12-15 rows
 // of each set (0: unused), 16 x_group, 17 x_row_stride, 18 y_row_stride.
 // ---------------------------------------------------------------------------

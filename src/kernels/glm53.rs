@@ -134,15 +134,16 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
     Ok(NAMES[t][m - 1])
 }
 
-/// On a G16 GPU (an M4), the `gemv_g16.comp` kernel of a type, row count
-/// and width, and the rows a subgroup of it takes; `None` keeps the
-/// glm53_gemv kernel.
+/// On a G16 GPU (an M4), the `gemv_g16.comp` kernel of a type, row count,
+/// width and activation layout, and the rows a subgroup of it takes; `None`
+/// keeps the glm53_gemv kernel.
 fn g16_gemv_name(
     ctx: &MetalContext,
     ty: GgmlType,
     cols: usize,
     m: usize,
     x_group: usize,
+    x_row_stride: usize,
 ) -> Option<(&'static str, usize)> {
     if !ctx.g16() {
         return None;
@@ -160,8 +161,11 @@ fn g16_gemv_name(
         _ => return None,
     };
     // Every row count's kernel or none: a verify pass's rows must sum as
-    // plain decode's row does.
-    (m <= names.len() && x_group.is_multiple_of(4)).then(|| (names[m - 1], rows))
+    // plain decode's row does. The kernel steps between activation rows in
+    // vec4s (x_row_stride / 4): a layout of another stride takes glm53_gemv,
+    // at m = 1 too.
+    (m <= names.len() && x_group.is_multiple_of(4) && x_row_stride.is_multiple_of(4))
+        .then(|| (names[m - 1], rows))
 }
 
 fn moe_name(gate_up: bool, ty: GgmlType) -> Result<&'static str> {
@@ -264,7 +268,7 @@ fn gemv_dispatch(
         "GEMV row of {} values",
         w0.cols
     );
-    let g16 = g16_gemv_name(ctx, w0.ty, w0.cols, m, l.x_group);
+    let g16 = g16_gemv_name(ctx, w0.ty, w0.cols, m, l.x_group, l.x_row_stride);
     let per_sg = match g16 {
         Some((_, rows)) => rows,
         None => 32 / tasks.min(32),
