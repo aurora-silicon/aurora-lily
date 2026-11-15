@@ -65,19 +65,19 @@ bfloat16_t bf16(bfloat16_t f) { return f; }
 // arg(i) costs a thread nothing; what it points at is a load.
 layout(push_constant, scalar) uniform LilyDispatch {
     uvec3 grid;
-    // Bit i: args[i] is a four-byte param's value itself, not its address.
+    // Unused (zero): params always travel by address. Testing a per-param
+    // by-value bit here cost every kernel's constant program a few
+    // instructions per param and every thread a select per param read; a
+    // dependent level of the Q8_0 GEMV ran 5.6% faster without it (M5 Max,
+    // 2026-11-15).
     uint by_value;
     uint64_t args[30];
 } lily_dispatch;
 
 uint64_t arg(uint index) { return lily_dispatch.args[index]; }
 // A `constant uint&`, `constant int&` or `constant float&` param at binding
-// `index`. Read a four-byte param through these and nothing else: it may
-// arrive by value.
-uint arg_u32(uint index) {
-    if ((lily_dispatch.by_value >> index & 1u) != 0u) return uint(lily_dispatch.args[index]);
-    return U32(lily_dispatch.args[index]).v[0];
-}
+// `index`: a load from the address the dispatch passes.
+uint arg_u32(uint index) { return U32(lily_dispatch.args[index]).v[0]; }
 int arg_i32(uint index) { return int(arg_u32(index)); }
 float arg_f32(uint index) { return uintBitsToFloat(arg_u32(index)); }
 

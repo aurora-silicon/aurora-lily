@@ -165,11 +165,10 @@ vec2 glm53_task_dot_sum(in float w[32], uint64_t x) {
 // The IQ4_NL code value (ggml's kvalues_iq4nl): a select tree, not a dynamically indexed array
 // (which the compiler copies to per-thread scratch).
 float glm53_iq4nl_value(uint c) {
-    const vec4 a = c < 8u ? (c < 4u ? vec4(-127.0, -104.0, -83.0, -65.0)
-                                    : vec4(-49.0, -35.0, -22.0, -10.0))
-                          : (c < 12u ? vec4(1.0, 13.0, 25.0, 38.0)
-                                     : vec4(53.0, 69.0, 89.0, 113.0));
-    return a[c & 3u];
+    // The sixteen codes as signed bytes, four to a word (little-endian).
+    const uint w = c < 8u ? (c < 4u ? 0xBFAD9881u : 0xF6EADDCFu)
+                          : (c < 12u ? 0x26190D01u : 0x71594535u);
+    return float(bitfieldExtract(int(w), int(8u * (c & 3u)), 8));
 }
 
 void glm53_decode_iq4_nl(uint64_t row, uint t, out float w[32]) {
