@@ -62,6 +62,28 @@ fn caches_grow_by_doubling_up_to_the_cap_and_no_further() {
     assert!(Gemma4State::new(&ctx, &cfg, 101, 100).is_err());
 }
 
+/// The shape-based session size is what a state and its snapshots
+/// allocate, and the growth peak bounds what growing to the cap holds.
+#[test]
+fn session_bytes_are_what_a_session_allocates() {
+    use crate::gemma4::model::{session_bytes, session_peak};
+    let ctx = MetalContext::new().unwrap();
+    let cfg = small();
+    let (cap, checkpoints) = (1000, 3);
+    let before = ctx.current_allocated();
+    let mut st = Gemma4State::new(&ctx, &cfg, 16, cap).unwrap();
+    for tokens in [17, 600, cap] {
+        st.ensure_capacity(&ctx, tokens).unwrap();
+    }
+    let snaps: Vec<_> = (0..checkpoints).map(|_| st.snapshot(&ctx).unwrap()).collect();
+    let used = (ctx.current_allocated() - before) as u64;
+    assert_eq!(used, session_bytes(&cfg, cap, checkpoints));
+    assert_eq!(st.bytes() as u64, session_bytes(&cfg, cap, 0));
+    let widest = 4 * cfg.kv_width(1) * cap;
+    assert_eq!(session_peak(&cfg, cap, checkpoints), used + widest as u64);
+    drop(snaps);
+}
+
 #[test]
 fn staged_tokens_are_checked_against_the_vocabulary() {
     let ctx = MetalContext::new().unwrap();

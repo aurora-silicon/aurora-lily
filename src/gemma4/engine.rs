@@ -269,6 +269,11 @@ impl Gemma4Model {
     }
 }
 
+/// What the passes the server keeps in flight allocate for their arguments
+/// (the backend's recycled 1 MiB arenas, one a pass; a Gemma step's take
+/// well under one), counted by the memory-limit fit.
+const PASS_ARENAS: usize = 4 << 20;
+
 /// A draft is proposed only when the draft model's probability of it is
 /// at least this; the chain stops at the first that is not.
 const DRAFT_MIN_PROB: f32 = 0.3;
@@ -320,10 +325,20 @@ impl Gemma4Model {
             + 1
     }
 
-    /// The longest context (a multiple of 256 tokens) whose session, with
-    /// `checkpoints` snapshots and the scratch's growth, fits `limit` bytes
-    /// next to `allocated` bytes (the weights and the scratch);
-    /// `context_cap` becomes it, so the server caps --max-seq there.
+    /// The most GPU memory one session holds on its way to `capacity` rows
+    /// with `checkpoints` snapshots: its caches at that capacity plus the
+    /// one global layer's K and V that `ensure_capacity` holds twice while
+    /// it replaces them (the old ones are freed layer by layer).
+    pub fn session_peak(&self, capacity: usize, checkpoints: usize) -> u64 {
+        super::model::session_peak(&self.cfg, capacity, checkpoints)
+    }
+
+    /// The longest context (a multiple of 256 tokens) whose session's peak
+    /// ([`Self::session_peak`], with the verify lookahead and `checkpoints`
+    /// snapshots) and the scratch's growth fit `limit` bytes next to
+    /// `allocated` bytes (the weights and the scratch); `context_cap`
+    /// becomes it, so the server caps --max-seq there, and the session
+    /// store keeps that peak free for the request's session.
     pub fn fit_context(
         &mut self,
         limit: u64,
@@ -331,11 +346,9 @@ impl Gemma4Model {
         checkpoints: usize,
     ) -> Result<usize> {
         let room = limit.saturating_sub(allocated);
-        let session =
-            |c: usize, k: usize| LanguageModel::session_bytes(self, c, k).unwrap_or(0);
-        let per_token =
-            (session(256, 0) - session(0, 0)) / 256 + self.partial_bytes_per_token();
-        let fixed = session(0, checkpoints);
+        let per_token = (self.session_peak(256, 0) - self.session_peak(0, 0)) / 256
+            + self.partial_bytes_per_token();
+        let fixed = self.session_peak(0, checkpoints);
         let rows = room.saturating_sub(fixed) / per_token.max(1);
         let context = (rows as usize).saturating_sub(LOOKAHEAD) / 256 * 256;
         let context = context.min(self.cfg.context_length).min(MAX_SEQ);
@@ -348,6 +361,8 @@ impl Gemma4Model {
             allocated as f64 / 1e9
         );
         self.context_cap = context;
+        self.acquire_reserve =
+            Some(self.session_peak(capacity_cap(context), checkpoints));
         Ok(context)
     }
 }
@@ -381,16 +396,16 @@ impl LanguageModel for Gemma4Model {
             }
         }
         if let Some(limit) = model.memory_limit {
-            // The weights and a scratch as the server allocates it (made
-            // here once to measure it; its attention partials grow with
-            // the context, which fit_context counts per token), then the
-            // longest context whose session fits the rest: the server caps
-            // --max-seq there.
+            // The weights, a scratch as the server allocates it (made here
+            // once to measure it; its attention partials grow with the
+            // context, which fit_context counts per token) and the passes'
+            // argument arenas, then the longest context whose session fits
+            // the rest: the server caps --max-seq there.
             let before = ctx.current_allocated();
             let probe = model.new_scratch(ctx, 1)?;
             let scratch = ctx.current_allocated().saturating_sub(before);
             drop(probe);
-            let allocated = before + scratch;
+            let allocated = before + scratch + PASS_ARENAS;
             let checkpoints = options.session_checkpoints.unwrap_or(
                 crate::serve::CHECKPOINTS_PER_SESSION
                     + crate::serve::DECODE_CHECKPOINTS_PER_SESSION,
@@ -398,15 +413,13 @@ impl LanguageModel for Gemma4Model {
             let context = model.fit_context(limit, allocated as u64, checkpoints)?;
             eprintln!(
                 "gemma4: --memory-limit-gb {:.1} ({:.1} GB) leaves {:.2} GB after {:.1} GB of weights and \
-                 scratch: contexts of up to {context} tokens (one session of {:.2} GB with \
+                 scratch: contexts of up to {context} tokens (one session of at most {:.2} GB with \
                  {checkpoints} snapshots); --max-seq is capped there",
                 limit as f64 / (1u64 << 30) as f64,
                 limit as f64 / 1e9,
                 limit.saturating_sub(allocated as u64) as f64 / 1e9,
                 allocated as f64 / 1e9,
-                model.session_bytes(capacity_cap(context), checkpoints).unwrap_or(0)
-                    as f64
-                    / 1e9,
+                model.session_peak(capacity_cap(context), checkpoints) as f64 / 1e9,
             );
         }
         Ok(model)
@@ -505,6 +518,10 @@ impl LanguageModel for Gemma4Model {
         self.memory_limit
     }
 
+    fn acquire_reserve(&self) -> Option<u64> {
+        self.acquire_reserve
+    }
+
     fn eos_token_ids(&self) -> Vec<u32> {
         super::tokenizer::stop_ids(&self.gguf).unwrap_or_else(|_| vec![self.cfg.eos])
     }
@@ -537,17 +554,7 @@ impl LanguageModel for Gemma4Model {
     /// The global layers' caches for `capacity` tokens, the rings, and
     /// `checkpoints` snapshots of the rings' windows.
     fn session_bytes(&self, capacity: usize, checkpoints: usize) -> Option<u64> {
-        let cfg = &self.cfg;
-        let slots = super::model::ring_slots(cfg);
-        let ring: usize = (0..cfg.n_layer)
-            .filter(|&il| cfg.swa[il])
-            .map(|il| 4 * cfg.kv_width(il))
-            .sum();
-        Some(
-            (self.bytes_per_token() * capacity
-                + ring * slots
-                + checkpoints * ring * cfg.window) as u64,
-        )
+        Some(super::model::session_bytes(&self.cfg, capacity, checkpoints))
     }
 
     fn weight_buffers(&self) -> Vec<crate::metal::Buffer> {

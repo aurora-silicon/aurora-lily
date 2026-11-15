@@ -101,6 +101,9 @@ pub struct Gemma4Model {
     /// The longest context served: the file's, the server's limit, or what
     /// fits the memory limit ([`Gemma4Model::fit_context`]).
     pub context_cap: usize,
+    /// What the session store keeps free for the request's session under a
+    /// fitted `--memory-limit-gb`: the session's peak at the fitted context.
+    pub acquire_reserve: Option<u64>,
 }
 
 /// Block types of the dense projections: those with both a GEMV (decode,
@@ -285,6 +288,7 @@ impl Gemma4Model {
             drafts: 0,
             draft_min_prob: 0.0,
             memory_limit: None,
+            acquire_reserve: None,
         })
     }
 
@@ -321,6 +325,33 @@ impl Gemma4Model {
 /// Slots of a sliding-window layer's ring.
 pub fn ring_slots(cfg: &Config) -> usize {
     cfg.window + PREFILL_ROWS
+}
+
+/// GPU bytes of one session's caches for `capacity` tokens (the global
+/// layers' f16 K and V), its sliding-window rings, and `checkpoints`
+/// snapshots of the rings' windows.
+pub fn session_bytes(cfg: &Config, capacity: usize, checkpoints: usize) -> u64 {
+    let per_row = |swa: bool| -> usize {
+        (0..cfg.n_layer)
+            .filter(|&il| cfg.swa[il] == swa)
+            .map(|il| 4 * cfg.kv_width(il))
+            .sum()
+    };
+    (per_row(false) * capacity
+        + per_row(true) * (ring_slots(cfg) + checkpoints * cfg.window)) as u64
+}
+
+/// The most GPU memory one session holds on its way to `capacity` rows
+/// with `checkpoints` snapshots: [`session_bytes`] plus the one global
+/// layer's K and V that growth holds twice while it replaces them (the old
+/// ones are freed layer by layer, after the copy).
+pub fn session_peak(cfg: &Config, capacity: usize, checkpoints: usize) -> u64 {
+    let widest = (0..cfg.n_layer)
+        .filter(|&il| !cfg.swa[il])
+        .map(|il| cfg.kv_width(il))
+        .max()
+        .unwrap_or(0);
+    session_bytes(cfg, capacity, checkpoints) + (4 * widest * capacity) as u64
 }
 
 /// One layer's K and V caches, f16 `[slots][kv heads][head dim]`.
