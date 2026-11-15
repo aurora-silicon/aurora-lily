@@ -2822,6 +2822,30 @@ fn moe_grouped_dot_route_boundaries() {
     }
 }
 
+/// The GPU zero fill (`zero`) clears exactly its tensor: a view 64 values
+/// into a nonzero buffer, 3 140 values long (785 16-byte units: the last
+/// 256-thread group partial), with the values around it untouched.
+#[test]
+fn gpu_zero_fills_its_view_only() {
+    let ctx = ctx();
+    let (lead, len, tail) = (64usize, 4 * (256 * 3 + 17), 64usize);
+    let n = lead + len + tail;
+    let pattern: Vec<f32> = (0..n).map(|i| 1.0 + i as f32).collect();
+    let all = tensor(&ctx, &pattern);
+    let view = all.view(lead, &[len]).unwrap();
+    run(&ctx, |p| zero(&ctx, p, &view).unwrap());
+    let got = all.to_f32().unwrap();
+    for (i, (&g, &p)) in got.iter().zip(&pattern).enumerate() {
+        let want = if (lead..lead + len).contains(&i) { 0.0 } else { p };
+        assert_eq!(g.to_bits(), want.to_bits(), "value {i}");
+    }
+    // A length that is not whole 16-byte units is refused.
+    let odd = all.view(lead, &[len - 1]).unwrap();
+    let pass = ctx.begin().unwrap();
+    assert!(zero(&ctx, &pass, &odd).is_err());
+    pass.commit_wait().unwrap();
+}
+
 /// The prefill's grouped routed experts at the model's shapes (gate/up
 /// IQ2_XXS 2048 x 4096, down Q2_K 4096 x 2048) over 64 experts, for runs
 /// whose pairs per expert match a 256-token and a 4K-token prompt of the
