@@ -939,6 +939,10 @@ fn kda_prefill_long_runs_match_cpu() {
 
 #[test]
 fn dsa_store_and_attend_match_cpu() {
+    // The prompt-run DSA kernels use matrix units.
+    if !ctx().matrix_units() {
+        return;
+    }
     // 42 cached rows then 3 rows of queries (SIMT kernels); 25 then a run
     // of 20 (matrix units); runs from row 0 in partial tiles of the
     // padded widths 8 and 16.
@@ -951,6 +955,10 @@ fn dsa_store_and_attend_match_cpu() {
 /// through f32 on the matrix route): finite, and as the CPU computes.
 #[test]
 fn dsa_attend_large_queries_stay_finite() {
+    // The prompt-run DSA kernels use matrix units.
+    if !ctx().matrix_units() {
+        return;
+    }
     for m in [3, 20] {
         dsa_causal_case(45, m, 64, true);
     }
@@ -1011,6 +1019,10 @@ fn dsa_attend_refuses_unpadded_prompt_widths() {
 #[test]
 fn dsa_scores_mu_block_boundaries() {
     let ctx = ctx();
+    // The prompt-run DSA kernels use matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(81);
     let n = 6000usize;
     let s = 192usize;
@@ -1134,6 +1146,10 @@ fn dsa_scores_mu_block_boundaries() {
 #[test]
 fn dsa_scores_at_and_past_f16_range() {
     let ctx = ctx();
+    // The prompt-run DSA kernels use matrix units.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(78);
     let (n, m) = (200usize, 6usize);
     let s = n;
@@ -1307,6 +1323,10 @@ fn dsa_causal_case(n: usize, m: usize, s: usize, big: bool) {
 /// lists with unused slots, against the CPU.
 #[test]
 fn dsa_attend_selected_matches_cpu() {
+    // The prompt-run DSA kernels use matrix units.
+    if !ctx().matrix_units() {
+        return;
+    }
     // Decode rows (SIMT kernels, the slots in chunks) and a prompt run
     // (matrix units); a short selection and a full one (its last chunk full).
     for (m, count) in [(2, 344), (6, 344), (2, 2056), (6, 2056)] {
@@ -2212,6 +2232,10 @@ fn gemm_matches_cpu() {
         (GgmlType::F32, 4096, 288, 33),
         (GgmlType::Q8_0, 128, 8192, 64),
     ] {
+        // The f32 GEMM without matrix units has no bf16 weights.
+        if matches!(ty, GgmlType::Bf16) && !ctx.matrix_units() {
+            continue;
+        }
         let raw = random_blocks(&mut rng, ty, rows * cols);
         let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
         let cpu = mat(ty, &raw, rows, cols);
@@ -2279,6 +2303,10 @@ fn gemm_k_widths() {
 #[test]
 fn gemm_bx_matches_gemm() {
     let ctx = ctx();
+    // The bfloat GEMMs run on matrix units only.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(78);
     // Rows within one 256-row tile, around its edge (255, 256, 257) and
     // across several (513, 1 024); widths with partial 64-column tiles.
@@ -2367,6 +2395,10 @@ fn moe_grouped_six_slots_matches_per_pair_kernels() {
 
 fn moe_grouped_case(used: usize) {
     let ctx = ctx();
+    // The bfloat GEMMs run on matrix units only.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(71);
     let (experts, hidden, ff, m) = (12, 512, 256, 70);
     let g_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
@@ -2540,6 +2572,10 @@ fn gemm_timing() {
 #[test]
 fn moe_grouped_fused_matches_separate() {
     let ctx = ctx();
+    // The bfloat GEMMs run on matrix units only.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(74);
     let (experts, hidden, ff, used, m) = (12, 1024, 512, 8, 60);
     let mk = |rng: &mut StdRng, ty, cols, rows| {
@@ -2592,6 +2628,10 @@ fn moe_grouped_fused_matches_separate() {
 #[test]
 fn moe_grouped_q2_k_gate_up_matches_per_pair_kernels() {
     let ctx = ctx();
+    // The bfloat GEMMs run on matrix units only.
+    if !ctx.matrix_units() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(76);
     let (experts, hidden, ff, used, m) = (12, 512, 256, 8, 70);
     let g_raw = random_blocks(&mut rng, GgmlType::Q2K, experts * ff * hidden);
