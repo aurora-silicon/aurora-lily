@@ -1,12 +1,15 @@
 //! The token embedding read from the file instead of mapped for the GPU:
-//! Qwen3.8's Q2 GGUF under a memory limit (`--memory-limit-gb`) keeps
-//! 1.27 GB of its footprint off the GPU this way. The trunk's rows are
-//! copied by the host for the tokens it feeds, which it knows before each
-//! pass reads them (a prompt chunk, a verify pass, a decode step), so the
-//! trunk embeds exactly what the mapped table held. The draft head embeds
-//! tokens only the GPU knows (the trunk's draws, its own proposals) from a
-//! resident copy of the rows of its narrow LM head (`spec.rs`): another id
-//! embeds as zeros there, which can only cost its proposals acceptance.
+//! Qwen3.8's Q2 GGUF under a memory limit (`--memory-limit-gb`) leaves its
+//! 1.27 GB table off the GPU this way. The trunk's rows are copied by the
+//! host for the tokens it feeds, which it knows before each pass reads them
+//! (a prompt chunk, a verify pass, a decode step), so the trunk embeds
+//! exactly what the mapped table held. The draft head, when loaded, also
+//! embeds tokens only the GPU knows (the trunk's draws, its own proposals):
+//! those come from a resident copy of the rows of its narrow LM head
+//! (`spec.rs`; 505 MB, so the net saving with the head is 767 MB), where
+//! another id embeds as zeros, which can only cost its proposals
+//! acceptance. Its catch-up over a prompt chunk past position 0 uses the
+//! chunk's exact staged rows (`Qwen4ExpModel::mtp_catch_up`).
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
