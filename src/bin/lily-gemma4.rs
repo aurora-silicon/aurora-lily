@@ -172,7 +172,11 @@ fn run() -> Result<()> {
                 ..Default::default()
             };
             let m = <Gemma4Model as LanguageModel>::load(&ctx, &model, &options)?;
-            println!("fit: context {} tokens, drafts {}", m.context_cap, m.max_drafts());
+            println!(
+                "fit: context {} tokens, drafts {}",
+                m.context_cap,
+                m.max_drafts()
+            );
             Ok(())
         }
         Cmd::Bench { model, text, prompt_len, n, runs } => {

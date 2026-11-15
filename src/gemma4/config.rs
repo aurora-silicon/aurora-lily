@@ -445,8 +445,10 @@ fn k_rot_pairs(g: &Gguf, c: &Config) -> Result<Vec<usize>> {
             let half = c.head_dim_of(il) / 2;
             let k_eq_v = g.tensor(&format!("blk.{il}.attn_v.weight")).is_none();
             let Some(ff) = ff.as_ref().filter(|_| k_eq_v && !c.swa[il]) else { return half };
-            let r = ff.iter().position(|&f| !(f < 1e20)).unwrap_or(half);
-            let rest_still = ff[r..].iter().all(|&f| !(f < 1e20));
+            // As the qkv kernel takes a factor: a pair turns below 1e20.
+            let still = |f: f32| f >= 1e20 || f.is_nan();
+            let r = ff.iter().position(|&f| still(f)).unwrap_or(half);
+            let rest_still = ff[r..].iter().all(|&f| still(f));
             if rest_still && r.is_multiple_of(64) && r < half { r } else { half }
         })
         .collect())
