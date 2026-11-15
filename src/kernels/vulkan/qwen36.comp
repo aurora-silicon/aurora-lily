@@ -670,12 +670,13 @@ void main() {
 // qwen36_gdn_scan and qwen36_gdn_out fused, their arithmetic bit for bit.
 // One threadgroup of 1024 a value head h. Threads 0..383 run the conv of the
 // channels the head reads (q and k of key head h % HK, v of h) into shared
-// memory; the window of q and k channels is written back by head h < HK
-// (whose key head is h), of v channels by h. Then 32 subgroups of 4 state
-// columns run the delta rule into shared o, then the first 128 threads the
-// gated RMSNorm. Grid (H).
-// Buffers: 0 qkv [m][C], 1 conv w [C][4], 2 conv window [3][C], 3 window
-// snapshot, 4 alpha [m][H], 5 b [m][H], 6 ssm_a [H], 7 dt_bias [H], 8 state
+// memory; the conv window is only read here: value heads h and h + HK share
+// their q and k channels, so no threadgroup may move it while another reads
+// it. qwen36_gdn_conv_window moves it (and writes its snapshot) in the level
+// after. Then 32 subgroups of 4 state columns run the delta rule into
+// shared o, then the first 128 threads the gated RMSNorm. Grid (H).
+// Buffers: 0 qkv [m][C], 1 conv w [C][4], 2 conv window [3][C] (read only),
+// 3 unused, 4 alpha [m][H], 5 b [m][H], 6 ssm_a [H], 7 dt_bias [H], 8 state
 // [H][128][128], 9 state snapshot, 10 z [m][H][128], 11 norm w [128], 12 y
 // [m][H][128]. Params: 13 HK, 14 H, 15 m (<= 4), 16 snap_row, 17 eps.
 // ---------------------------------------------------------------------------
@@ -698,7 +699,6 @@ void main() {
     if (tid < 384u) {
         const uint part = tid / 128u, at = tid % 128u;
         const uint ch = part == 0u ? kh * D + at : (part == 1u ? (HK + kh) * D + at : (2u * HK + h) * D + at);
-        const bool owner = part == 2u || h < HK;
         const vec4 w = F32x4(arg(1)).v[ch];
         F32 st = F32(arg(2));
         float x0 = st.v[ch], x1 = st.v[C + ch], x2 = st.v[2u * C + ch];
@@ -713,17 +713,6 @@ void main() {
             x0 = x1;
             x1 = x2;
             x2 = xn;
-            if (t == snap_row && owner) {
-                F32 sn = F32(arg(3));
-                sn.v[ch] = x0;
-                sn.v[C + ch] = x1;
-                sn.v[2u * C + ch] = x2;
-            }
-        }
-        if (owner) {
-            st.v[ch] = x0;
-            st.v[C + ch] = x1;
-            st.v[2u * C + ch] = x2;
         }
     }
     barrier();

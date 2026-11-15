@@ -578,93 +578,107 @@ fn residual_norm_matches_add_then_rmsnorm() {
     }
 }
 
-/// The one-level GDN step against the conv, scan and out kernels, at the
-/// model's heads (16 key, 32 value) for 1 to 4 rows with a snapshot: the
-/// same bits in y, the states and the snapshots.
+/// The one-level GDN step (then its conv window moved in a later level)
+/// against the conv, scan and out kernels, with value heads sharing key
+/// heads (h and h + HK read the same q and k conv channels): chains
+/// of steps of 1 to 4 rows carrying the window and state from step to step,
+/// with snapshots at row 0 and later rows, the whole chain repeated. Every
+/// step's y, window, state and snapshots the same bits. A step that moved
+/// the shared window while a sharing head still read it would part here.
 #[test]
 fn gdn_step_matches_gdn_bitwise() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(83);
-    let (hk, h, eps) = (16, 32, 1e-6f32);
-    let ch = (2 * hk + h) * GDN_DIM;
-    let inner = h * GDN_DIM;
-    let t = |v: &[f32]| tensor(&ctx, v);
-    let w = t(&f32s(&mut rng, 4 * ch, -0.5, 0.5));
-    let ssm_a = t(&f32s(&mut rng, h, -2.0, -0.1));
-    let dt = t(&f32s(&mut rng, h, -1.0, 1.0));
-    let norm = t(&f32s(&mut rng, GDN_DIM, 0.5, 1.5));
-    let p = GdnParams { conv_w: &w, ssm_a: &ssm_a, dt_bias: &dt, norm: &norm };
-    let conv0 = f32s(&mut rng, 3 * ch, -1.0, 1.0);
-    let s0 = f32s(&mut rng, h * GDN_DIM * GDN_DIM, -0.1, 0.1);
-    for m in 1..=4 {
-        let qkv = t(&f32s(&mut rng, m * ch, -1.0, 1.0));
-        let a = t(&f32s(&mut rng, m * h, -2.0, 2.0));
-        let b = t(&f32s(&mut rng, m * h, -2.0, 2.0));
-        let z = t(&f32s(&mut rng, m * inner, -2.0, 2.0));
-        let mk = || {
-            (
-                t(&conv0),
-                t(&s0),
-                zeros(&ctx, 3 * ch, DType::F32),
-                zeros(&ctx, s0.len(), DType::F32),
-                zeros(&ctx, m * inner, DType::F32),
-            )
+    // The model's 16 key and 32 value heads, and 160 value heads over 16 key
+    // heads: more threadgroups of 1024 than the GPU holds at once, so later
+    // ones start after earlier ones finished (a step that moved the shared
+    // window would then feed later heads a moved window).
+    for (hk, h) in [(16, 32), (16, 160)] {
+        let eps = 1e-6f32;
+        let ch = (2 * hk + h) * GDN_DIM;
+        let inner = h * GDN_DIM;
+        let t = |v: &[f32]| tensor(&ctx, v);
+        let w = t(&f32s(&mut rng, 4 * ch, -0.5, 0.5));
+        let ssm_a = t(&f32s(&mut rng, h, -2.0, -0.1));
+        let dt = t(&f32s(&mut rng, h, -1.0, 1.0));
+        let norm = t(&f32s(&mut rng, GDN_DIM, 0.5, 1.5));
+        let p = GdnParams { conv_w: &w, ssm_a: &ssm_a, dt_bias: &dt, norm: &norm };
+        let conv0 = f32s(&mut rng, 3 * ch, -1.0, 1.0);
+        let s0 = f32s(&mut rng, h * GDN_DIM * GDN_DIM, -0.1, 0.1);
+        let bits = |a: &Tensor, b: &Tensor, what: &str| {
+            let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+            for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "{what} at {k}: {x} vs {y}");
+            }
         };
-        let (c1, s1, sc1, ss1, y1) = mk();
-        let (c2, s2, sc2, ss2, y2) = mk();
-        let c = zeros(&ctx, m * ch, DType::F32);
-        let o = zeros(&ctx, m * inner, DType::F32);
-        let row = m / 2;
-        run(&ctx, |pass| {
-            let st = GdnState { conv: &c1, s: &s1 };
-            let snap = GdnSnapshot { row, conv: &sc1, s: &ss1 };
-            gdn(
-                &ctx,
-                pass,
-                &p,
-                &st,
-                Some(&snap),
-                &qkv,
-                &a,
-                &b,
-                &z,
-                &c,
-                &o,
-                &y1,
-                m,
-                hk,
-                eps,
-            )
-            .unwrap();
-            let st = GdnState { conv: &c2, s: &s2 };
-            let snap = GdnSnapshot { row, conv: &sc2, s: &ss2 };
-            gdn_step(
-                &ctx,
-                pass,
-                &p,
-                &st,
-                Some(&snap),
-                &qkv,
-                &a,
-                &b,
-                &z,
-                &y2,
-                m,
-                hk,
-                eps,
-            )
-            .unwrap();
-        });
-        for (name, u, v) in [
-            ("y", &y1, &y2),
-            ("conv", &c1, &c2),
-            ("s", &s1, &s2),
-            ("snap conv", &sc1, &sc2),
-            ("snap s", &ss1, &ss2),
-        ] {
-            let (u, v) = (u.to_f32().unwrap(), v.to_f32().unwrap());
-            for (k, (x, y)) in u.iter().zip(&v).enumerate() {
-                assert_eq!(x.to_bits(), y.to_bits(), "m {m} {name} at {k}: {x} vs {y}");
+        // (rows, snapshot row) of each step of a chain.
+        let chain = [(1, 0), (2, 0), (1, 0), (4, 0), (3, 1), (2, 1), (1, 0), (4, 2)];
+        for round in 0..3 {
+            let (c1, s1, c2, s2) = (t(&conv0), t(&s0), t(&conv0), t(&s0));
+            for (step, &(m, row)) in chain.iter().enumerate() {
+                let qkv = t(&f32s(&mut rng, m * ch, -1.0, 1.0));
+                let a = t(&f32s(&mut rng, m * h, -2.0, 2.0));
+                let b = t(&f32s(&mut rng, m * h, -2.0, 2.0));
+                let z = t(&f32s(&mut rng, m * inner, -2.0, 2.0));
+                let snaps = || {
+                    (zeros(&ctx, 3 * ch, DType::F32), zeros(&ctx, s0.len(), DType::F32))
+                };
+                let ((sc1, ss1), (sc2, ss2)) = (snaps(), snaps());
+                let (y1, y2) = (
+                    zeros(&ctx, m * inner, DType::F32),
+                    zeros(&ctx, m * inner, DType::F32),
+                );
+                let c = zeros(&ctx, m * ch, DType::F32);
+                let o = zeros(&ctx, m * inner, DType::F32);
+                run(&ctx, |pass| {
+                    let st = GdnState { conv: &c1, s: &s1 };
+                    let snap = GdnSnapshot { row, conv: &sc1, s: &ss1 };
+                    gdn(
+                        &ctx,
+                        pass,
+                        &p,
+                        &st,
+                        Some(&snap),
+                        &qkv,
+                        &a,
+                        &b,
+                        &z,
+                        &c,
+                        &o,
+                        &y1,
+                        m,
+                        hk,
+                        eps,
+                    )
+                    .unwrap();
+                    let st = GdnState { conv: &c2, s: &s2 };
+                    let snap = GdnSnapshot { row, conv: &sc2, s: &ss2 };
+                    gdn_step(
+                        &ctx,
+                        pass,
+                        &p,
+                        &st,
+                        Some(&snap),
+                        &qkv,
+                        &a,
+                        &b,
+                        &z,
+                        &y2,
+                        m,
+                        hk,
+                        eps,
+                    )
+                    .unwrap();
+                    pass.memory_barrier().unwrap();
+                    gdn_conv_window(&ctx, pass, &p, &st, Some(&snap), &qkv, m).unwrap();
+                });
+                let at =
+                    format!("round {round} step {step} (m {m}, snapshot row {row})");
+                bits(&y1, &y2, &format!("{at} y"));
+                bits(&c1, &c2, &format!("{at} window"));
+                bits(&s1, &s2, &format!("{at} state"));
+                bits(&sc1, &sc2, &format!("{at} snapshot window"));
+                bits(&ss1, &ss2, &format!("{at} snapshot state"));
             }
         }
     }

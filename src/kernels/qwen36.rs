@@ -647,9 +647,53 @@ pub fn rmsnorm(
     )
 }
 
+/// Moves the GDN conv window past `m` rows of `qkv` (and writes the window
+/// after row `snap.row` to the snapshot), `qwen36_gdn_conv_window`: what
+/// [`gdn_step`] leaves undone. It must run in a level after the step (which
+/// reads the window in every threadgroup) and before the next step.
+pub fn gdn_conv_window(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    p: &GdnParams<'_>,
+    st: &GdnState<'_>,
+    snap: Option<&GdnSnapshot<'_>>,
+    qkv: &Tensor,
+    m: usize,
+) -> Result<()> {
+    let ch = st.conv.numel() / 3;
+    check(&[(qkv, DType::F32), (st.conv, DType::F32)])?;
+    ensure!(
+        st.conv.numel() == 3 * ch
+            && p.conv_w.numel() == 4 * ch
+            && qkv.numel() >= m * ch,
+        "GDN conv window shapes"
+    );
+    let snap_row = snap.map_or(NO_SNAPSHOT, |s| s.row as u32);
+    if let Some(s) = snap {
+        ensure!(s.row < m && s.conv.numel() == st.conv.numel(), "window snapshot");
+    }
+    // The kernel's buffers are the conv's: 0 qkv, 1 conv w, 2 window, 3 c
+    // (unused), 4 snapshot.
+    let window = ctx.pipeline("qwen36_gdn_conv_window", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &window,
+        &[
+            qkv.binding(),
+            p.conv_w.binding(),
+            st.conv.binding(),
+            qkv.binding(),
+            snap.map_or(st.conv, |s| s.conv).binding(),
+        ],
+        &[&u32_bytes(ch), &u32_bytes(m), &snap_row.to_ne_bytes()],
+        Grid::Threads { grid: (ch, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 /// [`gdn`] of up to 4 rows (decode and verify) in one dispatch and level
 /// (`qwen36_gdn_step`: the conv, the delta rule and the gated norm of a
 /// value head in one threadgroup), the same bits; no `c` or `o` written.
+/// It only reads the conv window (value heads sharing a key head read the
+/// same channels): [`gdn_conv_window`] moves it in a later level.
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_step(
     ctx: &MetalContext,

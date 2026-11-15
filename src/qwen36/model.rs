@@ -1152,6 +1152,11 @@ impl Qwen36Model {
             )?;
         }
         pass.memory_barrier()?;
+        if m <= MAX_ROWS {
+            // The step only read the conv window; it moves beside the output
+            // projection, which does not read it.
+            k::gdn_conv_window(ctx, pass, &p, st, snap, &sc.qkv, m)?;
+        }
         let xb = self.bf16_input(ctx, pass, sc, &sc.y, cfg.gdn_inner(), m)?;
         self.proj(ctx, pass, &[(&w.out, &sc.mix)], &sc.y, xb, m)?;
         pass.memory_barrier()
