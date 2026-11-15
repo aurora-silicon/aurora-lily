@@ -37,15 +37,17 @@ fn a_held_instance_lock_refuses_the_load_before_mapping() {
 /// tensors read zero although they come from memory a dropped state filled;
 /// a snapshot of the recurrent tensors (packed into one allocation) restores
 /// every byte of each to its own tensor, stays independent of the live state,
-/// forks into another state, and follows a swapped KDA pair (the alternate
-/// views current after a rejected draft).
+/// forks into another state, and follows a swapped KDA pair (the scratch's
+/// alternates current after a rejected draft, the former current ones the
+/// scratch's).
 #[test]
 fn recurrent_state_zeroes_and_round_trips_without_the_model() {
     use crate::engine::{DecodeStateApi, SnapshotApi};
     let ctx = MetalContext::new().expect("context");
     let cfg = Config::glm53_flash();
+    let mut sc = Scratch::new(&ctx, &cfg).expect("scratch");
     // Every recurrent tensor (KDA conv and state, DSA incomplete-pool
-    // tails), in the snapshot's order, and the KDA alternates.
+    // tails), in the snapshot's order, and the scratch's KDA alternates.
     fn current(st: &Glm53State) -> Vec<&Tensor> {
         st.layers
             .iter()
@@ -55,14 +57,8 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
             })
             .collect()
     }
-    fn alternates(st: &Glm53State) -> Vec<&Tensor> {
-        st.layers
-            .iter()
-            .flat_map(|l| match l {
-                LayerState::Kda { conv_alt, s_alt, .. } => vec![conv_alt, s_alt],
-                LayerState::Dsa { .. } => vec![],
-            })
-            .collect()
+    fn alternates(sc: &Scratch) -> Vec<&Tensor> {
+        sc.kda_alt.iter().flatten().flat_map(|(c, s)| [c, s]).collect()
     }
     // Tensor t's pattern under seed k: distinct for every tensor and value.
     let fill = |ts: &[&Tensor], k: u32| {
@@ -90,9 +86,7 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
     };
     {
         let st = Glm53State::new(&ctx, &cfg, 64).unwrap();
-        let mut all = current(&st);
-        all.extend(alternates(&st));
-        fill(&all, 1);
+        fill(&current(&st), 1);
     }
     let mut st = Glm53State::new(&ctx, &cfg, 64).unwrap();
     for (il, l) in st.layers.iter().enumerate() {
@@ -108,7 +102,7 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
         }
     }
     fill(&current(&st), 2);
-    fill(&alternates(&st), 3);
+    fill(&alternates(&sc), 3);
     st.pos = 17;
     let snap = st.snapshot(&ctx).unwrap();
     assert_eq!(snap.pos(), 17);
@@ -121,7 +115,7 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
         st.restore(&ctx, &snap).unwrap();
         assert_eq!(st.pos, 17);
         check(&current(&st), 2, "restored");
-        check(&alternates(&st), 3, "alternates untouched");
+        check(&alternates(&sc), 3, "alternates untouched");
     }
     // A fork: another state restored from it.
     let mut other = Glm53State::new(&ctx, &cfg, 64).unwrap();
@@ -129,10 +123,10 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
     check(&current(&other), 2, "forked");
     // A swapped pair: the alternates become current, and a snapshot then
     // holds (and restores into) them.
-    st.take_kda_snapshots();
+    st.take_kda_snapshots(&mut sc);
     let swapped = st.snapshot(&ctx).unwrap();
     let before: Vec<Vec<f32>> =
-        alternates(&st).iter().map(|t| t.to_f32().unwrap()).collect();
+        alternates(&sc).iter().map(|t| t.to_f32().unwrap()).collect();
     fill(&current(&st), 5);
     st.restore(&ctx, &swapped).unwrap();
     // The KDA tensors current now are the former alternates, back to their
@@ -147,12 +141,240 @@ fn recurrent_state_zeroes_and_round_trips_without_the_model() {
         })
         .collect();
     check(&kda_now, 3, "swapped pair restored");
-    for (t, (x, b)) in alternates(&st).iter().zip(&before).enumerate() {
+    for (t, (x, b)) in alternates(&sc).iter().zip(&before).enumerate() {
         let got = x.to_f32().unwrap();
         assert!(
             got.iter().zip(b).all(|(g, w)| g.to_bits() == w.to_bits()),
             "alternate {t} changed"
         );
+    }
+}
+
+/// Two sessions taking turns through one scratch's KDA alternates (A
+/// rejects, B rejects, A rejects; each verify finished before the other
+/// session runs): a verify's writes to the alternates never change the idle
+/// session or a saved snapshot; snapshot, restore and fork after several
+/// swaps; state sizes unchanged by swaps; one session reset and dropped
+/// while the other lives on. A "verify" here writes the alternates as the
+/// verify pass's first row would, a "reject" is `take_kda_snapshots`.
+#[test]
+fn sessions_share_the_scratch_alternates_safely() {
+    use crate::engine::DecodeStateApi;
+    let ctx = MetalContext::new().expect("context");
+    let cfg = Config::glm53_flash();
+    let mut sc = Scratch::new(&ctx, &cfg).expect("scratch");
+    fn kda(st: &Glm53State) -> Vec<&Tensor> {
+        st.layers
+            .iter()
+            .flat_map(|l| match l {
+                LayerState::Kda { conv, s } => vec![conv, s],
+                LayerState::Dsa { .. } => vec![],
+            })
+            .collect()
+    }
+    fn alternates(sc: &Scratch) -> Vec<&Tensor> {
+        sc.kda_alt.iter().flatten().flat_map(|(c, s)| [c, s]).collect()
+    }
+    let word = |k: u32, t: usize, i: usize| {
+        0x3f80_0000 ^ ((k << 26) | ((t as u32) << 18) | (i as u32 & 0x3ffff))
+    };
+    let fill = |ts: &[&Tensor], k: u32| {
+        for (t, x) in ts.iter().enumerate() {
+            let v: Vec<f32> =
+                (0..x.numel()).map(|i| f32::from_bits(word(k, t, i))).collect();
+            x.write_bytes(bytemuck::cast_slice(&v)).unwrap();
+        }
+    };
+    let check = |ts: &[&Tensor], k: u32, what: &str| {
+        for (t, x) in ts.iter().enumerate() {
+            for (i, g) in x.to_f32().unwrap().iter().enumerate() {
+                assert_eq!(g.to_bits(), word(k, t, i), "{what}: tensor {t} value {i}");
+            }
+        }
+    };
+    let mut a = Glm53State::new(&ctx, &cfg, 64).unwrap();
+    let mut b = Glm53State::new(&ctx, &cfg, 64).unwrap();
+    fill(&kda(&a), 1);
+    fill(&kda(&b), 2);
+    let (bytes_a, bytes_b) = (a.bytes(), b.bytes());
+    let snap_a = a.snapshot(&ctx).unwrap();
+    // A: verify, reject.
+    fill(&alternates(&sc), 3);
+    a.take_kda_snapshots(&mut sc);
+    check(&kda(&a), 3, "A after its reject");
+    check(&kda(&b), 2, "B idle");
+    // B: verify (into A's former tensors), reject.
+    fill(&alternates(&sc), 4);
+    check(&kda(&a), 3, "A idle through B's verify");
+    b.take_kda_snapshots(&mut sc);
+    check(&kda(&b), 4, "B after its reject");
+    // A again: verify (into B's former tensors), reject.
+    fill(&alternates(&sc), 5);
+    check(&kda(&b), 4, "B idle through A's verify");
+    a.take_kda_snapshots(&mut sc);
+    check(&kda(&a), 5, "A after its second reject");
+    assert_eq!((a.bytes(), b.bytes()), (bytes_a, bytes_b), "state sizes");
+    // The snapshot taken before the swaps still holds A's first values.
+    let mut c = Glm53State::new(&ctx, &cfg, 64).unwrap();
+    c.restore(&ctx, &snap_a).unwrap();
+    check(&kda(&c), 1, "snapshot from before the swaps");
+    // Snapshot, mutate, restore and fork after the swaps.
+    let snap = a.snapshot(&ctx).unwrap();
+    fill(&kda(&a), 6);
+    a.restore(&ctx, &snap).unwrap();
+    check(&kda(&a), 5, "restored after swaps");
+    c.restore(&ctx, &snap).unwrap();
+    check(&kda(&c), 5, "forked after swaps");
+    // B reset and dropped; A and the scratch carry on.
+    b.reset();
+    assert!(
+        kda(&b).iter().all(|t| t.to_f32().unwrap().iter().all(|v| v.to_bits() == 0))
+    );
+    check(&kda(&a), 5, "A through B's reset");
+    drop(b);
+    fill(&alternates(&sc), 7);
+    check(&kda(&a), 5, "A through a verify after B's drop");
+    a.take_kda_snapshots(&mut sc);
+    check(&kda(&a), 7, "A after a reject with B gone");
+    check(&kda(&c), 5, "the fork untouched");
+}
+
+/// The MTP draft head's requantization: a Q8_0 block as Q4_0 reads back
+/// (the GGUF reader's Q4_0) within half a Q4_0 step of the Q8_0 values (a
+/// whole step for values the format clamps); an all-zero block stays zero.
+#[test]
+fn q8_0_blocks_requantize_to_q4_0() {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(83);
+    let mut blocks: Vec<[u8; 34]> = Vec::new();
+    for b in 0..200 {
+        let mut blk = [0u8; 34];
+        let d = half::f16::from_f32(rng.gen_range(1e-4f32..2e-2));
+        blk[..2].copy_from_slice(&d.to_le_bytes());
+        for i in 0..32 {
+            let q: i8 = match b % 4 {
+                0 => rng.gen_range(-127..=127),
+                1 => rng.gen_range(-10..=10),
+                2 => {
+                    if i == 7 {
+                        -127
+                    } else {
+                        rng.gen_range(-60..=60)
+                    }
+                }
+                _ => {
+                    if i == 31 {
+                        127
+                    } else {
+                        rng.gen_range(-127..=127)
+                    }
+                }
+            };
+            blk[2 + i] = q as u8;
+        }
+        blocks.push(blk);
+    }
+    blocks.push([0u8; 34]);
+    for blk in &blocks {
+        let mut x = [0f32; 32];
+        crate::gguf::dequantize(crate::gguf::GgmlType::Q8_0, blk, &mut x).unwrap();
+        let mut q4 = [0u8; 18];
+        q8_0_to_q4_0(blk, &mut q4);
+        let mut y = [0f32; 32];
+        crate::gguf::dequantize(crate::gguf::GgmlType::Q4_0, &q4, &mut y).unwrap();
+        let max =
+            x.iter().copied().fold(0f32, |m, v| if v.abs() > m.abs() { v } else { m });
+        let step = max.abs() / 8.0;
+        for (i, (a, b)) in x.iter().zip(&y).enumerate() {
+            // Q4_0 holds -8 .. 7 steps with the largest magnitude at -8:
+            // half a step, a whole one for values of the other sign past
+            // 7.5 steps (clamped), plus the f16 rounding of the scale.
+            let clamped = a * max < 0.0 && a.abs() > 7.5 * step;
+            let tol = if clamped { 1.0 } else { 0.5 } * step + 8.0 * step * 1e-3 + 1e-9;
+            assert!((a - b).abs() <= tol, "value {i}: {a} vs {b}");
+        }
+        if max == 0.0 {
+            assert!(y.iter().all(|&v| v == 0.0));
+        }
+    }
+}
+
+/// The weight inventory (`weight_buffers`): the mapped buffers alone
+/// without a draft head; with one, its buffer once more, not twice, and
+/// not again when it lies in a mapped buffer.
+#[test]
+fn weight_inventory_lists_the_draft_head_once() {
+    let ctx = MetalContext::new().expect("context");
+    let mapped: Vec<Buffer> = (0..3).map(|_| ctx.new_buffer(64).unwrap()).collect();
+    let same = |a: &Buffer, b: &Buffer| std::ptr::eq::<GpuBuffer>(&**a, &**b);
+    let none = weight_inventory(&mapped, None);
+    assert_eq!(none.len(), 3);
+    assert!(none.iter().zip(&mapped).all(|(a, b)| same(a, b)));
+    let head = Tensor::zeros(&ctx, &[16], crate::tensor::DType::F32).unwrap();
+    let with = weight_inventory(&mapped, Some(&head));
+    assert_eq!(with.len(), 4);
+    assert_eq!(with.iter().filter(|b| same(b, &head.shared_buffer())).count(), 1);
+    // A view into a mapped buffer adds nothing.
+    let inside =
+        Tensor::from_buffer(mapped[1].clone(), &[16], crate::tensor::DType::F32)
+            .unwrap()
+            .view(4, &[8])
+            .unwrap();
+    assert_eq!(weight_inventory(&mapped, Some(&inside)).len(), 3);
+}
+
+/// Known Q4_0 bytes for hand-made Q8_0 blocks: the first of two
+/// equal-magnitude extrema sets the scale's sign (both orders), values
+/// half a step from a rounding boundary round up, a -128 code, a zero
+/// scale (the scale then -0.0, as llama.cpp's max / -8 gives), a negative
+/// Q8_0 scale.
+#[test]
+fn q8_0_to_q4_0_known_blocks() {
+    // (Q8_0 scale bits, (index, code) pairs (others 0), Q4_0 scale bits,
+    // (index, nibble) pairs (others 8)).
+    #[allow(clippy::type_complexity)]
+    let cases: &[(u16, &[(usize, i8)], u16, &[(usize, u8)])] = &[
+        // x = 0.5 q: -8 first, then 8; d = 1.
+        (
+            0x3800,
+            &[(0, -16), (1, 1), (2, -1), (3, 3), (4, 16)],
+            0x3c00,
+            &[(0, 0), (1, 9), (2, 8), (3, 10), (4, 15)],
+        ),
+        // 8 first, then -8; d = -1.
+        (
+            0x3800,
+            &[(0, 16), (1, 1), (2, -1), (3, 3), (4, -16)],
+            0xbc00,
+            &[(0, 0), (1, 8), (2, 9), (3, 7), (4, 15)],
+        ),
+        // x = q / 128: -128 sets d = 0.125; 127 clamps; 64 -> 12.
+        (
+            0x2000,
+            &[(0, -128), (1, 127), (17, 64)],
+            0x3000,
+            &[(0, 0), (1, 15), (17, 12)],
+        ),
+        // A zero scale: every value 0.
+        (0x0000, &[(0, 100), (5, -7)], 0x8000, &[]),
+        // A negative Q8_0 scale: x = -0.5 q.
+        (0xb800, &[(0, 16), (1, -1)], 0x3c00, &[(0, 0), (1, 9)]),
+    ];
+    for (n, &(d8, codes, d4, nibbles)) in cases.iter().enumerate() {
+        let mut blk = [0u8; 34];
+        blk[..2].copy_from_slice(&d8.to_le_bytes());
+        for &(i, q) in codes {
+            blk[2 + i] = q as u8;
+        }
+        let mut want = [0x88u8; 18];
+        want[..2].copy_from_slice(&d4.to_le_bytes());
+        for &(i, q) in nibbles {
+            let byte = &mut want[2 + i % 16];
+            *byte = if i < 16 { (*byte & 0xf0) | q } else { (*byte & 0x0f) | (q << 4) };
+        }
+        let mut got = [0u8; 18];
+        q8_0_to_q4_0(&blk, &mut got);
+        assert_eq!(got, want, "case {n}");
     }
 }
 
@@ -277,6 +499,33 @@ fn first_routing_difference_stays_in_the_common_prefix() {
 }
 
 /// Loads the published file for the real-weight tests.
+/// Loads without and with speculation: the weight inventory is the mapped
+/// file's buffers, plus the Q4_0 draft head's buffer exactly once when
+/// speculation is on (the head is Q8_0 in this checkpoint).
+#[test]
+#[ignore = "requires LILY_GLM53_GGUF"]
+fn weight_buffers_include_the_draft_head_only_with_speculation() {
+    use crate::engine::{LanguageModel, LoadOptions};
+    let path = std::env::var("LILY_GLM53_GGUF").expect("LILY_GLM53_GGUF");
+    let ctx = MetalContext::new().expect("context");
+    let load = |drafts: usize| {
+        let options = LoadOptions { mtp_drafts: drafts, ..Default::default() };
+        <Glm53Model as LanguageModel>::load(&ctx, std::path::Path::new(&path), &options)
+            .expect("load")
+    };
+    let mapped = {
+        let model = load(0);
+        assert!(model.draft_head.is_none());
+        model.weight_buffers().len()
+    };
+    let model = load(1);
+    let head = model.draft_head.as_ref().expect("a draft head").t.shared_buffer();
+    let all = model.weight_buffers();
+    assert_eq!(all.len(), mapped + 1);
+    let same = |b: &Buffer| std::ptr::eq::<GpuBuffer>(&**b, &*head);
+    assert_eq!(all.iter().filter(|b| same(b)).count(), 1);
+}
+
 fn real_model(ctx: &MetalContext) -> Glm53Model {
     use crate::engine::{LanguageModel, LoadOptions};
     let path = std::env::var("LILY_GLM53_GGUF").expect("LILY_GLM53_GGUF");

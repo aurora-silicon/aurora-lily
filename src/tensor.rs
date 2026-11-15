@@ -59,6 +59,12 @@ impl Tensor {
         Ok(Self { buf, shape: shape.to_vec(), dtype, offset: 0 })
     }
 
+    /// The buffer this tensor (or view) lives in, as another handle to it
+    /// (weight inventories list the buffers a model holds).
+    pub fn shared_buffer(&self) -> Buffer {
+        self.buf.clone()
+    }
+
     /// Wraps an existing buffer (e.g. one filled directly from a checkpoint
     /// read) as a tensor.
     pub fn from_buffer(buf: Buffer, shape: &[usize], dtype: DType) -> Result<Self> {

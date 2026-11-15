@@ -17,7 +17,7 @@ use crate::kernels::glm53::{
     self as k, GemvLayout, KdaInputs, KdaParams, PoolParams, QWeight, Rows,
 };
 use crate::kernels::sample::SamplerScratch;
-use crate::metal::{Buffer, ComputePass, MetalContext};
+use crate::metal::{Buffer, ComputePass, GpuBuffer, MetalContext};
 use crate::tensor::{DType, Tensor};
 
 /// Rows one forward step takes (the GEMV's limit).
@@ -204,6 +204,10 @@ pub struct Glm53Model {
     nextn: NextnW,
     embed: QWeight,
     output: QWeight,
+    /// The output head requantized to Q4_0 (half the bytes) for the MTP
+    /// draft only ([`Self::build_draft_head`]): what is emitted is decided
+    /// by the full head of the verify pass.
+    draft_head: Option<QWeight>,
     output_norm: Tensor,
     /// Whether the engine speculates with the MTP block (`--mtp-drafts`).
     pub mtp: bool,
@@ -335,15 +339,53 @@ impl Glm53Model {
             nextn,
             embed,
             output,
+            draft_head: None,
             output_norm,
             mtp: false,
             draft_min_prob: 0.0,
         })
     }
 
+    /// Builds the MTP draft's Q4_0 output head from the Q8_0 head (each
+    /// block's 32 values requantized as llama.cpp's Q4_0: the scale is the
+    /// largest magnitude's signed value over -8). A draft step reads 0.36
+    /// instead of 0.67 GB of head. No-op for a head that is not Q8_0.
+    pub fn build_draft_head(&mut self, ctx: &MetalContext) -> Result<()> {
+        let w = &self.output;
+        if w.ty != crate::gguf::GgmlType::Q8_0 {
+            return Ok(());
+        }
+        ensure!(w.cols.is_multiple_of(32), "head rows of {} values", w.cols);
+        let src = w.t.contents();
+        let blocks = w.rows * w.cols / 32;
+        ensure!(src.len() >= blocks * 34, "Q8_0 head of {} bytes", src.len());
+        let mut dst = vec![0u8; blocks * 18];
+        let threads =
+            std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let per = blocks.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (t, out) in dst.chunks_mut(per * 18).enumerate() {
+                let src = &src[t * per * 34..];
+                scope.spawn(move || {
+                    for (b, o) in out.chunks_mut(18).enumerate() {
+                        q8_0_to_q4_0(&src[b * 34..b * 34 + 34], o);
+                    }
+                });
+            }
+        });
+        self.draft_head = Some(QWeight::from_bytes(
+            ctx,
+            &dst,
+            crate::gguf::GgmlType::Q4_0,
+            w.cols,
+            w.rows,
+        )?);
+        Ok(())
+    }
+
     /// The buffers holding the mapped file.
     pub fn weight_buffers(&self) -> Vec<Buffer> {
-        self.mapped.buffers.clone()
+        weight_inventory(&self.mapped.buffers, self.draft_head.as_ref().map(|w| &w.t))
     }
 
     pub fn new_state(&self, ctx: &MetalContext, capacity: usize) -> Result<Glm53State> {
@@ -357,13 +399,12 @@ impl Glm53Model {
 
 /// One layer's recurrent state or caches.
 pub enum LayerState {
-    /// `conv_alt`/`s_alt` receive the state after a verify pass's first row,
-    /// which becomes current when its draft is rejected.
+    /// A verify pass writes the state after its first row to the scratch's
+    /// `kda_alt` of the layer, which becomes current when the draft is
+    /// rejected ([`Glm53State::take_kda_snapshots`]).
     Kda {
         conv: Tensor,
         s: Tensor,
-        conv_alt: Tensor,
-        s_alt: Tensor,
     },
     Dsa {
         latent: Tensor,
@@ -396,15 +437,13 @@ impl Glm53State {
     pub fn new(ctx: &MetalContext, cfg: &Config, capacity: usize) -> Result<Self> {
         let capacity = capacity.next_multiple_of(4);
         let p = cfg.kda_projection();
-        // Every KDA layer's conv windows and states, and their alternates,
-        // views of one allocation (about 140 allocations of their own cost
-        // ~10 ms a session), zeroed on the GPU below: the recurrent state
-        // starts at zero (the alternates are written before they are read).
+        // Every KDA layer's conv windows and states, views of one allocation
+        // (about 70 allocations of their own cost ~5 ms a session), zeroed on
+        // the GPU below: the recurrent state starts at zero.
         let conv_len = 3 * (cfg.kda_conv - 1) * p;
         let s_len = cfg.kda_heads * cfg.kda_dim * cfg.kda_dim;
         let n_kda = cfg.kinds.iter().filter(|k| **k == LayerKind::Kda).count();
-        let kda_all =
-            Tensor::uninit(ctx, &[n_kda * 2 * (conv_len + s_len)], DType::F32)?;
+        let kda_all = Tensor::uninit(ctx, &[n_kda * (conv_len + s_len)], DType::F32)?;
         let kda_at = std::cell::Cell::new(0usize);
         let take = |n: usize| -> Result<Tensor> {
             let at = kda_at.get();
@@ -414,12 +453,9 @@ impl Glm53State {
         let layers = (0..cfg.n_layer)
             .map(|il| -> Result<LayerState> {
                 Ok(match cfg.kinds[il] {
-                    LayerKind::Kda => LayerState::Kda {
-                        conv: take(conv_len)?,
-                        s: take(s_len)?,
-                        conv_alt: take(conv_len)?,
-                        s_alt: take(s_len)?,
-                    },
+                    LayerKind::Kda => {
+                        LayerState::Kda { conv: take(conv_len)?, s: take(s_len)? }
+                    }
                     LayerKind::Dsa => LayerState::Dsa {
                         latent: Tensor::zeros(
                             ctx,
@@ -476,14 +512,45 @@ impl Glm53State {
         self.spec = None;
     }
 
-    /// Makes the KDA states saved after a verify pass's first row current.
-    pub(crate) fn take_kda_snapshots(&mut self) {
-        for l in &mut self.layers {
-            if let LayerState::Kda { conv, s, conv_alt, s_alt } = l {
+    /// Makes the KDA states a verify pass saved after its first row (the
+    /// scratch's `kda_alt`) current; the former ones become the scratch's.
+    pub(crate) fn take_kda_snapshots(&mut self, sc: &mut Scratch) {
+        for (l, alt) in self.layers.iter_mut().zip(&mut sc.kda_alt) {
+            if let (LayerState::Kda { conv, s }, Some((conv_alt, s_alt))) = (l, alt) {
                 std::mem::swap(conv, conv_alt);
                 std::mem::swap(s, s_alt);
             }
         }
+    }
+}
+
+/// The weight buffers a model holds: the mapped file's, and the buffer of
+/// a generated weight (the MTP draft head) once, unless it is one of them.
+fn weight_inventory(mapped: &[Buffer], generated: Option<&Tensor>) -> Vec<Buffer> {
+    let mut all = mapped.to_vec();
+    if let Some(t) = generated {
+        let b = t.shared_buffer();
+        if !all.iter().any(|x| std::ptr::eq::<GpuBuffer>(&**x, &*b)) {
+            all.push(b);
+        }
+    }
+    all
+}
+
+/// One Q8_0 block (f16 scale, 32 int8) as a Q4_0 block (f16 scale, 16
+/// bytes of nibbles: value j low, j + 16 high), as llama.cpp's
+/// `quantize_row_q4_0_ref` quantizes the block's values.
+fn q8_0_to_q4_0(b: &[u8], out: &mut [u8]) {
+    let d8 = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
+    let x: [f32; 32] = std::array::from_fn(|i| d8 * f32::from(b[2 + i] as i8));
+    let max =
+        x.iter().copied().fold(0f32, |m, v| if v.abs() > m.abs() { v } else { m });
+    let d = max / -8.0;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    out[..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+    let q = |v: f32| ((v * id + 8.5) as i32).clamp(0, 15) as u8;
+    for j in 0..16 {
+        out[2 + j] = q(x[j]) | (q(x[j + 16]) << 4);
     }
 }
 
@@ -535,6 +602,10 @@ pub struct Scratch {
     rsel: Tensor,
     rw: Tensor,
     moe_mid: Tensor,
+    /// Per layer, a KDA layer's (conv, state) alternates a verify pass
+    /// writes (one request at a time decodes: they are the scratch's, not
+    /// every session's), views of one allocation.
+    kda_alt: Vec<Option<(Tensor, Tensor)>>,
     moe_group: k::MoeGroupScratch,
     // Head
     /// The stream mean of the last step's rows (the MTP head's input).
@@ -598,6 +669,27 @@ impl Scratch {
     }
 
     fn new(ctx: &MetalContext, cfg: &Config) -> Result<Self> {
+        let kda_alt = {
+            let p = cfg.kda_projection();
+            let conv_len = 3 * (cfg.kda_conv - 1) * p;
+            let s_len = cfg.kda_heads * cfg.kda_dim * cfg.kda_dim;
+            let n_kda = cfg.kinds.iter().filter(|k| **k == LayerKind::Kda).count();
+            // Written by a verify pass before anything reads them.
+            let all = Tensor::uninit(ctx, &[n_kda * (conv_len + s_len)], DType::F32)?;
+            let mut at = 0;
+            let mut alt = Vec::with_capacity(cfg.n_layer);
+            for il in 0..cfg.n_layer {
+                alt.push(if cfg.kinds[il] == LayerKind::Kda {
+                    let conv = all.view(at, &[conv_len])?;
+                    let s = all.view(at + conv_len, &[s_len])?;
+                    at += conv_len + s_len;
+                    Some((conv, s))
+                } else {
+                    None
+                });
+            }
+            alt
+        };
         let m = PREFILL_ROWS;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let u = |n: usize| Tensor::zeros(ctx, &[n], DType::U32);
@@ -685,6 +777,7 @@ impl Scratch {
             mtp_h1: f(cfg.hidden)?,
             mtp_sel: u(s)?,
             mtp_prob: f(1)?,
+            kda_alt,
         })
     }
 
@@ -1276,7 +1369,8 @@ impl Glm53Model {
             cfg.rms_eps,
         )?;
         pass.memory_barrier()?;
-        k::gemv(ctx, pass, &self.output, &sc.hidden_norm, &sc.logits, 1)?;
+        let head = self.draft_head.as_ref().unwrap_or(&self.output);
+        k::gemv(ctx, pass, head, &sc.hidden_norm, &sc.logits, 1)?;
         pass.memory_barrier()?;
         let out = sc.mtp_io.view(1, &[1])?;
         crate::kernels::sample::sample_f32(
@@ -1414,7 +1508,7 @@ impl Glm53Model {
     ) -> Result<()> {
         let cfg = &self.cfg;
         match (a, &st.layers[il]) {
-            (AttnW::Kda(w), LayerState::Kda { conv, s, conv_alt, s_alt }) => {
+            (AttnW::Kda(w), LayerState::Kda { conv, s }) => {
                 let xb = self.bf16_input(ctx, pass, sc, &sc.xn, cfg.hidden, m)?;
                 self.proj(ctx, pass, &[(&w.q, &sc.kq), (&w.k, &sc.kk)], &sc.xn, xb, m)?;
                 self.proj(
@@ -1455,11 +1549,13 @@ impl Glm53Model {
                     out_gate: &sc.kog,
                     edges: Some(&sc.kedges),
                 };
-                let snap = snap.map(|row| k::KdaSnapshot {
-                    row,
-                    conv: conv_alt,
-                    state: s_alt,
-                });
+                let snap = match (snap, &sc.kda_alt[il]) {
+                    (Some(row), Some((conv_alt, s_alt))) => {
+                        Some(k::KdaSnapshot { row, conv: conv_alt, state: s_alt })
+                    }
+                    (None, _) => None,
+                    (Some(_), None) => anyhow::bail!("layer {il}: no KDA alternate"),
+                };
                 k::kda(ctx, pass, &p, &x, conv, s, &sc.kout, m, snap)?;
                 pass.memory_barrier()?;
                 let pw = cfg.kda_projection();
