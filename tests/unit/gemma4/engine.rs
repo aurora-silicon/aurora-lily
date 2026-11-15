@@ -91,7 +91,7 @@ fn staged_tokens_are_checked_against_the_vocabulary() {
     let mut cfg = small();
     cfg.vocab = 1000;
     cfg.n_expert = 8;
-    let sc = Scratch::new(&ctx, &cfg, 64).unwrap();
+    let sc = Scratch::new(&ctx, &cfg, 64, 256).unwrap();
     assert!(sc.stage_tokens(&[1, 2, 999]).is_ok());
     assert!(sc.stage_tokens(&[1, 1000]).is_err());
     assert!(sc.stage_tokens(&vec![1; PREFILL_ROWS + 1]).is_err());

@@ -225,7 +225,7 @@ impl ScratchApi for Scratch {
 }
 
 impl Gemma4Model {
-    /// Feeds `tokens` in runs of [`PREFILL_ROWS`], drawing after the last
+    /// Feeds `tokens` in runs of `prefill_rows`, drawing after the last
     /// when `draw`; before committing each run, stops if `stop` says so
     /// (the state then sits at a run boundary). Returns the tokens fed.
     fn prefill_chunks(
@@ -239,7 +239,7 @@ impl Gemma4Model {
     ) -> Result<usize> {
         ensure!(!tokens.is_empty(), "empty prefill");
         state.ensure_capacity(ctx, state.pos + tokens.len())?;
-        let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_ROWS).collect();
+        let chunks: Vec<&[u32]> = tokens.chunks(self.prefill_rows).collect();
         let mut fed = 0;
         for (i, chunk) in chunks.iter().enumerate() {
             if stop() {
@@ -403,19 +403,35 @@ impl LanguageModel for Gemma4Model {
             // argument arenas, then the longest context whose session fits
             // the rest: the server caps --max-seq there.
             let before = ctx.current_allocated();
-            let probe = model.new_scratch(ctx, 1)?;
-            let scratch = ctx.current_allocated().saturating_sub(before);
-            drop(probe);
-            let allocated = before + scratch + PASS_ARENAS;
             let checkpoints = options.session_checkpoints.unwrap_or(
                 crate::serve::CHECKPOINTS_PER_SESSION
                     + crate::serve::DECODE_CHECKPOINTS_PER_SESSION,
             );
+            // The run size: the longest whose fit keeps a context of 32K
+            // tokens, or that of 256-row runs when that is less (a 16 GB
+            // tier's); scratch grows ~0.3 MB a run row, and longer runs
+            // prefill faster (PREFILL_ROWS).
+            let mut fits = Vec::new();
+            for rows in [PREFILL_ROWS, PREFILL_ROWS / 2, PREFILL_ROWS / 4] {
+                model.prefill_rows = rows;
+                let probe = model.new_scratch(ctx, 1)?;
+                let scratch = ctx.current_allocated().saturating_sub(before);
+                drop(probe);
+                let allocated = before + scratch + PASS_ARENAS;
+                let context = model.fit_context(limit, allocated as u64, checkpoints).ok();
+                fits.push((rows, allocated, context));
+            }
+            let floor = fits.last().and_then(|f| f.2).map_or(0, |c| c.min(32768));
+            let &(rows, allocated, _) = fits
+                .iter()
+                .find(|f| f.2.is_some_and(|c| c >= floor))
+                .unwrap_or(fits.last().expect("three run sizes"));
+            model.prefill_rows = rows;
             let context = model.fit_context(limit, allocated as u64, checkpoints)?;
             eprintln!(
                 "gemma4: --memory-limit-gb {:.1} ({:.1} GB) leaves {:.2} GB after {:.1} GB of weights and \
                  scratch: contexts of up to {context} tokens (one session of at most {:.2} GB with \
-                 {checkpoints} snapshots); --max-seq is capped there",
+                 {checkpoints} snapshots), prompt runs of {rows} rows; --max-seq is capped there",
                 limit as f64 / (1u64 << 30) as f64,
                 limit as f64 / 1e9,
                 limit.saturating_sub(allocated as u64) as f64 / 1e9,
@@ -591,7 +607,7 @@ impl LanguageModel for Gemma4Model {
     }
 
     fn prefill_chunk_tokens(&self) -> Option<usize> {
-        Some(PREFILL_ROWS)
+        Some(self.prefill_rows)
     }
 
     fn prefill_until(

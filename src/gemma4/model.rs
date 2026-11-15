@@ -24,11 +24,17 @@ use crate::tensor::{DType, Tensor};
 /// Rows one step takes on the GEMV path (decode, verify, scoring).
 pub const MAX_ROWS: usize = k::GEMV_MAX_ROWS;
 
-/// Rows a prompt run takes. The sliding-window layers' rings hold the
-/// window plus one run, and the scratch is sized by it: 256 rows keep the
-/// 16 GB tier's configuration (UD-IQ2_M, 8K context) under its 11 GB
-/// budget (512 rows: 10.84 GB with one checkpoint, 256: 10.71).
-pub const PREFILL_ROWS: usize = 256;
+/// The most rows a prompt run takes ([`Gemma4Model::prefill_rows`]: fewer
+/// under a memory limit, the scratch growing ~0.3 MB a row). Each routed
+/// expert's weights are decoded once a run, so longer runs pay: 4K-token
+/// prompts 2366 -> 3462 tok/s (UD-IQ2_M) and 2111 -> 3184 (UD-Q5_K_M) at
+/// 1024 rows against 256 (2026-11-15).
+pub const PREFILL_ROWS: usize = 1024;
+
+/// The rows a prompt run's K/V store and attention take at a time (in
+/// turn within each layer): the sliding-window layers' rings hold the
+/// window plus this many, whatever the run.
+pub const ATTN_ROWS: usize = 256;
 
 /// The longest context lily serves Gemma at: the server's limit (positions
 /// and cache offsets fit the kernels' u32 arithmetic well past it).
@@ -98,6 +104,9 @@ pub struct Gemma4Model {
     pub draft_min_prob: f32,
     /// `--memory-limit-gb` in bytes: the footprint the server keeps to.
     pub memory_limit: Option<u64>,
+    /// Rows a prompt run takes (at most [`PREFILL_ROWS`]; scratches are
+    /// sized by it).
+    pub prefill_rows: usize,
     /// The longest context served: the file's, the server's limit, or what
     /// fits the memory limit ([`Gemma4Model::fit_context`]).
     pub context_cap: usize,
@@ -191,6 +200,7 @@ impl Gemma4Model {
             draft_min_prob: 0.0,
             memory_limit: None,
             acquire_reserve: None,
+            prefill_rows: PREFILL_ROWS,
         })
     }
 
@@ -229,13 +239,13 @@ impl Gemma4Model {
     }
 
     pub fn new_scratch(&self, ctx: &MetalContext, capacity: usize) -> Result<Scratch> {
-        Scratch::new(ctx, &self.cfg, capacity)
+        Scratch::new(ctx, &self.cfg, capacity, self.prefill_rows)
     }
 }
 
 /// Slots of a sliding-window layer's ring.
 pub fn ring_slots(cfg: &Config) -> usize {
-    cfg.window + PREFILL_ROWS
+    cfg.window + ATTN_ROWS
 }
 
 /// GPU bytes of one session's caches for `capacity` tokens (the global
@@ -336,8 +346,10 @@ impl Gemma4State {
     }
 }
 
-/// Per-step intermediates for up to [`PREFILL_ROWS`] rows.
+/// Per-step intermediates for up to `rows` rows.
 pub struct Scratch {
+    /// The rows a run may take.
+    rows: usize,
     pub tokens: Tensor,
     pub x: Tensor,
     h: Tensor,
@@ -378,9 +390,11 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    /// Scratch for states of up to `capacity` tokens.
-    pub fn new(ctx: &MetalContext, cfg: &Config, capacity: usize) -> Result<Self> {
-        let m = PREFILL_ROWS;
+    /// Scratch for states of up to `capacity` tokens and runs of up to
+    /// `rows` rows.
+    pub fn new(ctx: &MetalContext, cfg: &Config, capacity: usize, rows: usize) -> Result<Self> {
+        ensure!((MAX_ROWS..=PREFILL_ROWS).contains(&rows), "runs of {rows} rows");
+        let m = rows;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let h = cfg.hidden;
         let chunks = capacity.max(1).div_ceil(g4::ATTN_CHUNK);
@@ -392,6 +406,7 @@ impl Scratch {
         );
         let logits = f(MAX_ROWS * cfg.vocab)?;
         Ok(Self {
+            rows: m,
             logits_last: logits.view(0, &[cfg.vocab])?,
             tokens: Tensor::zeros(ctx, &[m], DType::U32)?,
             x: f(m * h)?,
@@ -438,10 +453,10 @@ impl Scratch {
         })
     }
 
-    /// Stages a run's token ids (at most PREFILL_ROWS, each in the
+    /// Stages a run's token ids (at most the scratch's rows, each in the
     /// vocabulary).
     pub(crate) fn stage_tokens(&self, tokens: &[u32]) -> Result<()> {
-        ensure!(tokens.len() <= PREFILL_ROWS, "a run of {} tokens", tokens.len());
+        ensure!(tokens.len() <= self.rows, "a run of {} tokens", tokens.len());
         check_tokens(tokens, self.vocab)?;
         crate::glm53::model::write_words(&self.tokens, tokens)
     }
@@ -531,7 +546,7 @@ impl Gemma4Model {
         Ok(())
     }
 
-    /// Feeds `tokens` (at most PREFILL_ROWS) at the state's position,
+    /// Feeds `tokens` (at most the scratch's rows) at the state's position,
     /// computes the logits `logits` asks for, and advances the state.
     pub fn forward(
         &self,
@@ -607,7 +622,7 @@ impl Gemma4Model {
     ) -> Result<()> {
         let cfg = &self.cfg;
         let pos0 = st.pos;
-        ensure!((1..=PREFILL_ROWS).contains(&m), "step of {m} rows");
+        ensure!((1..=sc.rows).contains(&m), "step of {m} rows");
         ensure!(logits != Logits::All || m <= MAX_ROWS, "logits of {m} rows");
         ensure!(
             pos0 + m <= st.capacity,
@@ -687,42 +702,44 @@ impl Gemma4Model {
             k_rot: cfg.k_rot[il],
             k_norm: &l.k_norm,
         };
-        g4::qkv(
-            ctx,
-            pass,
-            &a,
-            &sc.q,
-            &sc.kv,
-            if l.v.is_some() { &sc.vraw } else { &sc.kv },
-            kw,
-            0,
-            &l.q_norm,
-            &l.k_norm,
-            (!c.swa).then_some(&self.rope_freqs),
-            &sc.qo,
-            pos0,
-            m,
-            cfg.rope_base_of(il),
-            eps,
-        )?;
-        pass.memory_barrier()?;
-        ensure!(
-            m > MAX_ROWS || g4::attn_chunks(&a, pos0, m) <= sc.chunks,
-            "attention past the scratch's {} chunks",
-            sc.chunks
-        );
-        g4::attention(
-            ctx,
-            pass,
-            &a,
-            &sc.qo,
-            &sc.partial,
-            &sc.heads,
-            pos0,
-            m,
-            MAX_ROWS,
-        )?;
-        pass.memory_barrier()?;
+        // A prompt run's K/V store and attention in turns of ATTN_ROWS rows
+        // (a ring holds the window and one turn); its projections whole.
+        let (qw, d) = (cfg.q_width(il), cfg.head_dim_of(il));
+        let turn = if m > MAX_ROWS { ATTN_ROWS } else { m };
+        for off in (0..m).step_by(turn) {
+            let n = turn.min(m - off);
+            let rows = |t: &Tensor, w: usize| t.view(off * w, &[n * w]);
+            let (q, qo, heads) = (rows(&sc.q, qw)?, rows(&sc.qo, qw)?, rows(&sc.heads, qw)?);
+            let k_raw = rows(&sc.kv, kw)?;
+            let v_raw = if l.v.is_some() { rows(&sc.vraw, kw)? } else { k_raw.clone() };
+            g4::qkv(
+                ctx,
+                pass,
+                &a,
+                &q,
+                &k_raw,
+                &v_raw,
+                kw,
+                0,
+                &l.q_norm,
+                &l.k_norm,
+                (!c.swa).then_some(&self.rope_freqs),
+                &qo,
+                pos0 + off,
+                n,
+                cfg.rope_base_of(il),
+                eps,
+            )?;
+            pass.memory_barrier()?;
+            ensure!(
+                n > MAX_ROWS || g4::attn_chunks(&a, pos0 + off, n) <= sc.chunks,
+                "attention past the scratch's {} chunks",
+                sc.chunks
+            );
+            debug_assert_eq!(qw, cfg.n_head * d);
+            g4::attention(ctx, pass, &a, &qo, &sc.partial, &heads, pos0 + off, n, MAX_ROWS)?;
+            pass.memory_barrier()?;
+        }
         self.proj(ctx, pass, sc, &[(&l.o, &sc.attn)], &sc.heads, m)?;
         pass.memory_barrier()?;
         // The residual, and the inputs of the dense MLP, the routed
@@ -845,7 +862,7 @@ impl Gemma4Model {
         Ok(())
     }
 
-    /// Feeds a whole prompt in runs of PREFILL_ROWS, leaving the last
+    /// Feeds a whole prompt in runs of `prefill_rows`, leaving the last
     /// row's logits.
     pub fn prefill(
         &self,
@@ -855,8 +872,8 @@ impl Gemma4Model {
         tokens: &[u32],
     ) -> Result<()> {
         ensure!(!tokens.is_empty(), "empty prefill");
-        let n = tokens.len().div_ceil(PREFILL_ROWS);
-        for (i, chunk) in tokens.chunks(PREFILL_ROWS).enumerate() {
+        let n = tokens.len().div_ceil(self.prefill_rows);
+        for (i, chunk) in tokens.chunks(self.prefill_rows).enumerate() {
             let l = if i + 1 == n { Logits::Last } else { Logits::None };
             self.forward(ctx, st, sc, chunk, l)
                 .with_context(|| format!("prefill run {i} at {}", st.pos))?;
