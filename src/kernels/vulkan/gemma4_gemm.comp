@@ -185,9 +185,9 @@ void main() {
 // The GeGLU of the fused gate/up output, weighted, as the down GEMM's
 // bfloat operand: mid[p][j] = w[p] * gelu(y[p][j]) * y[p][F + j].
 // Grid::Threads (F, pairs). Buffers: 0 y [pairs][2 F], 1 weights [pairs],
-// 2 mid (bfloat [pairs][F]). Params: 3 F.
+// 2 mid (bfloat [pairs][F]; f32 in gemma4_moe_geglu_f32). Params: 3 F.
 // ---------------------------------------------------------------------------
-#ifdef KERNEL_gemma4_moe_geglu
+#if defined(KERNEL_gemma4_moe_geglu) || defined(KERNEL_gemma4_moe_geglu_f32)
 float g4_tanh(float x) {
     const float t = exp(-2.0 * abs(x));
     const float r = (1.0 - t) / (1.0 + t);
@@ -201,7 +201,12 @@ void main() {
     const float g = F32(y).v[j], u = F32(y).v[F + j];
     const float gelu = 0.5 * g * (1.0 + g4_tanh(0.79788456080286535587989211986876 * g * (1.0 + 0.044715 * g * g)));
     const float v = F32(arg(1)).v[p] * (gelu * u);
+#ifdef KERNEL_gemma4_moe_geglu_f32
+    // Without matrix units: the down GEMM's f32 operand.
+    F32(arg(2) + 4u * (uint64_t(p) * F + j)).v[0] = v;
+#else
     BF16(arg(2) + 2u * (uint64_t(p) * F + j)).v[0] = uintBitsToBFloat16EXT(uint16_t(g4_bf16_bits(v)));
+#endif
 }
 #endif
 

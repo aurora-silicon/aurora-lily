@@ -329,7 +329,28 @@ pub fn gemm_with(
     l: GemmLayout,
 ) -> Result<()> {
     check_f32(&[x])?;
+    if !ctx.matrix_units() {
+        return gemm_any(ctx, pass, w, x, y, m, n, l, sgemm_name(w.ty)?, 64, 256);
+    }
     gemm_any(ctx, pass, w, x, y, m, n, l, gemm_name(w.ty)?, 64, 128)
+}
+
+/// The GEMM without matrix units (`sgemm.comp`: f32 operands, 64 x 64
+/// tiles of 256 threads, K in 32-deep steps).
+fn sgemm_name(ty: GgmlType) -> Result<&'static str> {
+    Ok(match ty {
+        GgmlType::Q8_0 => "sgemm_q8_0",
+        GgmlType::Q4_0 => "sgemm_q4_0",
+        GgmlType::Q4K => "sgemm_q4_k",
+        GgmlType::Q5K => "sgemm_q5_k",
+        GgmlType::Q6K => "sgemm_q6_k",
+        GgmlType::Iq4Nl => "sgemm_iq4_nl",
+        GgmlType::Iq2S => "sgemm_iq2_s",
+        GgmlType::Iq2Xxs => "sgemm_iq2_xxs",
+        GgmlType::F16 => "sgemm_f16",
+        GgmlType::F32 => "sgemm_f32",
+        other => anyhow::bail!("no GEMM without matrix units over {other:?}"),
+    })
 }
 
 /// [`gemm`] over `xb`, the input's rows as bfloat ([`to_bf16`]'s rounding:

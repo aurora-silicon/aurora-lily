@@ -396,6 +396,10 @@ struct Dev {
     /// VK_EXT_pageable_device_local_memory, when the device has it: memory
     /// priority 1.0 keeps a buffer's memory resident.
     priority: Option<ash::ext::pageable_device_local_memory::Device>,
+    /// Whether VK_KHR_cooperative_matrix and VK_KHR_shader_bfloat16 are
+    /// enabled: the matrix-unit kernels (GEMMs, `_mu` kernels) need both.
+    /// Without them (an M4) only the kernels without matrix operations run.
+    matrix_units: bool,
     /// Whether VK_NV_cooperative_matrix2's conversions, reductions and
     /// per-element operations are enabled (the operations on a matrix in
     /// registers that the `_cm2` kernels use).
@@ -464,11 +468,11 @@ impl Dev {
             let has = |name: &CStr| {
                 extensions.iter().any(|e| e.extension_name_as_c_str() == Ok(name))
             };
-            ensure!(
-                has(COOPERATIVE_MATRIX_EXTENSION) && has(BFLOAT16_EXTENSION),
-                "lily needs VK_KHR_cooperative_matrix and VK_KHR_shader_bfloat16 \
-                 (Honeykrisp on an M5 with ASAHI_M5_COOPERATIVE_MATRIX=1)"
-            );
+            // Matrix units: VK_KHR_cooperative_matrix and bfloat (Honeykrisp
+            // on an M5 with ASAHI_M5_COOPERATIVE_MATRIX=1). Without them the
+            // models that have a path without matrix operations still run.
+            let matrix_units =
+                has(COOPERATIVE_MATRIX_EXTENSION) && has(BFLOAT16_EXTENSION);
             let queue_family = instance
                 .get_physical_device_queue_family_properties(physical)
                 .iter()
@@ -499,7 +503,7 @@ impl Dev {
             // VK_NV_cooperative_matrix2, when the device has it: chained
             // between bfloat and the memory priorities while queried, and
             // kept there (enabled as queried) when it offers any feature.
-            let has_cooperative2 = has(COOPERATIVE_MATRIX2_EXTENSION);
+            let has_cooperative2 = matrix_units && has(COOPERATIVE_MATRIX2_EXTENSION);
             let mut cooperative2 = CooperativeMatrix2Features {
                 s_type: COOPERATIVE_MATRIX2_FEATURES,
                 p_next: bfloat.p_next,
@@ -519,11 +523,19 @@ impl Dev {
             let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
             let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
+            // Without matrix units neither `cooperative` nor `bfloat` is in
+            // the chain; the optional structures linked after bfloat are
+            // linked after v11 (the chain's last) instead.
+            if !matrix_units {
+                v11.p_next = std::mem::replace(&mut bfloat.p_next, std::ptr::null_mut());
+            }
             let mut features = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut v11)
                 .push_next(&mut v12)
-                .push_next(&mut v13)
-                .push_next(&mut cooperative);
+                .push_next(&mut v13);
+            if matrix_units {
+                features = features.push_next(&mut cooperative);
+            }
             instance.get_physical_device_features2(physical, &mut features);
             let core = features.features;
             ensure!(
@@ -553,6 +565,9 @@ impl Dev {
             // v12.
             // Raw place accesses only, so the header reads do not narrow the
             // pointers to the header's size.
+            let prioritize = can_prioritize
+                && priority.memory_priority == vk::TRUE
+                && pageable.pageable_device_local_memory == vk::TRUE;
             let mut found = false;
             unsafe {
                 let mut next = features.p_next.cast::<vk::BaseOutStructure>();
@@ -563,13 +578,21 @@ impl Dev {
                         (*v12).buffer_device_address_multi_device = vk::FALSE;
                         found = true;
                     }
+                    // Without matrix units the memory priorities end the
+                    // chain after v11: unlinked here when not enabled.
+                    let after = (*next).p_next;
+                    if !matrix_units
+                        && !prioritize
+                        && !after.is_null()
+                        && (*after).s_type
+                            == vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT
+                    {
+                        (*next).p_next = std::ptr::null_mut();
+                    }
                     next = (*next).p_next;
                 }
             }
             ensure!(found, "the Vulkan 1.2 features are not in the device feature chain");
-            let prioritize = can_prioritize
-                && priority.memory_priority == vk::TRUE
-                && pageable.pageable_device_local_memory == vk::TRUE;
             let enable_cooperative2 = has_cooperative2
                 && [
                     cooperative2.workgroup_scope,
@@ -600,7 +623,11 @@ impl Dev {
             let queues = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&[1.0])];
-            let mut names = vec![COOPERATIVE_MATRIX_EXTENSION.as_ptr(), BFLOAT16_EXTENSION.as_ptr()];
+            let mut names = Vec::new();
+            if matrix_units {
+                names.push(COOPERATIVE_MATRIX_EXTENSION.as_ptr());
+                names.push(BFLOAT16_EXTENSION.as_ptr());
+            }
             if prioritize {
                 names.push(ash::ext::memory_priority::NAME.as_ptr());
                 names.push(ash::ext::pageable_device_local_memory::NAME.as_ptr());
@@ -683,6 +710,7 @@ impl Dev {
                 allocations: AtomicUsize::new(0),
                 host_import,
                 priority,
+                matrix_units,
                 cooperative_matrix_register_ops,
                 calibrated,
             }))
@@ -1910,6 +1938,12 @@ impl MetalContext {
     /// Whether buffers can be kept resident ([`GpuBuffer::residency`]).
     pub fn can_keep_resident(&self) -> bool {
         self.dev.priority.is_some()
+    }
+
+    /// Whether the device has matrix units (VK_KHR_cooperative_matrix with
+    /// bfloat): without them a kernel with matrix operations cannot run.
+    pub fn matrix_units(&self) -> bool {
+        self.dev.matrix_units
     }
 
     /// Whether the device offers, and the context enabled, the cooperative

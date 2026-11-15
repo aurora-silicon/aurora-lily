@@ -498,11 +498,12 @@ pub struct MoeGroupScratch {
     pairs: Tensor,
     tiles: Tensor,
     tile_count: Tensor,
-    /// The run's expert input as bfloat.
+    /// The run's expert input as bfloat (matrix units only).
     xb: Tensor,
     /// f32 `[pairs][2 ff]`: the fused gate/up GEMM's output.
     gate_up: Tensor,
-    /// bfloat `[pairs][ff]`: the down GEMM's operand.
+    /// bfloat `[pairs][ff]` (f32 without matrix units): the down GEMM's
+    /// operand.
     mid: Tensor,
     /// f32 `[pairs][hidden]`.
     down: Tensor,
@@ -523,9 +524,19 @@ impl MoeGroupScratch {
             pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
             tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
             tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
-            xb: Tensor::zeros(ctx, &[rows * hidden], DType::BF16)?,
+            // Without matrix units the GEMMs take f32 operands: no bfloat
+            // input, an f32 `mid`.
+            xb: if ctx.matrix_units() {
+                Tensor::zeros(ctx, &[rows * hidden], DType::BF16)?
+            } else {
+                Tensor::zeros(ctx, &[2], DType::BF16)?
+            },
             gate_up: Tensor::zeros(ctx, &[pairs * 2 * ff], DType::F32)?,
-            mid: Tensor::zeros(ctx, &[pairs * ff], DType::BF16)?,
+            mid: Tensor::zeros(
+                ctx,
+                &[pairs * ff],
+                if ctx.matrix_units() { DType::BF16 } else { DType::F32 },
+            )?,
             down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
         })
     }
@@ -554,8 +565,9 @@ pub fn moe_grouped(
     check_f32(&[x, weights, out])?;
     let hidden = gate_up.cols;
     let pairs = m * used;
+    let mu = ctx.matrix_units();
     ensure!(
-        sc.pairs.numel() >= pairs && sc.xb.numel() >= m * hidden,
+        sc.pairs.numel() >= pairs && (!mu || sc.xb.numel() >= m * hidden),
         "grouped MoE scratch"
     );
     ensure!(used.is_power_of_two(), "experts used {used}");
@@ -578,18 +590,25 @@ pub fn moe_grouped(
         &[&u32_bytes(pairs), &u32_bytes(experts), &u32_bytes(64)],
         Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
     )?;
-    crate::kernels::glm53::to_bf16(ctx, pass, x, &sc.xb, m * hidden)?;
+    if mu {
+        crate::kernels::glm53::to_bf16(ctx, pass, x, &sc.xb, m * hidden)?;
+    }
     pass.memory_barrier()?;
     let max_tiles = pairs.div_ceil(64) + experts;
     let gemm =
         |w: &QWeight, x: &Tensor, y: &Tensor, n: usize, x_shift: usize| -> Result<()> {
-            let name = match w.ty {
-                GgmlType::Iq2Xxs => "gemma4_gemm_moe_iq2_xxs",
-                GgmlType::Iq2S => "gemma4_gemm_moe_iq2_s",
-                GgmlType::Q5K => "gemma4_gemm_moe_q5_k",
-                GgmlType::Iq4Nl => "gemma4_gemm_moe_iq4_nl",
-                GgmlType::Q8_0 => "gemma4_gemm_moe_q8_0",
-                other => anyhow::bail!("no grouped Gemma expert GEMM over {other:?}"),
+            let name = match (w.ty, mu) {
+                (GgmlType::Iq2Xxs, true) => "gemma4_gemm_moe_iq2_xxs",
+                (GgmlType::Iq2S, true) => "gemma4_gemm_moe_iq2_s",
+                (GgmlType::Q5K, true) => "gemma4_gemm_moe_q5_k",
+                (GgmlType::Iq4Nl, true) => "gemma4_gemm_moe_iq4_nl",
+                (GgmlType::Q8_0, true) => "gemma4_gemm_moe_q8_0",
+                (GgmlType::Iq2Xxs, false) => "sgemm_moe_iq2_xxs",
+                (GgmlType::Iq2S, false) => "sgemm_moe_iq2_s",
+                (GgmlType::Q5K, false) => "sgemm_moe_q5_k",
+                (GgmlType::Iq4Nl, false) => "sgemm_moe_iq4_nl",
+                (GgmlType::Q8_0, false) => "sgemm_moe_q8_0",
+                (other, _) => anyhow::bail!("no grouped Gemma expert GEMM over {other:?}"),
             };
             let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
             pass.dispatch_at(
@@ -610,13 +629,18 @@ pub fn moe_grouped(
                 ],
                 Grid::Threadgroups {
                     groups: (n.div_ceil(64), max_tiles, 1),
-                    threadgroup: (128, 1, 1),
+                    threadgroup: (if mu { 128 } else { 256 }, 1, 1),
                 },
             )
         };
-    gemm(gate_up, &sc.xb, &sc.gate_up, 2 * ff, used.trailing_zeros() as usize)?;
+    let xin = if mu { &sc.xb } else { x };
+    gemm(gate_up, xin, &sc.gate_up, 2 * ff, used.trailing_zeros() as usize)?;
     pass.memory_barrier()?;
-    let geglu = ctx.pipeline("gemma4_moe_geglu", SOURCE, MslVersion::V3_1)?;
+    let geglu = ctx.pipeline(
+        if mu { "gemma4_moe_geglu" } else { "gemma4_moe_geglu_f32" },
+        SOURCE,
+        MslVersion::V3_1,
+    )?;
     pass.dispatch_at(
         &geglu,
         &[sc.gate_up.binding(), weights.binding(), sc.mid.binding()],
