@@ -14,8 +14,10 @@ and the desktop needs some, so lily keeps everything it allocates under
 
 | machine | file (huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) | GB | context |
 |---|---|---|---|
-| 16 GB | `gemma-4-26B-A4B-it-UD-IQ2_M.gguf` | 10.01 | 8K |
-| 32 GB | `gemma-4-26B-A4B-it-UD-Q5_K_M.gguf` | 21.15 | 32K |
+| 16 GB | `gemma-4-26B-A4B-it-UD-IQ2_M.gguf` | 10.01 | 14.5K |
+| 32 GB | `gemma-4-26B-A4B-it-UD-Q5_K_M.gguf` | 21.15 | 41K |
+
+The contexts are what `--memory-limit-gb` fits with the flags below.
 
 The routed experts' down projections are 704 values wide, not a multiple of
 256, so no file stores them as K-quants: the 2-bit files keep them at 4 bits
@@ -36,40 +38,52 @@ embeddings, shared KV layers) are refused.
 ## Running it
 
 ```sh
-# 16 GB
-lily --model ~/models/gemma-4-26B-A4B-it-UD-IQ2_M.gguf --max-seq 8192 \
-    --cache-bytes 0.6G --pin-weights off
-# 32 GB
-lily --model ~/models/gemma-4-26B-A4B-it-UD-Q5_K_M.gguf --max-seq 32768 \
-    --cache-bytes 2G --pin-weights off --mtp-drafts 2
+# 16 GB: everything under 11.0 GB, a 14.5K-token context
+lily --model ~/models/gemma-4-26B-A4B-it-UD-IQ2_M.gguf --memory-limit-gb 10.2 \
+    --mtp-drafts 0 --checkpoints-per-session 1 --decode-checkpoint-tokens 0 \
+    --pin-weights off
+# 32 GB: under 23.6 GB, a 41K-token context, two drafts a step
+lily --model ~/models/gemma-4-26B-A4B-it-UD-Q5_K_M.gguf --memory-limit-gb 22 \
+    --mtp-drafts 2 --decode-checkpoint-tokens 0 --pin-weights off
 ```
 
 Run with `hk_host_memory_read_only=true hk_host_memory_import_read_only=true`:
 the weights are mapped read-only from the page cache.
 
+- `--memory-limit-gb` (GiB): at load lily measures the weights and the
+  scratch and fits the longest context whose session at its largest (the
+  caches at the full context, the session's snapshots, growth) fits the
+  rest; the server caps `--max-seq` there, answers a longer prompt with a
+  400, keeps that session's room free in its cache and serves one request
+  at a time. Gemma's snapshots are large (the sliding-window layers' last
+  1024 positions: 0.21 GB each), so the tiers keep fewer of them:
+  `--checkpoints-per-session` (prompt-end checkpoints, 3 by default) and
+  `--decode-checkpoint-tokens 0` (no checkpoints inside answers, 4 by
+  default). With the defaults the same limit fits under 10K tokens on 32 GB,
+  and the 16 GB one refuses to load (less than 4K tokens).
 - `--mtp-drafts N` (N <= 3): speculative decoding with Gemma's draft model,
   the `gemma4-assistant` GGUF lily looks for beside the model
   (`mtp-gemma-4-26B-A4B-it.gguf` from the same repository, Q8_0, 0.45 GB, or
   ggml-org's `mtp-gemma-4-26B-A4B-it-Q4_0.gguf`, 0.24 GB). Drafts are greedy
   and proposed while the draft model's probability of them is at least 0.3;
-  the verify pass draws under the request's sampler. The 16 GB
-  configuration measures 10.9 GB without a draft model and 11.1 GB with the
-  Q4_0 one: leave it off there.
+  the verify pass draws under the request's sampler. The default is on;
+  the 16 GB configuration leaves it off (the Q4_0 draft model would cost it
+  9K tokens of context).
 - Reasoning: `chat_template_kwargs: {"enable_thinking": true}` makes the
   model think in its `<|channel>thought ... <channel|>` block, returned as
   `reasoning_content`. Tool calls (`<|tool_call>call:name{...}<tool_call|>`)
   come back as OpenAI tool calls, and tool results go back through the
   template.
 
-Memory (lily's allocation counter, `lily-gemma4 mem`): UD-IQ2_M at 8K
-context with one checkpoint 10.72 GB (weights 10.00, scratch 0.08, session
-0.43, checkpoint 0.21); the server peaked at 10.9 GB after a 7.5K-token
-request and its cached repeat. UD-Q5_K_M at 32K with three checkpoints 22.79
-GB; the server with two drafts peaked at 23.6 GB after four cached sessions.
-A session holds the 5 global layers' K/V for its whole context (20 KB a
-token) and a ring of the last 1024 + 256 positions for the 25
-sliding-window layers (0.26 GB); a checkpoint keeps the rings' last 1024
-positions (0.21 GB).
+Memory (lily's allocation counter, `lily-gemma4 mem`): UD-IQ2_M at the
+16 GB tier's full context with its checkpoint 10.95 GB (weights 10.00,
+scratch 0.12, session 0.62, checkpoint 0.21); the server held 10.8 GB after
+7.5K- and 5.8K-token requests. UD-Q5_K_M at 49K with three checkpoints
+23.17 GB plus the 0.45 GB draft model; the server held 22.2 GB after a
+31K-token request, its cached repeat and four short ones. A session holds
+the 5 global layers' K/V for its whole context (20 KB a token) and a ring of
+the last 1024 + 256 positions for the 25 sliding-window layers (0.26 GB); a
+checkpoint keeps the rings' last 1024 positions (0.21 GB).
 
 ## What runs
 
@@ -94,7 +108,7 @@ file), `chat`, `bench`, `spec`, `state-check`, `mem`.
 ## Quality and speed (M5 Max, 2026-11-14)
 
 Against llama.cpp on the same file and tokens, per-token mean NLL:
-UD-Q5_K_M 0.163 (llama.cpp 0.164) on model-written chat answers, 2.956
+UD-Q5_K_M 0.164 (llama.cpp 0.164) on model-written chat answers, 2.955
 (2.956) on human text continued in a chat turn; UD-IQ2_M 0.330 (0.334) and
 2.923 (2.927). The KL divergence between lily and llama.cpp on the same
 weights is about half of what Q8_0 to Q5_K costs (llama.cpp's CPU path
@@ -107,8 +121,10 @@ quantizes the activations to 8 bits; lily keeps them f32).
 | decode, plain (1K / 4K context) | 10.9 / 10.6 ms a step | 11.1 / 11.1 ms |
 | decode, 2 drafts, greedy (prose, code) | 121, 124 tok/s | 131, 150 tok/s |
 
-Served (`--mtp-drafts 2`, UD-Q5_K_M, 400-token answers): 118 to 150 tok/s
-depending on the prompt, 58 to 87% of the drafts accepted.
+Served (the 32 GB configuration, 400-token answers): 115 to 145 tok/s
+depending on the prompt, 58 to 87% of the drafts accepted; a 31K-token
+prompt prefills at 635 tok/s and decodes at 80 tok/s. The 16 GB
+configuration: a 7.5K-token prompt at 1290 tok/s, decoding at 91 tok/s.
 
 Not done: Metal kernels; prompt attention on the matrix units (it is a third of a 4K
 prompt's time and grows with the global layers' context);

@@ -194,9 +194,9 @@ impl Gemma4Draft {
             Ok(w)
         };
         let mut layers = Vec::with_capacity(n_layer);
-        for il in 0..n_layer {
+        for (il, &swa) in swa.iter().enumerate() {
             let n = |s: &str| format!("blk.{il}.{s}");
-            let d = if swa[il] { dh_swa } else { dh };
+            let d = if swa { dh_swa } else { dh };
             layers.push(LayerW {
                 attn_norm: f32_of(&n("attn_norm.weight"), hidden)?,
                 q: q_of(&n("attn_q.weight"), hidden, heads * d)?,
@@ -209,7 +209,7 @@ impl Gemma4Draft {
                 down: q_of(&n("ffn_down.weight"), ff, hidden)?,
                 post_ffw_norm: f32_of(&n("post_ffw_norm.weight"), hidden)?,
                 out_scale: f32_of(&n("layer_output_scale.weight"), 1)?,
-                swa: swa[il],
+                swa,
                 head_dim: d,
             });
         }

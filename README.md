@@ -142,11 +142,12 @@ cargo build --release --locked
   --bind 127.0.0.1:8002 --max-seq 65536 --cache-bytes 9G --pin-weights off \
   --mtp-drafts 5 --max-batch 1
 
-# Gemma 4 26B-A4B, 32 GB machines (16 GB: UD-IQ2_M, --max-seq 8192
-# --cache-bytes 0.6G, no drafts); the draft model is found beside the model
+# Gemma 4 26B-A4B, 32 GB machines (16 GB: UD-IQ2_M, --memory-limit-gb 10.2
+# --mtp-drafts 0 --checkpoints-per-session 1; docs/gemma4.md); the draft
+# model is found beside the model
 ./target/release/lily --model ~/models/gemma-4-26B-A4B-it-UD-Q5_K_M.gguf \
-  --bind 127.0.0.1:8003 --max-seq 32768 --cache-bytes 2G --pin-weights off \
-  --mtp-drafts 2
+  --bind 127.0.0.1:8003 --memory-limit-gb 22 --mtp-drafts 2 \
+  --decode-checkpoint-tokens 0 --pin-weights off
 ```
 
 Only one model fits in 128 GB at a time; every loader takes a machine-wide
@@ -210,8 +211,9 @@ a step and backs off when its drafts keep being rejected.
 Gemma 4 26B-A4B (30 layers: 25 sliding-window and 5 global attention
 layers, a dense GeGLU MLP and 128 routed experts with 8 active in each)
 runs from the published GGUF files, chosen so that everything lily
-allocates on the GPU stays under 11 GB on a 16 GB machine (UD-IQ2_M, 8K
-context) and under 24 GB on a 32 GB one (UD-Q5_K_M, 32K). `src/gemma4/`
+allocates on the GPU stays under 11 GB on a 16 GB machine (UD-IQ2_M, 14.5K
+context) and under 24 GB on a 32 GB one (UD-Q5_K_M, 41K), through
+`--memory-limit-gb`. `src/gemma4/`
 follows llama.cpp's graph, which is also the reference its scores are
 checked against on the same files. Speculative decoding uses Gemma's own
 draft model, which reads the target's caches (`--mtp-drafts 2`).

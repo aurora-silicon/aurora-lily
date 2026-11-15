@@ -270,7 +270,7 @@ fn router_matches_cpu() {
 fn router_non_finite_rows_pick_experts_below_e() {
     let ctx = ctx();
     let (e, kk) = (100, 8);
-    let mut rows = vec![vec![f32::NAN; e], vec![0.5; e], vec![0.0; e]];
+    let mut rows = [vec![f32::NAN; e], vec![0.5; e], vec![0.0; e]];
     rows[1][7] = f32::INFINITY;
     rows[1][40] = f32::INFINITY;
     rows[2][3] = f32::NAN;
