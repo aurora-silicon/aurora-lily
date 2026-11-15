@@ -144,7 +144,8 @@ fn wrong_typed_metadata_is_an_error() {
 
 #[test]
 fn shapes_the_kernels_do_not_take_are_refused() {
-    let cases: [(&str, Value, &str); 12] = [
+    let cases: [(&str, Value, &str); 13] = [
+        ("gemma4.feed_forward_length", Value::U32(2144), "multiples of 64"),
         ("gemma4.embedding_length", Value::U32(2800), "embedding_length"),
         ("gemma4.embedding_length", Value::U32(8192), "at most"),
         ("gemma4.expert_feed_forward_length", Value::U32(736), "multiples of 64"),

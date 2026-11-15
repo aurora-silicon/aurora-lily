@@ -301,8 +301,8 @@ impl Config {
             self.hidden
         );
         ensure!(
-            self.ff > 0 && self.ff.is_multiple_of(32),
-            "feed_forward_length {}",
+            self.ff > 0 && self.ff.is_multiple_of(64),
+            "feed_forward_length {} (the prompt GEMM's down projection takes multiples of 64)",
             self.ff
         );
         // The decode down kernel reads IQ4_NL in pairs of 32-value blocks,
