@@ -1,0 +1,131 @@
+#version 460
+// Gemma 4's Q5_K GEMVs of one to four rows
+// over activations quantized to int8 per 32 values (llama.cpp's q8_1: a
+// scale and the codes' sum), with integer products: a task's dot is
+// dx (scale sum(c q) - min sum(q)). The Q5_K GEMV over f32 activations
+// is bound by its instructions (extract, convert, FMA and the x sum a
+// weight); here a weight is an extract, a sign extract and an integer
+// multiply-add, the x sum comes with the codes, and x is a quarter of
+// the bytes.
+#define GLM53_EXT_TYPES
+#include "common.glsl"
+#include "glm53_quant.glsl"
+#include "gemma4_q8x.glsl"
+
+// ---------------------------------------------------------------------------
+// x f32 [m][K] -> codes int8 [m][K] and per 32 values (d = max|x| / 127,
+// sum of codes; gemma4_q8x.glsl) as f32 pairs [m][K / 32][2]. Grid::Threads (K, m), 256
+// threads (K a multiple of 32: a subgroup is one block).
+// Buffers: 0 x, 1 codes, 2 ds. Params: 3 K.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_gemma4_quant_q8x
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint K = arg_u32(3);
+    const uint e = gl_GlobalInvocationID.x, i = gl_GlobalInvocationID.y;
+    const uint at = i * K + e;
+    const float v = F32(arg(0)).v[at];
+    const bool bad = subgroupMax(uint(g4_q8x_nonfinite(v))) != 0u;
+    const float d = g4_q8x_scale(subgroupMax(g4_q8x_abs(v)), bad);
+    const int q = g4_q8x_code(v, d);
+    const int sum = subgroupAdd(q);
+    I8(arg(1)).v[at] = int8_t(q);
+    if (gl_SubgroupInvocationID == 0u) {
+        F32(arg(2)).v[2u * (at / 32u)] = d;
+        F32(arg(2)).v[2u * (at / 32u) + 1u] = float(sum);
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// y_s[i][n] = W_s[n] . x[i] for up to four Q5_K weights of K columns that
+// share x (one dispatch for a level's projections, as glm53_gemv), M rows
+// (the kernel's). A subgroup a weight row, eight a threadgroup; set s owns
+// the next ceil(rows_s / 8) threadgroups. K / 32 >= 32 tasks.
+// Buffers: 0 codes, 1 ds, 2-5 W, 6-9 y. Params: 10 K, 11 row_bytes, 12-15
+// rows of each set (0: unused).
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_gemma4_gemv_q5_k_q8x_m1)
+#define G8_M 1u
+#elif defined(KERNEL_gemma4_gemv_q5_k_q8x_m2)
+#define G8_M 2u
+#elif defined(KERNEL_gemma4_gemv_q5_k_q8x_m3)
+#define G8_M 3u
+#elif defined(KERNEL_gemma4_gemv_q5_k_q8x_m4)
+#define G8_M 4u
+#endif
+#ifdef G8_M
+void main() {
+    const uint K = arg_u32(10);
+    const uint row_bytes = arg_u32(11);
+    uint tg = gl_WorkGroupID.x;
+    uint set = 0u;
+    uint N = arg_u32(12);
+    [[unroll]] for (uint s = 0u; s < 3u; s++) {
+        const uint tgs = (N + 7u) / 8u;
+        if (set == s && tg >= tgs) {
+            tg -= tgs;
+            set = s + 1u;
+            N = arg_u32(13u + s);
+        }
+    }
+    const uint n = tg * 8u + gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint64_t row = arg(2u + set) + uint64_t(min(n, N - 1u)) * row_bytes;
+    U32x4 xq = U32x4(arg(0));
+    F32 ds = F32(arg(1));
+    const uint tasks = K / 32u;
+    float acc[G8_M];
+    [[unroll]] for (uint i = 0u; i < G8_M; i++) acc[i] = 0.0;
+    for (uint t = lane; t < tasks; t += 32u) {
+        const uint64_t b = row + uint64_t(t >> 3u) * 176u;
+        const uint j = t & 7u;
+        const uvec4 hd = U32x4(b).v[0];
+        const uvec4 qa = U32x4(b + 48u + (j >> 1u) * 32u).v[0];
+        const uvec4 qb = U32x4(b + 64u + (j >> 1u) * 32u).v[0];
+        const uvec4 ha = U32x4(b + 16u).v[0];
+        const uvec4 hb = U32x4(b + 32u).v[0];
+        uvec4 x0[G8_M], x1[G8_M];
+        vec2 dsx[G8_M];
+        [[unroll]] for (uint i = 0u; i < G8_M; i++) {
+            x0[i] = xq.v[(i * K) / 16u + 2u * t];
+            x1[i] = xq.v[(i * K) / 16u + 2u * t + 1u];
+            dsx[i] = vec2(ds.v[2u * (i * tasks + t)], ds.v[2u * (i * tasks + t) + 1u]);
+        }
+        const uvec3 sw = hd.yzw;
+        #define K5_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
+        uint sc, mn;
+        if (j < 4u) {
+            sc = K5_BYTE(j) & 63u;
+            mn = K5_BYTE(j + 4u) & 63u;
+        } else {
+            sc = (K5_BYTE(j + 4u) & 0xfu) | ((K5_BYTE(j - 4u) >> 6u) << 4u);
+            mn = (K5_BYTE(j + 4u) >> 4u) | ((K5_BYTE(j) >> 6u) << 4u);
+        }
+        #undef K5_BYTE
+        const float scale = glm53_h2f(hd.x & 0xffffu) * float(sc);
+        const float minv = glm53_h2f(hd.x >> 16u) * float(mn);
+        const uint shift = (j & 1u) * 4u;
+        int isum[G8_M];
+        [[unroll]] for (uint i = 0u; i < G8_M; i++) isum[i] = 0;
+        [[unroll]] for (uint c = 0u; c < 8u; c++) {
+            const uint word = (c < 4u ? qa[c] : qb[c - 4u]) >> shift;
+            const uint hw = (c < 4u ? ha[c] : hb[c - 4u]) >> j;
+            const uint c4 = (word & 0x0f0f0f0fu) | ((hw & 0x01010101u) << 4u);
+            [[unroll]] for (uint i = 0u; i < G8_M; i++) {
+                const uint xw = c < 4u ? x0[i][c] : x1[i][c - 4u];
+                [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                    isum[i] += int((c4 >> (8u * k)) & 0xffu) * (int(xw << (24u - 8u * k)) >> 24);
+                }
+            }
+        }
+        [[unroll]] for (uint i = 0u; i < G8_M; i++) {
+            acc[i] += dsx[i].x * (scale * float(isum[i]) - minv * dsx[i].y);
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < G8_M; i++) {
+        const float a = subgroupAdd(acc[i]);
+        if (lane == 0u && n < N) F32(arg(6u + set)).v[i * N + n] = a;
+    }
+}
+#endif

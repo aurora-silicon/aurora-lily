@@ -44,6 +44,29 @@ fn small() -> Config {
     c
 }
 
+/// The int8 activation scratch holds a row of every input a step's int8
+/// projections may take, whatever the shape: the published one, hidden
+/// wider than every query width, and a dense MLP wider than both.
+#[test]
+fn int8_scratch_holds_every_eligible_input() {
+    use crate::gemma4::model::Scratch;
+    let ctx = MetalContext::new().unwrap();
+    let mut narrow_q = small();
+    narrow_q.n_head = 2;
+    assert!(narrow_q.hidden > narrow_q.max_q_width());
+    let mut wide_ff = small();
+    wide_ff.ff = 3 * wide_ff.hidden;
+    for cfg in [small(), narrow_q, wide_ff] {
+        let sc = Scratch::new(&ctx, &cfg, 16, MAX_ROWS).unwrap();
+        let (w, codes, ds) = sc.q8_buffers();
+        let widths = (0..cfg.n_layer).map(|il| cfg.q_width(il));
+        for need in widths.chain([cfg.hidden, cfg.ff]) {
+            assert!(w >= need, "int8 rows of {w} for an input of {need}");
+        }
+        assert!(codes >= MAX_ROWS * w && ds >= MAX_ROWS * w.div_ceil(32) * 2);
+    }
+}
+
 #[test]
 fn caches_grow_by_doubling_up_to_the_cap_and_no_further() {
     let ctx = MetalContext::new().unwrap();
