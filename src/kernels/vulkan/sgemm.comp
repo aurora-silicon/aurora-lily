@@ -5,8 +5,8 @@
 // expert (src/kernels/gemma4.rs `moe_grouped`). f32 operands and sums: the
 // weights as glm53_decode gives them, the activations as stored.
 //
-// A threadgroup of 256 computes a tile of Y (sgemm_tile.glsl), a thread 4
-// activation rows x 8 weight rows: 64 x 128, or 32 x 256 for an expert's
+// A threadgroup of 256 computes a tile of Y (sgemm_tile.glsl), a thread 8
+// activation rows x 4 weight rows: 64 x 128, or 32 x 256 for an expert's
 // pairs that fit 32 rows. Every output is one f32 FMA chain over k in
 // order, whatever the tile.
 #if defined(KERNEL_sgemm_q4_0) || defined(KERNEL_sgemm_q5_k) || defined(KERNEL_sgemm_q6_k) || \
@@ -123,10 +123,8 @@ void sg_decode8(uint64_t row, uint k, out float w[8]) {
 }
 
 // The tile kernel (sgemm_tile.glsl), instantiated per tile shape below.
-// Threadgroup memory: the decoded weights of a K step (4096) and its
-// activations (up to 64 rows x 32).
+// Threadgroup memory: the decoded weights of a K step (4096).
 shared vec4 sg_w[1024];
-shared vec4 sg_x[512];
 
 // Y's tile: rows i < rows of the activations at x_row(i) (f32 elements
 // from X), of Y at y_row(i), weight rows n0 + j from W + j row_bytes.
