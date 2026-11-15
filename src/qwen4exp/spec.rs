@@ -633,6 +633,11 @@ impl Qwen4ExpModel {
                 "profile draft initial drafts={drafts}: gpu {:.2} ms",
                 (t.gpu_end_secs - t.gpu_start_secs) * 1e3
             );
+            // The first verify pass's gap is to this pass, not to another
+            // generation's last draft pass.
+            if let Ok(mut g) = DRAFT_GPU_END.lock() {
+                *g = Some(t.gpu_end_secs);
+            }
         }
         if drafts == 0 {
             return Ok(Vec::new());
