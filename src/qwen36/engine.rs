@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 
 use super::model::{
-    LayerState, Logits, PREFILL_ROWS, Qwen36Model, Qwen36State, Scratch,
+    LayerState, Logits, PREFILL_ROWS_LIMITED, Qwen36Model, Qwen36State, Scratch,
 };
 use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
@@ -263,7 +263,7 @@ impl ScratchApi for Scratch {
 }
 
 impl Qwen36Model {
-    /// Feeds `tokens` in runs of [`PREFILL_ROWS`], drawing after the last
+    /// Feeds `tokens` in runs of [`Qwen36Model::prefill_rows`], drawing after the last
     /// when `draw`; before committing each run, stops if `stop` says so
     /// (the state then sits at a run boundary). Returns the tokens fed.
     fn prefill_chunks(
@@ -278,7 +278,7 @@ impl Qwen36Model {
         ensure!(!tokens.is_empty(), "empty prefill");
         super::model::check_tokens(tokens, self.cfg.vocab)?;
         state.ensure_capacity(ctx, state.pos + tokens.len())?;
-        let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_ROWS).collect();
+        let chunks: Vec<&[u32]> = tokens.chunks(self.prefill_rows).collect();
         let mut fed = 0;
         for (i, chunk) in chunks.iter().enumerate() {
             if stop() {
@@ -338,6 +338,9 @@ impl LanguageModel for Qwen36Model {
     fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
         let mut model = Qwen36Model::load(ctx, path)?;
         model.memory_limit = options.memory_limit;
+        if model.memory_limit.is_some() {
+            model.prefill_rows = PREFILL_ROWS_LIMITED;
+        }
         if options.mtp_drafts > 0 {
             match model.find_mtp(path)? {
                 Some(p) => {
@@ -576,7 +579,7 @@ impl LanguageModel for Qwen36Model {
     }
 
     fn prefill_chunk_tokens(&self) -> Option<usize> {
-        Some(PREFILL_ROWS)
+        Some(self.prefill_rows)
     }
 
     fn prefill_until(

@@ -1,6 +1,7 @@
 //! Qwen3.6 on the GPU: weights mapped read-only from the GGUF, the
 //! per-session caches and recurrent state, and the forward pass over up to
-//! [`PREFILL_ROWS`] consecutive tokens at a time (decode is one row).
+//! [`Qwen36Model::prefill_rows`] consecutive tokens at a time (decode is
+//! one row).
 //!
 //! The graph is llama.cpp's `qwen35moe` (`src/models/qwen35moe.cpp`), which
 //! defines what the file's tensors mean: 40 layers, three Gated DeltaNet
@@ -24,8 +25,16 @@ use crate::tensor::{DType, Tensor};
 /// Rows a decode/verify step takes (the GEMV's limit).
 pub const MAX_ROWS: usize = g::GEMV_MAX_ROWS;
 
-/// Rows a prompt step takes (projections on the matrix units).
-pub const PREFILL_ROWS: usize = 1024;
+/// Rows a prompt step takes at most (projections on the matrix units):
+/// [`Qwen36Model::prefill_rows`] is this or [`PREFILL_ROWS_LIMITED`].
+pub const PREFILL_ROWS: usize = 2048;
+
+/// Rows a prompt step takes under `--memory-limit-gb`: the scratch of 2048
+/// rows is ~0.4 GB more, which the 32 and 64 GB settings' contexts need.
+/// 2048 rows a step: 4K-token prefill 3530-3540 -> 3780-3880 tok/s
+/// (lily-bench, 2026-11-15; each expert's grouped GEMM tiles about twice
+/// as full).
+pub const PREFILL_ROWS_LIMITED: usize = 1024;
 
 struct GdnW {
     qkv: QWeight,
@@ -90,6 +99,8 @@ pub struct Qwen36Model {
     /// The longest request context served: the file's, the attention
     /// kernel's, or what the memory limit fits ([`Self::fit_context`]).
     pub context_cap: usize,
+    /// Rows a prompt step takes (and its scratch holds).
+    pub prefill_rows: usize,
 }
 
 /// Cache rows a session needs past its request's tokens: a verify pass's
@@ -197,6 +208,7 @@ impl Qwen36Model {
             mtp: None,
             memory_limit: None,
             context_cap,
+            prefill_rows: PREFILL_ROWS,
         })
     }
 
@@ -346,7 +358,7 @@ impl Qwen36Model {
     }
 
     pub fn new_scratch(&self, ctx: &MetalContext) -> Result<Scratch> {
-        Scratch::new(ctx, &self.cfg)
+        Scratch::new(ctx, &self.cfg, self.prefill_rows)
     }
 }
 
@@ -483,7 +495,7 @@ impl Qwen36State {
     }
 }
 
-/// Per-step intermediates, for up to [`PREFILL_ROWS`] rows.
+/// Per-step intermediates, for up to [`Qwen36Model::prefill_rows`] rows.
 pub struct Scratch {
     pub tokens: Tensor,
     /// The residual stream.
@@ -525,7 +537,7 @@ pub struct Scratch {
     // Head
     pub hidden_norm: Tensor,
     // MTP
-    /// `[PREFILL_ROWS + 1][hidden]`: a prompt run's MTP inputs, row 0 the
+    /// `[rows + 1][hidden]`: a prompt run's MTP inputs, row 0 the
     /// session's pending row, row `i + 1` the run's row `i` normed.
     hbuf: Tensor,
     /// `[rows][2 hidden]`: normed embedding | normed hidden.
@@ -547,8 +559,8 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    pub(crate) fn new(ctx: &MetalContext, cfg: &Config) -> Result<Self> {
-        let r = PREFILL_ROWS;
+    pub(crate) fn new(ctx: &MetalContext, cfg: &Config, rows: usize) -> Result<Self> {
+        let r = rows;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let b = |n: usize| Tensor::zeros(ctx, &[n], DType::BF16);
         let u = |n: usize| Tensor::zeros(ctx, &[n], DType::U32);
@@ -615,7 +627,7 @@ impl Scratch {
         })
     }
 
-    /// Stages a run's token ids (at most PREFILL_ROWS; checked against the
+    /// Stages a run's token ids (at most the scratch's rows; checked against the
     /// vocabulary by the callers, [`check_tokens`]).
     pub(crate) fn stage_tokens(&self, tokens: &[u32]) -> Result<()> {
         crate::glm53::model::write_words(&self.tokens, tokens)
@@ -659,7 +671,7 @@ impl Qwen36Model {
         }
     }
 
-    /// Feeds `tokens` (at most [`PREFILL_ROWS`]) at the state's position,
+    /// Feeds `tokens` (at most [`Self::prefill_rows`]) at the state's position,
     /// leaving logits as `logits` says, and advances the state.
     pub fn forward(
         &self,
@@ -670,7 +682,7 @@ impl Qwen36Model {
         logits: Logits,
     ) -> Result<()> {
         let m = tokens.len();
-        ensure!((1..=PREFILL_ROWS).contains(&m), "forward of {m} rows");
+        ensure!((1..=self.prefill_rows).contains(&m), "forward of {m} rows");
         ensure!(st.pos + m <= st.capacity, "state capacity {}", st.capacity);
         check_tokens(tokens, self.cfg.vocab)?;
         sc.stage_tokens(tokens)?;
@@ -679,7 +691,7 @@ impl Qwen36Model {
         Ok(())
     }
 
-    /// Feeds a whole prompt in runs of [`PREFILL_ROWS`] rows, the last
+    /// Feeds a whole prompt in runs of [`Self::prefill_rows`] rows, the last
     /// row's logits at the end.
     pub fn prefill(
         &self,
@@ -689,8 +701,8 @@ impl Qwen36Model {
         tokens: &[u32],
     ) -> Result<()> {
         let n = tokens.len();
-        for (i, chunk) in tokens.chunks(PREFILL_ROWS).enumerate() {
-            let last = (i + 1) * PREFILL_ROWS >= n;
+        for (i, chunk) in tokens.chunks(self.prefill_rows).enumerate() {
+            let last = (i + 1) * self.prefill_rows >= n;
             let l = if last { Logits::Last } else { Logits::None };
             self.forward(ctx, st, sc, chunk, l)?;
         }
@@ -767,7 +779,7 @@ impl Qwen36Model {
         layers: std::ops::Range<usize>,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        ensure!((1..=PREFILL_ROWS).contains(&m), "step of {m} rows");
+        ensure!((1..=self.prefill_rows).contains(&m), "step of {m} rows");
         ensure!(logits != Logits::All || m <= MAX_ROWS, "logits of {m} rows");
         ensure!(st.pos + m <= st.capacity, "state capacity {}", st.capacity);
         ensure!(layers.end <= cfg.n_layer, "layers {layers:?}");
@@ -897,7 +909,7 @@ impl Qwen36Model {
         let w =
             self.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no MTP head loaded"))?;
         let ms = st.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no MTP state"))?;
-        ensure!((1..=PREFILL_ROWS).contains(&m), "MTP over {m} pairs");
+        ensure!((1..=self.prefill_rows).contains(&m), "MTP over {m} pairs");
         ensure!(pos0 + m <= st.capacity, "MTP rows past the state's capacity");
         k::embed(ctx, pass, &self.embed, tokens, &sc.xn, m)?;
         pass.memory_barrier()?;
