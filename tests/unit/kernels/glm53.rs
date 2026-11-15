@@ -328,51 +328,109 @@ fn moe_xh_rows_match_one_row_exactly() {
     }
 }
 
-/// The Q8_0 GEMV with two weight rows a subgroup (DeepSeek V4's verify
-/// rows) against the one-row-a-subgroup kernel: 2 to 8 activation rows,
-/// sets of different heights (one odd), and the grouped layout of the
-/// attention's output projection. The same products in the same task
-/// order, but the compiler associates each task's dot differently in the
-/// two kernels: equal to rounding.
+/// The Q8_0 GEMV with two weight rows a subgroup (DeepSeek V4's q_b) and
+/// the one-row-a-subgroup kernel, both against an f64 reference: 1 to 8
+/// activation rows; sets of different heights (96 and an odd 37; 1, 15, 16
+/// and 17 in one dispatch: a single row and a partial, a whole and a
+/// spilling 16-row threadgroup); blocks with negative scales; a padded
+/// output stride; and grouped inputs whose 8-row groups end inside a
+/// threadgroup. Each output within 2^-20 of the sum of its products'
+/// magnitudes (the outputs cancel heavily: random signs over 1 024 terms),
+/// and the new kernel's relative L2 error at most 1.5 times the old one's.
+/// The same products in the same task order, associated differently by the
+/// compiler (ds4_q_b_against_f64 does the same on real weights).
 #[test]
 fn gemv_r2_matches_gemv() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(87);
-    gemv_r2_case(&ctx, &mut rng, 1024, 1e-5);
-}
-
-fn gemv_r2_case(ctx: &MetalContext, rng: &mut StdRng, cols: usize, atol: f32) {
-    let mk = |rng: &mut StdRng, rows: usize| {
-        let raw = random_blocks(rng, GgmlType::Q8_0, rows * cols);
-        QWeight::from_bytes(ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap()
+    let cols = 1024;
+    let mk = |rng: &mut StdRng, rows: usize, negative: bool| {
+        let mut raw = random_blocks(rng, GgmlType::Q8_0, rows * cols);
+        if negative {
+            // Every third block's f16 scale negated.
+            for b in (0..raw.len() / 34).step_by(3) {
+                raw[b * 34 + 1] ^= 0x80;
+            }
+        }
+        let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap();
+        (w, mat(GgmlType::Q8_0, &raw, rows, cols))
     };
-    let (wa, wb) = (mk(&mut *rng, 96), mk(&mut *rng, 37));
-    let close = |a: &Tensor, b: &Tensor| {
-        assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), atol, 1e-5);
+    // Both kernels' outputs (`y_old`, `y_new`) of weight `w` against f64.
+    let check = |w: &r::Mat, x: &[f32], m: usize, l: GemvLayout, y_old: &Tensor, y_new: &Tensor| {
+        let stride = if l.y_row_stride == 0 { w.rows } else { l.y_row_stride };
+        let (yo, yn) = (y_old.to_f32().unwrap(), y_new.to_f32().unwrap());
+        let (mut e_old, mut e_new, mut norm) = (0f64, 0f64, 0f64);
+        for i in 0..m {
+            for n in 0..w.rows {
+                let xs = &x[i * l.x_row_stride + (n / l.x_group) * cols..][..cols];
+                let (mut sum, mut mag) = (0f64, 0f64);
+                for (a, b) in w.row(n).iter().zip(xs) {
+                    let t = f64::from(*a) * f64::from(*b);
+                    sum += t;
+                    mag += t.abs();
+                }
+                let (o, nw) = (f64::from(yo[i * stride + n]), f64::from(yn[i * stride + n]));
+                let bound = mag * 2f64.powi(-20);
+                assert!((o - sum).abs() <= bound, "old ({i}, {n}): {o} vs {sum} (bound {bound})");
+                assert!((nw - sum).abs() <= bound, "new ({i}, {n}): {nw} vs {sum} (bound {bound})");
+                e_old += (o - sum).powi(2);
+                e_new += (nw - sum).powi(2);
+                norm += sum * sum;
+            }
+        }
+        let (e_old, e_new) = ((e_old / norm).sqrt(), (e_new / norm).sqrt());
+        assert!(e_new <= 1.5 * e_old + 1e-12, "relative L2: new {e_new:e}, old {e_old:e}");
     };
-    for m in 1..=8 {
-        let x = tensor(ctx, &f32s(&mut *rng, m * cols, -2.0, 2.0));
-        let (ya, yb) = (zeros(ctx, m * 96), zeros(ctx, m * 37));
-        let (za, zb) = (zeros(ctx, m * 96), zeros(ctx, m * 37));
-        run(ctx, |p| {
-            gemv_sets(ctx, p, &[(&wa, &ya), (&wb, &yb)], &x, m).unwrap();
-            gemv_sets_r2(ctx, p, &[(&wa, &za), (&wb, &zb)], &x, m).unwrap();
-        });
-        close(&za, &ya);
-        close(&zb, &yb);
+    let sets: Vec<Vec<(QWeight, r::Mat)>> = vec![
+        vec![mk(&mut rng, 96, true), mk(&mut rng, 37, false)],
+        [1, 15, 16, 17].iter().map(|&r| mk(&mut rng, r, false)).collect(),
+    ];
+    for ws in &sets {
+        for m in 1..=8 {
+            let x = f32s(&mut rng, m * cols, -2.0, 2.0);
+            let tx = tensor(&ctx, &x);
+            let ys: Vec<(Tensor, Tensor)> = ws
+                .iter()
+                .map(|(w, _)| (zeros(&ctx, m * w.rows), zeros(&ctx, m * w.rows)))
+                .collect();
+            let a: Vec<(&QWeight, &Tensor)> = ws.iter().zip(&ys).map(|((w, _), y)| (w, &y.0)).collect();
+            let b: Vec<(&QWeight, &Tensor)> = ws.iter().zip(&ys).map(|((w, _), y)| (w, &y.1)).collect();
+            run(&ctx, |p| {
+                gemv_sets(&ctx, p, &a, &tx, m).unwrap();
+                gemv_sets_r2(&ctx, p, &b, &tx, m).unwrap();
+            });
+            for ((w, cpu), (y, z)) in ws.iter().zip(&ys) {
+                let l = GemvLayout { x_group: w.rows, x_row_stride: cols, y_row_stride: 0 };
+                check(cpu, &x, m, l, y, z);
+            }
+        }
     }
-    // Grouped: 4 groups of 32 weight rows, each over its own 1024 inputs.
-    let (groups, per) = (4, 32);
-    let wg = mk(&mut *rng, groups * per);
-    let m = 6;
-    let x = tensor(ctx, &f32s(&mut *rng, m * groups * cols, -2.0, 2.0));
-    let l = GemvLayout { x_group: per, x_row_stride: groups * cols, y_row_stride: groups * per };
-    let (y, z) = (zeros(ctx, m * groups * per), zeros(ctx, m * groups * per));
-    run(ctx, |p| {
-        gemv_with(ctx, p, &wg, &x, &y, m, l).unwrap();
-        gemv_with_r2(ctx, p, &wg, &x, &z, m, l).unwrap();
+    // A padded output stride: 40 rows written 45 apart.
+    let (w, cpu) = mk(&mut rng, 40, true);
+    let m = 3;
+    let x = f32s(&mut rng, m * cols, -2.0, 2.0);
+    let tx = tensor(&ctx, &x);
+    let l = GemvLayout { x_group: 40, x_row_stride: cols, y_row_stride: 45 };
+    let (y, z) = (zeros(&ctx, m * 45), zeros(&ctx, m * 45));
+    run(&ctx, |p| {
+        gemv_with(&ctx, p, &w, &tx, &y, m, l).unwrap();
+        gemv_with_r2(&ctx, p, &w, &tx, &z, m, l).unwrap();
     });
-    close(&z, &y);
+    check(&cpu, &x, m, l, &y, &z);
+    // Grouped: 6 groups of 8 weight rows, each over its own 1024 inputs (a
+    // 16-row threadgroup takes two groups).
+    let (groups, per) = (6, 8);
+    let (wg, cpu) = mk(&mut rng, groups * per, false);
+    let m = 6;
+    let x = f32s(&mut rng, m * groups * cols, -2.0, 2.0);
+    let tx = tensor(&ctx, &x);
+    let l = GemvLayout { x_group: per, x_row_stride: groups * cols, y_row_stride: groups * per };
+    let (y, z) = (zeros(&ctx, m * groups * per), zeros(&ctx, m * groups * per));
+    run(&ctx, |p| {
+        gemv_with(&ctx, p, &wg, &tx, &y, m, l).unwrap();
+        gemv_with_r2(&ctx, p, &wg, &tx, &z, m, l).unwrap();
+    });
+    check(&cpu, &x, m, l, &y, &z);
 }
 
 #[test]
@@ -3704,6 +3762,81 @@ fn gemm_small_timing() {
                 best * 1e6,
                 bytes / best / 1e9
             );
+        }
+    }
+}
+
+/// DeepSeek V4's real q_b weights (Q8_0, 32768 x 1024; layers 2, 21, 41)
+/// through the GEMV and the two-weight-rows GEMV, one and six rows, each
+/// against an f64 reference with the Q8_0 block scales applied per block:
+/// normalized inputs, and cancellation-heavy ones (large values of
+/// alternating sign with small ones). Prints each kernel's error; the new
+/// kernel's must not exceed the old one's by more than rounding noise.
+#[test]
+#[ignore = "needs LILY_DS4_GGUF"]
+fn ds4_q_b_against_f64() {
+    let path = std::env::var("LILY_DS4_GGUF").expect("LILY_DS4_GGUF");
+    let g = crate::gguf::Gguf::open(std::path::Path::new(&path)).unwrap();
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(88);
+    let (cols, rows, m) = (1024usize, 32768usize, 6usize);
+    for layer in [2, 21, 41] {
+        let t = g.require(&format!("blk.{layer}.attn_q_b.weight")).unwrap();
+        assert_eq!((t.ty, t.row_len(), t.rows()), (GgmlType::Q8_0, cols, rows));
+        let raw = g.read_bytes(t.offset, t.bytes as usize).unwrap();
+        let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap();
+        for (label, x) in [
+            ("normalized", f32s(&mut rng, m * cols, -1.7, 1.7)),
+            (
+                "cancelling",
+                (0..m * cols)
+                    .map(|i| {
+                        let sign = if i % 4 == 0 { 1.0 } else { -1.0 };
+                        if i % 2 == 0 { sign * rng.gen_range(20.0..30.0) } else { rng.gen_range(-0.01..0.01) }
+                    })
+                    .collect(),
+            ),
+        ] {
+            // f64 reference: per row, per 32-value block d * sum(q x).
+            let mut want = vec![0f64; m * rows];
+            for n in 0..rows {
+                let row = &raw[n * t.row_bytes()..(n + 1) * t.row_bytes()];
+                for b in 0..cols / 32 {
+                    let blk = &row[b * 34..(b + 1) * 34];
+                    let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f64();
+                    for i in 0..m {
+                        let xs = &x[i * cols + b * 32..i * cols + b * 32 + 32];
+                        let s: f64 =
+                            blk[2..].iter().zip(xs).map(|(&q, &v)| f64::from(q as i8) * f64::from(v)).sum();
+                        want[i * rows + n] += d * s;
+                    }
+                }
+            }
+            let tx = tensor(&ctx, &x);
+            for rows_in in [1usize, m] {
+                let (old, new) = (zeros(&ctx, rows_in * rows), zeros(&ctx, rows_in * rows));
+                run(&ctx, |p| {
+                    gemv_sets(&ctx, p, &[(&w, &old)], &tx, rows_in).unwrap();
+                    gemv_sets_r2(&ctx, p, &[(&w, &new)], &tx, rows_in).unwrap();
+                });
+                let err = |y: &Tensor| {
+                    let y = y.to_f32().unwrap();
+                    let (mut d2, mut n2, mut mx) = (0f64, 0f64, 0f64);
+                    for (a, b) in y.iter().zip(&want[..rows_in * rows]) {
+                        let e = f64::from(*a) - b;
+                        d2 += e * e;
+                        n2 += b * b;
+                        mx = mx.max(e.abs());
+                    }
+                    ((d2 / n2).sqrt(), mx)
+                };
+                let (eo, mo) = err(&old);
+                let (en, mn) = err(&new);
+                println!(
+                    "q_b layer {layer:2} {label:10} rows {rows_in}: rel L2 old {eo:.3e} new {en:.3e}, max abs old {mo:.3e} new {mn:.3e}"
+                );
+                assert!(en <= 1.5 * eo + 1e-9, "layer {layer} {label} rows {rows_in}: {en} vs {eo}");
+            }
         }
     }
 }
