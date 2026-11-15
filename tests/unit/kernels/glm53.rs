@@ -2545,10 +2545,11 @@ fn moe_grouped_case(used: usize) {
     }
 }
 
-/// The register path of short runs' experts ([`moe_grouped_dot`]): a sparse
-/// selection (40 experts, 6 and 9 rows of 8 slots: experts with one, two
-/// and more rows, so both paths) against the per-pair f32 kernels, at least
-/// as close as the bfloat tiles ([`moe_grouped`]), for 8 and 6 slots.
+/// The register path of short runs' experts ([`moe_grouped_dot`]) on a
+/// sparse selection (40 experts; 6, 9 and 7 rows: experts of one to three
+/// rows, all on the register path) against the per-pair f32 kernels, at
+/// least as close as the bfloat tiles ([`moe_grouped`]), for 8 and 6 slots.
+/// The route boundaries are `moe_grouped_dot_route_boundaries`'.
 #[test]
 fn moe_grouped_dot_matches_per_pair_kernels() {
     let ctx = ctx();
@@ -2639,6 +2640,185 @@ fn moe_grouped_dot_matches_per_pair_kernels() {
             err[1],
             err[0]
         );
+    }
+}
+
+/// The register path's route boundaries ([`moe_grouped_dot`]) with
+/// controlled expert occupancies: single-tile experts of 1, 2, 3 and 4 rows
+/// take it, one of 5 rows does not, nor do experts split over tiles whose
+/// last tile has 1 to 4 rows (64 + 1..4 with 64-row tiles, 128 + 1..4 with
+/// 128-row tiles), nor full 64-row fillers. Per pair, the gate/up output
+/// (`mid`) and the down output of an expert on the register path differ
+/// from the tile route's and are at least as close to the per-pair f32
+/// kernels; every other expert's are the tile route's bit for bit. Two runs
+/// give the same bits. Unclamped and clamped (10) SwiGLU.
+#[test]
+fn moe_grouped_dot_route_boundaries() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(81);
+    let (hidden, ff, used, m) = (512usize, 256usize, 8usize, 140usize);
+    // Experts 0-4: 1..5 rows; 5-8: 65..68; 9-12: 129..132; then fillers.
+    let mut occ: Vec<usize> = vec![1, 2, 3, 4, 5, 65, 66, 67, 68, 129, 130, 131, 132];
+    let mut left = m * used - occ.iter().sum::<usize>();
+    while left > 0 {
+        let c = left.min(64);
+        occ.push(c);
+        left -= c;
+    }
+    let experts = occ.len();
+    // Pairs of an expert go to consecutive rows (mod m): no row repeats an
+    // expert (every count <= m), and every row gets `used` pairs.
+    let mut rows: Vec<Vec<u32>> = vec![Vec::new(); m];
+    let mut cursor = 0;
+    for (e, &c) in occ.iter().enumerate() {
+        for _ in 0..c {
+            rows[cursor % m].push(e as u32);
+            cursor += 1;
+        }
+    }
+    assert!(rows.iter().all(|r| r.len() == used), "rows of {used} slots");
+    let sel: Vec<u32> = rows.concat();
+    let mut count = vec![0usize; experts];
+    for &e in &sel {
+        count[e as usize] += 1;
+    }
+    assert_eq!(count, occ, "occupancies as built");
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+    let shared = f32s(&mut rng, m * hidden, -1.0, 1.0);
+    let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+    for limit in [0.0f32, 10.0] {
+        // The per-pair f32 kernels: mid and the routed sum plus shared.
+        let mid_ref = zeros(&ctx, m * used * ff);
+        let out_ref = tensor(&ctx, &shared);
+        run(&ctx, |p| {
+            moe_gate_up(
+                &ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid_ref, m, used, limit,
+            )
+            .unwrap();
+            moe_down(
+                &ctx,
+                p,
+                &dw,
+                hidden,
+                &mid_ref,
+                &tsel,
+                Some(&out_ref),
+                &out_ref,
+                m,
+                used,
+            )
+            .unwrap();
+        });
+        let mid_ref = mid_ref.to_f32().unwrap();
+        let out_ref = out_ref.to_f32().unwrap();
+        for (tile_rows, tiles) in [(64usize, MoeTiles::R64), (128, MoeTiles::R128)] {
+            let route = |dot: usize| {
+                let out = tensor(&ctx, &shared);
+                run(&ctx, |p| {
+                    moe_grouped_with(
+                        &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs,
+                        m, used, experts, limit, true, tiles, dot,
+                    )
+                    .unwrap()
+                });
+                (
+                    gs.mid.to_f32().unwrap(),
+                    gs.down.to_f32().unwrap(),
+                    out.to_f32().unwrap(),
+                )
+            };
+            let tiles = route(0);
+            let dot = route(MOE_DOT_ROWS);
+            let again = route(MOE_DOT_ROWS);
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&dot.0), bits(&again.0), "mid repeat, tiles {tile_rows}");
+            assert_eq!(bits(&dot.2), bits(&again.2), "out repeat, tiles {tile_rows}");
+            // Routed sums against the f32 kernels, both routes.
+            let scale = (out_ref.iter().map(|v| v * v).sum::<f32>()
+                / out_ref.len() as f32)
+                .sqrt();
+            // Unclamped, the tiles' worst element is ~3.1% of the RMS, the
+            // register path's ~2.3% (bfloat inputs and intermediate).
+            for (k, ((a, b), r)) in tiles.2.iter().zip(&dot.2).zip(&out_ref).enumerate()
+            {
+                assert!(
+                    (a - r).abs() <= 4e-2 * scale,
+                    "limit {limit} tiles {tile_rows} out {k}"
+                );
+                assert!(
+                    (b - r).abs() <= 4e-2 * scale,
+                    "limit {limit} dot {tile_rows} out {k}"
+                );
+            }
+            let mut err = [0f64; 2];
+            for (pair, &e) in sel.iter().enumerate() {
+                let c = occ[e as usize];
+                let on_dot = c <= MOE_DOT_ROWS && c <= tile_rows;
+                let (mr, mt, md) = (
+                    &mid_ref[pair * ff..(pair + 1) * ff],
+                    &tiles.0[pair * ff..(pair + 1) * ff],
+                    &dot.0[pair * ff..(pair + 1) * ff],
+                );
+                let (dt, dd) = (
+                    &tiles.1[pair * hidden..(pair + 1) * hidden],
+                    &dot.1[pair * hidden..(pair + 1) * hidden],
+                );
+                if on_dot {
+                    assert_ne!(
+                        bits(mt),
+                        bits(md),
+                        "expert {e} ({c} rows) took the tiles"
+                    );
+                    assert_ne!(
+                        bits(dt),
+                        bits(dd),
+                        "expert {e} ({c} rows) down took the tiles"
+                    );
+                    let ms = (mr.iter().map(|v| v * v).sum::<f32>() / ff as f32).sqrt();
+                    // mid is bfloat: half a bfloat step of the value plus the
+                    // inputs' bfloat rounding over the row. (The tiles round
+                    // every weight too: their worst element is a few times
+                    // that, compared in aggregate below.)
+                    for (j, ((t, d), r)) in mt.iter().zip(md).zip(mr).enumerate() {
+                        let tol = r.abs() / 128.0 + 2e-2 * ms + 1e-6;
+                        assert!(
+                            (d - r).abs() <= tol,
+                            "limit {limit} expert {e} pair {pair} mid {j}: {d} vs {r}"
+                        );
+                        err[0] += f64::from(t - r).powi(2);
+                        err[1] += f64::from(d - r).powi(2);
+                    }
+                } else {
+                    assert_eq!(
+                        bits(mt),
+                        bits(md),
+                        "expert {e} ({c} rows) mid, tiles {tile_rows}"
+                    );
+                    assert_eq!(
+                        bits(dt),
+                        bits(dd),
+                        "expert {e} ({c} rows) down, tiles {tile_rows}"
+                    );
+                }
+            }
+            assert!(
+                err[1] <= err[0],
+                "limit {limit} tiles {tile_rows}: register path mid error {} above tiles' {}",
+                err[1],
+                err[0]
+            );
+        }
     }
 }
 
