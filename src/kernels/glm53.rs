@@ -348,7 +348,8 @@ pub fn gemm_with(
 }
 
 /// [`gemm`] over `xb`, the input's rows as bfloat ([`to_bf16`]'s rounding:
-/// the results are [`gemm`]'s bit for bit) for Q8_0 and Q4_K weights: the
+/// the results are [`gemm`]'s bit for bit) for Q8_0, Q4_K, Q5_K and Q6_K
+/// weights: the
 /// f32 kernel rounds every element in every column tile (about a third of
 /// a 1 024-row call; 2026-11-14).
 pub fn gemm_bx(
@@ -393,6 +394,8 @@ pub fn gemm_bx_with(
         GgmlType::Q8_0 => "glm53_gemm_q8_0_bx",
         GgmlType::Q4K => "glm53_gemm_q4_k_bx",
         GgmlType::F16 => "glm53_gemm_f16_bx",
+        GgmlType::Q5K => "glm53_gemm_q5_k_bx",
+        GgmlType::Q6K => "glm53_gemm_q6_k_bx",
         other => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
     };
     gemm_any(ctx, pass, w, xb, y, m, n, l, name, GEMM_BX_ROWS, GEMM_BX_THREADS)
@@ -406,12 +409,14 @@ const GEMM_BX_THREADS: usize = 256;
 
 /// Whether [`gemm_bx`] takes weights of this type.
 pub fn gemm_bx_takes(w: &QWeight) -> bool {
-    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K) && w.cols.is_multiple_of(8)
+    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
+        && w.cols.is_multiple_of(8)
 }
 
 /// Whether [`gemm_bx_with`] takes weights of this type (F16 too).
 pub fn gemm_bx_with_takes(w: &QWeight) -> bool {
-    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::F16) && w.cols.is_multiple_of(8)
+    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::F16)
+        && w.cols.is_multiple_of(8)
 }
 
 /// `out` = the first `n` values of `x` as bfloat (rounded to nearest even),

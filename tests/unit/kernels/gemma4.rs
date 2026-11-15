@@ -51,6 +51,7 @@ fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
                 put(blk, 0, rng.gen_range(0.001..0.01));
                 put(blk, 2, rng.gen_range(0.001..0.01));
             }
+            GgmlType::Q6K => put(blk, 208, rng.gen_range(0.0001..0.001)),
             other => panic!("no random {other:?} blocks"),
         }
     }
@@ -698,5 +699,43 @@ fn gemv_wide_q5_k_matches_cpu() {
         let expected: Vec<f32> =
             (0..rows).map(|r| dot(&wf[r * cols..(r + 1) * cols], &xv)).collect();
         assert_close(&y.to_f32().unwrap(), &expected, 1e-4, 1e-4);
+    }
+}
+
+/// The bfloat-input GEMM over Gemma's Q5_K and Q6_K weights against the
+/// f32-input one, bit for bit: rows inside and across 256-row tiles,
+/// partial column tiles, inputs at bfloat rounding ties.
+#[test]
+fn gemm_bx_q5_k_q6_k_match_gemm() {
+    use crate::kernels::glm53::{gemm, gemm_bx, to_bf16};
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(73);
+    for (ty, cols, rows, m) in [
+        (GgmlType::Q5K, 512usize, 72usize, 65usize),
+        (GgmlType::Q5K, 256, 100, 256),
+        (GgmlType::Q5K, 512, 40, 513),
+        (GgmlType::Q6K, 256, 72, 70),
+        (GgmlType::Q6K, 512, 136, 257),
+    ] {
+        let raw = random_blocks(&mut rng, ty, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+        let mut x = f32s(&mut rng, m * cols, -3.0, 3.0);
+        for v in x.iter_mut().step_by(5) {
+            *v = f32::from_bits((v.to_bits() & 0xffff_0000) | 0x8000);
+        }
+        let tx = tensor(&ctx, &x);
+        let xb = Tensor::zeros(&ctx, &[m * cols], DType::BF16).unwrap();
+        let (y, yb) = (zeros(&ctx, m * rows), zeros(&ctx, m * rows));
+        run(&ctx, |p| {
+            gemm(&ctx, p, &w, &tx, &y, m).unwrap();
+            to_bf16(&ctx, p, &tx, &xb, m * cols).unwrap();
+            p.memory_barrier().unwrap();
+            gemm_bx(&ctx, p, &w, &xb, &yb, m).unwrap();
+        });
+        let (a, b) = (y.to_f32().unwrap(), yb.to_f32().unwrap());
+        assert!(
+            a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+            "{ty:?} {rows} x {cols}, {m} rows"
+        );
     }
 }

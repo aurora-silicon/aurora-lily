@@ -335,6 +335,8 @@ pub struct Scratch {
     pub tokens: Tensor,
     pub x: Tensor,
     h: Tensor,
+    /// BF16: a prompt run's projection input (the bfloat-input GEMMs').
+    xb: Tensor,
     q: Tensor,
     kv: Tensor,
     vraw: Tensor,
@@ -388,6 +390,11 @@ impl Scratch {
             tokens: Tensor::zeros(ctx, &[m], DType::U32)?,
             x: f(m * h)?,
             h: f(m * h)?,
+            xb: Tensor::zeros(
+                ctx,
+                &[m * cfg.max_q_width().max(cfg.ff).max(h)],
+                DType::BF16,
+            )?,
             q: f(m * cfg.max_q_width())?,
             kv: f(m * cfg.max_kv_width())?,
             vraw: f(m * cfg.max_kv_width())?,
@@ -480,13 +487,28 @@ impl Gemma4Model {
         &self,
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
+        sc: &Scratch,
         sets: &[(&QWeight, &Tensor)],
         x: &Tensor,
         m: usize,
     ) -> Result<()> {
         if m > MAX_ROWS {
+            // The input once as bfloat for the weights the bfloat-input
+            // GEMM takes (the same products as the f32-input one, which
+            // rounds X in every column tile): UD-IQ2_M's 4K prompt
+            // 2115 -> 2378 tok/s, 2026-11-15.
+            let cols = sets[0].0.cols;
+            let bx = sets.iter().all(|(w, _)| w.cols == cols && k::gemm_bx_takes(w));
+            if bx {
+                k::to_bf16(ctx, pass, x, &sc.xb, m * cols)?;
+                pass.memory_barrier()?;
+            }
             for &(w, y) in sets {
-                k::gemm(ctx, pass, w, x, y, m)?;
+                if bx {
+                    k::gemm_bx(ctx, pass, w, &sc.xb, y, m)?;
+                } else {
+                    k::gemm(ctx, pass, w, x, y, m)?;
+                }
             }
             return Ok(());
         }
@@ -640,11 +662,12 @@ impl Gemma4Model {
             Some(v) => self.proj(
                 ctx,
                 pass,
+                sc,
                 &[(&l.q, &sc.q), (&l.k, &sc.kv), (v, &sc.vraw)],
                 &sc.h,
                 m,
             )?,
-            None => self.proj(ctx, pass, &[(&l.q, &sc.q), (&l.k, &sc.kv)], &sc.h, m)?,
+            None => self.proj(ctx, pass, sc, &[(&l.q, &sc.q), (&l.k, &sc.kv)], &sc.h, m)?,
         }
         pass.memory_barrier()?;
         let a = AttnShape {
@@ -692,7 +715,7 @@ impl Gemma4Model {
             MAX_ROWS,
         )?;
         pass.memory_barrier()?;
-        self.proj(ctx, pass, &[(&l.o, &sc.attn)], &sc.heads, m)?;
+        self.proj(ctx, pass, sc, &[(&l.o, &sc.attn)], &sc.heads, m)?;
         pass.memory_barrier()?;
         // The residual, and the inputs of the dense MLP, the routed
         // experts and the router.
@@ -710,8 +733,8 @@ impl Gemma4Model {
             eps,
         )?;
         pass.memory_barrier()?;
-        self.proj(ctx, pass, &[(&l.gate, &sc.g), (&l.up, &sc.u)], &sc.n1, m)?;
-        self.proj(ctx, pass, &[(&l.router, &sc.rlogits)], &sc.t, m)?;
+        self.proj(ctx, pass, sc, &[(&l.gate, &sc.g), (&l.up, &sc.u)], &sc.n1, m)?;
+        self.proj(ctx, pass, sc, &[(&l.router, &sc.rlogits)], &sc.t, m)?;
         pass.memory_barrier()?;
         g4::geglu(ctx, pass, &sc.g, &sc.u, &sc.mid, m * cfg.ff)?;
         g4::router(
@@ -726,7 +749,7 @@ impl Gemma4Model {
             cfg.n_expert_used,
         )?;
         pass.memory_barrier()?;
-        self.proj(ctx, pass, &[(&l.down, &sc.m1)], &sc.mid, m)?;
+        self.proj(ctx, pass, sc, &[(&l.down, &sc.m1)], &sc.mid, m)?;
         if m > MAX_ROWS {
             // A prompt run: grouped by expert on the matrix units.
             g4::moe_grouped(

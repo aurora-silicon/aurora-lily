@@ -18,7 +18,8 @@
 // Gemma 4's block types (glm53_quant.glsl).
 #if defined(KERNEL_glm53_gemm_q4_0) || defined(KERNEL_glm53_gemm_q5_k) || \
     defined(KERNEL_glm53_gemm_q6_k) || defined(KERNEL_glm53_gemm_iq4_nl) || \
-    defined(KERNEL_glm53_gemm_iq2_s)
+    defined(KERNEL_glm53_gemm_iq2_s) || defined(KERNEL_glm53_gemm_q5_k_bx) || \
+    defined(KERNEL_glm53_gemm_q6_k_bx)
 #define GLM53_EXT_TYPES
 #endif
 #include "common.glsl"
@@ -47,6 +48,15 @@ uint glm53_bf16_bits(float f) {
 // glm53_gemm_f16_bx: F16 weights (DeepSeek V4's compressors and indexer).
 #ifdef KERNEL_glm53_gemm_f16_bx
 #define KERNEL_glm53_gemm_f16
+#define GEMM_BX
+#endif
+// Gemma 4's Q5_K and Q6_K (glm53_gemm_q5_k_bx, _q6_k_bx).
+#ifdef KERNEL_glm53_gemm_q5_k_bx
+#define KERNEL_glm53_gemm_q5_k
+#define GEMM_BX
+#endif
+#ifdef KERNEL_glm53_gemm_q6_k_bx
+#define KERNEL_glm53_gemm_q6_k
 #define GEMM_BX
 #endif
 
