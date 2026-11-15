@@ -219,6 +219,7 @@ fn run() -> Result<()> {
     match checkpoint_model_type(&cli.model)?.as_str() {
         "qwen4_exp" => bench::<Qwen4ExpModel>(&cli),
         lily::glm53::config::ARCH => bench::<lily::glm53::Glm53Model>(&cli),
+        lily::qwen36::config::ARCH => bench::<lily::qwen36::Qwen36Model>(&cli),
         other => anyhow::bail!("unsupported model_type {other:?}"),
     }
 }
