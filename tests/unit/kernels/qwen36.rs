@@ -732,3 +732,20 @@ fn router_sg_matches_router_bitwise() {
         assert_eq!(a.to_bits(), b.to_bits(), "weight {i}: {a} vs {b}");
     }
 }
+
+/// The K-split Q8_0 GEMV of rows of 4096 against GLM's (sums regrouped).
+#[test]
+fn gemv_q8_0_k4096_matches_glm53() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(87);
+    let (cols, rows) = (4096, 2048);
+    let raw = random_blocks(&mut rng, GgmlType::Q8_0, rows * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap();
+    let x = tensor(&ctx, &f32s(&mut rng, cols, -2.0, 2.0));
+    let (a, b) = (zeros(&ctx, rows, DType::F32), zeros(&ctx, rows, DType::F32));
+    run(&ctx, |p| {
+        gemv_q8_0_k4096(&ctx, p, &w, &x, &a).unwrap();
+        crate::kernels::glm53::gemv(&ctx, p, &w, &x, &b, 1).unwrap();
+    });
+    assert_close(&a.to_f32().unwrap(), &b.to_f32().unwrap(), 1e-5, 1e-5);
+}

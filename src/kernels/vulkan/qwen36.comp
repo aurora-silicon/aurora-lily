@@ -947,3 +947,48 @@ void main() {
     }
 }
 #endif
+// ---------------------------------------------------------------------------
+// glm53_gemv_q8_0_m1 for rows of K = 4096 (the GDN and attention output
+// projections, 2048 rows: 256 threadgroups) with each row split over KS = 2
+// subgroups of a threadgroup, each taking half its values: twice the
+// threadgroups and half the dependent task rounds a lane. The sum
+// regrouped: each half's lanes summed, then the halves.
+// Threadgroups of 256 (8 / KS rows). Buffers: 0 x [K], 1 W, 2 y. Param: 3 N.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_qwen36_gemv_q8_0_k4096_s2
+#define KS 2u
+shared float ks_part[8];
+void main() {
+    const uint K = 4096u;
+    const uint tasks = K / GLM53_TASK;
+    const uint row_bytes = tasks * 34u;
+    const uint N = arg_u32(3);
+    const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint n = gl_WorkGroupID.x * (8u / KS) + sg / KS;
+    const uint part = sg % KS;
+    const uint64_t X = arg(0);
+    const uint64_t row = arg(1) + uint64_t(min(n, N - 1u)) * row_bytes;
+    float acc = 0.0;
+    const uint t0 = part * (tasks / KS);
+    [[unroll]] for (uint it = 0u; it < tasks / KS / 32u; it++) {
+        const uint t = t0 + lane + 32u * it;
+        const uint64_t b = row + uint64_t(t) * 34u;
+        const float d = glm53_h2f(uint(U16(b).v[0]));
+        float w[32];
+        [[unroll]] for (uint i = 0u; i < 16u; i++) {
+            const uint pair = uint(U16(b + 2u).v[i]);
+            w[2u * i] = float(int(pair << 24) >> 24);
+            w[2u * i + 1u] = float(int(pair << 16) >> 24);
+        }
+        acc += d * glm53_task_dot(w, X + 4u * uint64_t(t * GLM53_TASK));
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0u) ks_part[sg] = acc;
+    barrier();
+    if (part == 0u && lane == 0u && n < N) {
+        float total = ks_part[sg];
+        [[unroll]] for (uint p = 1u; p < KS; p++) total += ks_part[sg + p];
+        F32(arg(2)).v[n] = total;
+    }
+}
+#endif
