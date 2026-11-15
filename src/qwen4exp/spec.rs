@@ -40,7 +40,7 @@ use crate::engine::DecodeStateApi;
 use crate::kernels::elementwise::copy_words;
 use crate::kernels::gdn::{GDN_HEAD_DIM, conv_window_rollback};
 use crate::kernels::sample::{
-    SamplingParams, draft_params, draft_step, sample_draft_f32,
+    SamplingParams, draft_params, draft_step, sample_draft_f32, sample_draft_prob_f32,
 };
 use crate::kernels::spec::{
     SLOT_ACCEPTED, SLOT_KEEP, copy_row, ctrl_word, slot_block, slot_count, slot_pos,
@@ -107,6 +107,67 @@ pub(super) fn note_prompt(state: &mut DecodeState, tokens: &[u32]) {
         if tail.iter().all(|&t| in_narrow_head(t)) { 0 } else { WIDE_DRAFT_STEPS };
 }
 
+/// The draft gate: a step verifies the first proposal and the ones after
+/// it while their probability under the head is at least this (per
+/// position); the rest are dropped. A verified row costs about a fifth of a
+/// plain step (q4-xl: 2.9 ms of 14.6, the Q2 file 4.5 of 18.7), so a
+/// proposal below a third or so costs more than it returns. The first is
+/// always verified: a verify pass of one row takes other kernels, whose
+/// rounding would make the output differ from the ungated run's. Chosen on
+/// logged (probability, accepted) steps of both checkpoints over prose,
+/// code and Italian, 2026-11-15 (`lily-wt/night/q38.md`).
+/// `LILY_DRAFT_GATE=0` verifies every proposal.
+const DRAFT_MIN_PROB: [f32; MAX_DRAFTS] = [0.0, 0.4, 0.3];
+
+fn draft_gate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LILY_DRAFT_GATE").map_or(true, |v| v != "0"))
+}
+
+/// The proposals the gate keeps of `tokens` drawn with `probs`.
+fn gate_proposals(mut tokens: Vec<u32>, probs: &[f32]) -> Vec<u32> {
+    let keep = probs
+        .iter()
+        .zip(DRAFT_MIN_PROB)
+        .take_while(|(p, min)| **p >= *min)
+        .count();
+    tokens.truncate(keep);
+    tokens
+}
+
+/// Proposal `i`'s draw from the head's `logits` into the spec scratch, with
+/// its probability when the step is `gated`.
+#[allow(clippy::too_many_arguments)]
+fn draft_draw(
+    ctx: &MetalContext,
+    pass: &crate::metal::ComputePass<'_>,
+    logits: &Tensor,
+    s: &Scratch,
+    sp: &super::model::SpecScratch,
+    params: &SamplingParams,
+    step: usize,
+    i: usize,
+    gated: bool,
+) -> Result<()> {
+    let out = sp.draft_tokens.view(i, &[1])?;
+    if !gated {
+        let dist = sp.dists.slot(i)?;
+        return sample_draft_f32(ctx, pass, logits, &s.sampler, params, step, &out, &dist);
+    }
+    sample_draft_prob_f32(
+        ctx,
+        pass,
+        logits,
+        &s.sampler,
+        params,
+        step,
+        &out,
+        &sp.dists.slot(i)?,
+        &sp.draft_probs.view(i, &[1])?,
+        &sp.prob_sums,
+    )
+}
+
 /// `w`'s rows `[start, start + rows)`.
 fn head_rows(w: &LinearWeights, start: usize, rows: usize) -> Result<LinearWeights> {
     Ok(match w {
@@ -163,6 +224,16 @@ pub(super) struct SpecAhead {
 }
 
 impl Qwen4ExpModel {
+    /// Whether the draft gate drops proposals ([`DRAFT_MIN_PROB`]): on lily's
+    /// own checkpoints, whose verify passes of two to four rows compute every
+    /// row alike (the gate leaves the output as it was). Not on GGUF files,
+    /// whose GEMVs are a kernel per row count with their own rounding: there
+    /// it changed the tokens, and on prose cost GPU time per token
+    /// (2026-11-15).
+    fn draft_gated(&self) -> bool {
+        draft_gate() && self.config.gguf_down_cols.is_none()
+    }
+
     /// Draft tokens per step, or 0 without the head.
     pub fn max_drafts(&self) -> usize {
         if self.weights.mtp.is_some() { MAX_DRAFTS } else { 0 }
@@ -566,7 +637,11 @@ impl Qwen4ExpModel {
         if drafts == 0 {
             return Ok(Vec::new());
         }
-        Ok(sp.draft_tokens.to_u32()?[..drafts].to_vec())
+        let tokens = sp.draft_tokens.to_u32()?[..drafts].to_vec();
+        if !self.draft_gated() {
+            return Ok(tokens);
+        }
+        Ok(gate_proposals(tokens, &sp.draft_probs.to_f32()?[..drafts]))
     }
 
     /// Waits for the committed draft pass of `pending`'s step and reads its
@@ -598,7 +673,11 @@ impl Qwen4ExpModel {
             return Ok(Vec::new());
         }
         let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("no spec scratch"))?;
-        Ok(sp.draft_tokens.to_u32()?[..drafts].to_vec())
+        let tokens = sp.draft_tokens.to_u32()?[..drafts].to_vec();
+        if !self.draft_gated() {
+            return Ok(tokens);
+        }
+        Ok(gate_proposals(tokens, &sp.draft_probs.to_f32()?[..drafts]))
     }
 
     /// Encodes the draft pass that follows a verify pass of `m` rows at
@@ -766,15 +845,16 @@ impl Qwen4ExpModel {
                     state.wide_drafts > 0,
                 )?;
                 let out = sp.draft_tokens.view(i, &[1])?;
-                sample_draft_f32(
+                draft_draw(
                     ctx,
                     &pass,
                     &logits,
-                    &s.sampler,
+                    s,
+                    sp,
                     &head_params,
                     draft_step(draw0 + i),
-                    &out,
-                    &sp.dists.slot(i)?,
+                    i,
+                    self.draft_gated(),
                 )?;
                 pass.level_barrier(&[&sp.draft_tokens])?;
                 if i + 1 < chain {
@@ -929,15 +1009,16 @@ impl Qwen4ExpModel {
                         state.wide_drafts > 0,
                     )?;
                     let out = sp.draft_tokens.view(i, &[1])?;
-                    sample_draft_f32(
+                    draft_draw(
                         ctx,
                         &pass,
                         &logits,
-                        &s.sampler,
+                        s,
+                        sp,
                         &head_params,
                         draft_step(draw0 + i),
-                        &out,
-                        &sp.dists.slot(i)?,
+                        i,
+                        self.draft_gated(),
                     )?;
                     pass.level_barrier(&[&sp.draft_tokens])?;
                     if i + 1 < drafts {

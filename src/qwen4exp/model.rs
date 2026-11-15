@@ -1248,6 +1248,10 @@ pub(super) struct SpecScratch {
     /// F32 `[vocab]`: the draft head's logits from its narrow LM head
     /// (`spec.rs`, `DRAFT_LOW_ROWS`); the ids it leaves out stay -inf.
     pub(super) draft_logits: Option<Tensor>,
+    /// F32 `[MAX_DRAFTS]`: each proposal's probability under the head (the
+    /// draft gate's input), and the argmax's partial sums behind it.
+    pub(super) draft_probs: Tensor,
+    pub(super) prob_sums: Tensor,
     /// U32 `[MAX_DRAFTS + 1]`: the trunk's draw per verified row.
     pub(super) verify_tokens: Tensor,
     /// U32 `[MAX_DRAFTS]`: the draft head's proposals.
@@ -1302,6 +1306,12 @@ impl SpecScratch {
                     )
                 })
                 .transpose()?,
+            draft_probs: Tensor::zeros(ctx, &[MAX_DRAFTS], DType::F32)?,
+            prob_sums: Tensor::zeros(
+                ctx,
+                &[crate::kernels::elementwise::ARGMAX_GROUPS],
+                DType::F32,
+            )?,
             verify_tokens: Tensor::zeros(ctx, &[rows], DType::U32)?,
             draft_tokens: Tensor::zeros(ctx, &[MAX_DRAFTS], DType::U32)?,
             dists: DraftDists::new(ctx, MAX_DRAFTS)?,
