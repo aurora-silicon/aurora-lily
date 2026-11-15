@@ -2343,6 +2343,11 @@ fn gemm_bx_matches_gemm() {
         (GgmlType::Q4K, 512, 136, 1024),
         (GgmlType::F16, 256, 72, 255),
         (GgmlType::F16, 512, 100, 513),
+        // Short runs over 8 192 weight rows (four-subgroup tiles), and
+        // their edge at 128 and 129 rows.
+        (GgmlType::Q8_0, 256, 8192, 24),
+        (GgmlType::Q4K, 256, 8200, 128),
+        (GgmlType::Q8_0, 256, 8192, 129),
     ] {
         let raw = random_blocks(&mut rng, ty, rows * cols);
         let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
@@ -3121,5 +3126,55 @@ fn moe_rows_timing() {
             line += &format!("  {name} {:6.1} us", best / repeat as f64 * 1e6);
         }
         println!("{line}");
+    }
+}
+
+/// The dense bfloat-input GEMM at a short prompt's rows (`LILY_GLM53_ROWS`,
+/// default 8,24,64): us a call, eight calls a pass (independent: they
+/// overlap as a level's do).
+#[test]
+#[ignore = "timing only"]
+fn gemm_small_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(74);
+    let rows_list: Vec<usize> = std::env::var("LILY_GLM53_ROWS")
+        .unwrap_or_else(|_| "8,24,64".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    for (label, ty, cols, rows) in [
+        ("kda_v Q8_0 8192x4096", GgmlType::Q8_0, 4096usize, 8192usize),
+        ("kda_out Q8_0 4096x8192", GgmlType::Q8_0, 8192, 4096),
+        ("kda_q Q4_K 8192x4096", GgmlType::Q4K, 4096, 8192),
+        ("shexp Q8_0 2048x4096", GgmlType::Q8_0, 4096, 2048),
+    ] {
+        let ws: Vec<QWeight> = (0..4)
+            .map(|_| {
+                let raw = random_blocks(&mut rng, ty, rows * cols);
+                QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+            })
+            .collect();
+        let bytes = ws[0].t.byte_len() as f64;
+        for &m in &rows_list {
+            let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
+            let xb = Tensor::zeros(&ctx, &[m * cols], DType::BF16).unwrap();
+            run(&ctx, |p| to_bf16(&ctx, p, &x, &xb, m * cols).unwrap());
+            let ys: Vec<Tensor> = (0..8).map(|_| zeros(&ctx, m * rows)).collect();
+            let mut best = f64::MAX;
+            for _ in 0..4 {
+                let pass = ctx.begin().unwrap();
+                for (r, y) in ys.iter().enumerate() {
+                    gemm_bx(&ctx, &pass, &ws[r % 4], &xb, y, m).unwrap();
+                }
+                let t = std::time::Instant::now();
+                pass.commit_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64() / 8.0);
+            }
+            println!(
+                "gemm small {label:24} m {m:3}: {:7.1} us {:4.0} GB/s",
+                best * 1e6,
+                bytes / best / 1e9
+            );
+        }
     }
 }

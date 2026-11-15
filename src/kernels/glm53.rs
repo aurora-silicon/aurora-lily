@@ -391,15 +391,24 @@ pub fn gemm_bx_with(
         l.ldx.is_multiple_of(8) && l.x_batch.is_multiple_of(8),
         "bfloat GEMM input layout"
     );
-    let name = match w.ty {
-        GgmlType::Q8_0 => "glm53_gemm_q8_0_bx",
-        GgmlType::Q4K => "glm53_gemm_q4_k_bx",
-        GgmlType::F16 => "glm53_gemm_f16_bx",
-        GgmlType::Q5K => "glm53_gemm_q5_k_bx",
-        GgmlType::Q6K => "glm53_gemm_q6_k_bx",
-        other => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
+    // Four subgroups a threadgroup for an unbatched short run over at least
+    // 8 192 Q8_0 or Q4_K weight rows: gemm_small_timing (eight calls
+    // overlapping, as a level's do; 2026-11-15), kda_v Q8_0 8192 x 4096 at
+    // 8 / 24 / 64 rows 270 / 276 / 307 -> 186 / 195 / 206 us, kda_q Q4_K
+    // 205 / 193 / 279 -> 182 / 185 / 200; narrower weights (4096 x 8192,
+    // 2048 x 4096) were 10-20% slower. The same products in the same order.
+    let sg4 = m <= 128 && n >= 8192 && l.batches == 1;
+    let (name, rows, threads) = match (w.ty, sg4) {
+        (GgmlType::Q8_0, false) => ("glm53_gemm_q8_0_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q4K, false) => ("glm53_gemm_q4_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q8_0, true) => ("glm53_gemm_q8_0_bx4", 128, 128),
+        (GgmlType::Q4K, true) => ("glm53_gemm_q4_k_bx4", 128, 128),
+        (GgmlType::F16, _) => ("glm53_gemm_f16_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q5K, _) => ("glm53_gemm_q5_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q6K, _) => ("glm53_gemm_q6_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (other, _) => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
     };
-    gemm_any(ctx, pass, w, xb, y, m, n, l, name, GEMM_BX_ROWS, GEMM_BX_THREADS)
+    gemm_any(ctx, pass, w, xb, y, m, n, l, name, rows, threads)
 }
 
 /// Rows of X a threadgroup of the bfloat-input GEMM takes (the kernel's

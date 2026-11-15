@@ -59,6 +59,19 @@ uint glm53_bf16_bits(float f) {
 #define KERNEL_glm53_gemm_q6_k
 #define GEMM_BX
 #endif
+// The _bx4 forms: four subgroups a threadgroup (128 rows of X, a thread
+// decoding 4 weight rows a step), the same products in the same order:
+// short runs over wide weights (gemm_bx).
+#ifdef KERNEL_glm53_gemm_q8_0_bx4
+#define KERNEL_glm53_gemm_q8_0
+#define GEMM_BX
+#define GM_BX_SG 4
+#endif
+#ifdef KERNEL_glm53_gemm_q4_k_bx4
+#define KERNEL_glm53_gemm_q4_k
+#define GEMM_BX
+#define GM_BX_SG 4
+#endif
 
 // The _r128 expert variants: tiles of up to 128 rows, a subgroup taking 32
 // (moe_group's cap set to match). A row's sums are the same products in
@@ -279,7 +292,9 @@ void gd_decode8(uint64_t row, uint k, out float w[8]) {
 #define GM_BX_SUB 32u
 // Subgroups a threadgroup: 4 (a thread decodes 8 values of 4 weight rows a
 // step) or 8 (of 2 rows).
+#ifndef GM_BX_SG
 #define GM_BX_SG 8
+#endif
 void main() {
     const uint M = arg_u32(3);
     const uint N = arg_u32(4);
