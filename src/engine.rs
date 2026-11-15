@@ -382,6 +382,11 @@ pub struct LoadOptions {
     /// 4-bit n-gram table is paged in place of the file's BF16 one
     /// (`--ngram-checkpoint`; `LILY_NGRAM_TABLE` when `None`).
     pub ngram_checkpoint: Option<std::path::PathBuf>,
+    /// Snapshots one server session may hold: its prompt checkpoints, plus
+    /// its decode checkpoints when those are on. Gemma 4 fits the context
+    /// of `memory_limit` around them; `None` (the bench, the tools) means
+    /// the server's defaults.
+    pub session_checkpoints: Option<usize>,
 }
 
 /// Which draw a decode pass ends with.

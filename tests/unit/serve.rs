@@ -479,6 +479,7 @@ fn warm_up_on_load_and_reload() {
         session_context: None,
         kv_format: Default::default(),
         ngram_checkpoint: None,
+        session_checkpoints: None,
     };
     for round in ["load", "reload"] {
         let ctx = MetalContext::new().expect("metal");

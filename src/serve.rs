@@ -308,6 +308,9 @@ pub struct ServeOptions {
     /// tokens, so a next prompt that diverges inside the answer resumes
     /// near the divergence (0 disables).
     pub decode_checkpoint_tokens: usize,
+    /// Prompt-end checkpoints a session keeps, at most
+    /// [`CHECKPOINTS_PER_SESSION`].
+    pub checkpoints_per_session: usize,
     pub thinking: bool,
     pub reasoning_effort: Option<String>,
     /// The thinking controls' defaults for chat requests
@@ -981,6 +984,14 @@ impl<M: LanguageModel> Engine<M> {
                     kv_format: options.kv_format.unwrap_or_default(),
                 }),
                 kv_format: options.kv_format.unwrap_or_default(),
+                session_checkpoints: Some(
+                    options.checkpoints_per_session
+                        + if options.decode_checkpoint_tokens > 0 {
+                            DECODE_CHECKPOINTS_PER_SESSION
+                        } else {
+                            0
+                        },
+                ),
             },
         )?;
         check_memory_options(
@@ -1127,8 +1138,9 @@ impl<M: LanguageModel> Engine<M> {
                 reserve as usize
             }
             (None, None) => {
-                let floor =
-                    model.cache_budget_floor().unwrap_or_else(|| budget_floor(model.kv_format()));
+                let floor = model
+                    .cache_budget_floor()
+                    .unwrap_or_else(|| budget_floor(model.kv_format()));
                 let (derived, floored) =
                     derive_cache_budget(working_set, allocated, paged, floor);
                 let (budget, limited) =
@@ -1182,9 +1194,12 @@ impl<M: LanguageModel> Engine<M> {
                  lower --max-seq or raise --cache-bytes"
             );
         }
-        let mut sessions =
-            SessionStore::new(budget, options.max_sessions, CHECKPOINTS_PER_SESSION)
-                .with_lineages(board.lineages());
+        let mut sessions = SessionStore::new(
+            budget,
+            options.max_sessions,
+            options.checkpoints_per_session,
+        )
+        .with_lineages(board.lineages());
         // A fitted --memory-limit-gb: the request's session at its largest
         // is kept free of resident ones.
         if let Some(reserve) = model.acquire_reserve() {
@@ -2401,6 +2416,11 @@ fn run_with<M: LanguageModel + 'static>(
     options: ServeOptions,
     signals: signal::Signals,
 ) -> Result<()> {
+    ensure!(
+        (1..=CHECKPOINTS_PER_SESSION).contains(&options.checkpoints_per_session),
+        "--checkpoints-per-session {}: 1 to {CHECKPOINTS_PER_SESSION}",
+        options.checkpoints_per_session
+    );
     let address = options
         .bind
         .to_socket_addrs()
