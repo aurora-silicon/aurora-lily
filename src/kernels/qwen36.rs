@@ -592,7 +592,7 @@ pub fn residual_norm(
             out.binding(),
         ],
         &[&u32_bytes(hidden), &f32_bytes(eps)],
-        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (1024, 1, 1) },
     )
 }
 
@@ -643,7 +643,7 @@ pub fn rmsnorm(
             out.binding(),
         ],
         &[&u32_bytes(hidden), &f32_bytes(eps)],
-        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (1024, 1, 1) },
     )
 }
 

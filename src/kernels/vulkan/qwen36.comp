@@ -501,18 +501,19 @@ void main() {
 // glm53_add (x += a) then glm53_rmsnorm, qwen36_ffn_residual_norm
 // qwen36_ffn_residual (x += a + shared * sigmoid(g)) then glm53_rmsnorm, in
 // their arithmetic: out = (x * inversesqrt(sum x^2 / H + eps)) * w, the sum
-// in glm53_rmsnorm's order; qwen36_rmsnorm_h2048 is glm53_rmsnorm alone.
-// One threadgroup of 256 a row, H = 2048. Grid (m). Buffers: 0 x [m][H]
-// (updated), 1 a [m][H], 2 shared [m][H], 3 g [m], 4 w [H], 5 out [m][H].
-// Params: 6 H, 7 eps.
+// glm53_rmsnorm's way (a thread's values, then the subgroups' sums);
+// qwen36_rmsnorm_h2048 is glm53_rmsnorm alone. One threadgroup of 1024 a
+// row (256 measured 5.9 us a level, 1024 4.3, the same bits), H = 2048.
+// Grid (m). Buffers: 0 x [m][H] (updated), 1 a [m][H], 2 shared [m][H],
+// 3 g [m], 4 w [H], 5 out [m][H]. Params: 6 H, 7 eps.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_qwen36_add_norm) || defined(KERNEL_qwen36_ffn_residual_norm) || \
     defined(KERNEL_qwen36_rmsnorm_h2048)
-shared float red[8];
+shared float red[32];
 void main() {
-    // Rows of 2048: a thread's 8 values have compile-time indices, so all
-    // its loads are in flight at once (a runtime loop waits for each
-    // iteration's load: glm53_rmsnorm's 8 round trips were most of its
+    // Rows of 2048, 1024 threads: a thread's 2 values have compile-time
+    // indices, so its loads are in flight at once (a runtime loop waits for
+    // each iteration's load: glm53_rmsnorm's 8 round trips were most of its
     // time at one row).
     const uint n = 2048u;
     const float eps = arg_f32(7);
@@ -520,15 +521,15 @@ void main() {
     const uint tid = gl_LocalInvocationIndex;
     F32 X = F32(arg(0) + 4u * uint64_t(i) * n);
     F32 O = F32(arg(5) + 4u * uint64_t(i) * n);
-    float v[8];
+    float v[2];
 #if defined(KERNEL_qwen36_rmsnorm_h2048)
-    [[unroll]] for (uint j = 0u; j < 8u; j++) v[j] = X.v[tid + 256u * j];
+    [[unroll]] for (uint j = 0u; j < 2u; j++) v[j] = X.v[tid + 1024u * j];
 #elif defined(KERNEL_qwen36_ffn_residual_norm)
     F32 A = F32(arg(1) + 4u * uint64_t(i) * n);
     F32 S = F32(arg(2) + 4u * uint64_t(i) * n);
     const float gate = qwen36_sigmoid(F32(arg(3)).v[i]);
-    [[unroll]] for (uint j = 0u; j < 8u; j++) {
-        const uint d = tid + 256u * j;
+    [[unroll]] for (uint j = 0u; j < 2u; j++) {
+        const uint d = tid + 1024u * j;
         precise float sh = S.v[d] * gate;
         precise float f = A.v[d] + sh;
         precise float x = f + X.v[d];
@@ -536,27 +537,27 @@ void main() {
     }
 #else
     F32 A = F32(arg(1) + 4u * uint64_t(i) * n);
-    [[unroll]] for (uint j = 0u; j < 8u; j++) {
-        precise float x = X.v[tid + 256u * j] + A.v[tid + 256u * j];
+    [[unroll]] for (uint j = 0u; j < 2u; j++) {
+        precise float x = X.v[tid + 1024u * j] + A.v[tid + 1024u * j];
         v[j] = x;
     }
 #endif
 #if !defined(KERNEL_qwen36_rmsnorm_h2048)
-    [[unroll]] for (uint j = 0u; j < 8u; j++) X.v[tid + 256u * j] = v[j];
+    [[unroll]] for (uint j = 0u; j < 2u; j++) X.v[tid + 1024u * j] = v[j];
 #endif
     // glm53_rmsnorm's sum: a thread's values in order, then the subgroups.
     float ss = 0.0;
-    [[unroll]] for (uint j = 0u; j < 8u; j++) ss += v[j] * v[j];
+    [[unroll]] for (uint j = 0u; j < 2u; j++) ss += v[j] * v[j];
     ss = subgroupAdd(ss);
     if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = ss;
     barrier();
-    float total = gl_SubgroupInvocationID < 8u ? red[gl_SubgroupInvocationID] : 0.0;
+    float total = red[gl_SubgroupInvocationID];
     total = subgroupAdd(total);
     const float scale = inversesqrt(total / float(n) + eps);
     F32 W = F32(arg(4));
-    [[unroll]] for (uint j = 0u; j < 8u; j++) {
+    [[unroll]] for (uint j = 0u; j < 2u; j++) {
         const float y = v[j] * scale;
-        O.v[tid + 256u * j] = y * W.v[tid + 256u * j];
+        O.v[tid + 1024u * j] = y * W.v[tid + 1024u * j];
     }
 }
 #endif
