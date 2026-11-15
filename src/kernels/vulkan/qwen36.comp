@@ -614,7 +614,8 @@ void main() {
 // 10.2 of a 1024-token prompt's 305 ms).
 // Grid threads (C, m) / (C). Buffers and params as qwen36_gdn_conv.
 // ---------------------------------------------------------------------------
-#if defined(KERNEL_qwen36_gdn_conv_rows) || defined(KERNEL_qwen36_gdn_conv_window)
+#if defined(KERNEL_qwen36_gdn_conv_rows) || defined(KERNEL_qwen36_gdn_conv_window) || \
+    defined(KERNEL_qwen36_gdn_conv_rows_prep)
 // Value k of the run's sequence: rows of `in` from 0, the window's 3 before.
 float qwen36_conv_x(F32 in_rows, F32 st, uint C, uint ch, int k) {
     return k >= 0 ? in_rows.v[uint(k) * C + ch] : st.v[uint(3 + k) * C + ch];
@@ -639,6 +640,59 @@ void main() {
     acc += x2 * w.z;
     acc += xn * w.w;
     F32(arg(3)).v[t * C + ch] = qwen36_silu(acc);
+}
+#endif
+// qwen36_gdn_conv_rows for the chunked delta rule, with
+// the chunked passes' bf16 operands from the same values (q and k
+// L2-normed, q scaled by 1 / sqrt(128), v as it is): one subgroup a
+// (head of 128 channels, row), four channels a lane, so a head's L2 norm is
+// one subgroupAdd and the operands need no level of their own (the separate
+// prepass took 1.44 ms a 2048-row step and layer). The conv's sums are
+// qwen36_gdn_conv_rows'; c is written for rows m_main.. only (the
+// token-serial tail's).
+// Grid (ceil((2 HK + H) / 8), m), 256 threads.
+// Buffers: 0-4 as qwen36_gdn_conv_rows (4 unused), 5 out bf16 [m][C].
+// Params: 6 C, 7 HK, 8 H, 9 eps, 10 m_main.
+#ifdef KERNEL_qwen36_gdn_conv_rows_prep
+void main() {
+    const uint D = 128u;
+    const uint C = arg_u32(6);
+    const uint HK = arg_u32(7);
+    const uint H = arg_u32(8);
+    const float eps = arg_f32(9);
+    const uint m_main = arg_u32(10);
+    const uint head = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    const uint t = gl_WorkGroupID.y;
+    if (head >= 2u * HK + H) return;  // a whole subgroup; no barriers below
+    const uint lane = gl_SubgroupInvocationID;
+    F32 st = F32(arg(2));
+    F32 in_rows = F32(arg(0));
+    const int ti = int(t);
+    float y[4];
+    float ss = 0.0;
+    [[unroll]] for (uint j = 0u; j < 4u; j++) {
+        const uint ch = head * D + 4u * lane + j;
+        const vec4 w = F32x4(arg(1)).v[ch];
+        const float x0 = qwen36_conv_x(in_rows, st, C, ch, ti - 3);
+        const float x1 = qwen36_conv_x(in_rows, st, C, ch, ti - 2);
+        const float x2 = qwen36_conv_x(in_rows, st, C, ch, ti - 1);
+        const float xn = in_rows.v[t * C + ch];
+        precise float acc = x0 * w.x;
+        acc += x1 * w.y;
+        acc += x2 * w.z;
+        acc += xn * w.w;
+        y[j] = qwen36_silu(acc);
+        if (t >= m_main) F32(arg(3)).v[t * C + ch] = y[j];
+        ss += y[j] * y[j];
+    }
+    float scale = 1.0;
+    if (head < 2u * HK) {
+        scale = inversesqrt(subgroupAdd(ss) + eps);
+        if (head < HK) scale *= inversesqrt(float(D));
+    }
+    [[unroll]] for (uint j = 0u; j < 4u; j++) {
+        BF16(arg(5)).v[t * C + head * D + 4u * lane + j] = bfloat16_t(y[j] * scale);
+    }
 }
 #endif
 #ifdef KERNEL_qwen36_gdn_conv_window
@@ -1095,38 +1149,5 @@ void main() {
             F32(Y).v[i * N + n] = k2_part[i][sg] + k2_part[i][sg + 1u];
         }
     }
-}
-#endif
-
-// ---------------------------------------------------------------------------
-// The chunked GDN prefill's operands (gdn_chunk_wy3_q36 / gdn_chunk_scan_q36
-// in gdn.comp): the conv's rows `c` as bf16 rows of the same layout, each q
-// head L2-normed and scaled by 1 / sqrt(128) (where qwen36_gdn_scan scales
-// its outputs), each k head L2-normed, v as it is. One threadgroup of 128 a
-// (head, row): grid (2 HK + H, m).
-// Buffers: 0 c [m][C], 1 out bf16 [m][C]. Params: 2 HK, 3 H, 4 eps.
-// ---------------------------------------------------------------------------
-#ifdef KERNEL_qwen36_gdn_chunk_prep
-shared float cp_part[4];
-void main() {
-    const uint D = 128u;
-    const uint HK = arg_u32(2);
-    const uint H = arg_u32(3);
-    const float eps = arg_f32(4);
-    const uint head = gl_WorkGroupID.x;
-    const uint t = gl_WorkGroupID.y;
-    const uint tid = gl_LocalInvocationIndex;
-    const uint i = (t * (2u * HK + H) + head) * D + tid;
-    const float x = F32(arg(0)).v[i];
-    float y = x;
-    if (head < 2u * HK) {
-        const float sum = subgroupAdd(x * x);
-        if (gl_SubgroupInvocationID == 0u) cp_part[gl_SubgroupID] = sum;
-        barrier();
-        const float total = (cp_part[0] + cp_part[1]) + (cp_part[2] + cp_part[3]);
-        y = x * inversesqrt(total + eps);
-        if (head < HK) y *= inversesqrt(float(D));
-    }
-    BF16(arg(1)).v[i] = bfloat16_t(y);
 }
 #endif

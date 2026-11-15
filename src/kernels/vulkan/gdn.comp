@@ -329,7 +329,7 @@ void main() {
 // Qwen3.6's chunked prefill (gdn_chunk_wy3_q36, gdn_chunk_scan_q36; called
 // from kernels/qwen36.rs): the same passes over its layout. Value head h
 // reads key head h % HK (Qwen3.8's: h / vpk); q, k and v are one bf16 buffer of
-// the mixed rows (q pre-scaled and q, k L2-normed: qwen36_gdn_chunk_prep),
+// the mixed rows (q pre-scaled and q, k L2-normed: qwen36_gdn_conv_rows_prep),
 // so arg(0) and arg(1) are the same rows of (2 HK + H) * DIM; the gates are
 // f32 (alpha and b [M][H], ssm_a = -exp(A_log) and dt_bias [H]); the state
 // is [H][DIM (v column)][DIM (k)], the transpose of this one; o is f32.
