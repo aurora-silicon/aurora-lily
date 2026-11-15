@@ -40,7 +40,7 @@ use crate::engine::DecodeStateApi;
 use crate::kernels::elementwise::copy_words;
 use crate::kernels::gdn::{GDN_HEAD_DIM, conv_window_rollback};
 use crate::kernels::sample::{
-    SamplingParams, draft_params, draft_step, sample_draft_f32,
+    SamplingParams, draft_params, draft_step, sample_draft_f32, sample_draft_prob_f32,
 };
 use crate::kernels::spec::{
     SLOT_ACCEPTED, SLOT_KEEP, copy_row, ctrl_word, slot_block, slot_count, slot_pos,
@@ -52,6 +52,7 @@ use crate::metal::DetachedPass;
 use crate::metal::{EncodedPass, MetalContext, PendingPass};
 use crate::moe_ffn::{prefix_rows, project_mat};
 use crate::tensor::Tensor;
+use crate::weights::{GgufLinear, LinearWeights};
 
 use super::model::{
     AttnPos, BatchMode, DecodeState, LayerState, MAX_DRAFTS, Qwen4ExpModel, Scratch,
@@ -61,6 +62,162 @@ use super::ngram::NgramHasher;
 
 fn profiling() -> bool {
     std::env::var_os("LILY_PROFILE").is_some()
+}
+
+/// GPU end time of the last draft pass (`LILY_PROFILE` only), for the gap
+/// to the verify pass after it.
+static DRAFT_GPU_END: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// The draft head's narrow LM head: Qwen3.8's ids below this and from
+/// [`DRAFT_SPECIAL_FROM`] on (the tokenizer's added tokens: turn, tool and
+/// thinking markers). On English prose, code and lily's own sources 99.8 to
+/// 100% of the tokens are among them (2026-11-15); its multilingual ids
+/// (151 643 up) are not, and Italian text draws 14% of its tokens there.
+/// The rows read per proposal drop from 248 320 to 98 580 (Q2 file: 1.2 to
+/// 0.5 ms). The trunk draws every emitted token with the whole LM head, so
+/// greedy output is unchanged; under a sampler, speculative sampling still
+/// draws from the trunk's distribution, but with other proposals a given
+/// seed may draw other tokens.
+const DRAFT_LOW_ROWS: usize = 98_304;
+const DRAFT_SPECIAL_FROM: usize = 248_044;
+const QWEN38_VOCAB: usize = 248_320;
+/// Positions after a fed token outside the narrow head during which drafts
+/// take the whole LM head: text in another script keeps drafting at full
+/// acceptance.
+const WIDE_WINDOW: usize = 96;
+
+/// Whether the checkpoint's vocabulary has the narrow draft head (Qwen3.8's).
+pub(super) fn has_narrow_head(cfg: &super::config::Qwen4ExpConfig) -> bool {
+    cfg.vocab_size == QWEN38_VOCAB
+}
+
+/// `LILY_DRAFT_HEAD=full`: the draft head always takes the whole LM head.
+pub(super) fn narrow_head_env() -> bool {
+    !std::env::var("LILY_DRAFT_HEAD").is_ok_and(|v| v == "full")
+}
+
+pub(super) fn in_narrow_head(token: u32) -> bool {
+    let t = token as usize;
+    t < DRAFT_LOW_ROWS || t >= DRAFT_SPECIAL_FROM
+}
+
+/// Which LM head the draft head takes, from the position of the last fed
+/// token outside the narrow head. A position, not a countdown, so it is the
+/// same whatever pieces the tokens were fed in (the server prefills a
+/// prompt up to its last token, then that token; a cached prefix feeds only
+/// the suffix) and it travels with a snapshot to restores and forks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DraftVocab {
+    last_wide: Option<usize>,
+}
+
+impl DraftVocab {
+    /// `tokens` fed at positions `pos0..`.
+    pub fn note(&mut self, pos0: usize, tokens: &[u32]) {
+        if let Some(i) = tokens.iter().rposition(|&t| !in_narrow_head(t)) {
+            self.last_wide = Some(pos0 + i);
+        }
+    }
+
+    /// Whether drafts at state position `pos` take the whole LM head.
+    pub fn wide(&self, pos: usize) -> bool {
+        self.last_wide.is_some_and(|at| pos < at + WIDE_WINDOW)
+    }
+
+    /// Kept for a snapshot at `pos`: nothing past it.
+    pub fn at(self, pos: usize) -> Self {
+        Self { last_wide: self.last_wide.filter(|&at| at < pos) }
+    }
+
+    /// A state read back from the disk tier, whose layout does not carry
+    /// the history: taken as if the token before `pos` were outside the
+    /// narrow head (the whole head for the first drafts, never a narrow
+    /// head the history would not have allowed).
+    pub fn after_disk_restore(pos: usize) -> Self {
+        Self { last_wide: Some(pos.saturating_sub(1)) }
+    }
+}
+
+/// The draft gate: a step verifies the first proposal and the ones after
+/// it while the head's confidence in them is at least this (per position);
+/// the rest are dropped. The confidence is a heuristic: the largest softmax
+/// probability of the head's raw logits (before a sampler's temperature or
+/// truncation), not the probability the proposal was drawn with. A
+/// verified row costs about a fifth of a plain step (q4-xl: 2.9 ms of 14.6,
+/// the Q2 file 4.5 of 18.7), so a proposal below a third or so costs more
+/// than it returns. The first is always verified: a verify pass of one row
+/// takes other kernels, whose rounding would make the output differ from
+/// the ungated run's. Greedy output is unchanged; under a sampler,
+/// speculative sampling still draws from the trunk's distribution, but a
+/// step verifying fewer rows may draw other tokens for a given seed. Chosen
+/// on logged (confidence, accepted) steps of both checkpoints over prose,
+/// code and Italian, 2026-11-15 (`lily-wt/night/q38.md`).
+const DRAFT_MIN_PROB: [f32; MAX_DRAFTS] = [0.0, 0.4, 0.3];
+
+/// `LILY_DRAFT_GATE=0` verifies every proposal. Linux only: the confidence
+/// kernels exist only in GLSL.
+pub(super) fn draft_gate_env() -> bool {
+    cfg!(target_os = "linux") && std::env::var("LILY_DRAFT_GATE").map_or(true, |v| v != "0")
+}
+
+/// The proposals the gate keeps of `tokens` drawn with `probs`.
+fn gate_proposals(mut tokens: Vec<u32>, probs: &[f32]) -> Vec<u32> {
+    let keep = probs
+        .iter()
+        .zip(DRAFT_MIN_PROB)
+        .take_while(|(p, min)| **p >= *min)
+        .count();
+    tokens.truncate(keep);
+    tokens
+}
+
+/// Proposal `i`'s draw from the head's `logits` into the spec scratch, with
+/// its probability when the step is `gated`.
+#[allow(clippy::too_many_arguments)]
+fn draft_draw(
+    ctx: &MetalContext,
+    pass: &crate::metal::ComputePass<'_>,
+    logits: &Tensor,
+    s: &Scratch,
+    sp: &super::model::SpecScratch,
+    params: &SamplingParams,
+    step: usize,
+    i: usize,
+    gated: bool,
+) -> Result<()> {
+    let out = sp.draft_tokens.view(i, &[1])?;
+    if !gated {
+        let dist = sp.dists.slot(i)?;
+        return sample_draft_f32(ctx, pass, logits, &s.sampler, params, step, &out, &dist);
+    }
+    sample_draft_prob_f32(
+        ctx,
+        pass,
+        logits,
+        &s.sampler,
+        params,
+        step,
+        &out,
+        &sp.dists.slot(i)?,
+        &sp.draft_probs.view(i, &[1])?,
+        &sp.prob_sums,
+    )
+}
+
+/// `w`'s rows `[start, start + rows)`.
+fn head_rows(w: &LinearWeights, start: usize, rows: usize) -> Result<LinearWeights> {
+    Ok(match w {
+        LinearWeights::Affine(q) => LinearWeights::Affine(q.view_rows(start, rows)?),
+        LinearWeights::Gguf(g) => {
+            ensure!(g.parts.len() == 1, "an LM head of {} parts", g.parts.len());
+            let p = &g.parts[0];
+            ensure!(start + rows <= p.rows, "rows past the LM head");
+            let mut v = p.clone();
+            v.t = p.t.view(start * p.row_bytes, &[rows * p.row_bytes])?;
+            v.rows = rows;
+            LinearWeights::Gguf(GgufLinear { parts: vec![v] })
+        }
+    })
 }
 
 /// A point of the step's host work in the backend's trace (`LILY_VK_TRACE`).
@@ -103,6 +260,29 @@ pub(super) struct SpecAhead {
 }
 
 impl Qwen4ExpModel {
+    /// Whether the draft gate drops proposals ([`DRAFT_MIN_PROB`]): on lily's
+    /// own checkpoints, whose verify passes of two to four rows compute every
+    /// row alike (the gate leaves the output as it was). Not on GGUF files,
+    /// whose GEMVs are a kernel per row count with their own rounding: there
+    /// it changed the tokens, and on prose cost GPU time per token
+    /// (2026-11-15).
+    fn draft_gated(&self) -> bool {
+        self.draft_gate && self.config.gguf_down_cols.is_none()
+    }
+
+    /// Whether drafts from `state` take the draft head's whole LM head.
+    fn draft_wide(&self, state: &DecodeState) -> bool {
+        !self.draft_narrow || state.draft_vocab.wide(state.pos)
+    }
+
+    /// Turns the narrow draft head and the draft gate on or off (both on by
+    /// default unless the environment says otherwise); greedy output does
+    /// not depend on either.
+    pub fn set_draft_policy(&mut self, narrow: bool, gate: bool) {
+        self.draft_narrow = narrow;
+        self.draft_gate = gate && cfg!(target_os = "linux");
+    }
+
     /// Draft tokens per step, or 0 without the head.
     pub fn max_drafts(&self) -> usize {
         if self.weights.mtp.is_some() { MAX_DRAFTS } else { 0 }
@@ -202,8 +382,13 @@ impl Qwen4ExpModel {
         let done = committed.wait_retain_polled()?;
         let verify_gpu_end = if profiling() {
             let t = done.timing()?;
+            let gap = DRAFT_GPU_END
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .map_or(f64::NAN, |end| (t.gpu_start_secs - end) * 1e3);
             eprintln!(
-                "profile verify m={m}: gpu {:.2} ms",
+                "profile verify m={m}: gpu {:.2} ms, started {gap:.3} ms after the draft pass ended",
                 (t.gpu_end_secs - t.gpu_start_secs) * 1e3
             );
             Some(t.gpu_end_secs)
@@ -257,6 +442,11 @@ impl Qwen4ExpModel {
             "accepted {accepted} rows but only {gpu_accepted} drafts were confirmed"
         );
         let chain = pending.chain;
+        // The emitted draws: draw j is fed at pos_before + 1 + j. The draft
+        // pass already running chose its head before they were known, so a
+        // token outside the narrow head moves the step after it to the whole
+        // head (one pass late).
+        state.draft_vocab.note(pending.pos_before + 1, &pending.sampled[..=accepted]);
 
         // Host-side rollback: position, hash history, penalty counts of the
         // rejected rows' draws. (The running draft pass never touches the
@@ -392,6 +582,55 @@ impl Qwen4ExpModel {
         Ok(())
     }
 
+    /// The draft head's logits `[vocab]` of its mixed row `x`, ordered after
+    /// on return: the whole LM head into the spec scratch's first logits
+    /// row, or (`wide` false, the narrow head in use) the narrow head's rows
+    /// into `draft_logits`, whose other ids hold -inf.
+    #[allow(clippy::too_many_arguments)]
+    fn draft_head_logits(
+        &self,
+        ctx: &MetalContext,
+        pass: &crate::metal::ComputePass<'_>,
+        mtp: &super::weights::MtpWeights,
+        x: &Tensor,
+        sp: &super::model::SpecScratch,
+        s: &Scratch,
+        wide: bool,
+    ) -> Result<Tensor> {
+        let vocab = self.config.vocab_size;
+        let head = mtp.head(&self.weights.lm_head);
+        let narrow = sp.draft_logits.as_ref().filter(|_| !wide);
+        let Some(out) = narrow else {
+            let logits = sp.logits.view(0, &[1, vocab])?;
+            project_mat(ctx, pass, x, head, &logits, &s.dequant)?;
+            pass.level_barrier(&[&logits])?;
+            return logits.view(0, &[vocab]);
+        };
+        let low = head_rows(head, 0, DRAFT_LOW_ROWS)?;
+        let special = head_rows(head, DRAFT_SPECIAL_FROM, vocab - DRAFT_SPECIAL_FROM)?;
+        let low_out = out.view(0, &[1, DRAFT_LOW_ROWS])?;
+        let special_out =
+            out.view(DRAFT_SPECIAL_FROM, &[1, vocab - DRAFT_SPECIAL_FROM])?;
+        match (&low, &special) {
+            // One dispatch: the GEMV takes both row ranges as sets.
+            (LinearWeights::Gguf(l), LinearWeights::Gguf(h)) => {
+                crate::moe_ffn::gguf_gemv_sets(
+                    ctx,
+                    pass,
+                    x,
+                    &[(l, &low_out), (h, &special_out)],
+                    1,
+                )?;
+            }
+            _ => {
+                project_mat(ctx, pass, x, &special, &special_out, &s.dequant)?;
+                project_mat(ctx, pass, x, &low, &low_out, &s.dequant)?;
+            }
+        }
+        pass.level_barrier(&[out])?;
+        Ok(out.clone())
+    }
+
     /// See [`crate::engine::LanguageModel::draft_initial`].
     #[allow(clippy::too_many_arguments)]
     pub fn draft_initial(
@@ -411,6 +650,7 @@ impl Qwen4ExpModel {
         ensure!(state.pos > 0, "draft_initial before any token was fed");
         let wide = self.config.hc_width();
         let drafts = drafts.min(MAX_DRAFTS);
+        state.draft_vocab.note(state.pos, &[first]);
         self.ensure_room(ctx, state, s, 1 + drafts)?;
         let hidden = state
             .mtp
@@ -441,11 +681,20 @@ impl Qwen4ExpModel {
                 "profile draft initial drafts={drafts}: gpu {:.2} ms",
                 (t.gpu_end_secs - t.gpu_start_secs) * 1e3
             );
+            // The first verify pass's gap is to this pass, not to another
+            // generation's last draft pass.
+            if let Ok(mut g) = DRAFT_GPU_END.lock() {
+                *g = Some(t.gpu_end_secs);
+            }
         }
         if drafts == 0 {
             return Ok(Vec::new());
         }
-        Ok(sp.draft_tokens.to_u32()?[..drafts].to_vec())
+        let tokens = sp.draft_tokens.to_u32()?[..drafts].to_vec();
+        if !self.draft_gated() {
+            return Ok(tokens);
+        }
+        Ok(gate_proposals(tokens, &sp.draft_probs.to_f32()?[..drafts]))
     }
 
     /// Waits for the committed draft pass of `pending`'s step and reads its
@@ -460,6 +709,9 @@ impl Qwen4ExpModel {
         let done = committed.wait_retain_polled()?;
         if profiling() {
             let t = done.timing()?;
+            if let Ok(mut g) = DRAFT_GPU_END.lock() {
+                *g = Some(t.gpu_end_secs);
+            }
             let gap = pending
                 .verify_gpu_end
                 .map_or(f64::NAN, |end| (t.gpu_start_secs - end) * 1e3);
@@ -474,7 +726,11 @@ impl Qwen4ExpModel {
             return Ok(Vec::new());
         }
         let sp = s.spec.as_ref().ok_or_else(|| anyhow::anyhow!("no spec scratch"))?;
-        Ok(sp.draft_tokens.to_u32()?[..drafts].to_vec())
+        let tokens = sp.draft_tokens.to_u32()?[..drafts].to_vec();
+        if !self.draft_gated() {
+            return Ok(tokens);
+        }
+        Ok(gate_proposals(tokens, &sp.draft_probs.to_f32()?[..drafts]))
     }
 
     /// Encodes the draft pass that follows a verify pass of `m` rows at
@@ -631,26 +887,27 @@ impl Qwen4ExpModel {
                 // Head: mixer over the last residual row, the head's LM head
                 // (the trunk's, or its 4-bit copy), argmax.
                 self.hc_read_batched(ctx, &pass, &mtp.mixer, &last, s, &ps1)?;
-                let logits = sp.logits.view(0, &[1, cfg.vocab_size])?;
-                project_mat(
+                let logits =
+                    self.draft_head_logits(
                     ctx,
                     &pass,
+                    mtp,
                     &ps1.hc.mixed,
-                    mtp.head(&self.weights.lm_head),
-                    &logits,
-                    &s.dequant,
+                    sp,
+                    s,
+                    self.draft_wide(state),
                 )?;
-                pass.level_barrier(&[&logits])?;
                 let out = sp.draft_tokens.view(i, &[1])?;
-                sample_draft_f32(
+                draft_draw(
                     ctx,
                     &pass,
-                    &logits.view(0, &[cfg.vocab_size])?,
-                    &s.sampler,
+                    &logits,
+                    s,
+                    sp,
                     &head_params,
                     draft_step(draw0 + i),
-                    &out,
-                    &sp.dists.slot(i)?,
+                    i,
+                    self.draft_gated(),
                 )?;
                 pass.level_barrier(&[&sp.draft_tokens])?;
                 if i + 1 < chain {
@@ -795,26 +1052,26 @@ impl Qwen4ExpModel {
                     // Head: mixer over the last residual row, the head's LM
                     // head (the trunk's, or its 4-bit copy), argmax.
                     self.hc_read_batched(ctx, &pass, &mtp.mixer, &last, s, &ps1)?;
-                    let logits = sp.logits.view(0, &[1, cfg.vocab_size])?;
-                    project_mat(
+                    let logits = self.draft_head_logits(
                         ctx,
                         &pass,
+                        mtp,
                         &ps1.hc.mixed,
-                        mtp.head(&self.weights.lm_head),
-                        &logits,
-                        &s.dequant,
+                        sp,
+                        s,
+                        self.draft_wide(state),
                     )?;
-                    pass.level_barrier(&[&logits])?;
                     let out = sp.draft_tokens.view(i, &[1])?;
-                    sample_draft_f32(
+                    draft_draw(
                         ctx,
                         &pass,
-                        &logits.view(0, &[cfg.vocab_size])?,
-                        &s.sampler,
+                        &logits,
+                        s,
+                        sp,
                         &head_params,
                         draft_step(draw0 + i),
-                        &out,
-                        &sp.dists.slot(i)?,
+                        i,
+                        self.draft_gated(),
                     )?;
                     pass.level_barrier(&[&sp.draft_tokens])?;
                     if i + 1 < drafts {

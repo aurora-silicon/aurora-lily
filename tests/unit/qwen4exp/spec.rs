@@ -364,3 +364,41 @@ fn probe_head_row_result_vs_batch_size() {
         );
     }
 }
+
+/// The narrow-head policy depends on positions fed, not on how the prompt
+/// was split: the server prefills up to the last token, then that token;
+/// a cached prefix feeds only the suffix after a restore. An excluded token
+/// in the prompt's tail followed by an in-range final token keeps the
+/// whole head both ways, and the window ends the same way.
+#[test]
+fn the_draft_vocabulary_ignores_how_the_prompt_was_fed() {
+    use super::DraftVocab;
+    let mut prompt = vec![1_000u32; 40];
+    prompt[30] = 200_000;
+    prompt.push(248_046);
+    let n = prompt.len();
+    // Cold: one prefill of the whole prompt.
+    let mut whole = DraftVocab::default();
+    whole.note(0, &prompt);
+    // The server's split: up to the last token, then the last token.
+    let mut split = DraftVocab::default();
+    split.note(0, &prompt[..n - 1]);
+    split.note(n - 1, &prompt[n - 1..]);
+    // A cached prefix of 35 tokens restored from a snapshot, then the rest.
+    let mut cached = DraftVocab::default();
+    cached.note(0, &prompt[..35]);
+    let mut cached = cached.at(35);
+    cached.note(35, &prompt[35..n - 1]);
+    cached.note(n - 1, &prompt[n - 1..]);
+    for (name, v) in [("whole", whole), ("split", split), ("cached", cached)] {
+        assert!(v.wide(n), "{name}: the excluded token is in the tail");
+        assert!(!v.wide(30 + 96), "{name}: the window ends");
+        assert_eq!(v, whole, "{name}");
+    }
+    // A snapshot before the excluded token knows nothing of it.
+    assert!(!whole.at(30).wide(30));
+    // Only in-range tokens: the narrow head.
+    let mut plain = DraftVocab::default();
+    plain.note(0, &[5, 248_044, 98_303]);
+    assert!(!plain.wide(3));
+}

@@ -307,6 +307,46 @@ pub fn argmax_f32(
     argmax_f32_final(ctx, pass, partials, out)
 }
 
+/// [`argmax_f32`] that also writes the softmax probability of the maximum
+/// into `prob` (F32 `[1]`); `sums` holds `ARGMAX_GROUPS` floats. Entries of
+/// -inf count as absent.
+pub fn argmax_prob_f32(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    partials: &Tensor,
+    sums: &Tensor,
+    out: &Tensor,
+    prob: &Tensor,
+) -> Result<()> {
+    let n = x.numel();
+    ensure!(n > 0 && x.dtype() == DType::F32, "argmax input must be non-empty F32");
+    ensure!(
+        partials.numel() * partials.dtype().size() >= ARGMAX_GROUPS * 8
+            && sums.dtype() == DType::F32
+            && sums.numel() >= ARGMAX_GROUPS,
+        "argmax scratch too small"
+    );
+    ensure!(out.dtype() == DType::U32 && out.numel() >= 1, "out must be U32[1]");
+    ensure!(prob.dtype() == DType::F32 && prob.numel() >= 1, "prob must be F32[1]");
+    let chunk = n.div_ceil(ARGMAX_GROUPS);
+    let partial = ctx.pipeline("argmax_prob_f32_partial", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &partial,
+        &[x.binding(), partials.binding(), sums.binding()],
+        &[&u32_bytes(n), &u32_bytes(chunk)],
+        Grid::Threadgroups { groups: (ARGMAX_GROUPS, 1, 1), threadgroup: (256, 1, 1) },
+    )?;
+    pass.level_barrier(&[partials, sums])?;
+    let fin = ctx.pipeline("argmax_prob_f32_final", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &fin,
+        &[partials.binding(), sums.binding(), out.binding(), prob.binding()],
+        &[&u32_bytes(ARGMAX_GROUPS)],
+        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 /// Which GELU [`gelu_bf16`] applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gelu {

@@ -1198,3 +1198,35 @@ fn threadgroup_mode_probe() {
         }
     }
 }
+
+/// argmax_prob_f32: argmax_f32's first-max index and the softmax
+/// probability of the maximum, with runs of -inf (the draft head's narrow
+/// LM head leaves them) and a tie.
+#[test]
+#[cfg(target_os = "linux")]
+fn argmax_prob_matches_softmax_max() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(9);
+    for (n, peak) in [(248_320usize, 12.0f32), (4097, 9.0), (300, 30.0)] {
+        let mut x: Vec<f32> = (0..n).map(|_| rng.gen_range(-8.0f32..8.0)).collect();
+        if n > 100_000 {
+            x[98_304..248_044].fill(f32::NEG_INFINITY);
+        }
+        x[n / 5] = peak;
+        x[n / 3] = peak;
+        let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f64 = x.iter().map(|&v| f64::from(v - max).exp()).sum();
+        let tx = Tensor::from_f32(&ctx, &x, &[n]).expect("x");
+        let partials = Tensor::zeros(&ctx, &[ARGMAX_GROUPS * 2], DType::U32).expect("p");
+        let sums = Tensor::zeros(&ctx, &[ARGMAX_GROUPS], DType::F32).expect("sums");
+        let out = Tensor::zeros(&ctx, &[1], DType::U32).expect("out");
+        let prob = Tensor::zeros(&ctx, &[1], DType::F32).expect("prob");
+        let pass = ctx.begin().expect("pass");
+        argmax_prob_f32(&ctx, &pass, &tx, &partials, &sums, &out, &prob).expect("argmax");
+        pass.commit_wait().expect("commit");
+        assert_eq!(out.to_u32().expect("out")[0] as usize, n / 5, "n {n}");
+        let p = prob.to_f32().expect("prob")[0];
+        let want = (1.0 / sum) as f32;
+        assert!((p - want).abs() <= 1e-4 * want.max(1e-3), "n {n}: {p} vs {want}");
+    }
+}

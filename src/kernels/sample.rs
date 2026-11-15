@@ -413,6 +413,38 @@ pub fn sample_draft_f32(
     encode_draw(ctx, pass, logits, scratch, params, step, out, Draw::Draft(dist))
 }
 
+/// [`sample_draft_f32`] that also writes the proposal's probability under
+/// the head into `prob` (F32 `[1]`), for the draft gate: an argmax's
+/// softmax maximum computed with it (`sums` holds `ARGMAX_GROUPS` floats),
+/// or under a sampler the top probability of the logits beside the draw.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_draft_prob_f32(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    logits: &Tensor,
+    scratch: &SamplerScratch,
+    params: &SamplingParams,
+    step: usize,
+    out: &Tensor,
+    dist: &DraftDist,
+    prob: &Tensor,
+    sums: &Tensor,
+) -> Result<()> {
+    if !samples(params) {
+        return crate::kernels::elementwise::argmax_prob_f32(
+            ctx,
+            pass,
+            logits,
+            &scratch.argmax_partials,
+            sums,
+            out,
+            prob,
+        );
+    }
+    crate::kernels::glm53::top_prob(ctx, pass, logits, prob, logits.numel())?;
+    encode_draw(ctx, pass, logits, scratch, params, step, out, Draw::Draft(dist))
+}
+
 /// The verify pass's draw for a row whose proposal `draft` (U32 `[1]`) the
 /// draft head drew from `dist`: speculative sampling, which returns the
 /// proposal exactly when it accepts it and otherwise a token from the
