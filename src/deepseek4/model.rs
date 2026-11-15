@@ -1231,20 +1231,30 @@ impl Ds4Model {
         let group_in = cfg.o_group_heads() * cfg.head_dim;
         debug_assert_eq!(l.out_a.cols, group_in);
         if m > EXACT_ROWS {
-            // Per group: low[i][g] (1024) = out_a[g] (1024 x 4096) . heads[i][g].
+            // Per group: low[i][g] (1024) = out_a[g] (1024 x 4096) . heads[i][g],
+            // a dispatch a group: the eight as one batched grid ran at 25
+            // TFLOP/s, apart at 36 (gemm_bx_timing_ds4: 5.3 -> 3.8 ms a
+            // 2048-row layer, 2026-11-15).
             let gl = k::GemmLayout {
                 ldx: cfg.q_dim(),
                 ldy: l.out_a.rows,
-                batches: cfg.o_groups,
-                x_batch: group_in,
-                w_batch: cfg.o_lora,
-                y_batch: cfg.o_lora,
+                batches: 1,
+                x_batch: 0,
+                w_batch: 0,
+                y_batch: 0,
             };
             if !bf16_heads {
                 k::to_bf16(ctx, pass, &sc.heads, &sc.headsb, m * cfg.q_dim())?;
                 pass.memory_barrier()?;
             }
-            k::gemm_bx_with(ctx, pass, &l.out_a, &sc.headsb, &sc.low, m, cfg.o_lora, gl)?;
+            let (n, rb) = (cfg.o_lora, l.out_a.row_bytes);
+            for g in 0..cfg.o_groups {
+                let wt = l.out_a.t.view(g * n * rb, &[n * rb])?;
+                let w = QWeight::new(wt, l.out_a.ty, group_in, n)?;
+                let x = sc.headsb.view(g * group_in, &[sc.headsb.numel() - g * group_in])?;
+                let y = sc.low.view(g * n, &[sc.low.numel() - g * n])?;
+                k::gemm_bx_with(ctx, pass, &w, &x, &y, m, n, gl)?;
+            }
         }
         let chunk = k::gemv_max_rows(l.out_a.ty);
         for c0 in (0..m).step_by(chunk).take_while(|_| m <= EXACT_ROWS) {

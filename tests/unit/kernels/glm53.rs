@@ -2518,6 +2518,71 @@ fn moe_grouped_timing() {
     }
 }
 
+/// DeepSeek V4's prompt-run Q8_0 GEMMs over bfloat input at a run of 2 048
+/// rows; the grouped output projection's eight groups as one batched grid
+/// and as a dispatch a group (the model's): best of three passes of four
+/// calls.
+#[test]
+#[ignore = "timing only"]
+fn gemm_bx_timing_ds4() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(80);
+    let m = 2048;
+    for (label, cols, rows, batches, split) in [
+        ("q_a 1024x4096", 4096usize, 1024usize, 1usize, false),
+        ("kv 512x4096", 4096, 512, 1, false),
+        ("q_b 32768x1024", 1024, 32768, 1, false),
+        ("out_a 8 x 1024x4096 batched", 4096, 8192, 8, false),
+        ("out_a 8 dispatches", 4096, 8192, 8, true),
+        ("out_b 4096x8192", 8192, 4096, 1, false),
+        ("shexp gate 2048x4096", 4096, 2048, 1, false),
+        ("shexp down 4096x2048", 2048, 4096, 1, false),
+    ] {
+        let raw = random_blocks(&mut rng, GgmlType::Q8_0, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap();
+        let xcols = cols * batches;
+        let x = tensor(&ctx, &f32s(&mut rng, m * xcols, -1.0, 1.0));
+        let n = rows / batches;
+        let y = zeros(&ctx, m * rows);
+        let xb = Tensor::zeros(&ctx, &[m * xcols], DType::BF16).unwrap();
+        run(&ctx, |p| to_bf16(&ctx, p, &x, &xb, m * xcols).unwrap());
+        let l = GemmLayout {
+            ldx: xcols,
+            ldy: rows,
+            batches,
+            x_batch: cols,
+            w_batch: n,
+            y_batch: n,
+        };
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let pass = ctx.begin().unwrap();
+            for _ in 0..4 {
+                if !split {
+                    gemm_bx_with(&ctx, &pass, &w, &xb, &y, m, n, l).unwrap();
+                    continue;
+                }
+                for b in 0..batches {
+                    let one = GemmLayout { batches: 1, ..l };
+                    let xv = xb.view(b * cols, &[m * xcols - b * cols]).unwrap();
+                    let yv = y.view(b * n, &[m * rows - b * n]).unwrap();
+                    let t = w.t.view(b * n * w.row_bytes, &[n * w.row_bytes]).unwrap();
+                    let wv = QWeight::new(t, GgmlType::Q8_0, cols, n).unwrap();
+                    gemm_bx_with(&ctx, &pass, &wv, &xv, &yv, m, n, one).unwrap();
+                }
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64() / 4.0);
+        }
+        println!(
+            "gemm_bx {label:28} m {m}: {:8.1} us  {:5.1} TFLOP/s",
+            best * 1e6,
+            2.0 * (m * rows * cols) as f64 / best / 1e12
+        );
+    }
+}
+
 /// The prefill's dense GEMMs at the model's shapes for a run of 1 024 rows:
 /// best of three passes of four calls.
 #[test]
