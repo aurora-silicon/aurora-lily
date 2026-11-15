@@ -93,6 +93,22 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         runs: usize,
     },
+    /// Long-context NLL: BOS and the first `prompt_len` tokens of each text
+    /// as one prompt (runs of the prefill), then the next `n` tokens
+    /// teacher-forced one decode step each; prints the mean NLL per text
+    /// and each position's (`--per-token`) for paired comparisons.
+    Ppl {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, num_args = 1..)]
+        text: Vec<PathBuf>,
+        #[arg(long, default_value_t = 4096)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 256)]
+        n: usize,
+        #[arg(long)]
+        per_token: bool,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -134,6 +150,9 @@ fn run() -> Result<()> {
         }
         Cmd::Bench { model, text, prompt_len, n, runs } => {
             bench(&model, &text, prompt_len, n, runs)
+        }
+        Cmd::Ppl { model, text, prompt_len, n, per_token } => {
+            ppl(&model, &text, prompt_len, n, per_token)
         }
     }
 }
@@ -473,6 +492,49 @@ fn bench(
             steps[steps.len() / 2]
         );
     }
+    Ok(())
+}
+
+fn ppl(
+    path: &PathBuf,
+    texts: &[PathBuf],
+    prompt_len: usize,
+    n: usize,
+    per_token: bool,
+) -> Result<()> {
+    let ctx = MetalContext::new()?;
+    let model = Ds4Model::load(&ctx, path)?;
+    let vocab = model.cfg.vocab;
+    let sc = model.new_scratch(&ctx)?;
+    let mut all = Vec::new();
+    for text in texts {
+        let ids = text_tokens(path, text, prompt_len + n)?;
+        let name = text.display();
+        anyhow::ensure!(ids.len() == prompt_len + n + 1, "{name} is too short");
+        let mut st = model.new_state(&ctx, ids.len() + 8)?;
+        model.forward(&ctx, &mut st, &sc, &ids[..=prompt_len], Logits::Last)?;
+        let mut nll = Vec::with_capacity(n);
+        for j in 0..n {
+            let at = prompt_len + 1 + j;
+            let logits = &sc.logits.to_f32()?[..vocab];
+            let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let lse = mx + logits.iter().map(|&v| (v as f64 - mx).exp()).sum::<f64>().ln();
+            nll.push(lse - logits[ids[at] as usize] as f64);
+            if j + 1 < n {
+                model.forward(&ctx, &mut st, &sc, &ids[at..=at], Logits::Last)?;
+            }
+        }
+        let mean = nll.iter().sum::<f64>() / n as f64;
+        println!("ppl {name}: prompt {prompt_len}, {n} tokens, mean NLL {mean:.6}");
+        if per_token {
+            for (j, v) in nll.iter().enumerate() {
+                println!("tok {name} {j} {v:.6}");
+            }
+        }
+        all.extend(nll);
+    }
+    let mean = all.iter().sum::<f64>() / all.len() as f64;
+    println!("ppl total: {} tokens, mean NLL {mean:.6}", all.len());
     Ok(())
 }
 
