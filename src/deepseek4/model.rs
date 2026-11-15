@@ -237,7 +237,8 @@ impl Ds4Model {
     }
 
     pub fn new_scratch(&self, ctx: &MetalContext) -> Result<Scratch> {
-        let mut sc = Scratch::new(ctx, &self.cfg)?;
+        let separate = separate_gate_up(self.layers.iter().map(|l| l.gate.ty));
+        let mut sc = Scratch::new(ctx, &self.cfg, separate)?;
         if let Some(ds) = &self.dspark {
             sc.ds = Some(ds.new_scratch(ctx, &self.cfg)?);
         }
@@ -471,8 +472,33 @@ impl VerifyBufs {
     }
 }
 
+/// Whether layers whose routed gate/up are of these types (gate and up
+/// share one) need the grouped MoE's separate gate and up route: anything
+/// but IQ2_XXS (the schema also accepts Q2_K), which has the fused GEMM.
+pub(crate) fn separate_gate_up(gate_types: impl IntoIterator<Item = GgmlType>) -> bool {
+    gate_types.into_iter().any(|t| t != GgmlType::Iq2Xxs)
+}
+
+/// The grouped routed experts' scratch for prompt runs of up to `rows`
+/// rows of `used` pairs: with the separate gate and up outputs when
+/// `separate` ([`separate_gate_up`]), else the fused route's compact one.
+pub(crate) fn moe_group_scratch(
+    ctx: &MetalContext,
+    rows: usize,
+    (used, e, ff, h): (usize, usize, usize, usize),
+    separate: bool,
+) -> Result<k::MoeGroupScratch> {
+    if separate {
+        k::MoeGroupScratch::new(ctx, rows * used, e, ff, h)
+    } else {
+        k::MoeGroupScratch::fused(ctx, rows, used, e, ff, h)
+    }
+}
+
 impl Scratch {
-    fn new(ctx: &MetalContext, cfg: &Config) -> Result<Self> {
+    /// `separate`: some layer's routed gate/up take the separate grouped
+    /// route (see [`moe_group_scratch`]).
+    fn new(ctx: &MetalContext, cfg: &Config, separate: bool) -> Result<Self> {
         let m = PREFILL_ROWS;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let u = |n: usize| Tensor::zeros(ctx, &[n], DType::U32);
@@ -510,13 +536,11 @@ impl Scratch {
             rsel: u(m * cfg.n_expert_used)?,
             rw: f(m * cfg.n_expert_used)?,
             moe_mid: f(EXACT_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
-            moe_group: k::MoeGroupScratch::fused(
+            moe_group: moe_group_scratch(
                 ctx,
                 m,
-                cfg.n_expert_used,
-                cfg.n_expert,
-                cfg.ff_expert,
-                cfg.hidden,
+                (cfg.n_expert_used, cfg.n_expert, cfg.ff_expert, cfg.hidden),
+                separate,
             )?,
             opre: f(m * cfg.n_hc)?,
             hidden: f(m * cfg.hidden)?,

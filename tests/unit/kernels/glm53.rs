@@ -2731,6 +2731,60 @@ fn moe_grouped_fused_matches_separate() {
     }
 }
 
+/// DeepSeek V4's prompt scratch for Q2_K gate/up experts (which its schema
+/// accepts): the model picks the separate route's scratch, and the grouped
+/// experts over it give the per-pair kernels' result; the compact fused
+/// scratch is refused for that route instead of written past.
+#[test]
+fn deepseek4_q2_k_gate_up_scratch() {
+    use crate::deepseek4::model::{moe_group_scratch, separate_gate_up};
+    assert!(separate_gate_up([GgmlType::Iq2Xxs, GgmlType::Q2K]));
+    assert!(!separate_gate_up([GgmlType::Iq2Xxs, GgmlType::Iq2Xxs]));
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(82);
+    let (experts, hidden, ff, used, m) = (12, 512, 256, 6, 40);
+    let mk = |rng: &mut StdRng, cols, rows| {
+        let raw = random_blocks(rng, GgmlType::Q2K, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, GgmlType::Q2K, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, hidden, experts * ff);
+    let uw = mk(&mut rng, hidden, experts * ff);
+    let dw = mk(&mut rng, ff, experts * hidden);
+    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+    let sel: Vec<u32> = (0..m * used).map(|s| ((s * 5 + s / used) % experts) as u32).collect();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+    let dims = (used, experts, ff, hidden);
+    let gs = moe_group_scratch(&ctx, m, dims, separate_gate_up([GgmlType::Q2K])).unwrap();
+    let compact = moe_group_scratch(&ctx, m, dims, false).unwrap();
+    let (out, refused) = (zeros(&ctx, m * hidden), zeros(&ctx, m * hidden));
+    let (mid, want) = (zeros(&ctx, m * used * ff), zeros(&ctx, m * hidden));
+    let mut err = None;
+    run(&ctx, |p| {
+        moe_grouped_tiles(
+            &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m, used,
+            experts, 10.0, MoeTiles::R64,
+        )
+        .unwrap();
+        err = moe_grouped_tiles(
+            &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &refused, &compact, m,
+            used, experts, 10.0, MoeTiles::R64,
+        )
+        .err();
+        moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid, m, used, 10.0).unwrap();
+        p.memory_barrier().unwrap();
+        moe_down(&ctx, p, &dw, hidden, &mid, &tsel, None, &want, m, used).unwrap();
+    });
+    assert!(err.is_some(), "the compact scratch must be refused for Q2_K gate/up");
+    let (a, b) = (out.to_f32().unwrap(), want.to_f32().unwrap());
+    let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
+    for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!((x - y).abs() <= 3e-2 * scale, "element {k}: {x} vs {y}");
+    }
+}
+
 /// The grouped route of Q2_K gate/up experts (separate GEMMs and SwiGLU)
 /// against the per-pair kernels.
 #[test]
