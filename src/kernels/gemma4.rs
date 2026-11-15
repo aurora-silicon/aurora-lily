@@ -296,7 +296,26 @@ pub fn attention(
     m: usize,
     small_rows: usize,
 ) -> Result<()> {
+    attention_q8x(ctx, pass, a, q, partial, heads, pos0, m, small_rows, None)
+}
+
+/// [`attention`], with `q8` also writing a few rows' `heads` (the output
+/// projection's input) as [`quant_q8x`] does (the decode path).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_q8x(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &AttnShape<'_>,
+    q: &Tensor,
+    partial: &Tensor,
+    heads: &Tensor,
+    pos0: usize,
+    m: usize,
+    small_rows: usize,
+    q8: Option<(&Tensor, &Tensor)>,
+) -> Result<()> {
     check_f32(&[q, partial, heads])?;
+    ensure!(q8.is_none() || m <= small_rows, "int8 heads of a prompt run");
     a.check_caches()?;
     let d = a.head_dim;
     ensure!(
@@ -399,10 +418,19 @@ pub fn attention(
         },
     )?;
     pass.memory_barrier()?;
-    let combine = ctx.pipeline("gemma4_attn_combine", SOURCE, MslVersion::V3_1)?;
+    let mut bindings = vec![partial.binding(), heads.binding()];
+    let name = q8_variant(
+        q8,
+        m,
+        a.heads * d,
+        &mut bindings,
+        "gemma4_attn_combine",
+        "gemma4_attn_combine_q8x",
+    )?;
+    let combine = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &combine,
-        &[partial.binding(), heads.binding()],
+        &bindings,
         &[&u32_bytes(d), &u32_bytes(a.heads), &u32_bytes(chunks)],
         Grid::Threadgroups { groups: (a.heads, m, 1), threadgroup: (256, 1, 1) },
     )
@@ -791,27 +819,56 @@ pub fn post_attn(
     n: usize,
     eps: f32,
 ) -> Result<()> {
+    post_attn_q8x(ctx, pass, a, w_post, x, r, w, o, m, n, eps, None)
+}
+
+/// [`post_attn`], with `q8` also writing `o[0]` (the dense MLP's input) as
+/// [`quant_q8x`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn post_attn_q8x(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    w_post: &Tensor,
+    x: &Tensor,
+    r: &Tensor,
+    w: [&Tensor; 3],
+    o: [&Tensor; 3],
+    m: usize,
+    n: usize,
+    eps: f32,
+    q8: Option<(&Tensor, &Tensor)>,
+) -> Result<()> {
     check_f32(&[a, w_post, x, r, w[0], w[1], w[2], o[0], o[1], o[2]])?;
     ensure!(
         [a, x, r, o[0], o[1], o[2]].iter().all(|t| t.numel() >= m * n),
         "post_attn of {m} x {n}"
     );
     let threads = row_threads(n)?;
-    let pipeline = ctx.pipeline("gemma4_post_attn", SOURCE, MslVersion::V3_1)?;
+    let mut bindings = vec![
+        a.binding(),
+        w_post.binding(),
+        x.binding(),
+        r.binding(),
+        w[0].binding(),
+        w[1].binding(),
+        w[2].binding(),
+        o[0].binding(),
+        o[1].binding(),
+        o[2].binding(),
+    ];
+    let name = q8_variant(
+        q8,
+        m,
+        n,
+        &mut bindings,
+        "gemma4_post_attn",
+        "gemma4_post_attn_q8x",
+    )?;
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
-        &[
-            a.binding(),
-            w_post.binding(),
-            x.binding(),
-            r.binding(),
-            w[0].binding(),
-            w[1].binding(),
-            w[2].binding(),
-            o[0].binding(),
-            o[1].binding(),
-            o[2].binding(),
-        ],
+        &bindings,
         &[&u32_bytes(n), &f32_bytes(eps)],
         Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (threads, 1, 1) },
     )
@@ -835,7 +892,29 @@ pub fn ffn_out(
     n: usize,
     eps: f32,
 ) -> Result<()> {
+    ffn_out_q8x(ctx, pass, m1, m2, w, r, layer_scale, x, next, m, n, eps, None)
+}
+
+/// [`ffn_out`], with `q8` also writing the next layer's input as
+/// [`quant_q8x`] does (with `next`).
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_out_q8x(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    m1: &Tensor,
+    m2: &Tensor,
+    w: [&Tensor; 3],
+    r: &Tensor,
+    layer_scale: &Tensor,
+    x: &Tensor,
+    next: Option<(&Tensor, &Tensor)>,
+    m: usize,
+    n: usize,
+    eps: f32,
+    q8: Option<(&Tensor, &Tensor)>,
+) -> Result<()> {
     check_f32(&[m1, m2, w[0], w[1], w[2], r, layer_scale, x])?;
+    ensure!(q8.is_none() || next.is_some(), "int8 output without a next input");
     ensure!([m1, m2, r, x].iter().all(|t| t.numel() >= m * n), "ffn_out of {m} x {n}");
     if let Some((wn, h)) = next {
         check_f32(&[wn, h])?;
@@ -843,21 +922,24 @@ pub fn ffn_out(
     }
     let threads = row_threads(n)?;
     let (wn, h) = next.unwrap_or((x, x));
-    let pipeline = ctx.pipeline("gemma4_ffn_out", SOURCE, MslVersion::V3_1)?;
+    let mut bindings = vec![
+        m1.binding(),
+        m2.binding(),
+        w[0].binding(),
+        w[1].binding(),
+        w[2].binding(),
+        r.binding(),
+        layer_scale.binding(),
+        x.binding(),
+        wn.binding(),
+        h.binding(),
+    ];
+    let name =
+        q8_variant(q8, m, n, &mut bindings, "gemma4_ffn_out", "gemma4_ffn_out_q8x")?;
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
-        &[
-            m1.binding(),
-            m2.binding(),
-            w[0].binding(),
-            w[1].binding(),
-            w[2].binding(),
-            r.binding(),
-            layer_scale.binding(),
-            x.binding(),
-            wn.binding(),
-            h.binding(),
-        ],
+        &bindings,
         &[&u32_bytes(n), &f32_bytes(eps), &u32_bytes(usize::from(next.is_some()))],
         Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (threads, 1, 1) },
     )
@@ -931,16 +1013,56 @@ pub fn rmsnorm(
     n: usize,
     eps: f32,
 ) -> Result<()> {
+    rmsnorm_q8x(ctx, pass, x, w, h, m, n, eps, None)
+}
+
+/// [`rmsnorm`], with `q8` also writing `h` as [`quant_q8x`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_q8x(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    w: &Tensor,
+    h: &Tensor,
+    m: usize,
+    n: usize,
+    eps: f32,
+    q8: Option<(&Tensor, &Tensor)>,
+) -> Result<()> {
     check_f32(&[x, w, h])?;
     ensure!(x.numel() >= m * n && h.numel() >= m * n, "rmsnorm of {m} x {n}");
     let threads = row_threads(n)?;
-    let pipeline = ctx.pipeline("gemma4_rmsnorm", SOURCE, MslVersion::V3_1)?;
+    let mut bindings = vec![x.binding(), w.binding(), h.binding()];
+    let name =
+        q8_variant(q8, m, n, &mut bindings, "gemma4_rmsnorm", "gemma4_rmsnorm_q8x")?;
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
-        &[x.binding(), w.binding(), h.binding()],
+        &bindings,
         &[&u32_bytes(n), &f32_bytes(eps)],
         Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (threads, 1, 1) },
     )
+}
+
+/// The kernel `name` or, with `q8`, its `_q8x` variant (its codes and
+/// scales appended to the bindings), checked for `m` rows of `n`.
+fn q8_variant<'a>(
+    q8: Option<(&'a Tensor, &'a Tensor)>,
+    m: usize,
+    n: usize,
+    bindings: &mut Vec<(&'a crate::metal::GpuBuffer, usize)>,
+    name: &'static str,
+    q8_name: &'static str,
+) -> Result<&'static str> {
+    let Some((codes, ds)) = q8 else { return Ok(name) };
+    check_f32(&[ds])?;
+    ensure!(
+        n.is_multiple_of(32) && codes.byte_len() >= m * n && ds.numel() >= m * n / 16,
+        "int8 output of {m} x {n}"
+    );
+    bindings.push(codes.binding());
+    bindings.push(ds.binding());
+    Ok(q8_name)
 }
 
 /// `x = c tanh(x / c)` over `n` values in place.
@@ -965,3 +1087,95 @@ pub fn softcap(
 #[cfg(test)]
 #[path = "../../tests/unit/kernels/gemma4.rs"]
 mod tests;
+
+/// `x` (f32 [m][k]) as int8 codes a 32-value block's
+/// max |x| / 127 apart, with each block's (scale, sum of codes) as f32
+/// pairs (`gemma4_q8x.comp`).
+pub fn quant_q8x(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    codes: &Tensor,
+    ds: &Tensor,
+    m: usize,
+    k: usize,
+) -> Result<()> {
+    check_f32(&[x, ds])?;
+    ensure!(k.is_multiple_of(32), "int8 activations of {k} values");
+    ensure!(
+        x.numel() >= m * k && codes.byte_len() >= m * k && ds.numel() >= m * k / 16,
+        "int8 activations of {m} x {k}"
+    );
+    let pipeline = ctx.pipeline("gemma4_quant_q8x", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[x.binding(), codes.binding(), ds.binding()],
+        &[&u32_bytes(k)],
+        Grid::Threads { grid: (k, m, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
+/// The GEMV of up to four Q5_K weights of one width over
+/// [`quant_q8x`]'s activations of `m` (1 to 4) rows.
+pub fn gemv_q5_k_q8x(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    sets: &[(&QWeight, &Tensor)],
+    codes: &Tensor,
+    ds: &Tensor,
+    m: usize,
+) -> Result<()> {
+    ensure!(
+        (1..=4).contains(&sets.len()) && (1..=4).contains(&m),
+        "int8 GEMV of {m} rows"
+    );
+    let w0 = sets[0].0;
+    ensure!(
+        w0.ty == GgmlType::Q5K && w0.cols.is_multiple_of(256) && w0.cols >= 1024,
+        "int8 GEMV over {:?} of {}",
+        w0.ty,
+        w0.cols
+    );
+    let mut groups = 0;
+    for &(w, y) in sets {
+        ensure!(
+            w.ty == w0.ty && w.cols == w0.cols && w.row_bytes == w0.row_bytes,
+            "int8 GEMV sets"
+        );
+        check_f32(&[y])?;
+        ensure!(y.numel() >= m * w.rows, "int8 GEMV output");
+        groups += w.rows.div_ceil(8);
+    }
+    ensure!(
+        codes.byte_len() >= m * w0.cols && ds.numel() >= m * w0.cols / 16,
+        "int8 GEMV input"
+    );
+    let mut bindings = vec![codes.binding(), ds.binding()];
+    for s in 0..4 {
+        bindings.push(sets.get(s).map_or(ds.binding(), |(w, _)| w.t.binding()));
+    }
+    for s in 0..4 {
+        bindings.push(sets.get(s).map_or(ds.binding(), |(_, y)| y.binding()));
+    }
+    let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
+    let name = [
+        "gemma4_gemv_q5_k_q8x_m1",
+        "gemma4_gemv_q5_k_q8x_m2",
+        "gemma4_gemv_q5_k_q8x_m3",
+        "gemma4_gemv_q5_k_q8x_m4",
+    ][m - 1];
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &bindings,
+        &[
+            &u32_bytes(w0.cols),
+            &u32_bytes(w0.row_bytes),
+            &rows(0),
+            &rows(1),
+            &rows(2),
+            &rows(3),
+        ],
+        Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}

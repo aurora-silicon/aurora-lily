@@ -107,6 +107,10 @@ pub struct Gemma4Model {
     /// Rows a prompt run takes (at most [`PREFILL_ROWS`]; scratches are
     /// sized by it).
     pub prefill_rows: usize,
+    /// Q5_K attention and dense weights (UD-IQ2_M), not on a G16 GPU:
+    /// steps of up to MAX_ROWS rows run their projections over int8
+    /// activations, which the kernels before them write.
+    q8x: bool,
     /// The longest context served: the file's, the server's limit, or what
     /// fits the memory limit ([`Gemma4Model::fit_context`]).
     pub context_cap: usize,
@@ -183,6 +187,9 @@ impl Gemma4Model {
             };
             layers.push(l);
         }
+        // A G16 GPU (an M4) keeps its own Q5_K GEMVs (`gemv_g16.comp`).
+        let q8x = !ctx.g16()
+            && layers.first().is_some_and(|l| l.q.ty == crate::gguf::GgmlType::Q5K);
         let embed = mapped.q("token_embd.weight")?;
         let output_norm = mapped.f32("output_norm.weight")?;
         let rope_freqs = mapped.f32("rope_freqs.weight")?;
@@ -201,6 +208,7 @@ impl Gemma4Model {
             memory_limit: None,
             acquire_reserve: None,
             prefill_rows: PREFILL_ROWS,
+            q8x,
         })
     }
 
@@ -356,6 +364,11 @@ pub struct Scratch {
     /// BF16: a prompt run's projection input (the bfloat-input GEMMs';
     /// matrix units only).
     xb: Tensor,
+    /// A step's projection input as int8 codes and per 32 values (scale,
+    /// sum of codes), rows of [`q8_width`] values.
+    xq8: Tensor,
+    xds: Tensor,
+    q8_width: usize,
     q: Tensor,
     kv: Tensor,
     vraw: Tensor,
@@ -390,7 +403,21 @@ pub struct Scratch {
     vocab: usize,
 }
 
+/// The widest input a step's projections may take as int8 (a row of
+/// [`Scratch`]'s int8 buffers): the layer's input and the residual's norms
+/// (hidden), the attention's heads (the query width) and the dense MLP's
+/// down projection's (ff).
+pub(crate) fn q8_width(cfg: &Config) -> usize {
+    cfg.hidden.max(cfg.max_q_width()).max(cfg.ff)
+}
+
 impl Scratch {
+    /// The int8 buffers' row width, code bytes and scale floats.
+    #[cfg(test)]
+    pub(crate) fn q8_buffers(&self) -> (usize, usize, usize) {
+        (self.q8_width, self.xq8.byte_len(), self.xds.numel())
+    }
+
     /// Scratch for states of up to `capacity` tokens and runs of up to
     /// `rows` rows.
     pub fn new(ctx: &MetalContext, cfg: &Config, capacity: usize, rows: usize) -> Result<Self> {
@@ -425,6 +452,9 @@ impl Scratch {
             tokens: Tensor::zeros(ctx, &[m], DType::U32)?,
             x: f(m * h)?,
             h: hb.clone(),
+            xq8: Tensor::zeros(ctx, &[MAX_ROWS * q8_width(cfg)], DType::I8)?,
+            xds: f(MAX_ROWS * q8_width(cfg).div_ceil(32) * 2)?,
+            q8_width: q8_width(cfg),
             xb: Tensor::zeros(
                 ctx,
                 &[if ctx.matrix_units() {
@@ -532,6 +562,22 @@ impl Gemma4Model {
         x: &Tensor,
         m: usize,
     ) -> Result<()> {
+        self.proj_q8(ctx, pass, sc, sets, x, m, false)
+    }
+
+    /// [`Self::proj`]; `pre`: the step's producer left `x` as int8 in the
+    /// scratch already.
+    #[allow(clippy::too_many_arguments)]
+    fn proj_q8(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        sc: &Scratch,
+        sets: &[(&QWeight, &Tensor)],
+        x: &Tensor,
+        m: usize,
+        pre: bool,
+    ) -> Result<()> {
         if m > MAX_ROWS {
             // The input once as bfloat for the weights the bfloat-input
             // GEMM takes (the same products as the f32-input one, which
@@ -550,6 +596,25 @@ impl Gemma4Model {
                 } else {
                     k::gemm(ctx, pass, w, x, y, m)?;
                 }
+            }
+            return Ok(());
+        }
+        // Q5_K projections over int8 activations.
+        let cols = sets[0].0.cols;
+        if self.q8x
+            && cols.is_multiple_of(256)
+            && cols >= 1024
+            && cols <= sc.q8_width
+            && sets
+                .iter()
+                .all(|(w, _)| w.ty == crate::gguf::GgmlType::Q5K && w.cols == cols)
+        {
+            if !pre {
+                g4::quant_q8x(ctx, pass, x, &sc.xq8, &sc.xds, m, cols)?;
+                pass.memory_barrier()?;
+            }
+            for group in sets.chunks(4) {
+                g4::gemv_q5_k_q8x(ctx, pass, group, &sc.xq8, &sc.xds, m)?;
             }
             return Ok(());
         }
@@ -665,7 +730,18 @@ impl Gemma4Model {
             // The first layer's input; each layer's FFN end writes the next
             // one's (and the last layer's the head's).
             let w = &self.layers[0].attn_norm;
-            g4::rmsnorm(ctx, pass, &sc.x, w, &sc.h, m, cfg.hidden, cfg.rms_eps)?;
+            let q8 = (self.q8x && m <= MAX_ROWS).then_some((&sc.xq8, &sc.xds));
+            g4::rmsnorm_q8x(
+                ctx,
+                pass,
+                &sc.x,
+                w,
+                &sc.h,
+                m,
+                cfg.hidden,
+                cfg.rms_eps,
+                q8,
+            )?;
             pass.memory_barrier()?;
         }
         for il in layers.clone() {
@@ -699,16 +775,30 @@ impl Gemma4Model {
         let pos0 = st.pos;
         // Attention.
         let kw = cfg.kv_width(il);
+        // The producers of the Q5_K projections' inputs write them as int8
+        // too (the layer's input norm, the attention's merge, the residual's
+        // norms).
+        let q8 = (self.q8x && m <= MAX_ROWS).then_some((&sc.xq8, &sc.xds));
+        let pre = q8.is_some();
         match &l.v {
-            Some(v) => self.proj(
+            Some(v) => self.proj_q8(
                 ctx,
                 pass,
                 sc,
                 &[(&l.q, &sc.q), (&l.k, &sc.kv), (v, &sc.vraw)],
                 &sc.h,
                 m,
+                pre,
             )?,
-            None => self.proj(ctx, pass, sc, &[(&l.q, &sc.q), (&l.k, &sc.kv)], &sc.h, m)?,
+            None => self.proj_q8(
+                ctx,
+                pass,
+                sc,
+                &[(&l.q, &sc.q), (&l.k, &sc.kv)],
+                &sc.h,
+                m,
+                pre,
+            )?,
         }
         pass.memory_barrier()?;
         let a = AttnShape {
@@ -757,14 +847,25 @@ impl Gemma4Model {
                 sc.chunks
             );
             debug_assert_eq!(qw, cfg.n_head * d);
-            g4::attention(ctx, pass, &a, &qo, &sc.partial, &heads, pos0 + off, n, MAX_ROWS)?;
+            g4::attention_q8x(
+                ctx,
+                pass,
+                &a,
+                &qo,
+                &sc.partial,
+                &heads,
+                pos0 + off,
+                n,
+                MAX_ROWS,
+                q8,
+            )?;
             pass.memory_barrier()?;
         }
-        self.proj(ctx, pass, sc, &[(&l.o, &sc.attn)], &sc.heads, m)?;
+        self.proj_q8(ctx, pass, sc, &[(&l.o, &sc.attn)], &sc.heads, m, pre)?;
         pass.memory_barrier()?;
         // The residual, and the inputs of the dense MLP, the routed
         // experts and the router.
-        g4::post_attn(
+        g4::post_attn_q8x(
             ctx,
             pass,
             &sc.attn,
@@ -776,9 +877,18 @@ impl Gemma4Model {
             m,
             h,
             eps,
+            q8,
         )?;
         pass.memory_barrier()?;
-        self.proj(ctx, pass, sc, &[(&l.gate, &sc.g), (&l.up, &sc.u)], &sc.n1, m)?;
+        self.proj_q8(
+            ctx,
+            pass,
+            sc,
+            &[(&l.gate, &sc.g), (&l.up, &sc.u)],
+            &sc.n1,
+            m,
+            pre,
+        )?;
         self.proj(ctx, pass, sc, &[(&l.router, &sc.rlogits)], &sc.t, m)?;
         pass.memory_barrier()?;
         g4::geglu(ctx, pass, &sc.g, &sc.u, &sc.mid, m * cfg.ff)?;
@@ -841,7 +951,7 @@ impl Gemma4Model {
         pass.memory_barrier()?;
         // The FFN's end, with the next layer's input norm (or the head's).
         let next = self.layers.get(il + 1).map_or(&self.output_norm, |n| &n.attn_norm);
-        g4::ffn_out(
+        g4::ffn_out_q8x(
             ctx,
             pass,
             &sc.m1,
@@ -854,6 +964,7 @@ impl Gemma4Model {
             m,
             h,
             eps,
+            q8,
         )?;
         pass.memory_barrier()
     }

@@ -4,6 +4,31 @@
 // caches f16. The graph is llama.cpp's (src/models/gemma4.cpp, MIT): the
 // formulas below follow its ops (rms_norm, NEOX rope with frequency
 // factors, softmax gating, GeGLU with the tanh GELU, final logit softcap).
+// <kernel>_q8x also writes its output (the next Q5_K GEMV's
+// input) as int8 codes and per-32-value (scale, sum of codes), as
+// gemma4_q8x.comp's gemma4_quant_q8x does: two more buffers after the
+// kernel's own, its params two places later.
+#ifdef KERNEL_gemma4_rmsnorm_q8x
+#define KERNEL_gemma4_rmsnorm
+#define G4_Q8X
+#endif
+#ifdef KERNEL_gemma4_post_attn_q8x
+#define KERNEL_gemma4_post_attn
+#define G4_Q8X
+#endif
+#ifdef KERNEL_gemma4_ffn_out_q8x
+#define KERNEL_gemma4_ffn_out
+#define G4_Q8X
+#endif
+#ifdef KERNEL_gemma4_attn_combine_q8x
+#define KERNEL_gemma4_attn_combine
+#define G4_Q8X
+#endif
+#ifdef G4_Q8X
+#define G4_PB(i) ((i) + 2u)
+#else
+#define G4_PB(i) (i)
+#endif
 #if defined(KERNEL_gemma4_embed_q5_k) || defined(KERNEL_gemma4_embed_q6_k) || \
     defined(KERNEL_gemma4_moe_gate_up_q5_k) || defined(KERNEL_gemma4_moe_gate_up_q6_k) || \
     defined(KERNEL_gemma4_moe_gate_up_iq2_s)
@@ -11,6 +36,9 @@
 #endif
 #include "common.glsl"
 #include "glm53_quant.glsl"
+#ifdef G4_Q8X
+#include "gemma4_q8x.glsl"
+#endif
 
 // tanh without the overflow of (e^2x - 1) / (e^2x + 1).
 float gemma4_tanh(float x) {
@@ -441,9 +469,9 @@ void main() {
 #define G4_MAXC 1024u
 shared float g4c_m[G4_MAXC], g4c_w[G4_MAXC], g4c_red[8];
 void main() {
-    const uint d = arg_u32(2);
-    const uint H = arg_u32(3);
-    const uint chunks = min(arg_u32(4), G4_MAXC);
+    const uint d = arg_u32(G4_PB(2u));
+    const uint H = arg_u32(G4_PB(3u));
+    const uint chunks = min(arg_u32(G4_PB(4u)), G4_MAXC);
     const uint h = gl_WorkGroupID.x, i = gl_WorkGroupID.y;
     const uint tid = gl_LocalInvocationIndex;
     const uint64_t P = arg(0) + 4u * ((uint64_t(i) * H + h) * chunks * (d + 2u));
@@ -479,6 +507,20 @@ void main() {
             if (g4c_m[c] != -1.0 / 0.0) a += F32(P).v[c * (d + 2u) + 2u + e] * g4c_w[c];
         }
         F32(O).v[e] = a / L;
+#ifdef G4_Q8X
+        // The row's heads as int8 (a subgroup is one 32-value block).
+        const float v = a / L;
+        const bool bad = subgroupMax(uint(g4_q8x_nonfinite(v))) != 0u;
+        const float dq = g4_q8x_scale(subgroupMax(g4_q8x_abs(v)), bad);
+        const int q = g4_q8x_code(v, dq);
+        const int sum = subgroupAdd(q);
+        const uint at = (i * H + h) * d + e;
+        I8(arg(2)).v[at] = int8_t(q);
+        if (gl_SubgroupInvocationID == 0u) {
+            F32(arg(3)).v[2u * (at / 32u)] = dq;
+            F32(arg(3)).v[2u * (at / 32u) + 1u] = float(sum);
+        }
+#endif
     }
 }
 #endif
@@ -940,14 +982,44 @@ float gemma4_inv_rms(vec4 v, uint n, float eps) {
     return inversesqrt(gemma4_row_sum(dot(v, v)) / float(n) + eps);
 }
 
+#ifdef G4_Q8X
+// A row kernel thread's four values at 4 e of row `row` (n values) as
+// int8: eight neighbouring lanes hold a 32-value block. Codes at buffer
+// `cb`, (scale, sum) pairs at `db`.
+void g4_q8x_put4(vec4 v, uint row, uint e, uint n, uint cb, uint db) {
+    float a = max(max(g4_q8x_abs(v.x), g4_q8x_abs(v.y)),
+                  max(g4_q8x_abs(v.z), g4_q8x_abs(v.w)));
+    uint bad = uint(any(isnan(v)) || any(isinf(v)));
+    a = max(a, subgroupShuffleXor(a, 1u));
+    a = max(a, subgroupShuffleXor(a, 2u));
+    a = max(a, subgroupShuffleXor(a, 4u));
+    bad |= subgroupShuffleXor(bad, 1u);
+    bad |= subgroupShuffleXor(bad, 2u);
+    bad |= subgroupShuffleXor(bad, 4u);
+    const float d = g4_q8x_scale(a, bad != 0u);
+    const ivec4 q = g4_q8x_code4(v, d);
+    U32(arg(cb)).v[row * (n / 4u) + e] = (uint(q.x) & 0xffu) | ((uint(q.y) & 0xffu) << 8u)
+        | ((uint(q.z) & 0xffu) << 16u) | (uint(q.w) << 24u);
+    int sum = (q.x + q.y) + (q.z + q.w);
+    sum += subgroupShuffleXor(sum, 1u);
+    sum += subgroupShuffleXor(sum, 2u);
+    sum += subgroupShuffleXor(sum, 4u);
+    if ((gl_SubgroupInvocationID & 7u) == 0u) {
+        const uint blk = row * (n / 32u) + e / 8u;
+        F32(arg(db)).v[2u * blk] = d;
+        F32(arg(db)).v[2u * blk + 1u] = float(sum);
+    }
+}
+#endif
+
 // The attention sublayer's end and the FFN's inputs: r = rmsnorm(a) w_post
 // + x; n1, n2, t = rmsnorm(r) times w1, w2, w3. Grid (m), n / 4 threads.
 // Buffers: 0 a, 1 w_post, 2 x, 3 r, 4-6 w1-w3, 7-9 n1, n2, t.
 // Params: 10 n, 11 eps.
 #ifdef KERNEL_gemma4_post_attn
 void main() {
-    const uint n = arg_u32(10);
-    const float eps = arg_f32(11);
+    const uint n = arg_u32(G4_PB(10u));
+    const float eps = arg_f32(G4_PB(11u));
     const uint row = gl_WorkGroupID.x, e = gl_LocalInvocationIndex;
     const uint64_t o = 16u * (uint64_t(row) * (n / 4u) + e);
     const vec4 a = F32x4(arg(0) + o).v[0];
@@ -957,6 +1029,9 @@ void main() {
     [[unroll]] for (uint j = 0u; j < 3u; j++) {
         F32x4(arg(7u + j) + o).v[0] = r * k * F32x4(arg(4u + j)).v[e];
     }
+#ifdef G4_Q8X
+    g4_q8x_put4(r * k * F32x4(arg(4u)).v[e], row, e, n, 10u, 11u);
+#endif
 }
 #endif
 
@@ -967,9 +1042,9 @@ void main() {
 // 8 w_next, 9 h. Params: 10 n, 11 eps, 12 has_next.
 #ifdef KERNEL_gemma4_ffn_out
 void main() {
-    const uint n = arg_u32(10);
-    const float eps = arg_f32(11);
-    const bool next = arg_u32(12) != 0u;
+    const uint n = arg_u32(G4_PB(10u));
+    const float eps = arg_f32(G4_PB(11u));
+    const bool next = arg_u32(G4_PB(12u)) != 0u;
     const uint row = gl_WorkGroupID.x, e = gl_LocalInvocationIndex;
     const uint64_t o = 16u * (uint64_t(row) * (n / 4u) + e);
     const vec4 m1 = F32x4(arg(0) + o).v[0], m2 = F32x4(arg(1) + o).v[0];
@@ -980,7 +1055,11 @@ void main() {
     const vec4 x = (s * k * F32x4(arg(4)).v[e] + F32x4(arg(5) + o).v[0]) * F32(arg(6)).v[0];
     F32x4(arg(7) + o).v[0] = x;
     if (next) {
-        F32x4(arg(9) + o).v[0] = x * gemma4_inv_rms(x, n, eps) * F32x4(arg(8)).v[e];
+        const vec4 h = x * gemma4_inv_rms(x, n, eps) * F32x4(arg(8)).v[e];
+        F32x4(arg(9) + o).v[0] = h;
+#ifdef G4_Q8X
+        g4_q8x_put4(h, row, e, n, 10u, 11u);
+#endif
     }
 }
 #endif
@@ -1015,12 +1094,16 @@ void main() {
 // threads. Buffers: 0 x, 1 w, 2 h. Params: 3 n, 4 eps.
 #ifdef KERNEL_gemma4_rmsnorm
 void main() {
-    const uint n = arg_u32(3);
-    const float eps = arg_f32(4);
+    const uint n = arg_u32(G4_PB(3u));
+    const float eps = arg_f32(G4_PB(4u));
     const uint row = gl_WorkGroupID.x, e = gl_LocalInvocationIndex;
     const uint64_t o = 16u * (uint64_t(row) * (n / 4u) + e);
     const vec4 x = F32x4(arg(0) + o).v[0];
-    F32x4(arg(2) + o).v[0] = x * gemma4_inv_rms(x, n, eps) * F32x4(arg(1)).v[e];
+    const vec4 h = x * gemma4_inv_rms(x, n, eps) * F32x4(arg(1)).v[e];
+    F32x4(arg(2) + o).v[0] = h;
+#ifdef G4_Q8X
+    g4_q8x_put4(h, row, e, n, 3u, 4u);
+#endif
 }
 #endif
 

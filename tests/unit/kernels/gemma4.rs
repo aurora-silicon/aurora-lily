@@ -1383,3 +1383,517 @@ fn moe_grouped_in_an_external_pool_stays_in_it() {
         assert!(outside.into_iter().all(|&v| v == sentinel), "m {m}: wrote outside the pool");
     }
 }
+
+/// The Q5_K GEMV over int8 activations ([`gemv_q5_k_q8x`] after
+/// [`quant_q8x`]) against glm53_gemv_q5_k_m1 at Gemma's shapes: time
+/// (passes of 256 dispatches over four copies) and error against an f32 CPU
+/// sum.
+#[test]
+#[ignore = "timing only"]
+fn int8_gemv_probe() {
+    use crate::kernels::glm53::gemv;
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(79);
+    for (label, rows, cols) in
+        [("q/k/v", 8192, 2816), ("o", 2816, 4096), ("gate/up", 4224, 2816)]
+    {
+        let raws: Vec<Vec<u8>> = (0..4)
+            .map(|_| random_blocks(&mut rng, GgmlType::Q5K, rows * cols))
+            .collect();
+        let ws: Vec<QWeight> = raws
+            .iter()
+            .map(|r| QWeight::from_bytes(&ctx, r, GgmlType::Q5K, cols, rows).unwrap())
+            .collect();
+        let xv = f32s(&mut rng, cols, -1.0, 1.0);
+        let x = tensor(&ctx, &xv);
+        let codes = Tensor::zeros(&ctx, &[cols], DType::I8).unwrap();
+        let ds = zeros(&ctx, cols / 16);
+        let (y, y8) = (zeros(&ctx, rows), zeros(&ctx, rows));
+        let q =
+            |p: &ComputePass<'_>| quant_q8x(&ctx, p, &x, &codes, &ds, 1, cols).unwrap();
+        let g8 = |p: &ComputePass<'_>, w: &QWeight| {
+            gemv_q5_k_q8x(&ctx, p, &[(w, &y8)], &codes, &ds, 1).unwrap()
+        };
+        run(&ctx, |p| {
+            q(p);
+            p.memory_barrier().unwrap();
+            g8(p, &ws[0]);
+            gemv(&ctx, p, &ws[0], &x, &y, 1).unwrap();
+        });
+        let wf = decode(GgmlType::Q5K, &raws[0]);
+        let cpu: Vec<f32> =
+            (0..rows).map(|r| dot(&wf[r * cols..(r + 1) * cols], &xv)).collect();
+        let rms = (cpu.iter().map(|v| v * v).sum::<f32>() / rows as f32).sqrt();
+        let err = |g: &[f32]| {
+            g.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / rms
+        };
+        let (e32, e8) = (err(&y.to_f32().unwrap()), err(&y8.to_f32().unwrap()));
+        let time = |f: &dyn Fn(&ComputePass<'_>, usize)| {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let pass = ctx.begin().unwrap();
+                for r in 0..256 {
+                    f(&pass, r);
+                }
+                let t = std::time::Instant::now();
+                pass.commit_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64() / 256.0);
+            }
+            best * 1e6
+        };
+        let t32 = time(&|p, r| gemv(&ctx, p, &ws[r % 4], &x, &y, 1).unwrap());
+        let t8 = time(&|p, r| g8(p, &ws[r % 4]));
+        let tq = time(&|p, _| q(p));
+        eprintln!(
+            "int8 {label:8} f32-x {t32:6.1} us (err {e32:.2e} of rms) | int8-x {t8:6.1} us + quant {tq:5.1} us (err {e8:.2e})"
+        );
+    }
+}
+
+/// The int8-activation Q5_K GEMV's rows of 2 to 4-row kernels
+/// equal the one-row kernel's, bit for bit (a verify pass decodes as a
+/// plain step), and it is within int8's rounding of the f32-input GEMV.
+#[test]
+fn int8_gemv_rows_match_one_row() {
+    use crate::kernels::glm53::gemv;
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(80);
+    let (rows, cols) = (520, 2816);
+    let raw = random_blocks(&mut rng, GgmlType::Q5K, rows * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q5K, cols, rows).unwrap();
+    let xv = f32s(&mut rng, 4 * cols, -1.0, 1.0);
+    let x = tensor(&ctx, &xv);
+    let codes = Tensor::zeros(&ctx, &[4 * cols], DType::I8).unwrap();
+    let ds = zeros(&ctx, 4 * cols / 16);
+    let mut one = Vec::new();
+    for i in 0..4 {
+        let xi = x.view(i * cols, &[cols]).unwrap();
+        let (c1, d1, y) = (
+            Tensor::zeros(&ctx, &[cols], DType::I8).unwrap(),
+            zeros(&ctx, cols / 16),
+            zeros(&ctx, rows),
+        );
+        run(&ctx, |p| {
+            quant_q8x(&ctx, p, &xi, &c1, &d1, 1, cols).unwrap();
+            p.memory_barrier().unwrap();
+            gemv_q5_k_q8x(&ctx, p, &[(&w, &y)], &c1, &d1, 1).unwrap();
+        });
+        one.push(y.to_f32().unwrap());
+    }
+    for m in 2..=4 {
+        let y = zeros(&ctx, m * rows);
+        run(&ctx, |p| {
+            quant_q8x(&ctx, p, &x, &codes, &ds, m, cols).unwrap();
+            p.memory_barrier().unwrap();
+            gemv_q5_k_q8x(&ctx, p, &[(&w, &y)], &codes, &ds, m).unwrap();
+        });
+        let got = y.to_f32().unwrap();
+        for i in 0..m {
+            assert!(
+                got[i * rows..(i + 1) * rows]
+                    .iter()
+                    .zip(&one[i])
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "m {m} row {i}"
+            );
+        }
+    }
+    let yf = zeros(&ctx, rows);
+    run(&ctx, |p| gemv(&ctx, p, &w, &x.view(0, &[cols]).unwrap(), &yf, 1).unwrap());
+    let f = yf.to_f32().unwrap();
+    let rms = (f.iter().map(|v| v * v).sum::<f32>() / rows as f32).sqrt();
+    let err =
+        one[0].iter().zip(&f).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / rms;
+    assert!(err < 0.05, "int8 against f32 activations: {err} of rms");
+}
+
+/// The norms' and the attention merge's int8 outputs equal
+/// quant_q8x of their f32 outputs, bit for bit, edge blocks included
+/// (zero, subnormal, NaN, infinities), and the f32 outputs are the plain
+/// kernels'.
+#[test]
+fn producers_write_the_int8_quant_q8x_writes() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(81);
+    let (m, n, eps) = (3, 2816, 1e-6);
+    let t: Vec<Tensor> =
+        (0..5).map(|_| tensor(&ctx, &f32s(&mut rng, m * n, -2.0, 2.0))).collect();
+    let tw: Vec<Tensor> =
+        (0..5).map(|_| tensor(&ctx, &f32s(&mut rng, n, 0.1, 3.0))).collect();
+    // The weight of each producer's int8 output, with edge blocks: zero,
+    // subnormal products, a NaN, overflow to infinities, and tiny normal
+    // values.
+    let mut swv = f32s(&mut rng, n, 0.1, 3.0);
+    for e in 0..32 {
+        swv[e] = 0.0;
+        swv[32 + e] = 1e-40;
+        swv[96 + e] = f32::MAX;
+        swv[128 + e] = f32::INFINITY;
+        swv[160 + e] = 1e-36;
+    }
+    swv[64 + 7] = f32::NAN;
+    let sw = tensor(&ctx, &swv);
+    let ls = tensor(&ctx, &[0.7]);
+    let q8 = || {
+        (
+            Tensor::zeros(&ctx, &[m * 8192], DType::I8).unwrap(),
+            zeros(&ctx, m * 8192 / 16),
+        )
+    };
+    let same = |a: &Tensor, b: &Tensor| {
+        let (a, b) = (a.to_f32().unwrap(), b.to_f32().unwrap());
+        a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits())
+    };
+    let same_codes = |a: &Tensor, b: &Tensor, len: usize| {
+        a.to_f32().unwrap()[..len] == b.to_f32().unwrap()[..len]
+    };
+    // The f32 output of each producer, plain and with int8, then
+    // quant_q8x of the plain one.
+    let cases: [(&str, usize); 3] = [("rmsnorm", n), ("post_attn", n), ("ffn_out", n)];
+    for (name, k) in cases {
+        let (plain, with) = (zeros(&ctx, m * n), zeros(&ctx, m * n));
+        let ((c1, d1), (c2, d2)) = (q8(), q8());
+        let o: Vec<Tensor> = (0..6).map(|_| zeros(&ctx, m * n)).collect();
+        run(&ctx, |p| {
+            match name {
+                "rmsnorm" => {
+                    rmsnorm(&ctx, p, &t[0], &sw, &plain, m, n, eps).unwrap();
+                    rmsnorm_q8x(
+                        &ctx,
+                        p,
+                        &t[0],
+                        &sw,
+                        &with,
+                        m,
+                        n,
+                        eps,
+                        Some((&c1, &d1)),
+                    )
+                    .unwrap();
+                }
+                "post_attn" => {
+                    post_attn(
+                        &ctx,
+                        p,
+                        &t[0],
+                        &tw[0],
+                        &t[1],
+                        &o[0],
+                        [&sw, &tw[2], &tw[3]],
+                        [&plain, &o[1], &o[2]],
+                        m,
+                        n,
+                        eps,
+                    )
+                    .unwrap();
+                    post_attn_q8x(
+                        &ctx,
+                        p,
+                        &t[0],
+                        &tw[0],
+                        &t[1],
+                        &o[3],
+                        [&sw, &tw[2], &tw[3]],
+                        [&with, &o[4], &o[5]],
+                        m,
+                        n,
+                        eps,
+                        Some((&c1, &d1)),
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    ffn_out(
+                        &ctx,
+                        p,
+                        &t[2],
+                        &t[3],
+                        [&tw[0], &tw[1], &tw[2]],
+                        &t[4],
+                        &ls,
+                        &o[0],
+                        Some((&sw, &plain)),
+                        m,
+                        n,
+                        eps,
+                    )
+                    .unwrap();
+                    ffn_out_q8x(
+                        &ctx,
+                        p,
+                        &t[2],
+                        &t[3],
+                        [&tw[0], &tw[1], &tw[2]],
+                        &t[4],
+                        &ls,
+                        &o[1],
+                        Some((&sw, &with)),
+                        m,
+                        n,
+                        eps,
+                        Some((&c1, &d1)),
+                    )
+                    .unwrap();
+                }
+            }
+            p.memory_barrier().unwrap();
+            quant_q8x(&ctx, p, &plain, &c2, &d2, m, k).unwrap();
+        });
+        assert!(same(&plain, &with), "{name}: f32 output");
+        assert!(same_codes(&c1, &c2, m * k), "{name}: codes");
+        assert!(
+            same(
+                &d1.view(0, &[m * k / 16]).unwrap(),
+                &d2.view(0, &[m * k / 16]).unwrap()
+            ),
+            "{name}: scales"
+        );
+        let ds = d1.to_f32().unwrap();
+        let scales: Vec<f32> = ds[..m * k / 16].iter().step_by(2).copied().collect();
+        assert!(scales.iter().any(|d| d.is_nan()), "{name}: no nonfinite block");
+        assert!(scales.iter().any(|&d| d == 0.0), "{name}: no zero block");
+    }
+    // The attention merge: heads of 16 x 256 a row.
+    let (d, kvh, heads, pos) = (256, 8, 16, 700);
+    let ring = 1024 + 256;
+    // f16 caches, V with edge dimensions: zero, a NaN, infinities of
+    // both signs.
+    let f16s = |v: &[f32]| {
+        let b: Vec<u8> =
+            v.iter().flat_map(|x| f16::from_f32(*x).to_bits().to_le_bytes()).collect();
+        Tensor::from_bytes(&ctx, &b, &[v.len()], DType::F16).unwrap()
+    };
+    let kc = f16s(&f32s(&mut rng, ring * kvh * d, -0.1, 0.1));
+    let mut vcv = f32s(&mut rng, ring * kvh * d, -0.1, 0.1);
+    for (i, v) in vcv.iter_mut().enumerate() {
+        match i % d {
+            0..32 => *v = 0.0,
+            40 => *v = f32::NAN,
+            64..96 => *v = f32::INFINITY,
+            96..128 => *v = f32::NEG_INFINITY,
+            _ => {}
+        }
+    }
+    let vc = f16s(&vcv);
+    let kn = tensor(&ctx, &f32s(&mut rng, d, 0.5, 1.5));
+    let a = AttnShape {
+        head_dim: d,
+        heads,
+        kv_heads: kvh,
+        ring,
+        window: 1024,
+        k_cache: &kc,
+        v_cache: &vc,
+        k_rot: d / 2,
+        k_norm: &kn,
+    };
+    let q = tensor(&ctx, &f32s(&mut rng, m * heads * d, -1.0, 1.0));
+    let partial = zeros(&ctx, attn_partial_len(m, heads, d, attn_chunks(&a, pos, m)));
+    let (plain, with) = (zeros(&ctx, m * heads * d), zeros(&ctx, m * heads * d));
+    let ((c1, d1), (c2, d2)) = (q8(), q8());
+    run(&ctx, |p| {
+        attention(&ctx, p, &a, &q, &partial, &plain, pos, m, 4).unwrap();
+        p.memory_barrier().unwrap();
+        attention_q8x(&ctx, p, &a, &q, &partial, &with, pos, m, 4, Some((&c1, &d1)))
+            .unwrap();
+        p.memory_barrier().unwrap();
+        quant_q8x(&ctx, p, &plain, &c2, &d2, m, heads * d).unwrap();
+    });
+    let k = heads * d;
+    assert!(same(&plain, &with), "merge: f32 output");
+    assert!(same_codes(&c1, &c2, m * k), "merge: codes");
+    assert!(
+        same(&d1.view(0, &[m * k / 16]).unwrap(), &d2.view(0, &[m * k / 16]).unwrap()),
+        "merge: scales"
+    );
+    let ds = d1.to_f32().unwrap();
+    let scales: Vec<f32> = ds[..m * k / 16].iter().step_by(2).copied().collect();
+    assert!(scales.iter().any(|d| d.is_nan()), "merge: no nonfinite block");
+    assert!(scales.iter().any(|&d| d == 0.0), "merge: no zero block");
+}
+
+/// quant_q8x on edge blocks: codes in [-127, 127] with the sign of their
+/// value (a subnormal maximum would round to 128), the stored sum the
+/// codes', a zero block zero, extrema at +-127, codes within half a step
+/// of x / d, and a NaN or an infinity flagging its block with a NaN scale
+/// and zero codes.
+#[test]
+fn quant_q8x_edge_blocks() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(82);
+    let (m, k) = (2, 512);
+    let mut x = f32s(&mut rng, m * k, -1.0, 1.0);
+    let tiny = |n: u32| f32::from_bits(n); // n times the smallest subnormal
+    let blk = |b: usize| b * 32..(b + 1) * 32;
+    x[blk(0)].fill(0.0);
+    // Subnormal maxima: 2^-142 (x / d = 128) and 190 x 2^-149.
+    x[blk(1)].fill(0.0);
+    x[32..36].copy_from_slice(&[tiny(1 << 7), -tiny(1 << 7), tiny(1 << 6), -tiny(3)]);
+    x[blk(2)].fill(0.0);
+    x[64..67].copy_from_slice(&[-tiny(190), tiny(190), tiny(64)]);
+    // Signed extrema.
+    x[96] = f32::MAX;
+    x[97] = -f32::MAX;
+    x[128] = -3.0;
+    x[129] = 1.5;
+    // Rounding boundaries around a scale of 1.
+    let halves =
+        [127.0, -127.0, 0.5, -0.5, 1.5, -1.5, 2.5, 126.5, -126.5, 63.49, 63.51];
+    x[160..160 + halves.len()].copy_from_slice(&halves);
+    x[192 + 7] = f32::NAN;
+    x[224 + 31] = f32::INFINITY;
+    x[256] = f32::NEG_INFINITY;
+    x[k + 288] = f32::NAN; // the second row's block 9
+    let xt = tensor(&ctx, &x);
+    let codes = Tensor::zeros(&ctx, &[m * k], DType::I8).unwrap();
+    let ds = zeros(&ctx, m * k / 16);
+    run(&ctx, |p| quant_q8x(&ctx, p, &xt, &codes, &ds, m, k).unwrap());
+    let (c, ds) = (codes.to_f32().unwrap(), ds.to_f32().unwrap());
+    for b in 0..m * k / 32 {
+        let (xs, cs) = (&x[b * 32..(b + 1) * 32], &c[b * 32..(b + 1) * 32]);
+        let (d, sum) = (ds[2 * b], ds[2 * b + 1]);
+        if xs.iter().any(|v| !v.is_finite()) {
+            assert!(
+                d.is_nan() && sum == 0.0 && cs.iter().all(|&q| q == 0.0),
+                "block {b}"
+            );
+            continue;
+        }
+        assert!(cs.iter().all(|q| (-127.0..=127.0).contains(q)), "block {b}: range");
+        assert!(
+            xs.iter().zip(cs).all(|(v, q)| *q == 0.0 || q.signum() == v.signum()),
+            "block {b}: sign"
+        );
+        assert_eq!(sum, cs.iter().sum::<f32>(), "block {b}: sum");
+        let amax = xs.iter().fold(0f32, |a, v| a.max(v.abs()));
+        if amax == 0.0 {
+            assert!(d == 0.0 && cs.iter().all(|&q| q == 0.0), "block {b}: zero");
+            continue;
+        }
+        if amax / 127.0 < f32::MIN_POSITIVE {
+            // The GPU may flush subnormals: then the block is zero.
+            assert!(
+                d == 0.0 || cs.iter().any(|q| q.abs() == 127.0),
+                "block {b}: subnormal"
+            );
+            continue;
+        }
+        assert!(
+            (d - amax / 127.0).abs() <= 2.0 * f32::EPSILON * d,
+            "block {b}: scale {d}"
+        );
+        for (v, q) in xs.iter().zip(cs) {
+            let r = (v / d).clamp(-127.0, 127.0);
+            assert!((q - r).abs() <= 0.5 + 1e-4, "block {b}: {v} / {d} -> {q}");
+            if v.abs() == amax {
+                assert_eq!(q.abs(), 127.0, "block {b}: extremum {v}");
+            }
+        }
+    }
+    // The four blocks with a NaN or an infinity, and no other.
+    assert_eq!(ds.iter().step_by(2).filter(|d| d.is_nan()).count(), 4);
+}
+
+/// Q5_K weights decoded from the block layout (d, dmin, 12 bytes of 6-bit
+/// scales and mins, 32 bytes of high bits, 128 of low nibbles), apart from
+/// the crate's dequantizer.
+fn q5_k_values(raw: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(raw.len() / 176 * 256);
+    for b in raw.chunks_exact(176) {
+        let h =
+            |i: usize| f16::from_bits(u16::from_le_bytes([b[i], b[i + 1]])).to_f32();
+        let (d, dmin) = (h(0), h(2));
+        let sc = &b[4..16];
+        let scale_min = |j: usize| {
+            if j < 4 {
+                (sc[j] & 63, sc[j + 4] & 63)
+            } else {
+                (
+                    (sc[j + 4] & 0xf) | ((sc[j - 4] >> 6) << 4),
+                    (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4),
+                )
+            }
+        };
+        let (qh, qs) = (&b[16..48], &b[48..176]);
+        for j in 0..8 {
+            let (s, mn) = scale_min(j);
+            let (s, mn) = (d * s as f32, dmin * mn as f32);
+            for l in 0..32 {
+                let lo = if j % 2 == 0 {
+                    qs[j / 2 * 32 + l] & 0xf
+                } else {
+                    qs[j / 2 * 32 + l] >> 4
+                };
+                let hi = (qh[l] >> j) & 1;
+                out.push(s * (lo + 16 * hi) as f32 - mn);
+            }
+        }
+    }
+    out
+}
+
+/// The int8 GEMV with two to four sets of distinct row counts (each ending
+/// in a partial group of eight rows) equals one dispatch per set, bit for
+/// bit, and the products of the codes with independently decoded Q5_K
+/// weights (nonzero scales and mins).
+#[test]
+fn int8_gemv_sets_match_one_set_and_the_block_layout() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(83);
+    let cols = 1024;
+    let rows = [523, 77, 300, 9];
+    let raws: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|&r| random_blocks(&mut rng, GgmlType::Q5K, r * cols))
+        .collect();
+    let ws: Vec<QWeight> = raws
+        .iter()
+        .zip(rows)
+        .map(|(raw, r)| QWeight::from_bytes(&ctx, raw, GgmlType::Q5K, cols, r).unwrap())
+        .collect();
+    for m in [1, 3] {
+        let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
+        let codes = Tensor::zeros(&ctx, &[m * cols], DType::I8).unwrap();
+        let ds = zeros(&ctx, m * cols / 16);
+        run(&ctx, |p| quant_q8x(&ctx, p, &x, &codes, &ds, m, cols).unwrap());
+        let one: Vec<Tensor> = rows.iter().map(|&r| zeros(&ctx, m * r)).collect();
+        run(&ctx, |p| {
+            for (w, y) in ws.iter().zip(&one) {
+                gemv_q5_k_q8x(&ctx, p, &[(w, y)], &codes, &ds, m).unwrap();
+            }
+        });
+        let one: Vec<Vec<f32>> = one.iter().map(|y| y.to_f32().unwrap()).collect();
+        for sets in 2..=4 {
+            let ys: Vec<Tensor> =
+                rows[..sets].iter().map(|&r| zeros(&ctx, m * r)).collect();
+            let pairs: Vec<(&QWeight, &Tensor)> = ws.iter().zip(&ys).collect();
+            run(&ctx, |p| gemv_q5_k_q8x(&ctx, p, &pairs, &codes, &ds, m).unwrap());
+            for (s, y) in ys.iter().enumerate() {
+                let y = y.to_f32().unwrap();
+                assert!(
+                    y.iter().zip(&one[s]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "m {m}, {sets} sets: set {s}"
+                );
+            }
+        }
+        let (c, ds) = (codes.to_f32().unwrap(), ds.to_f32().unwrap());
+        for (s, raw) in raws.iter().enumerate() {
+            let w = q5_k_values(raw);
+            let r = rows[s];
+            let want: Vec<f32> = (0..m * r)
+                .map(|o| {
+                    let (i, n) = (o / r, o % r);
+                    (0..cols)
+                        .map(|e| {
+                            let b = (i * cols + e) / 32;
+                            w[n * cols + e] as f64
+                                * ds[2 * b] as f64
+                                * c[i * cols + e] as f64
+                        })
+                        .sum::<f64>() as f32
+                })
+                .collect();
+            assert_close(&one[s], &want, 1e-4, 1e-4);
+        }
+    }
+}
