@@ -235,7 +235,11 @@ fn gemv_dispatch(
         w0.cols
     );
     let per_sg = 32 / tasks.min(32);
-    let rows_per_tg = 8 * per_sg;
+    let max_rows = sets.iter().map(|(w, _)| w.rows).max().unwrap_or(0);
+    // Two rows a subgroup share one input row, so grouped inputs (GLM's
+    // per-head attn_k_b) take one.
+    let r = if l.x_group >= max_rows { gemv_rows_per_subgroup(w0.ty, m, max_rows) } else { 1 };
+    let rows_per_tg = 8 * per_sg * r;
     let mut groups = 0;
     for &(w, y) in sets {
         ensure!(
@@ -261,7 +265,8 @@ fn gemv_dispatch(
         bindings.push(sets.get(s).map_or(x.binding(), |(_, y)| y.binding()));
     }
     let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
-    let pipeline = ctx.pipeline(gemv_name(w0.ty, m)?, SOURCE, MslVersion::V3_1)?;
+    let name = if r == 2 { "glm53_gemv_q5_k_m1_r2" } else { gemv_name(w0.ty, m)? };
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &bindings,
@@ -279,6 +284,17 @@ fn gemv_dispatch(
         ],
         Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
     )
+}
+
+/// Weights of more rows than this take two rows a subgroup where a kernel
+/// for it exists (Q5_K at one row: Gemma's LM head).
+const GEMV_R2_MIN_ROWS: usize = 32768;
+
+/// Weight rows a subgroup of the GEMV of `ty` takes for each of its lane
+/// groups at `m` rows over weights of up to `rows` rows: two for a wide
+/// Q5_K at one row (they share the x loads), else one.
+fn gemv_rows_per_subgroup(ty: GgmlType, m: usize, rows: usize) -> usize {
+    if ty == GgmlType::Q5K && m == 1 && rows >= GEMV_R2_MIN_ROWS { 2 } else { 1 }
 }
 
 /// Rows (of activations) at which [`gemm`] takes over from the GEMV.
@@ -333,7 +349,8 @@ pub fn gemm_with(
 }
 
 /// [`gemm`] over `xb`, the input's rows as bfloat ([`to_bf16`]'s rounding:
-/// the results are [`gemm`]'s bit for bit) for Q8_0 and Q4_K weights: the
+/// the results are [`gemm`]'s bit for bit) for Q8_0, Q4_K, Q5_K and Q6_K
+/// weights: the
 /// f32 kernel rounds every element in every column tile (about a third of
 /// a 1 024-row call; 2026-11-14).
 pub fn gemm_bx(
@@ -378,6 +395,8 @@ pub fn gemm_bx_with(
         GgmlType::Q8_0 => "glm53_gemm_q8_0_bx",
         GgmlType::Q4K => "glm53_gemm_q4_k_bx",
         GgmlType::F16 => "glm53_gemm_f16_bx",
+        GgmlType::Q5K => "glm53_gemm_q5_k_bx",
+        GgmlType::Q6K => "glm53_gemm_q6_k_bx",
         other => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
     };
     gemm_any(ctx, pass, w, xb, y, m, n, l, name, GEMM_BX_ROWS, GEMM_BX_THREADS)
@@ -391,12 +410,14 @@ const GEMM_BX_THREADS: usize = 256;
 
 /// Whether [`gemm_bx`] takes weights of this type.
 pub fn gemm_bx_takes(w: &QWeight) -> bool {
-    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K) && w.cols.is_multiple_of(8)
+    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
+        && w.cols.is_multiple_of(8)
 }
 
 /// Whether [`gemm_bx_with`] takes weights of this type (F16 too).
 pub fn gemm_bx_with_takes(w: &QWeight) -> bool {
-    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::F16) && w.cols.is_multiple_of(8)
+    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::F16)
+        && w.cols.is_multiple_of(8)
 }
 
 /// `out` = the first `n` values of `x` as bfloat (rounded to nearest even),

@@ -18,7 +18,8 @@
 // Gemma 4's block types (glm53_quant.glsl).
 #if defined(KERNEL_glm53_gemm_q4_0) || defined(KERNEL_glm53_gemm_q5_k) || \
     defined(KERNEL_glm53_gemm_q6_k) || defined(KERNEL_glm53_gemm_iq4_nl) || \
-    defined(KERNEL_glm53_gemm_iq2_s)
+    defined(KERNEL_glm53_gemm_iq2_s) || defined(KERNEL_glm53_gemm_q5_k_bx) || \
+    defined(KERNEL_glm53_gemm_q6_k_bx)
 #define GLM53_EXT_TYPES
 #endif
 #include "common.glsl"
@@ -47,6 +48,15 @@ uint glm53_bf16_bits(float f) {
 // glm53_gemm_f16_bx: F16 weights (DeepSeek V4's compressors and indexer).
 #ifdef KERNEL_glm53_gemm_f16_bx
 #define KERNEL_glm53_gemm_f16
+#define GEMM_BX
+#endif
+// Gemma 4's Q5_K and Q6_K (glm53_gemm_q5_k_bx, _q6_k_bx).
+#ifdef KERNEL_glm53_gemm_q5_k_bx
+#define KERNEL_glm53_gemm_q5_k
+#define GEMM_BX
+#endif
+#ifdef KERNEL_glm53_gemm_q6_k_bx
+#define KERNEL_glm53_gemm_q6_k
 #define GEMM_BX
 #endif
 
@@ -81,7 +91,8 @@ uint glm53_bf16_bits(float f) {
 
 // Gemma 4's block types (glm53_gemm_q4_0, _q5_k, _q6_k, _iq4_nl, _iq2_s):
 // the dense GEMM with gd_decode8 taking 8 values of glm53_decode's 32-value
-// task (four times the decode work of a dedicated decode8).
+// task (four times the decode work of a dedicated decode8), but for Q5_K
+// and Q6_K, which decode their 8 directly.
 #if defined(KERNEL_glm53_gemm_q4_0) || defined(KERNEL_glm53_gemm_q5_k) || \
     defined(KERNEL_glm53_gemm_q6_k) || defined(KERNEL_glm53_gemm_iq4_nl) || \
     defined(KERNEL_glm53_gemm_iq2_s)
@@ -167,6 +178,30 @@ void gd_decode8(uint64_t row, uint k, out float w[8]) {
     [[unroll]] for (uint i = 0u; i < 8u; i++) {
         const uint c = ((q[i >> 2u] >> (8u * (i & 3u))) & 0xfu) | (((h[i >> 2u] >> (8u * (i & 3u))) & 1u) << 4u);
         w[i] = scale * float(c) - minv;
+    }
+    return;
+#endif
+#ifdef KERNEL_glm53_gemm_q6_k
+    // Q6_K values 8 o .. 8 o + 8 of task t (o = k / 8 % 4), as
+    // glm53_decode_q6_k computes them: low nibbles of bytes ql + 8 o ..,
+    // two high bits of bytes qh + 8 o .., the scale of their 16-value half.
+    const uint ts = k >> 5u, o = (k >> 3u) & 3u;
+    const uint64_t b = row + uint64_t(ts >> 3u) * 210u;
+    const uint n = (ts >> 2u) & 1u, q = ts & 3u;
+    const float d = glm53_h2f(uint(U16(b).v[104]));
+    const uint sw = uint(U16(b + 192u).v[4u * n + q]);
+    precise float s = d * float(int(sw << (o < 2u ? 24u : 16u)) >> 24);
+    const uint64_t ql = b + 64u * n + 32u * (q & 1u) + 8u * o;
+    const uint64_t qh = b + 128u + 32u * n + 8u * o;
+    const uint lshift = 4u * (q >> 1u), hshift = 2u * q;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint lo = uint(U16(ql).v[i]) >> lshift;
+        const uint hi = uint(U16(qh).v[i]) >> hshift;
+        [[unroll]] for (uint c2 = 0u; c2 < 2u; c2++) {
+            const uint c = ((lo >> (8u * c2)) & 0xfu) | (((hi >> (8u * c2)) & 3u) << 4u);
+            precise float v = s * float(int(c) - 32);
+            w[2u * i + c2] = v;
+        }
     }
     return;
 #endif

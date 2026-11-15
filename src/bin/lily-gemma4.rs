@@ -70,6 +70,18 @@ enum Cmd {
         #[arg(long, default_value_t = 24)]
         steps: usize,
     },
+    /// The context `--memory-limit-gb` fits, loading as the server does
+    /// (prints the load's fit line): `checkpoints` snapshots a session.
+    Fit {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        memory_limit_gb: f64,
+        #[arg(long, default_value_t = 0)]
+        drafts: usize,
+        #[arg(long, default_value_t = 1)]
+        checkpoints: usize,
+    },
     /// GPU memory of a configuration: the loaded weights, the scratch and
     /// one session for `ctx` tokens with `checkpoints` snapshots, exactly
     /// (the backend's allocation counter).
@@ -150,6 +162,23 @@ fn run() -> Result<()> {
             state_check(&model, &cases, n, steps)
         }
         Cmd::Mem { model, ctx, checkpoints } => mem(&model, ctx, checkpoints),
+        Cmd::Fit { model, memory_limit_gb, drafts, checkpoints } => {
+            use lily::engine::{LanguageModel, LoadOptions};
+            let ctx = MetalContext::new()?;
+            let options = LoadOptions {
+                mtp_drafts: drafts,
+                memory_limit: Some((memory_limit_gb * (1u64 << 30) as f64) as u64),
+                session_checkpoints: Some(checkpoints),
+                ..Default::default()
+            };
+            let m = <Gemma4Model as LanguageModel>::load(&ctx, &model, &options)?;
+            println!(
+                "fit: context {} tokens, drafts {}",
+                m.context_cap,
+                m.max_drafts()
+            );
+            Ok(())
+        }
         Cmd::Bench { model, text, prompt_len, n, runs } => {
             bench(&model, &text, prompt_len, n, runs)
         }

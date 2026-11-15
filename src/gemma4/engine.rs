@@ -128,8 +128,8 @@ impl DecodeStateApi for Gemma4State {
             if l.swa {
                 continue;
             }
-            let per_tok = l.k.numel() / l.slots;
             let grow = |t: &Tensor| -> Result<Tensor> {
+                let per_tok = t.numel() / l.slots;
                 let n = Tensor::zeros(ctx, &[capacity * per_tok], DType::F16)?;
                 host_copy(t, &n, self.pos * per_tok * 2);
                 Ok(n)
@@ -201,9 +201,8 @@ impl DecodeStateApi for Gemma4State {
             if src.swa {
                 continue;
             }
-            let per_tok = src.k.numel() / src.slots;
-            host_copy(&src.k, &dst.k, tokens * per_tok * 2);
-            host_copy(&src.v, &dst.v, tokens * per_tok * 2);
+            host_copy(&src.k, &dst.k, tokens * (src.k.numel() / src.slots) * 2);
+            host_copy(&src.v, &dst.v, tokens * (src.v.numel() / src.slots) * 2);
         }
         Ok(())
     }
@@ -226,7 +225,7 @@ impl ScratchApi for Scratch {
 }
 
 impl Gemma4Model {
-    /// Feeds `tokens` in runs of [`PREFILL_ROWS`], drawing after the last
+    /// Feeds `tokens` in runs of `prefill_rows`, drawing after the last
     /// when `draw`; before committing each run, stops if `stop` says so
     /// (the state then sits at a run boundary). Returns the tokens fed.
     fn prefill_chunks(
@@ -240,7 +239,7 @@ impl Gemma4Model {
     ) -> Result<usize> {
         ensure!(!tokens.is_empty(), "empty prefill");
         state.ensure_capacity(ctx, state.pos + tokens.len())?;
-        let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_ROWS).collect();
+        let chunks: Vec<&[u32]> = tokens.chunks(self.prefill_rows).collect();
         let mut fed = 0;
         for (i, chunk) in chunks.iter().enumerate() {
             if stop() {
@@ -319,14 +318,6 @@ impl Gemma4Model {
 
 impl Gemma4Model {
     /// Bytes of the scratch's attention partials per token of context.
-    fn partial_bytes_per_token(&self) -> u64 {
-        let cfg = &self.cfg;
-        let d = cfg.head_dim.max(cfg.head_dim_swa);
-        (4 * crate::kernels::gemma4::attn_partial_len(MAX_ROWS, cfg.n_head, d, 1)
-            / crate::kernels::gemma4::ATTN_CHUNK) as u64
-            + 1
-    }
-
     /// The most GPU memory one session holds on its way to `capacity` rows
     /// with `checkpoints` snapshots: its caches at that capacity plus the
     /// one global layer's K and V that `ensure_capacity` holds twice while
@@ -348,12 +339,7 @@ impl Gemma4Model {
         checkpoints: usize,
     ) -> Result<usize> {
         let room = limit.saturating_sub(allocated);
-        let per_token = (self.session_peak(256, 0) - self.session_peak(0, 0)) / 256
-            + self.partial_bytes_per_token();
-        let fixed = self.session_peak(0, checkpoints);
-        let rows = room.saturating_sub(fixed) / per_token.max(1);
-        let context = (rows as usize).saturating_sub(LOOKAHEAD) / 256 * 256;
-        let context = context.min(self.cfg.context_length).min(MAX_SEQ);
+        let context = fit_tokens(&self.cfg, room, checkpoints);
         ensure!(
             context >= 4096,
             "--memory-limit-gb {:.1} leaves {:.2} GB after {:.1} GB of weights and scratch: a context \
@@ -367,6 +353,37 @@ impl Gemma4Model {
             Some(self.session_peak(capacity_cap(context), checkpoints));
         Ok(context)
     }
+}
+
+/// GPU bytes a token of context adds to the scratch: the decode attention's
+/// partials (MAX_ROWS rows, a chunk of ATTN_CHUNK keys).
+pub(crate) fn partial_bytes_per_token(cfg: &super::config::Config) -> u64 {
+    let d = cfg.head_dim.max(cfg.head_dim_swa);
+    (4 * crate::kernels::gemma4::attn_partial_len(MAX_ROWS, cfg.n_head, d, 1)
+        / crate::kernels::gemma4::ATTN_CHUNK) as u64
+        + 1
+}
+
+/// The longest context (a multiple of 256 tokens, at most the model's and
+/// MAX_SEQ) whose session at its peak (`session_peak` at `capacity_cap` of
+/// it, with `checkpoints` snapshots) and attention partials fit `room`
+/// bytes.
+pub(crate) fn fit_tokens(cfg: &super::config::Config, room: u64, checkpoints: usize) -> usize {
+    let peak = |c: usize| super::model::session_peak(cfg, c, checkpoints);
+    let per_token = (peak(256) - peak(0)) / 256 + partial_bytes_per_token(cfg);
+    let rows = room.saturating_sub(peak(0)) / per_token.max(1);
+    let context = (rows as usize).saturating_sub(LOOKAHEAD) / 256 * 256;
+    context.min(cfg.context_length).min(MAX_SEQ)
+}
+
+/// The prompt run a memory limit takes, from each run's fitted context
+/// (`(rows, context)`, longest run first and 256 rows last; `None` where
+/// less than 4096 tokens fit): the longest run that keeps a context of
+/// 32K tokens, or that of the last run when that is less (a 16 GB tier
+/// keeps its context and short runs). `None` when nothing fits.
+pub(crate) fn choose_prompt_run(fits: &[(usize, Option<usize>)]) -> Option<usize> {
+    let floor = fits.last()?.1?.min(32768);
+    fits.iter().position(|f| f.1.is_some_and(|c| c >= floor))
 }
 
 impl LanguageModel for Gemma4Model {
@@ -404,19 +421,32 @@ impl LanguageModel for Gemma4Model {
             // argument arenas, then the longest context whose session fits
             // the rest: the server caps --max-seq there.
             let before = ctx.current_allocated();
-            let probe = model.new_scratch(ctx, 1)?;
-            let scratch = ctx.current_allocated().saturating_sub(before);
-            drop(probe);
-            let allocated = before + scratch + PASS_ARENAS;
             let checkpoints = options.session_checkpoints.unwrap_or(
                 crate::serve::CHECKPOINTS_PER_SESSION
                     + crate::serve::DECODE_CHECKPOINTS_PER_SESSION,
             );
+            // The run size (choose_prompt_run): scratch grows ~0.3 MB a
+            // run row, and longer runs prefill faster (PREFILL_ROWS).
+            let mut fits = Vec::new();
+            for rows in [PREFILL_ROWS, PREFILL_ROWS / 2, PREFILL_ROWS / 4] {
+                model.prefill_rows = rows;
+                let probe = model.new_scratch(ctx, 1)?;
+                let scratch = ctx.current_allocated().saturating_sub(before);
+                drop(probe);
+                let allocated = before + scratch + PASS_ARENAS;
+                let context = model.fit_context(limit, allocated as u64, checkpoints).ok();
+                fits.push((rows, allocated, context));
+            }
+            let contexts: Vec<(usize, Option<usize>)> =
+                fits.iter().map(|&(rows, _, c)| (rows, c)).collect();
+            let pick = choose_prompt_run(&contexts).unwrap_or(fits.len() - 1);
+            let (rows, allocated, _) = fits[pick];
+            model.prefill_rows = rows;
             let context = model.fit_context(limit, allocated as u64, checkpoints)?;
             eprintln!(
                 "gemma4: --memory-limit-gb {:.1} ({:.1} GB) leaves {:.2} GB after {:.1} GB of weights and \
                  scratch: contexts of up to {context} tokens (one session of at most {:.2} GB with \
-                 {checkpoints} snapshots); --max-seq is capped there",
+                 {checkpoints} snapshots), prompt runs of {rows} rows; --max-seq is capped there",
                 limit as f64 / (1u64 << 30) as f64,
                 limit as f64 / 1e9,
                 limit.saturating_sub(allocated as u64) as f64 / 1e9,
@@ -541,7 +571,7 @@ impl LanguageModel for Gemma4Model {
     fn bytes_per_token(&self) -> usize {
         (0..self.cfg.n_layer)
             .filter(|&il| !self.cfg.swa[il])
-            .map(|il| 4 * self.cfg.kv_width(il))
+            .map(|il| 2 * (self.cfg.k_cache_width(il) + self.cfg.kv_width(il)))
             .sum()
     }
 
@@ -552,7 +582,7 @@ impl LanguageModel for Gemma4Model {
         Some(
             (0..self.cfg.n_layer)
                 .filter(|&il| self.cfg.swa[il])
-                .map(|il| 4 * slots * self.cfg.kv_width(il))
+                .map(|il| 2 * slots * (self.cfg.k_cache_width(il) + self.cfg.kv_width(il)))
                 .sum(),
         )
     }
@@ -592,7 +622,7 @@ impl LanguageModel for Gemma4Model {
     }
 
     fn prefill_chunk_tokens(&self) -> Option<usize> {
-        Some(PREFILL_ROWS)
+        Some(self.prefill_rows)
     }
 
     fn prefill_until(

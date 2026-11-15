@@ -211,3 +211,61 @@ fn semantics_the_graph_lacks_are_refused() {
         assert!(Config::from_metadata(&with(k, v), VOCAB).is_ok(), "{k}");
     }
 }
+
+/// The published files' global layers keep 64 of 256 RoPE pairs in their
+/// K caches (V is their K projection, the pairs from 64 on do not turn);
+/// the sliding-window layers whole heads.
+#[test]
+#[ignore = "reads the Gemma 4 GGUF in LILY_GEMMA4_GGUF"]
+fn the_published_file_narrows_the_global_k_caches() {
+    let Some(path) = std::env::var_os("LILY_GEMMA4_GGUF") else { return };
+    let g = crate::gguf::Gguf::open(std::path::Path::new(&path)).unwrap();
+    let c = Config::from_gguf(&g).unwrap();
+    for il in 0..c.n_layer {
+        assert_eq!(c.k_rot[il], if c.swa[il] { 128 } else { 64 }, "layer {il}");
+    }
+}
+
+/// The K cache's RoPE pairs from a layer's frequency factors (`None`: a
+/// sliding-window layer, one with its own V projection, or no factors).
+#[test]
+fn k_caches_keep_the_turning_pairs_of_a_still_suffix() {
+    let factors = |turning: &[usize]| -> Vec<f32> {
+        (0..256).map(|i| if turning.contains(&i) { 1.0 } else { 1e30 }).collect()
+    };
+    let published = factors(&(0..64).collect::<Vec<_>>());
+    assert_eq!(k_rot_of(512, Some(&published)), 64);
+    // Every pair still: no pair to keep, so the whole head.
+    assert_eq!(k_rot_of(512, Some(&factors(&[]))), 256);
+    // Every pair turning.
+    assert_eq!(k_rot_of(512, Some(&vec![1.0; 256])), 256);
+    // A turning pair inside the still part.
+    assert_eq!(k_rot_of(512, Some(&factors(&[0, 1, 2, 100]))), 256);
+    let mut gap: Vec<usize> = (0..64).collect();
+    gap.push(200);
+    assert_eq!(k_rot_of(512, Some(&factors(&gap))), 256);
+    // A still suffix not on a 64-pair boundary.
+    assert_eq!(k_rot_of(512, Some(&factors(&(0..40).collect::<Vec<_>>()))), 256);
+    // 128 turning pairs.
+    assert_eq!(k_rot_of(512, Some(&factors(&(0..128).collect::<Vec<_>>()))), 128);
+    // A NaN factor counts as still, as the kernel takes it.
+    let mut nan = published.clone();
+    nan[255] = f32::NAN;
+    assert_eq!(k_rot_of(512, Some(&nan)), 64);
+    // A layer with its own V projection, or without factors; factors of
+    // another head width.
+    assert_eq!(k_rot_of(512, None), 256);
+    assert_eq!(k_rot_of(256, Some(&published)), 128);
+}
+
+#[test]
+fn config_validation_bounds_the_k_cache_pairs() {
+    let mut c = Config::gemma4_26b_a4b();
+    c.validate().unwrap();
+    c.k_rot[5] = 64;
+    c.validate().unwrap();
+    for bad in [0, 32, 300] {
+        c.k_rot[5] = bad;
+        assert!(c.validate().is_err(), "k_rot {bad}");
+    }
+}

@@ -44,13 +44,14 @@ fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
     };
     for blk in b.chunks_exact_mut(bb) {
         match ty {
-            GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Iq2Xxs => {
+            GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Iq2Xxs | GgmlType::Iq2S => {
                 put(blk, 0, rng.gen_range(0.001..0.01))
             }
             GgmlType::Q5K => {
                 put(blk, 0, rng.gen_range(0.001..0.01));
                 put(blk, 2, rng.gen_range(0.001..0.01));
             }
+            GgmlType::Q6K => put(blk, 208, rng.gen_range(0.0001..0.001)),
             other => panic!("no random {other:?} blocks"),
         }
     }
@@ -102,8 +103,11 @@ fn attention_case(
     let ff: Vec<f32> = (0..d / 2).map(|i| if i < d / 8 { 1.0 } else { 1e30 }).collect();
     let q = f32s(&mut rng, total * heads * d, -1.0, 1.0);
     let k = f32s(&mut rng, total * kw, -1.0, 1.0);
-    let v = f32s(&mut rng, total * kw, -1.0, 1.0);
-    let kc = Tensor::zeros(&ctx, &[ring * kw], DType::F16).unwrap();
+    // A global layer's V is its K projection (attention_k_eq_v), and its K
+    // cache keeps only the turning pairs (d / 8 of them here).
+    let v = if global { k.clone() } else { f32s(&mut rng, total * kw, -1.0, 1.0) };
+    let k_rot = if global { d / 8 } else { d / 2 };
+    let kc = Tensor::zeros(&ctx, &[ring * kvh * 2 * k_rot], DType::F16).unwrap();
     let vc = Tensor::zeros(&ctx, &[ring * kw], DType::F16).unwrap();
     let (tqn, tkn, tff) = (tensor(&ctx, &qn), tensor(&ctx, &kn), tensor(&ctx, &ff));
     let a = AttnShape {
@@ -114,6 +118,8 @@ fn attention_case(
         window,
         k_cache: &kc,
         v_cache: &vc,
+        k_rot,
+        k_norm: &tkn,
     };
     let chunks = attn_chunks(&a, pos0, m).max(1);
     let partial = zeros(&ctx, attn_partial_len(m, heads, d, chunks));
@@ -228,6 +234,9 @@ fn attention_prefill_matches_cpu() {
     attention_case(256, 8, 40, 100, 50, false);
     attention_case(512, 2, 0, 70, 37, true);
     attention_case(256, 8, 1024, 0, 20, false);
+    // Whole prompt runs: a ring that wraps, a global layer deep in its cache.
+    attention_case(256, 8, 1024, 1100, 256, false);
+    attention_case(512, 2, 0, 500, 200, true);
 }
 
 #[test]
@@ -470,10 +479,15 @@ fn embed_geglu_softcap_match_cpu() {
 fn moe_timing() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(70);
-    let repeat = 32;
+    // Passes as long as a decode step's (32 dispatches measured 30% apart).
+    let repeat = 256;
     let (experts, hidden, ff, used) = (24, 2816, 704, 8);
     for (gt, dt) in
-        [(GgmlType::Iq2Xxs, GgmlType::Iq4Nl), (GgmlType::Q5K, GgmlType::Q8_0)]
+        [
+            (GgmlType::Iq2Xxs, GgmlType::Iq4Nl),
+            (GgmlType::Iq2S, GgmlType::Iq4Nl),
+            (GgmlType::Q5K, GgmlType::Q8_0),
+        ]
     {
         let layers: Vec<(QWeight, QWeight)> = (0..4)
             .map(|_| {
@@ -538,7 +552,11 @@ fn moe_grouped_matches_a_bf16_reference() {
     let bfw = |v: f32| f32::from_bits((v.to_bits() + 0x8000) & 0xffff_0000);
     let bf = |v: f32| half::bf16::from_f32(v).to_f32();
     for (gt, dt) in
-        [(GgmlType::Iq2Xxs, GgmlType::Iq4Nl), (GgmlType::Q5K, GgmlType::Q8_0)]
+        [
+            (GgmlType::Iq2Xxs, GgmlType::Iq4Nl),
+            (GgmlType::Iq2S, GgmlType::Iq4Nl),
+            (GgmlType::Q5K, GgmlType::Q8_0),
+        ]
     {
         let gu_raw = random_blocks(&mut rng, gt, ne * 2 * ff * hid);
         let dn_raw = random_blocks(&mut rng, dt, ne * hid * ff);
@@ -602,5 +620,193 @@ fn moe_grouped_matches_a_bf16_reference() {
             "{gt:?}/{dt:?}: worst error {worst:.3} of the bound, mean {:.2e} of the inputs' magnitude",
             mean / (m * hid) as f64
         );
+    }
+}
+
+/// The decode step's dense GEMVs at Gemma's shapes, one row, as the model
+/// groups them (q/k/v one dispatch, gate/up one), Q5_K (UD-IQ2_M) and Q8_0
+/// (UD-Q5_K_M); best of five passes of 256 dispatches over four weight
+/// copies (the head: one copy, 16 dispatches): passes as long as a decode
+/// step's, shorter ones measured 30% apart run to run.
+#[test]
+#[ignore = "timing only"]
+fn gemv_timing() {
+    use crate::kernels::glm53::gemv_sets;
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(71);
+    let h = 2816;
+    for ty in [GgmlType::Q5K, GgmlType::Q8_0] {
+        let shapes: [(&str, usize, &[usize]); 5] = [
+            ("q/k/v", h, &[4096, 2048, 2048]),
+            ("o", 4096, &[h]),
+            ("gate/up", h, &[2112, 2112]),
+            ("down", 2112, &[h]),
+            ("head", h, &[262144]),
+        ];
+        for (label, cols, rows) in shapes {
+            let ty = if label == "down" { GgmlType::Q8_0 } else { ty };
+            if label == "down" && ty == GgmlType::Q8_0 && cols != 2112 {
+                continue;
+            }
+            let copies = if label == "head" { 1 } else { 4 };
+            let repeat = if label == "head" { 16 } else { 256 };
+            let ws: Vec<Vec<QWeight>> = (0..copies)
+                .map(|_| {
+                    rows.iter()
+                        .map(|&r| {
+                            let raw = random_blocks(&mut rng, ty, r * cols);
+                            QWeight::from_bytes(&ctx, &raw, ty, cols, r).unwrap()
+                        })
+                        .collect()
+                })
+                .collect();
+            let x = tensor(&ctx, &f32s(&mut rng, cols, -1.0, 1.0));
+            let ys: Vec<Tensor> = rows.iter().map(|&r| zeros(&ctx, r)).collect();
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let pass = ctx.begin().unwrap();
+                for r in 0..repeat {
+                    let sets: Vec<(&QWeight, &Tensor)> =
+                        ws[r % copies].iter().zip(ys.iter()).collect();
+                    gemv_sets(&ctx, &pass, &sets, &x, 1).unwrap();
+                }
+                let t = std::time::Instant::now();
+                pass.commit_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            let bytes: usize = ws[0].iter().map(|w| w.row_bytes * w.rows).sum();
+            let per = best / repeat as f64;
+            eprintln!(
+                "gemv {ty:?} {label:8} {:8.1} us {:6.1} GB/s",
+                per * 1e6,
+                bytes as f64 / per / 1e9
+            );
+        }
+    }
+}
+
+/// The two-rows-a-subgroup Q5_K GEMV (weights past GEMV_R2_MIN_ROWS rows,
+/// the LM head) against the CPU, an odd row count, rows of fewer and of
+/// more than 32 tasks.
+#[test]
+fn gemv_wide_q5_k_matches_cpu() {
+    use crate::kernels::glm53::gemv;
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(72);
+    for (cols, rows) in [(512, 32771), (2816, 32769)] {
+        let raw = random_blocks(&mut rng, GgmlType::Q5K, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q5K, cols, rows).unwrap();
+        let xv = f32s(&mut rng, cols, -1.0, 1.0);
+        let x = tensor(&ctx, &xv);
+        let y = zeros(&ctx, rows);
+        run(&ctx, |pass| gemv(&ctx, pass, &w, &x, &y, 1).unwrap());
+        let wf = decode(GgmlType::Q5K, &raw);
+        let expected: Vec<f32> =
+            (0..rows).map(|r| dot(&wf[r * cols..(r + 1) * cols], &xv)).collect();
+        assert_close(&y.to_f32().unwrap(), &expected, 1e-4, 1e-4);
+    }
+}
+
+/// The bfloat-input GEMM over Gemma's Q5_K and Q6_K weights against the
+/// f32-input one, bit for bit: rows inside and across 256-row tiles,
+/// partial column tiles, inputs at bfloat rounding ties.
+#[test]
+fn gemm_bx_q5_k_q6_k_match_gemm() {
+    use crate::kernels::glm53::{gemm, gemm_bx, to_bf16};
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(73);
+    for (ty, cols, rows, m) in [
+        (GgmlType::Q5K, 512usize, 72usize, 65usize),
+        (GgmlType::Q5K, 256, 100, 256),
+        (GgmlType::Q5K, 512, 40, 513),
+        (GgmlType::Q6K, 256, 72, 70),
+        (GgmlType::Q6K, 512, 136, 257),
+    ] {
+        let raw = random_blocks(&mut rng, ty, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+        let mut x = f32s(&mut rng, m * cols, -3.0, 3.0);
+        for v in x.iter_mut().step_by(5) {
+            *v = f32::from_bits((v.to_bits() & 0xffff_0000) | 0x8000);
+        }
+        let tx = tensor(&ctx, &x);
+        let xb = Tensor::zeros(&ctx, &[m * cols], DType::BF16).unwrap();
+        let (y, yb) = (zeros(&ctx, m * rows), zeros(&ctx, m * rows));
+        run(&ctx, |p| {
+            gemm(&ctx, p, &w, &tx, &y, m).unwrap();
+            to_bf16(&ctx, p, &tx, &xb, m * cols).unwrap();
+            p.memory_barrier().unwrap();
+            gemm_bx(&ctx, p, &w, &xb, &yb, m).unwrap();
+        });
+        let (a, b) = (y.to_f32().unwrap(), yb.to_f32().unwrap());
+        assert!(
+            a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+            "{ty:?} {rows} x {cols}, {m} rows"
+        );
+    }
+}
+
+/// Decode attention (one row) at a sliding-window layer's shape (256-wide
+/// heads, 8 KV heads, window 1024) and a global one's (512, 2 KV heads)
+/// at 1K and 4K positions: best of five passes of 128 layers (two cache
+/// copies alternating).
+#[test]
+#[ignore = "timing only"]
+fn attention_decode_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(74);
+    for (label, d, kvh, window, pos) in [
+        ("local 1K", 256, 8, 1024, 1000),
+        ("local 4K", 256, 8, 1024, 4000),
+        ("global 1K", 512, 2, 0, 1000),
+        ("global 4K", 512, 2, 0, 4000),
+        ("global 16K", 512, 2, 0, 16000),
+        ("global 16K full K", 512, 2, 0, 16001),
+    ] {
+        let heads = 16;
+        let ring = if window > 0 { window + 256 } else { pos + 8 };
+        let caches: Vec<(Tensor, Tensor)> = (0..2)
+            .map(|_| {
+                let k: Vec<f32> = f32s(&mut rng, ring * kvh * d, -0.1, 0.1);
+                let v: Vec<f32> = f32s(&mut rng, ring * kvh * d, -1.0, 1.0);
+                let h = |x: &[f32]| {
+                    let o = Tensor::zeros(&ctx, &[x.len()], DType::F16).unwrap();
+                    let b: Vec<u8> =
+                        x.iter().flat_map(|v| f16::from_f32(*v).to_bits().to_le_bytes()).collect();
+                    o.write_bytes(&b).unwrap();
+                    o
+                };
+                (h(&k), h(&v))
+            })
+            .collect();
+        let q = tensor(&ctx, &f32s(&mut rng, heads * d, -1.0, 1.0));
+        let kn = tensor(&ctx, &f32s(&mut rng, d, 0.5, 1.5));
+        let out = zeros(&ctx, heads * d);
+        let chunks = (pos + 1).min(if window > 0 { window } else { usize::MAX }).div_ceil(ATTN_CHUNK);
+        let partial = zeros(&ctx, attn_partial_len(1, heads, d, chunks));
+        let repeat = 128;
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin_concurrent().unwrap();
+            for r in 0..repeat {
+                let (kc, vc) = &caches[r % 2];
+                let a = AttnShape {
+                    head_dim: d,
+                    heads,
+                    kv_heads: kvh,
+                    ring,
+                    window,
+                    k_cache: kc,
+                    v_cache: vc,
+                    k_rot: if window > 0 || pos == 16001 { d / 2 } else { d / 8 },
+                    k_norm: &kn,
+                };
+                attention(&ctx, &pass, &a, &q, &partial, &out, pos, 1, 4).unwrap();
+                pass.memory_barrier().unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("attn decode {label:10} {:7.1} us", best / repeat as f64 * 1e6);
     }
 }

@@ -39,6 +39,7 @@ fn small() -> Config {
     c.n_layer = 2;
     c.swa = vec![true, false];
     c.n_head_kv = vec![8, 2];
+    c.k_rot = vec![128, 64];
     c.window = 64;
     c
 }
@@ -79,7 +80,7 @@ fn session_bytes_are_what_a_session_allocates() {
     let used = (ctx.current_allocated() - before) as u64;
     assert_eq!(used, session_bytes(&cfg, cap, checkpoints));
     assert_eq!(st.bytes() as u64, session_bytes(&cfg, cap, 0));
-    let widest = 4 * cfg.kv_width(1) * cap;
+    let widest = 2 * (cfg.k_cache_width(1) + cfg.kv_width(1)) * cap;
     assert_eq!(session_peak(&cfg, cap, checkpoints), used + widest as u64);
     drop(snaps);
 }
@@ -90,7 +91,7 @@ fn staged_tokens_are_checked_against_the_vocabulary() {
     let mut cfg = small();
     cfg.vocab = 1000;
     cfg.n_expert = 8;
-    let sc = Scratch::new(&ctx, &cfg, 64).unwrap();
+    let sc = Scratch::new(&ctx, &cfg, 64, 256).unwrap();
     assert!(sc.stage_tokens(&[1, 2, 999]).is_ok());
     assert!(sc.stage_tokens(&[1, 1000]).is_err());
     assert!(sc.stage_tokens(&vec![1; PREFILL_ROWS + 1]).is_err());
@@ -158,13 +159,18 @@ fn speculation_at_rest_restores_and_forks_like_plain_decoding() {
     let path = std::env::var("LILY_GEMMA4_GGUF").expect("LILY_GEMMA4_GGUF");
     let ctx = MetalContext::new().unwrap();
     let options = LoadOptions { mtp_drafts: 3, ..Default::default() };
-    let model = <Gemma4Model as LanguageModel>::load(
+    let mut model = <Gemma4Model as LanguageModel>::load(
         &ctx,
         std::path::Path::new(&path),
         &options,
     )
     .unwrap();
     assert!(model.draft.is_some(), "no draft model beside {path}");
+    // Every step proposes: the prompt is arbitrary tokens, whose drafts
+    // rarely reach the served gate's probability, and the checks below
+    // compare proposals.
+    model.draft_min_prob = 0.0;
+    let model = model;
     let greedy = SamplingParams::greedy();
     // A prompt past the sliding window, so the rings wrap.
     let prompt: Vec<u32> = (0..1500u32).map(|i| 1000 + (i * 7919) % 50000).collect();
@@ -239,4 +245,43 @@ fn speculation_at_rest_restores_and_forks_like_plain_decoding() {
     agree(&e, "to the end of the context");
     assert!(log.iter().all(|(p, d)| p + 1 + d.len() <= cap), "{log:?}");
     assert!(st.ensure_capacity(&ctx, cap + 1).is_err());
+}
+
+/// The prompt run a memory limit takes from the runs' fitted contexts.
+#[test]
+fn the_prompt_run_keeps_32k_tokens_or_the_shortest_runs_context() {
+    let pick = |fits: &[(usize, Option<usize>)]| choose_prompt_run(fits).map(|i| fits[i].0);
+    // 1024 rows still fit 32K.
+    assert_eq!(pick(&[(1024, Some(40000)), (512, Some(45000)), (256, Some(48000))]), Some(1024));
+    assert_eq!(pick(&[(1024, Some(32768)), (512, Some(36000)), (256, Some(40000))]), Some(1024));
+    // Only 512 rows do.
+    assert_eq!(pick(&[(1024, Some(30000)), (512, Some(33000)), (256, Some(40000))]), Some(512));
+    // Only 256 rows do (a longer run below 32K, or not fitting at all).
+    assert_eq!(pick(&[(1024, None), (512, Some(30000)), (256, Some(34000))]), Some(256));
+    // 256-row runs fit less than 32K: their context is kept.
+    assert_eq!(pick(&[(1024, Some(15000)), (512, Some(19000)), (256, Some(22784))]), Some(256));
+    assert_eq!(pick(&[(1024, Some(22784)), (512, Some(22784)), (256, Some(22784))]), Some(1024));
+    // Nothing fits 4096 tokens.
+    assert_eq!(pick(&[(1024, None), (512, None), (256, None)]), None);
+}
+
+/// A fitted context's session at its peak (caches at capacity_cap with
+/// the checkpoints, growth) and its attention partials fit the room, and
+/// 256 tokens more would not.
+#[test]
+fn a_fitted_context_covers_the_session_peak_and_partials() {
+    use crate::gemma4::model::{capacity_cap, session_peak};
+    let mut cfg = Config::gemma4_26b_a4b();
+    cfg.k_rot = (0..cfg.n_layer).map(|il| if cfg.swa[il] { 128 } else { 64 }).collect();
+    cfg.context_length = 262144;
+    for (room, checkpoints) in [(840_000_000u64, 1), (1_710_000_000, 3), (3_000_000_000, 7)] {
+        let c = fit_tokens(&cfg, room, checkpoints);
+        assert!(c > 0 && c.is_multiple_of(256), "{room}: {c}");
+        let need = |c: usize| {
+            let rows = capacity_cap(c);
+            session_peak(&cfg, rows, checkpoints) + partial_bytes_per_token(&cfg) * rows as u64
+        };
+        assert!(need(c) <= room, "{room}: {c} needs {}", need(c));
+        assert!(need(c + 256) > room, "{room}: {} would fit too", c + 256);
+    }
 }
