@@ -213,12 +213,14 @@ void glm53_q5_k_codes(uint64_t row, uint t, out float scale, out float minv, out
     const uvec4 qb = U32x4(b + 64u + (j >> 1u) * 32u).v[0];
     const uvec4 ha = U32x4(b + 16u).v[0];
     const uvec4 hb = U32x4(b + 32u).v[0];
+    // The four codes of a word at once: its bytes' nibbles and high bits
+    // under masks, then a byte extract and a convert each (one row's GEMV
+    // spent a fifth of its time on per-code extracts, 2026-11-15).
     [[unroll]] for (uint c = 0u; c < 8u; c++) {
         const uint word = (c < 4u ? qa[c] : qb[c - 4u]) >> shift;
         const uint hw = (c < 4u ? ha[c] : hb[c - 4u]) >> j;
-        [[unroll]] for (uint k = 0u; k < 4u; k++) {
-            q[4u * c + k] = float(((word >> (8u * k)) & 0xfu) | (((hw >> (8u * k)) & 1u) << 4u));
-        }
+        const uint c4 = (word & 0x0f0f0f0fu) | ((hw & 0x01010101u) << 4u);
+        [[unroll]] for (uint k = 0u; k < 4u; k++) q[4u * c + k] = float((c4 >> (8u * k)) & 0xffu);
     }
 }
 
