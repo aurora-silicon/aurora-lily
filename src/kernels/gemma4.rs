@@ -567,16 +567,43 @@ impl MoeGroupScratch {
         ff: usize,
         hidden: usize,
     ) -> Result<Self> {
+        let pool = Tensor::zeros(ctx, &[Self::pool_len(rows, used, ff, hidden)], DType::F32)?;
+        Self::in_pool(ctx, rows, used, experts, ff, hidden, &pool)
+    }
+
+    /// f32 values of the gate/up and down outputs for `rows` rows: what
+    /// [`Self::in_pool`] takes of its pool.
+    pub fn pool_len(rows: usize, used: usize, ff: usize, hidden: usize) -> usize {
+        rows * used * (2 * ff + hidden)
+    }
+
+    /// The scratch with its f32 gate/up and down outputs at the start of
+    /// `pool` (at least [`Self::pool_len`] values), which a caller may
+    /// share with buffers that are dead while the experts run.
+    pub fn in_pool(
+        ctx: &MetalContext,
+        rows: usize,
+        used: usize,
+        experts: usize,
+        ff: usize,
+        hidden: usize,
+        pool: &Tensor,
+    ) -> Result<Self> {
         let pairs = rows * used;
         let max_tiles = pairs.div_ceil(64) + experts;
+        ensure!(
+            pool.dtype() == DType::F32 && pool.numel() >= Self::pool_len(rows, used, ff, hidden),
+            "grouped MoE pool of {}",
+            pool.numel()
+        );
         Ok(Self {
             pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
             tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
             tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
             xb: Tensor::zeros(ctx, &[rows * hidden], DType::BF16)?,
-            gate_up: Tensor::zeros(ctx, &[pairs * 2 * ff], DType::F32)?,
+            gate_up: pool.view(0, &[pairs * 2 * ff])?,
             mid: Tensor::zeros(ctx, &[pairs * ff], DType::BF16)?,
-            down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
+            down: pool.view(pairs * 2 * ff, &[pairs * hidden])?,
         })
     }
 }

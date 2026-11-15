@@ -108,6 +108,9 @@ enum Cmd {
         n: usize,
         #[arg(long, default_value_t = 2)]
         runs: usize,
+        /// Rows a prompt run takes (default: the model's, 1024).
+        #[arg(long)]
+        prefill_rows: Option<usize>,
     },
     /// Greedy speculative decoding with the draft model (a gemma4-assistant
     /// GGUF beside the model) through the engine interface, against plain
@@ -179,8 +182,8 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Bench { model, text, prompt_len, n, runs } => {
-            bench(&model, &text, prompt_len, n, runs)
+        Cmd::Bench { model, text, prompt_len, n, runs, prefill_rows } => {
+            bench(&model, &text, prompt_len, n, runs, prefill_rows)
         }
     }
 }
@@ -498,6 +501,7 @@ fn bench(
     prompt_len: usize,
     n: usize,
     runs: usize,
+    prefill_rows: Option<usize>,
 ) -> Result<()> {
     let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
     let text = std::fs::read_to_string(text)?;
@@ -507,7 +511,10 @@ fn bench(
     ensure!(body.len() + ids.len() >= prompt_len, "text has {} tokens", body.len());
     ids.extend_from_slice(&body[..prompt_len - ids.len()]);
     let ctx = MetalContext::new()?;
-    let model = Gemma4Model::load(&ctx, path)?;
+    let mut model = Gemma4Model::load(&ctx, path)?;
+    if let Some(r) = prefill_rows {
+        model.prefill_rows = r;
+    }
     let vocab = model.cfg.vocab;
     let sc = model.new_scratch(&ctx, prompt_len + n + 8)?;
     for run in 0..runs {
