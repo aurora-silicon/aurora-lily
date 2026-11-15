@@ -103,6 +103,21 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
         self
     }
 
+    /// For a grammar whose model opens its reasoning itself (Gemma): when
+    /// the prompt's text (`tail`, its last tokens) already opened the block
+    /// (Gemma's template does after a tool response with thinking on), the
+    /// output starts inside it, without the opener. Call after
+    /// [`Self::with_tool_grammar`].
+    pub fn with_prompt_tail(mut self, tail: &str) -> Self {
+        if let (Some(open), false) = (self.tool_grammar.think_open(), self.raw)
+            && tail.trim_end().ends_with(open)
+        {
+            self.phase = Phase::Reasoning;
+            self.think_open_settled = true;
+        }
+        self
+    }
+
     /// Where a `<tool_call>` ends the reasoning in `buf` (at a line start,
     /// outside a code fence and a kept tool call), when that rule is on and
     /// tools were offered.

@@ -580,6 +580,21 @@ fn gemma_self_opened_channel_after_a_tool_response_is_not_content() {
 }
 
 #[test]
+fn gemma_reasoning_opened_by_the_prompt_is_reasoning() {
+    // After a tool response with thinking on the template ends the prompt
+    // with "<|channel>thought\n": the output starts inside the block,
+    // "Let me add.<channel|>391".
+    let mut p = gemma_parser(true, false)
+        .with_prompt_tail("<tool_response|><|channel>thought\n");
+    let (r, c, _) = text_of(&run(&mut p, &[3, 4, 5]));
+    assert_eq!((r.as_str(), c.as_str()), ("Let me add.", "391"));
+    // A prompt that did not open it leaves the opener to the model.
+    let mut p = gemma_parser(true, false).with_prompt_tail("<|turn>model\n");
+    let (r, c, _) = text_of(&run(&mut p, &[12, 13, 1, 2, 3, 4, 5]));
+    assert_eq!((r.as_str(), c.as_str()), ("Let me add.", "391"));
+}
+
+#[test]
 fn gemma_tool_call_block_is_a_call() {
     // "<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"
     let mut p = gemma_parser(false, true);

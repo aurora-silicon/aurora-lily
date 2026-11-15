@@ -896,6 +896,14 @@ impl<M: LanguageModel> Engine<M> {
             },
         )
         .with_tool_grammar(tokenizer.tool_grammar());
+        // A model that opens its reasoning itself may find it opened by the
+        // prompt (Gemma after a tool response).
+        let parser = match tokenizer.tool_grammar().think_open() {
+            Some(_) => parser.with_prompt_tail(
+                &tokenizer.decode(&p.prompt[n.saturating_sub(4)..], false)?,
+            ),
+            None => parser,
+        };
         // The thinking controls, when the request asked for any and the
         // prompt opens a reasoning block (the generation prompt ends with
         // `<think>\n`; a raw completion's prompt may too). Off, the decode is
