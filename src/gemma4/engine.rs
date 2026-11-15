@@ -318,14 +318,6 @@ impl Gemma4Model {
 
 impl Gemma4Model {
     /// Bytes of the scratch's attention partials per token of context.
-    fn partial_bytes_per_token(&self) -> u64 {
-        let cfg = &self.cfg;
-        let d = cfg.head_dim.max(cfg.head_dim_swa);
-        (4 * crate::kernels::gemma4::attn_partial_len(MAX_ROWS, cfg.n_head, d, 1)
-            / crate::kernels::gemma4::ATTN_CHUNK) as u64
-            + 1
-    }
-
     /// The most GPU memory one session holds on its way to `capacity` rows
     /// with `checkpoints` snapshots: its caches at that capacity plus the
     /// one global layer's K and V that `ensure_capacity` holds twice while
@@ -347,12 +339,7 @@ impl Gemma4Model {
         checkpoints: usize,
     ) -> Result<usize> {
         let room = limit.saturating_sub(allocated);
-        let per_token = (self.session_peak(256, 0) - self.session_peak(0, 0)) / 256
-            + self.partial_bytes_per_token();
-        let fixed = self.session_peak(0, checkpoints);
-        let rows = room.saturating_sub(fixed) / per_token.max(1);
-        let context = (rows as usize).saturating_sub(LOOKAHEAD) / 256 * 256;
-        let context = context.min(self.cfg.context_length).min(MAX_SEQ);
+        let context = fit_tokens(&self.cfg, room, checkpoints);
         ensure!(
             context >= 4096,
             "--memory-limit-gb {:.1} leaves {:.2} GB after {:.1} GB of weights and scratch: a context \
@@ -366,6 +353,37 @@ impl Gemma4Model {
             Some(self.session_peak(capacity_cap(context), checkpoints));
         Ok(context)
     }
+}
+
+/// GPU bytes a token of context adds to the scratch: the decode attention's
+/// partials (MAX_ROWS rows, a chunk of ATTN_CHUNK keys).
+pub(crate) fn partial_bytes_per_token(cfg: &super::config::Config) -> u64 {
+    let d = cfg.head_dim.max(cfg.head_dim_swa);
+    (4 * crate::kernels::gemma4::attn_partial_len(MAX_ROWS, cfg.n_head, d, 1)
+        / crate::kernels::gemma4::ATTN_CHUNK) as u64
+        + 1
+}
+
+/// The longest context (a multiple of 256 tokens, at most the model's and
+/// MAX_SEQ) whose session at its peak (`session_peak` at `capacity_cap` of
+/// it, with `checkpoints` snapshots) and attention partials fit `room`
+/// bytes.
+pub(crate) fn fit_tokens(cfg: &super::config::Config, room: u64, checkpoints: usize) -> usize {
+    let peak = |c: usize| super::model::session_peak(cfg, c, checkpoints);
+    let per_token = (peak(256) - peak(0)) / 256 + partial_bytes_per_token(cfg);
+    let rows = room.saturating_sub(peak(0)) / per_token.max(1);
+    let context = (rows as usize).saturating_sub(LOOKAHEAD) / 256 * 256;
+    context.min(cfg.context_length).min(MAX_SEQ)
+}
+
+/// The prompt run a memory limit takes, from each run's fitted context
+/// (`(rows, context)`, longest run first and 256 rows last; `None` where
+/// less than 4096 tokens fit): the longest run that keeps a context of
+/// 32K tokens, or that of the last run when that is less (a 16 GB tier
+/// keeps its context and short runs). `None` when nothing fits.
+pub(crate) fn choose_prompt_run(fits: &[(usize, Option<usize>)]) -> Option<usize> {
+    let floor = fits.last()?.1?.min(32768);
+    fits.iter().position(|f| f.1.is_some_and(|c| c >= floor))
 }
 
 impl LanguageModel for Gemma4Model {
@@ -407,10 +425,8 @@ impl LanguageModel for Gemma4Model {
                 crate::serve::CHECKPOINTS_PER_SESSION
                     + crate::serve::DECODE_CHECKPOINTS_PER_SESSION,
             );
-            // The run size: the longest whose fit keeps a context of 32K
-            // tokens, or that of 256-row runs when that is less (a 16 GB
-            // tier's); scratch grows ~0.3 MB a run row, and longer runs
-            // prefill faster (PREFILL_ROWS).
+            // The run size (choose_prompt_run): scratch grows ~0.3 MB a
+            // run row, and longer runs prefill faster (PREFILL_ROWS).
             let mut fits = Vec::new();
             for rows in [PREFILL_ROWS, PREFILL_ROWS / 2, PREFILL_ROWS / 4] {
                 model.prefill_rows = rows;
@@ -421,11 +437,10 @@ impl LanguageModel for Gemma4Model {
                 let context = model.fit_context(limit, allocated as u64, checkpoints).ok();
                 fits.push((rows, allocated, context));
             }
-            let floor = fits.last().and_then(|f| f.2).map_or(0, |c| c.min(32768));
-            let &(rows, allocated, _) = fits
-                .iter()
-                .find(|f| f.2.is_some_and(|c| c >= floor))
-                .unwrap_or(fits.last().expect("three run sizes"));
+            let contexts: Vec<(usize, Option<usize>)> =
+                fits.iter().map(|&(rows, _, c)| (rows, c)).collect();
+            let pick = choose_prompt_run(&contexts).unwrap_or(fits.len() - 1);
+            let (rows, allocated, _) = fits[pick];
             model.prefill_rows = rows;
             let context = model.fit_context(limit, allocated as u64, checkpoints)?;
             eprintln!(
