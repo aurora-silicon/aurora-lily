@@ -6,7 +6,7 @@
 // [-127, 127] (a subnormal maximum can give 128), converted from a finite
 // float; the stored sum is the clamped codes'.
 
-const float G4_Q8X_NAN = uintBitsToFloat(0x7fc00000u);
+float g4_q8x_nan() { return uintBitsToFloat(0x7fc00000u); }
 
 bool g4_q8x_nonfinite(float v) {
     return isnan(v) || isinf(v);
@@ -20,7 +20,7 @@ float g4_q8x_abs(float v) {
 // The block's scale from its finite maximum and whether it holds a NaN or
 // an infinity.
 float g4_q8x_scale(float amax, bool nonfinite) {
-    return nonfinite ? G4_Q8X_NAN : amax / 127.0;
+    return nonfinite ? g4_q8x_nan() : amax / 127.0;
 }
 
 int g4_q8x_code(float v, float d) {
