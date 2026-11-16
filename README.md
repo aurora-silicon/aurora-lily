@@ -32,7 +32,9 @@ leaves the GPU, and fits the longest context that budget allows.
   expect lower numbers than the tables below.
 - **M4 family** (no matrix units): Gemma 4 runs, with f32 GEMMs and decode
   kernels tuned for the M4's GPU. The other models' kernels need matrix
-  units and are refused on these GPUs.
+  units and are refused on these GPUs. Mesa offers the M4 8 x 8 cooperative
+  matrices, which run on the same ALUs as its FMAs; lily's matrix kernels
+  need the M5's 16 x 16 ones, so the M4 keeps the f32 path.
 
 ## Speed
 
@@ -80,9 +82,27 @@ Neither project publishes M5 Max numbers for the other models.
 
 ### Linux, M4 (16 GB)
 
-Gemma 4 UD-IQ2_M on an M4 MacBook Air (8-core GPU, fanless, measured below 60 °C): decode about
-25 tok/s (a 40 ms step at 1K context), prefill 160–190 tok/s at 1K and 132 at 4K, 21 760 tokens of
-context at `--memory-limit-gb 10.2`.
+Gemma 4 UD-IQ2_M on an M4 MacBook Air (16 GB, 10-core CPU, 8-core GPU, fanless) with the 16 GB command
+below (`--memory-limit-gb 10.2`: 512-row prompt runs, 21 760 tokens of context, 10.1 GB on the GPU).
+Measured 2026-11-15 on `main` (9211b45) with #34, Mesa `aurora-wip` (19fff1a) plus the
+AGX compiler pull requests #370 to #375, #379 to #381 and #386, on AC.
+
+Served, the same five requests as the M5 Max table, twice, starting below 60 °C:
+
+| Memory | Model   | Weights  | Decode | Prefill, long prompt | Prefill, short prompts |
+|--------|---------|----------|-------:|---------------------:|-----------------------:|
+| 16 GB  | Gemma 4 | UD-IQ2_M |  19–27 |              107–111 |                  41–71 |
+
+`lily-gemma4 bench`, starting below 60 °C:
+
+| Prompt | Prefill       | Decode step                   |
+|--------|---------------|-------------------------------|
+| 1K     | 172 tok/s     | 39.7–40.4 ms (about 25 tok/s) |
+| 4K     | 128–134 tok/s | 42 ms                         |
+
+- The fanless Air clocks down under sustained load: over the five requests the die reaches 80 °C and
+  decode falls from 27 to 19 tok/s. Back-to-back benches drop 1K prefill to 130–155 tok/s.
+- Short prompts mostly measure fixed per-request costs (about 0.8 s each).
 
 ### Quality
 
@@ -132,7 +152,8 @@ You need:
   (aurora-silicon/linux #1752); on the M5 Max, the GPU mailbox interrupt fix
   (#1844) for full decode speed.
 - Mesa's Honeykrisp from aurora-silicon/mesa `aurora-wip`, with the M5's
-  matrix units enabled (`ASAHI_M5_COOPERATIVE_MATRIX=1`). The AGX compiler
+  matrix units enabled (`ASAHI_M5_COOPERATIVE_MATRIX=1`; the M4 needs no
+  setting). The AGX compiler
   pull requests #370 to #375, #379 and #380 are in the build measured above;
   they add 2–15% to prefill.
 - The Rust toolchain pinned by `rust-toolchain.toml`.

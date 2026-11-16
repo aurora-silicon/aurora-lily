@@ -1905,6 +1905,10 @@ fn int8_gemv_sets_match_one_set_and_the_block_layout() {
 #[test]
 fn moe_gate_up_q8x_matches_int8_products() {
     let ctx = ctx();
+    // A G16 GPU keeps the f32 gate/up (moe_matches_cpu checks it).
+    if ctx.g16() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(84);
     let (hid, ff, ne, used) = (2816, 72, 6, 3);
     let raw = random_blocks(&mut rng, GgmlType::Q5K, ne * 2 * ff * hid);
@@ -2125,6 +2129,11 @@ fn post_attn_writes_its_int8_and_f16_outputs() {
 #[test]
 fn f16_experts_match_the_f32_kernels_on_f16_values() {
     let ctx = ctx();
+    // A G16 GPU keeps the f32 experts, and its gate/up sums in another
+    // order than the generic one this compares against.
+    if ctx.g16() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(86);
     let (hid, ff, ne, used) = (2816, 704, 10, 8);
     let gu_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, ne * 2 * ff * hid);
@@ -2284,6 +2293,11 @@ fn f16_conversion_boundaries() {
 #[test]
 fn f16_mid_saturates_and_keeps_the_f32_mid() {
     let ctx = ctx();
+    // A G16 GPU keeps the f32 experts, and its gate/up sums in another
+    // order than the generic one this compares against.
+    if ctx.g16() {
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(88);
     let (hid, ff, ne, used, m) = (2816, 64, 4, 3, 3);
     let mut raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, ne * 2 * ff * hid);

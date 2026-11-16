@@ -130,3 +130,46 @@ fn matrix_unit_kernels_are_refused_without_matrix_units() {
         }
     }
 }
+
+/// Matrix units need the 16 x 16 x 16 f16 and bfloat products summed in
+/// f32 and the bfloat one summed in bfloat: an M5's shapes have them, an
+/// M4's 8 x 8 ones do not.
+#[test]
+fn matrix16_needs_every_16x16_product() {
+    use vk::ComponentTypeKHR as T;
+    let shape = |size: u32, input: T, sum: T| {
+        vk::CooperativeMatrixPropertiesKHR::default()
+            .m_size(size)
+            .n_size(size)
+            .k_size(size)
+            .a_type(input)
+            .b_type(input)
+            .c_type(sum)
+            .result_type(sum)
+            .scope(vk::ScopeKHR::SUBGROUP)
+    };
+    let bf = BFLOAT16_COMPONENT;
+    let m4 = [
+        shape(8, T::FLOAT32, T::FLOAT32),
+        shape(8, T::FLOAT16, T::FLOAT32),
+        shape(8, bf, T::FLOAT32),
+        shape(8, bf, bf),
+    ];
+    let m5 = [
+        shape(16, T::FLOAT16, T::FLOAT32),
+        shape(16, bf, T::FLOAT32),
+        shape(16, bf, bf),
+        m4[0],
+        m4[1],
+    ];
+    assert!(!matrix16(&m4));
+    assert!(matrix16(&m5));
+    // Each of the three products is needed.
+    for i in 0..3 {
+        let without: Vec<_> =
+            (0..m5.len()).filter(|&j| j != i).map(|j| m5[j]).collect();
+        assert!(!matrix16(&without), "without product {i}");
+    }
+    assert!(!matrix16(&[m5[0], m5[1], m5[2].scope(vk::ScopeKHR::WORKGROUP)]));
+    assert!(!matrix16(&[m5[0], m5[1], m5[2].c_type(T::FLOAT32)]));
+}
