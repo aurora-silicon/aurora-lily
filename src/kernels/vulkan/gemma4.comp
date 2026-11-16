@@ -28,6 +28,14 @@
 #define KERNEL_gemma4_moe_gate_up_q5_k
 #define G4_Q8X
 #endif
+#ifdef KERNEL_gemma4_moe_gate_up_iq2_xxs_xh
+#define KERNEL_gemma4_moe_gate_up_iq2_xxs
+#define G4_XH
+#endif
+#ifdef KERNEL_gemma4_moe_down_iq4_nl_xh
+#define KERNEL_gemma4_moe_down_iq4_nl
+#define G4_XH
+#endif
 #ifdef G4_Q8X
 #define G4_PB(i) ((i) + 2u)
 #else
@@ -40,6 +48,7 @@
 #endif
 #include "common.glsl"
 #include "glm53_quant.glsl"
+#include "gemma4_half.glsl"
 #ifdef G4_Q8X
 #include "gemma4_q8x.glsl"
 #endif
@@ -615,7 +624,10 @@ void main() {
 // Buffers: 0 gate_up experts, 1 x [m][K], 2 sel, 3 mid [m * used][F].
 // Params: 4 K, 5 F, 6 row_bytes, 7 used. Q5_K's `_q8x` variant takes x as
 // int8 (gemma4_q8x.glsl) from buffers 4 codes, 5 (scale, sum) pairs, its
-// params two places later.
+// params two places later. IQ2_XXS's `_xh` variant takes x as f16 in the
+// IQ2_XXS dot's pairing (g4_dot_iq2_xxs_xh) in buffer 1 and also writes
+// mid as f16 in the IQ4_NL down's pairing (of each 32 values, word j holds
+// values j and j + 16; g4_half) to buffer 4, its params one place later.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_gemma4_moe_gate_up_q8_0) || defined(KERNEL_gemma4_moe_gate_up_q5_k) || \
     defined(KERNEL_gemma4_moe_gate_up_q6_k) || defined(KERNEL_gemma4_moe_gate_up_iq2_xxs) || \
@@ -708,11 +720,44 @@ float g4_q5k_dot_q8(uint64_t row, uint t, uvec4 x0, uvec4 x1, vec2 dsx) {
 }
 #endif
 
+#ifdef G4_XH
+// glm53_dot_iq2_xxs over x as f16 in its pairing (of each 8 values, word p
+// holds values p and p + 4): GLM's glm53_dot_iq2_xxs_xh, the products and
+// sums of glm53_dot_iq2_xxs in its order.
+float g4_dot_iq2_xxs_xh(uint64_t row, uint t, in uvec4 xh[4]) {
+    const uint bw = (t >> 3u) * 33u;
+    const uint qw = bw + 1u + 4u * (t & 7u);
+    const float d = glm53_h2f(uint(U16(row).v[bw]));
+    const uint aux0 = uint(U16(row).v[qw]) | (uint(U16(row).v[qw + 1u]) << 16u);
+    const uint aux1 = uint(U16(row).v[qw + 2u]) | (uint(U16(row).v[qw + 3u]) << 16u);
+    precise float s = 0.0;
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const uint gi = (aux0 >> (8u * l)) & 0xffu;
+        const uint si = (aux1 >> (7u * l)) & 127u;
+        const uvec4 g = glm53_iq2xxs_grid_h[gi] ^ glm53_iq2xxs_signs_h[si];
+        const vec2 p0 = unpackHalf2x16(g.x), p1 = unpackHalf2x16(g.y);
+        const vec2 p2 = unpackHalf2x16(g.z), p3 = unpackHalf2x16(g.w);
+        const vec2 a0 = unpackHalf2x16(xh[l].x), a1 = unpackHalf2x16(xh[l].y);
+        const vec2 a2 = unpackHalf2x16(xh[l].z), a3 = unpackHalf2x16(xh[l].w);
+        precise float e = ((p0.x * a0.x + p0.y * a0.y) + (p1.x * a1.x + p1.y * a1.y))
+                        + ((p2.x * a2.x + p2.y * a2.y) + (p3.x * a3.x + p3.y * a3.y));
+        s += e;
+    }
+    precise float k = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
+    precise float v = k * s;
+    return v;
+}
+#endif
+#if defined(G4_XH)
+#define G4_MP(i) ((i) + 1u)
+#else
+#define G4_MP(i) G4_PB(i)
+#endif
 void main() {
-    const uint K = arg_u32(G4_PB(4u));
-    const uint F = arg_u32(G4_PB(5u));
-    const uint row_bytes = arg_u32(G4_PB(6u));
-    const uint used = arg_u32(G4_PB(7u));
+    const uint K = arg_u32(G4_MP(4u));
+    const uint F = arg_u32(G4_MP(5u));
+    const uint row_bytes = arg_u32(G4_MP(6u));
+    const uint used = arg_u32(G4_MP(7u));
     const uint slot = gl_WorkGroupID.y;
     const uint i = slot / used;
     const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
@@ -738,6 +783,11 @@ void main() {
         [[unroll]] for (uint q = 0u; q < 8u; q++) sx += (xv[q].x + xv[q].y) + (xv[q].z + xv[q].w);
         ag += g4_q5k_dot(gate, t, xv, sx);
         au += g4_q5k_dot(up, t, xv, sx);
+#elif defined(KERNEL_gemma4_moe_gate_up_iq2_xxs) && defined(G4_XH)
+        uvec4 xh[4];
+        [[unroll]] for (uint q = 0u; q < 4u; q++) xh[q] = U32x4(arg(1) + 2u * uint64_t(i) * K).v[4u * t + q];
+        ag += g4_dot_iq2_xxs_xh(gate, t, xh);
+        au += g4_dot_iq2_xxs_xh(up, t, xh);
 #elif defined(KERNEL_gemma4_moe_gate_up_iq2_xxs)
         vec4 xv[8];
         [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(X).v[8u * t + q];
@@ -753,7 +803,15 @@ void main() {
     }
     ag = subgroupAdd(ag);
     au = subgroupAdd(au);
-    if (gl_SubgroupInvocationID == 0u) F32(arg(3)).v[slot * F + r] = gemma4_gelu(ag) * au;
+    if (gl_SubgroupInvocationID == 0u) {
+        const float v = gemma4_gelu(ag) * au;
+        F32(arg(3)).v[slot * F + r] = v;
+#ifdef G4_XH
+        const uint j = r & 31u;
+        U16(arg(4)).v[slot * F + (r - j) + 2u * (j & 15u) + (j >> 4u)] =
+            uint16_t(g4_half(v));
+#endif
+    }
 }
 #endif
 
@@ -819,7 +877,25 @@ float g4_iq4nl_dot(in uint wd[9], uint blk, in vec4 xv[8]) {
     }
     return d * s;
 }
+#ifdef G4_XH
+// g4_iq4nl_dot over x as f16 in its pairing: word j of the block holds
+// values j and j + 16; the same products and sums, in its order.
+float g4_iq4nl_dot_xh(in uint wd[9], uint blk, in uvec4 xh[4]) {
+    const uint base = 18u * blk;
+    const float d = glm53_h2f(PB(base) | (PB(base + 1u) << 8u));
+    vec2 v[16];
+    [[unroll]] for (uint j = 0u; j < 16u; j++) v[j] = g4_kv2[PB(base + 2u + j)];
+    float s = 0.0;
+    [[unroll]] for (uint j = 0u; j < 16u; j++) {
+        const vec2 a = unpackHalf2x16(xh[j >> 2u][j & 3u]);
+        s += v[j].x * a.x + v[j].y * a.y;
+    }
+    return d * s;
+}
+#endif
 #undef PB
+// The `_xh` variant takes mid as f16 in g4_iq4nl_dot_xh's pairing (the
+// IQ2_XXS gate/up's `_xh` output) in buffer 1.
 void main() {
     const uint F = arg_u32(5);
     const uint H = arg_u32(6);
@@ -844,14 +920,25 @@ void main() {
     [[dont_unroll]] for (uint u = lane; u < used * pairs; u += 32u) {
         const uint e = subgroupShuffle(my_e, s);
         const float we = subgroupShuffle(my_w, s);
+#ifdef G4_XH
+        const uint64_t X = arg(1) + 2u * (uint64_t(i * used + s) * F + 64u * p);
+        uvec4 xa[4], xb[4];
+        [[unroll]] for (uint q = 0u; q < 4u; q++) xa[q] = U32x4(X).v[q];
+        [[unroll]] for (uint q = 0u; q < 4u; q++) xb[q] = U32x4(X + 64u).v[q];
+#else
         const uint64_t X = arg(1) + 4u * (uint64_t(i * used + s) * F + 64u * p);
         vec4 xa[8], xb[8];
         [[unroll]] for (uint q = 0u; q < 8u; q++) xa[q] = F32x4(X).v[q];
         [[unroll]] for (uint q = 0u; q < 8u; q++) xb[q] = F32x4(X + 128u).v[q];
+#endif
         const uint64_t W = arg(0) + (uint64_t(e) * H + r) * row_bytes + 36u * p;
         uint wd[9];
         [[unroll]] for (uint w = 0u; w < 9u; w++) wd[w] = U32(W).v[w];
+#ifdef G4_XH
+        acc += we * (g4_iq4nl_dot_xh(wd, 0u, xa) + g4_iq4nl_dot_xh(wd, 1u, xb));
+#else
         acc += we * (g4_iq4nl_dot(wd, 0u, xa) + g4_iq4nl_dot(wd, 1u, xb));
+#endif
         p += 32u;
         while (p >= pairs) {
             p -= pairs;
@@ -1069,11 +1156,13 @@ void g4_q8x_put4(vec4 v, uint row, uint e, uint n, uint cb, uint db) {
 // + x; n1, n2, t = rmsnorm(r) times w1, w2, w3. Grid (m), n / 4 threads.
 // Buffers: 0 a, 1 w_post, 2 x, 3 r, 4-6 w1-w3, 7-9 n1, n2, t.
 // Params: 10 n, 11 eps. The `_q8x` variant writes n1 (mask bit 0) and n2
-// (bit 1) as int8 too: buffers 10, 11 n1's codes and pairs, 12, 13 n2's;
-// params 14 n, 15 eps, 16 mask.
+// (bit 1) as int8 too, and n2 (bit 2) as f16 in the IQ2_XXS dot's pairing
+// (of each 8 values, word p holds values p and p + 4; g4_half):
+// buffers 10, 11 n1's codes and pairs, 12, 13 n2's, 14 n2's f16; params 15
+// n, 16 eps, 17 mask.
 #ifdef KERNEL_gemma4_post_attn
 #ifdef G4_Q8X
-#define G4_PA(i) ((i) + 4u)
+#define G4_PA(i) ((i) + 5u)
 #else
 #define G4_PA(i) (i)
 #endif
@@ -1093,6 +1182,17 @@ void main() {
     const uint mask = arg_u32(G4_PA(12u));
     if ((mask & 1u) != 0u) g4_q8x_put4(r * k * F32x4(arg(4u)).v[e], row, e, n, 10u, 11u);
     if ((mask & 2u) != 0u) g4_q8x_put4(r * k * F32x4(arg(5u)).v[e], row, e, n, 12u, 13u);
+    if ((mask & 4u) != 0u) {
+        // An even thread's four values and its odd neighbour's: one 8-value
+        // group, four words.
+        const vec4 v = r * k * F32x4(arg(5u)).v[e];
+        const vec4 o = subgroupShuffleXor(v, 1u);
+        if ((e & 1u) == 0u) {
+            U32x4(arg(14u) + 16u * (uint64_t(row) * (n / 8u) + e / 2u)).v[0] =
+                uvec4(g4_half(v.x), g4_half(v.y), g4_half(v.z), g4_half(v.w))
+                | (uvec4(g4_half(o.x), g4_half(o.y), g4_half(o.z), g4_half(o.w)) << 16u);
+        }
+    }
 #endif
 }
 #endif
