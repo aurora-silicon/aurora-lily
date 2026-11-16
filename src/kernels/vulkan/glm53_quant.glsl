@@ -10,6 +10,18 @@
 
 #define GLM53_TASK 32u
 
+// A product pinned as written (`precise`), declared as `name`; see
+// common.glsl for the two forms.
+#ifdef LILY_PRECISE_LEGACY
+#define GLM53_PRECISE_MUL(name, a, b) precise float name = (a) * (b)
+#else
+float glm53_precise_mul(float a, float b) {
+    precise float r = a * b;
+    return r;
+}
+#define GLM53_PRECISE_MUL(name, a, b) const float name = glm53_precise_mul(a, b)
+#endif
+
 // Type ids (GGUF): the kernels take the type as a compile-time constant.
 #define GLM53_F32 0u
 #define GLM53_F16 1u
@@ -237,8 +249,8 @@ void glm53_decode_q6_k(uint64_t row, uint t, out float w[32]) {
     const uint n = (t >> 2u) & 1u, q = t & 3u;
     const float d = glm53_h2f(uint(U16(b).v[104]));
     const uint sw = uint(U16(b + 192u).v[4u * n + q]);
-    precise float s0 = d * float(int(sw << 24) >> 24);
-    precise float s1 = d * float(int(sw << 16) >> 24);
+    GLM53_PRECISE_MUL(s0, d, float(int(sw << 24) >> 24));
+    GLM53_PRECISE_MUL(s1, d, float(int(sw << 16) >> 24));
     const uint64_t ql = b + 64u * n + 32u * (q & 1u);
     const uint64_t qh = b + 128u + 32u * n;
     const uint lshift = 4u * (q >> 1u), hshift = 2u * q;
@@ -247,7 +259,7 @@ void glm53_decode_q6_k(uint64_t row, uint t, out float w[32]) {
         const uint hi = uint(U16(qh).v[i]) >> hshift;
         [[unroll]] for (uint k = 0u; k < 2u; k++) {
             const uint c = ((lo >> (8u * k)) & 0xfu) | (((hi >> (8u * k)) & 3u) << 4u);
-            precise float v = (i < 8u ? s0 : s1) * float(int(c) - 32);
+            GLM53_PRECISE_MUL(v, i < 8u ? s0 : s1, float(int(c) - 32));
             w[2u * i + k] = v;
         }
     }
@@ -367,6 +379,18 @@ uvec4 glm53_iq2xxs_signs_h[128] = uvec4[128](
 #include "glm53_iq2xxs_signs_h.glsl"
 );
 
+// The block scale of an IQ2_XXS task, 0.125 d (2 s + 1), pinned.
+#ifdef LILY_PRECISE_LEGACY
+#define GLM53_IQ2_XXS_SCALE(name, d, aux1) \
+    precise float name = 0.125 * (d) * float(2u * ((aux1) >> 28u) + 1u)
+#else
+float glm53_iq2_xxs_scale(float d, uint aux1) {
+    precise float k = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
+    return k;
+}
+#define GLM53_IQ2_XXS_SCALE(name, d, aux1) const float name = glm53_iq2_xxs_scale(d, aux1)
+#endif
+
 // IQ2_XXS task t of `row` against the 32 activations xv (as decoded by
 // glm53_decode_iq2_xxs, then dotted). Loads index the row as 16-bit words
 // (66-byte blocks are 33 words).
@@ -397,8 +421,8 @@ float glm53_dot_iq2_xxs(uint64_t row, uint t, in vec4 xv[8]) {
         s += e;
     }
     // Scale and product pinned: glm53_dot2_iq2_xxs gives the same.
-    precise float k = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
-    precise float v = k * s;
+    GLM53_IQ2_XXS_SCALE(k, d, aux1);
+    GLM53_PRECISE_MUL(v, k, s);
     return v;
 }
 
@@ -430,7 +454,8 @@ vec2 glm53_dot2_iq2_xxs(uint64_t row, uint t, in vec4 xa[8], in vec4 xb[8]) {
             s1 += e;
         }
     }
-    precise float k = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
-    precise float v0 = k * s0, v1 = k * s1;
+    GLM53_IQ2_XXS_SCALE(k, d, aux1);
+    GLM53_PRECISE_MUL(v0, k, s0);
+    GLM53_PRECISE_MUL(v1, k, s1);
     return vec2(v0, v1);
 }

@@ -58,10 +58,15 @@ void qg_decode_mxfp4(uint64_t row, uint t, out float w[32]) {
     [[unroll]] for (uint j = 0u; j < 16u; j++) {
         const uint q = uint(U8(b + 1u).v[j]);
         // precise: d * d2 folded first would be the subnormal again.
+#ifdef LILY_PRECISE_LEGACY
         precise float lo = qg_mxfp4_value(q & 15u) * d;
         precise float hi = qg_mxfp4_value(q >> 4u) * d;
         lo = lo * d2;
         hi = hi * d2;
+#else
+        const float lo = glm53_precise_mul(glm53_precise_mul(qg_mxfp4_value(q & 15u), d), d2);
+        const float hi = glm53_precise_mul(glm53_precise_mul(qg_mxfp4_value(q >> 4u), d), d2);
+#endif
         w[j] = lo;
         w[j + 16u] = hi;
     }

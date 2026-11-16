@@ -19,6 +19,22 @@
 // The threadgroup size of the dispatch (Metal's threadsPerThreadgroup).
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
+// `precise` and glslang: glslang follows a precise value back through every
+// object it depends on, and it takes all buffer_reference accesses
+// (`F32(a).v[i]`, `U16(b).v[j]`, ...) for one object. So a precise value
+// computed from a buffer load, in any function of the kernel's source (one
+// the kernel never calls too), makes everything the kernel stores through
+// any buffer reference precise: no fused multiply-adds in the whole kernel.
+// A precise value whose operands are its function's parameters (loaded by
+// the caller) stays contained. The shared decoders that pinned products of
+// values they load themselves keep that form under LILY_PRECISE_LEGACY,
+// which every kernel has unless its file defines LILY_PRECISE_ISOLATED
+// before including this file; then they pin the same products through
+// parameter-only functions. A kernel's results can change when it moves.
+#ifndef LILY_PRECISE_ISOLATED
+#define LILY_PRECISE_LEGACY
+#endif
+
 // Memory by GPU address: `F32(address).v[i]` is element i of the floats at
 // `address`. bfloat16_t is Metal's bfloat: float(x) widens it exactly and
 // bfloat16_t(f) rounds to nearest even.

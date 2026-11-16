@@ -106,6 +106,12 @@ one beside its `.metal` before starting.
   register value to `f`, unrounded: where a kernel needs the rounded value
   back, round in integer math (attention_common.glsl).
   `precise` does not reach `exp` and the other extended instructions.
+  Give a `precise` computation only its function's parameters (and locals
+  computed from them), never a value loaded through a buffer reference in
+  the same function: glslang takes every buffer-reference access for one
+  object, so such a precise value makes everything the kernel stores
+  precise, with no fused multiply-adds anywhere in it, even when the
+  function is never called (common.glsl, LILY_PRECISE_LEGACY).
 - **Params are loads.** `arg(i)` is a push constant, read once per
   dispatch; `arg_u32(i)` loads through it: take each once, outside loops (the compiler does not hoist the load).
 - **Templates and macros.** MSL is C++: templates, lambdas, references,
