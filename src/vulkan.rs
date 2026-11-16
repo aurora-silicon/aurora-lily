@@ -343,6 +343,9 @@ struct Bfloat16Features {
 }
 const BFLOAT16_FEATURES: vk::StructureType = vk::StructureType::from_raw(1000141000);
 const BFLOAT16_EXTENSION: &CStr = c"VK_KHR_shader_bfloat16";
+/// `VK_COMPONENT_TYPE_BFLOAT16_KHR`, which the `ash` release in use predates.
+const BFLOAT16_COMPONENT: vk::ComponentTypeKHR =
+    vk::ComponentTypeKHR::from_raw(1000141000);
 const COOPERATIVE_MATRIX_EXTENSION: &CStr = c"VK_KHR_cooperative_matrix";
 
 /// `VkPhysicalDeviceCooperativeMatrix2FeaturesNV`, which the `ash` release
@@ -362,6 +365,27 @@ struct CooperativeMatrix2Features {
 const COOPERATIVE_MATRIX2_FEATURES: vk::StructureType =
     vk::StructureType::from_raw(1000593000);
 const COOPERATIVE_MATRIX2_EXTENSION: &CStr = c"VK_NV_cooperative_matrix2";
+
+/// Whether a device's cooperative matrix shapes include the subgroup
+/// 16 x 16 x 16 products the kernels use: f16 and bfloat inputs summed in
+/// f32, and bfloat inputs summed in bfloat.
+fn matrix16(props: &[vk::CooperativeMatrixPropertiesKHR<'_>]) -> bool {
+    use vk::ComponentTypeKHR as T;
+    [
+        (T::FLOAT16, T::FLOAT32),
+        (BFLOAT16_COMPONENT, T::FLOAT32),
+        (BFLOAT16_COMPONENT, BFLOAT16_COMPONENT),
+    ]
+    .iter()
+    .all(|&(input, sum)| {
+        props.iter().any(|p| {
+            (p.m_size, p.n_size, p.k_size) == (16, 16, 16)
+                && (p.a_type, p.b_type) == (input, input)
+                && (p.c_type, p.result_type) == (sum, sum)
+                && p.scope == vk::ScopeKHR::SUBGROUP
+        })
+    })
+}
 
 /// The SPIR-V capabilities a device without matrix units cannot run:
 /// BFloat16TypeKHR, BFloat16DotProductKHR, BFloat16CooperativeMatrixKHR,
@@ -482,11 +506,17 @@ impl Dev {
             let has = |name: &CStr| {
                 extensions.iter().any(|e| e.extension_name_as_c_str() == Ok(name))
             };
-            // Matrix units: VK_KHR_cooperative_matrix and bfloat (Honeykrisp
-            // on an M5 with ASAHI_M5_COOPERATIVE_MATRIX=1). Without them the
+            // Matrix units: VK_KHR_cooperative_matrix and bfloat with the
+            // 16 x 16 products the kernels use (Honeykrisp on an M5). An M4
+            // offers the extensions with 8 x 8 products only. Without them the
             // models that have a path without matrix operations still run.
-            let matrix_units =
-                has(COOPERATIVE_MATRIX_EXTENSION) && has(BFLOAT16_EXTENSION);
+            let matrix_units = has(COOPERATIVE_MATRIX_EXTENSION)
+                && has(BFLOAT16_EXTENSION)
+                && matrix16(
+                    &ash::khr::cooperative_matrix::Instance::new(&entry, &instance)
+                        .get_physical_device_cooperative_matrix_properties(physical)
+                        .context("querying the cooperative matrix shapes")?,
+                );
             let queue_family = instance
                 .get_physical_device_queue_family_properties(physical)
                 .iter()
