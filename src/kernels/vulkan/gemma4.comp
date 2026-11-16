@@ -48,15 +48,10 @@
 #endif
 #include "common.glsl"
 #include "glm53_quant.glsl"
+#include "gemma4_half.glsl"
 #ifdef G4_Q8X
 #include "gemma4_q8x.glsl"
 #endif
-
-// f32 to f16 bits, clamped to +-65504 (a NaN stays NaN: clamp would make it
-// -65504) and rounded to nearest even (packHalf2x16 truncates here).
-uint g4_half(float v) {
-    return uint(float16BitsToUint16(float16_t(isnan(v) ? v : clamp(v, -65504.0, 65504.0))));
-}
 
 // tanh without the overflow of (e^2x - 1) / (e^2x + 1).
 float gemma4_tanh(float x) {
@@ -632,8 +627,7 @@ void main() {
 // params two places later. IQ2_XXS's `_xh` variant takes x as f16 in the
 // IQ2_XXS dot's pairing (g4_dot_iq2_xxs_xh) in buffer 1 and also writes
 // mid as f16 in the IQ4_NL down's pairing (of each 32 values, word j holds
-// values j and j + 16; clamped to +-65504) to buffer 4, its params one
-// place later.
+// values j and j + 16; g4_half) to buffer 4, its params one place later.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_gemma4_moe_gate_up_q8_0) || defined(KERNEL_gemma4_moe_gate_up_q5_k) || \
     defined(KERNEL_gemma4_moe_gate_up_q6_k) || defined(KERNEL_gemma4_moe_gate_up_iq2_xxs) || \
@@ -1163,7 +1157,7 @@ void g4_q8x_put4(vec4 v, uint row, uint e, uint n, uint cb, uint db) {
 // Buffers: 0 a, 1 w_post, 2 x, 3 r, 4-6 w1-w3, 7-9 n1, n2, t.
 // Params: 10 n, 11 eps. The `_q8x` variant writes n1 (mask bit 0) and n2
 // (bit 1) as int8 too, and n2 (bit 2) as f16 in the IQ2_XXS dot's pairing
-// (of each 8 values, word p holds values p and p + 4; clamped to +-65504):
+// (of each 8 values, word p holds values p and p + 4; g4_half):
 // buffers 10, 11 n1's codes and pairs, 12, 13 n2's, 14 n2's f16; params 15
 // n, 16 eps, 17 mask.
 #ifdef KERNEL_gemma4_post_attn

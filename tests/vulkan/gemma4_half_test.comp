@@ -1,0 +1,15 @@
+#version 460
+// The f16 conversion of Gemma 4's f16 activations (gemma4_half.glsl's
+// g4_half) on its own, for the boundary table of tests/unit/kernels/
+// gemma4.rs (`f16_conversion_boundaries`).
+#include "common.glsl"
+#include "gemma4_half.glsl"
+
+// out[i] = g4_half(x[i]). Grid::Threads (n). Buffers: 0 x f32, 1 out u16.
+#ifdef KERNEL_g4t_half
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint i = gl_GlobalInvocationID.x;
+    U16(arg(1)).v[i] = uint16_t(g4_half(F32(arg(0)).v[i]));
+}
+#endif

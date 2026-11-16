@@ -970,7 +970,7 @@ pub fn post_attn(
 /// [`post_attn`], with `q8[0]` also writing `o[0]` (the dense MLP's input)
 /// and `q8[1]` `o[1]` (the routed experts') as [`quant_q8x`] does, and
 /// `xh` `o[1]` as f16 in the IQ2_XXS dot's pairing ([`moe_gate_up_xh`]'s
-/// input; values clamped to +-65504).
+/// input; `gemma4_half.glsl`: clamped to +-65504, a NaN stays NaN).
 #[allow(clippy::too_many_arguments)]
 pub fn post_attn_q8x(
     ctx: &MetalContext,
