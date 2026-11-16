@@ -1196,6 +1196,37 @@ measures the same at 8K and 32K in the chain; the 32K step's extra
 attention cost is in the block selection (0.14 to 0.44 ms per step in the
 profile) and the block scores.
 
+## Against llama.cpp's Vulkan backend, per kernel
+
+Measured 2026-11-16 on a 16-inch M1 Max (16-core G13 GPU), same GGUF
+(gemma-4-26B-A4B-it, unsloth UD-IQ2_M), both engines on Vulkan (this fork on
+Mesa Honeykrisp, llama.cpp 0.6.0-dev at `65840ed` with `GGML_VK_PERF_LOGGER=1`).
+Short-prompt decode: about 42 tok/s here, 28 tok/s there; the 4 452-token
+prompt prefills at 300 against 208 tok/s and decodes at 42 against 22.
+
+The per-kernel tables decompose the gap. llama.cpp spends about 26 ms of GPU
+time per decode step (sum of its `Vulkan Timings` decode-path ops), lily's
+kernel profile sums to about 9.3 ms. Two causes, both structural:
+
+- **Unfused memory passes.** llama.cpp's vec path stages iq2/iq4 weights
+  through GET_ROWS (2.5 ms a step) before its matvec, runs the expert
+  weighted-combine as a separate elementwise MUL (4.0 ms), and GeGLU as
+  another pass (2.4 ms). lily consumes the iq2/iq4 in-register inside its
+  matmuls (`moe_gate_up_iq2_xxs_xh`, `moe_down_iq4_nl_xh`: the whole expert
+  block, 1.6 ms) and fuses the q8x activation quantization into the
+  elementwise chain (2.1 ms for all of it).
+- **The dense matvecs.** Five q5_K matvecs at 25 to 600 GFLOPS effective
+  (7.0 ms) against lily's one `gemv_q5_k_q8x_m1` family (2.4 ms, 87
+  dispatches a step), which keeps activations pre-quantized so the kernel
+  reads one narrow operand set.
+
+The q8x activation format is a producer-side property of the whole graph, so
+the second cause is not portable to ggml as a kernel; the first is: fused
+iq2/iq4 vec-matmul shaders (killing GET_ROWS) and a fused expert-combine
+epilogue are upstreamable Vulkan work worth about 9 ms a step of llama.cpp's
+26, still short of parity. Receipt: omarchy-mplus-private
+`receipts/wAN/2026-11-16-lily-vs-llamacpp-per-kernel-jw16.md`.
+
 ## What is left, and what is out of scope
 
 **Decode is at its floor for this design.** The step is a chain of about
