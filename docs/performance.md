@@ -1204,12 +1204,12 @@ Mesa Honeykrisp, llama.cpp 0.6.0-dev at `65840ed` with `GGML_VK_PERF_LOGGER=1`).
 Short-prompt decode: about 42 tok/s here, 28 tok/s there; the 4 452-token
 prompt prefills at 300 against 208 tok/s and decodes at 42 against 22.
 
-The per-kernel tables decompose the gap. llama.cpp spends about 26 ms of GPU
+The per-kernel tables decompose the gap. llama.cpp spends about 28.6 ms of GPU
 time per decode step (sum of its `Vulkan Timings` decode-path ops), lily's
 kernel profile sums to about 9.3 ms. Two causes, both structural:
 
 - **Unfused memory passes.** llama.cpp's vec path stages iq2/iq4 weights
-  through GET_ROWS (2.5 ms a step) before its matvec, runs the expert
+  through GET_ROWS (4.7 ms a step) before its matvec, runs the expert
   weighted-combine as a separate elementwise MUL (4.0 ms), and GeGLU as
   another pass (2.4 ms). lily consumes the iq2/iq4 in-register inside its
   matmuls (`moe_gate_up_iq2_xxs_xh`, `moe_down_iq4_nl_xh`: the whole expert
@@ -1223,8 +1223,8 @@ kernel profile sums to about 9.3 ms. Two causes, both structural:
 The q8x activation format is a producer-side property of the whole graph, so
 the second cause is not portable to ggml as a kernel; the first is: fused
 iq2/iq4 vec-matmul shaders (killing GET_ROWS) and a fused expert-combine
-epilogue are upstreamable Vulkan work worth about 9 ms a step of llama.cpp's
-26, still short of parity. Receipt: omarchy-mplus-private
+epilogue are upstreamable Vulkan work worth about 11 ms a step of llama.cpp's
+28.6, still short of parity. Receipt: omarchy-mplus-private
 `receipts/wAN/2026-11-16-lily-vs-llamacpp-per-kernel-jw16.md`.
 
 ## What is left, and what is out of scope
