@@ -63,6 +63,70 @@ matches the weights (`docs/qwen38-flash-next-checkpoint-format.md`).
     --src ~/models/Qwen3.8-Flash-Next --dst ~/models/Qwen3.8-Flash-Next-lily-q4 --vision-only
 ```
 
+## convert/convert_agnes3_flash.py
+
+Converts Agnes 3.0 Flash (`Agnes-AI/Agnes-3.0-Flash`, the open-weight Preview
+checkpoint, BF16) into GGUF files of llama.cpp's `qwen35` architecture: the
+trunk and `mtp-<name>.gguf` (the MTP block) beside it, as Qwen3.6's GGUFs come.
+Agnes is Qwen3.5's dense decoder plus a second, 2048-wide SwiGLU in every
+layer's MLP, so the file is an ordinary `qwen35` model that llama.cpp runs as
+a reference. The module docstring lists every transform (norms stored as
+`1 + w`, `-exp(A_log)`, value heads to ggml's tiled order, the MTP block's
+naming). The vision tower is not converted.
+
+```sh
+.venv/bin/python tools/convert/convert_agnes3_flash.py \
+    --src ~/models/Agnes-3.0-Flash --dst ~/models/Agnes-3.0-Flash-Q4_K \
+    [--recipe q4_k|q8_0] [--layers 4] [--no-mtp] [--keep-inert] [--dry-run] [--jobs N]
+```
+
+Part of the Preview is untrained: layers 20-23 and 48-51 and every layer's
+parallel branch hold initial values, with output projections near 1e-30
+(found 2026-11-17). They add nothing to the residual stream, and the
+converter leaves them out after checking that every output projection of the
+part is below 1e-20 (`find_inert`): the file is a 64-layer model with a
+17 408-wide MLP, Qwen3.5-27B's shape. A live branch would be folded into the
+main MLP (two SwiGLUs on one input are one of the summed width, as Agnes's
+SGLang patch does); `--keep-inert` converts everything (72 layers, 19 456 wide,
+18.86 GB at `q4_k`). Use one output directory a conversion: lily takes the
+first `mtp-*.gguf` beside a model, and the converter refuses a directory that
+holds another conversion's.
+
+Measured 2026-11-17 on x86-64 (32 cores, `--jobs 32`), sampling the total RSS
+of the converter and its workers:
+
+| recipe          | trunk    | MTP file | time  | peak RSS | types                                  |
+|-----------------|----------|----------|-------|----------|----------------------------------------|
+| `q4_k` (default)| 15.87 GB | 2.32 GB  | 322 s | 7.3 GiB  | Q4_K; `attn_k`, `attn_v`, `output` Q8_0 |
+| `q8_0`          | 28.60 GB | 3.16 GB  | 136 s | 7.1 GiB  | Q8_0                                   |
+| `q4_k --layers 4` | 2.94 GB | 2.32 GB | 63 s  | 7.2 GiB  | as `q4_k`                              |
+
+The peak is the largest tensor in f32 (the embedding, 5.1 GB) plus bounded
+work, whatever the core count, so a 36 GB machine converts too. Vectors,
+norms and the conv kernel stay f32. The MTP file repeats the embedding, output
+norm and LM head (llama.cpp's `--mtp-only` layout; lily maps only its
+`blk.<n>` tensors). The worst relative RMS quantization errors are 7.7 %
+(Q4_K) and 0.8 % (Q8_0), the GDN's small `ssm_alpha`/`ssm_beta`; the report at
+the end lists them.
+
+The quantizers are numpy ports of ggml's `quantize_row_q8_0_ref` and
+`quantize_row_q4_K_ref`, the functions `llama-quantize` runs without an
+importance matrix; on x86-64 their output was byte-identical to that C
+compiled with `-ffp-contract=off` on random, heavy-tailed, sparse, constant
+and zero blocks (2026-11-17). Workers quantize 2^16 values at a time: Q4_K's
+search makes some 300 passes over its temporaries, and larger chunks fall out
+of cache (2^22 values a chunk ran 8 M values a second over 14 workers, 2^16
+94 M). The output is the same for any `--jobs`. gguf-py reads the files and
+decodes every tensor of a converted layer to exactly the converter's values.
+Only numpy is needed.
+
+The tests need neither a checkpoint nor llama.cpp:
+`.venv/bin/python tools/convert/test_convert_agnes3_flash.py`. They check the
+quantizers against a scalar transliteration of the C, convert synthetic
+4-layer checkpoints end to end (live and inert parts), and run a Gated
+DeltaNet layer and the MLP in Hugging Face's convention on the source weights
+against llama.cpp's on the converted ones (exact on an f32 conversion).
+
 ## reference/glm53/
 
 For GLM 5.3 Flash ([docs/glm53.md](../docs/glm53.md)): `gguf_dump.py` prints a
