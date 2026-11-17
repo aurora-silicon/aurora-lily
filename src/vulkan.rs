@@ -442,6 +442,12 @@ struct Dev {
     /// Whether the GPU is an Apple G16 (the M4's, "Apple M4 (G16G B0)"):
     /// its decode GEMVs take the G16 kernels (`gemv_g16.comp`).
     g16: bool,
+    /// Whether every pipeline requests 32-lane subgroups. The kernels are
+    /// written for 32 lanes, the only width Apple's GPUs have; a device
+    /// that defaults to another width (RADV runs RDNA compute in wave64) but
+    /// can run 32 gets them requested, and one that can do neither is
+    /// refused. On Apple's GPUs the request is never made.
+    subgroup32: bool,
     /// VK_KHR_calibrated_timestamps, enabled for the trace ([`trace`]).
     calibrated: Option<ash::khr::calibrated_timestamps::Device>,
 }
@@ -741,6 +747,30 @@ impl Dev {
                 && std::env::var_os("LILY_G16_KERNELS").is_none_or(|v| v != "0");
             let calibrated = calibrate
                 .then(|| ash::khr::calibrated_timestamps::Device::new(&instance, &device));
+            // The kernels index subgroups as 32 lanes. Where the default
+            // width differs, 32 is requested per pipeline (the feature is
+            // enabled with the rest of the queried Vulkan 1.3 features);
+            // without the feature or the width, the device is refused:
+            // other widths read out of bounds (GPU page faults on RADV).
+            let mut v11_props = vk::PhysicalDeviceVulkan11Properties::default();
+            let mut v13_props = vk::PhysicalDeviceVulkan13Properties::default();
+            let mut props = vk::PhysicalDeviceProperties2::default()
+                .push_next(&mut v11_props)
+                .push_next(&mut v13_props);
+            instance.get_physical_device_properties2(physical, &mut props);
+            let default_width = v11_props.subgroup_size;
+            let subgroup32 = default_width != 32;
+            ensure!(
+                !subgroup32
+                    || (v13.subgroup_size_control == vk::TRUE
+                        && v13_props
+                            .required_subgroup_size_stages
+                            .contains(vk::ShaderStageFlags::COMPUTE)
+                        && (v13_props.min_subgroup_size..=v13_props.max_subgroup_size)
+                            .contains(&32)),
+                "the Vulkan device runs {default_width}-lane subgroups and cannot be asked \
+                 for the 32 lily's kernels are written for"
+            );
 
             Ok(Arc::new(Self {
                 _entry: entry,
@@ -762,6 +792,7 @@ impl Dev {
                 matrix_units,
                 cooperative_matrix_register_ops,
                 g16,
+                subgroup32,
                 calibrated,
             }))
         }
@@ -833,11 +864,17 @@ impl Dev {
         let data: Vec<u8> = local.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let specialization =
             vk::SpecializationInfo::default().map_entries(&entries).data(&data);
-        let stage = vk::PipelineShaderStageCreateInfo::default()
+        let mut width =
+            vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(32);
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
             .name(c"main")
             .specialization_info(&specialization);
+        if self.subgroup32 {
+            stage = stage.push_next(&mut width);
+        }
         let info =
             [vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.layout)];
         // SAFETY: valid module and layout.
