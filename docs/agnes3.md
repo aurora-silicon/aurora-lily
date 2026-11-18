@@ -81,7 +81,7 @@ them:
   results bit for bit. The tests that compare the two
   (`bits_kernels_are_bit_identical_to_their_bfloat_kernels`,
   `attn_prep_and_gate_bits_are_bit_identical`) need a device with matrix
-  units and have not run on one yet; elsewhere they return at once.
+  units, and pass on an M5 Max (2026-11-17); elsewhere they return at once.
 - Decode attention takes the split kernel's variant at every length, so the
   scratch holds splits of 64 keys for the kernels' whole 262 144 (96 MiB for
   24 query heads; where the bfloat kernels run, contexts past 8 192 keys
@@ -96,6 +96,21 @@ There, with the `q4_k` file (2026-11-17): a 2 048-token prompt at 140-150
 tokens a second, 13.2 tokens a second decoded plain and 18-21 with one MTP
 draft a step (78-95 % of drafts accepted). These are not Apple numbers.
 
+## Speed on an M5 Max
+
+`lily-qwen36 bench` (a 4 096-token prompt, then 64 tokens decoded) and
+`lily-qwen36 spec` (128 tokens with one MTP draft a step, against plain
+greedy decoding), two interleaved runs a file, 16-inch M5 Max, 2026-11-17:
+
+| file | prefill | decode, plain | decode with one draft |
+|---|---|---|---|
+| `q4_k` | 700-740 tok/s | 24.6-25.3 tok/s | 31.0 tok/s (84 % accepted) |
+| `q8_0` | 680-740 tok/s | 17.1-17.8 tok/s | 26.2 tok/s (85 % accepted) |
+
+A dense 27B model reads all its weights every token, so decode is bounded
+by memory bandwidth (the `q4_k` file is 15.9 GB). Served, a short code
+answer decoded at 36 tokens a second with 47 of 49 drafts accepted.
+
 ## Checks
 
 Against llama.cpp (CPU backend, the same file), teacher-forced, on the
@@ -106,7 +121,13 @@ Radeon 8060S path, 2026-11-17:
 | `q4_k`, 64 layers | 220 tokens of `CONTRIBUTING.md`, the last 100 scored | 97/100 | 3.0819 / 3.0812 |
 | `q4_k --layers 4` | a 42-token Python function, 32 scored | 32/32 | 7.7981 / 7.7961 |
 | `q4_k --layers 4` | 9 000 tokens of `README.md`, the last 100 scored | 100/100 | 7.8892 / 7.8883 |
+| `q4_k`, M5 Max (matrix units) | the 220 tokens above | 96/100 | 3.0835 / 3.0812 |
+| `q4_k --layers 4`, M5 Max | the 9 000 tokens above | 100/100 | 7.8894 / 7.8883 |
 
-The three disagreements are near-ties in llama.cpp's own logits (margins
-0.048, 0.049 and 0.171). Speculative decoding with the MTP head gives the
+The disagreements are near-ties in llama.cpp's own logits (margins 0.048
+to 0.171); the M5's matrix-unit path rounds the prompt GEMMs' operands to
+bfloat, which is its NLL's extra 0.002 (Qwen3.6's chunked prefill added
+0.001 to 0.003 the same way). On the M5 the branch leaves Qwen3.6's output
+unchanged byte for byte (teacher-forced NLL, a 9 000-token context and
+greedy generation, against `main`). Speculative decoding with the MTP head gives the
 same tokens as plain greedy decoding (64 of 64; `lily-qwen36 spec`).
