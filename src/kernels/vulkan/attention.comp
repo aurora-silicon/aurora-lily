@@ -2,6 +2,13 @@
 // The kernels of src/kernels/metal/attention.metal: RoPE, q/gate splitting,
 // KV-cache appends and scaled dot-product attention, each the same
 // arithmetic in the same order. The comments there say why each is as it is.
+// The `_bits` kernels are their namesakes over bfloat bits (common.glsl), and
+// sdpa_prefill_rows (no Metal counterpart) is prompt attention without matrix
+// units over the same caches.
+#if defined(KERNEL_scatter_kv_bf16_bits) || defined(KERNEL_sdpa_decode_split64_bf16_bits) || \
+    defined(KERNEL_sdpa_decode_combine_bits) || defined(KERNEL_sdpa_prefill_rows)
+#define LILY_BF16_BITS
+#endif
 #include "common.glsl"
 #include "attention_common.glsl"
 #if defined(KERNEL_sdpa_prefill_nax_qdev128) || defined(KERNEL_sdpa_rows_split_nax) || \
@@ -99,7 +106,7 @@ void main() {
 }
 #endif
 
-#ifdef KERNEL_scatter_kv_bf16
+#if defined(KERNEL_scatter_kv_bf16) || defined(KERNEL_scatter_kv_bf16_bits)
 void main() {
     if (!LILY_THREAD_IN_GRID) return;
     uint D = arg_u32(2), max_seq = arg_u32(3), base_pos = arg_u32(4), kvh = arg_u32(5);
@@ -107,7 +114,11 @@ void main() {
     uint d = gid % D;
     uint h = (gid / D) % kvh;
     uint m = gid / (D * kvh);
+#ifdef LILY_BF16_BITS
+    U16(arg(0) + 2 * ((uint64_t(h) * max_seq + base_pos + m) * D)).v[d] = U16(arg(1)).v[gid];
+#else
     BF16(arg(0) + 2 * ((uint64_t(h) * max_seq + base_pos + m) * D)).v[d] = BF16(arg(1)).v[gid];
+#endif
 }
 #endif
 
@@ -722,7 +733,7 @@ void main() {
 // split's subgroups walk 8 keys each where 256 make them walk 32 rounds of
 // dependent loads, and short contexts get 4x the threadgroups.
 // sdpa_decode_split64_q8 is the same for a q8 cache (Qwen3.8's dense decode).
-#ifdef KERNEL_sdpa_decode_split64_bf16
+#if defined(KERNEL_sdpa_decode_split64_bf16) || defined(KERNEL_sdpa_decode_split64_bf16_bits)
 #define SDPA_SPLIT 64
 #define KERNEL_sdpa_decode_split_bf16
 #elif defined(KERNEL_sdpa_decode_split64_q8)
@@ -772,7 +783,7 @@ void main() {
             continue;
         }
 
-        if (tid < D) q_s[tid] = float(BF16(arg(0)).v[hq * D + tid]);
+        if (tid < D) q_s[tid] = BF16_LOAD(arg(0), hq * D + tid);
         barrier();
 
         float local_max = NEG_INFINITY;
@@ -802,7 +813,7 @@ void main() {
         } else {
             if (tid < count) {
                 float dp = 0.0;
-                for (uint d = 0; d < D; ++d) dp += q_s[d] * float(BF16(k_head).v[(base + tid) * D + d]);
+                for (uint d = 0; d < D; ++d) dp += q_s[d] * BF16_LOAD(k_head, (base + tid) * D + d);
                 float s = dp * scale;
                 scores[tid] = s;
                 local_max = s;
@@ -865,7 +876,7 @@ void main() {
         } else {
             for (uint d = tid; d < D; d += TG) {
                 float acc = 0.0;
-                for (uint p = 0; p < count; ++p) acc += scores[p] * float(BF16(v_head).v[(base + p) * D + d]);
+                for (uint p = 0; p < count; ++p) acc += scores[p] * BF16_LOAD(v_head, (base + p) * D + d);
                 partials.v[d] = acc;
             }
         }
@@ -1253,7 +1264,7 @@ void main() {
 }
 #endif
 
-#ifdef KERNEL_sdpa_decode_combine
+#if defined(KERNEL_sdpa_decode_combine) || defined(KERNEL_sdpa_decode_combine_bits)
 // Combine split statistics without per-split scratch.
 shared float m_max;
 shared float inv_l;
@@ -1283,7 +1294,61 @@ void main() {
         for (uint s = 0; s < splits; ++s) {
             acc += exp(stats.v[(hq * splits + s) * 2] - m) * partials.v[s * D + d];
         }
-        BF16(arg(2)).v[hq * D + d] = bfloat16_t(acc * inv_l);
+        BF16_STORE(arg(2), hq * D + d, acc * inv_l);
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Causal prompt attention without matrix units (an M4's GPU; RADV), over the
+// bf16 caches sdpa_prefill_nax_qdev128 reads and with its arguments, the
+// bfloats as bits. Row t of the run (position base + t) attends to cache
+// rows 0..base + t. Threadgroup (t, key head): one subgroup a query head of
+// the key head's group (`group` subgroups, at most 8), so the group's heads
+// share each K/V row they read. Lane l holds dimensions 8l..8l+7 (D = 256):
+// a key's score is one subgroup sum, and the softmax is online over the
+// keys in order (the running maximum, the scale of the sum and of the
+// accumulated V when it rises). Buffers: 0 q bf16 [m][NQ][256], 1 k cache,
+// 2 v cache bf16 [KVH][max_seq][256], 3 out bf16 [m][NQ][256]. Params:
+// 4 max_seq, 5 base, 6 m, 7 NQ, 8 group, 9 scale.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_sdpa_prefill_rows
+void main() {
+    const uint D = 256u;
+    const uint max_seq = arg_u32(4), base = arg_u32(5), NQ = arg_u32(7);
+    const uint group = arg_u32(8);
+    const float scale = arg_f32(9);
+    const uint t = gl_WorkGroupID.x;
+    const uint kh = gl_WorkGroupID.y;
+    const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    if (sg >= group) return;
+    const uint hq = kh * group + sg;
+    U32x4 q_row = U32x4(arg(0) + 2 * (uint64_t(t * NQ + hq) * D));
+    const uvec4 qq = q_row.v[lane];
+    const vec4 qa = bf4(qq.xy), qb = bf4(qq.zw);
+    U32x4 k_rows = U32x4(arg(1) + 2 * (uint64_t(kh) * max_seq * D));
+    U32x4 v_rows = U32x4(arg(2) + 2 * (uint64_t(kh) * max_seq * D));
+    const uint len = base + t + 1u;
+    float run_max = NEG_INFINITY, run_sum = 0.0;
+    vec4 acc0 = vec4(0.0), acc1 = vec4(0.0);
+    for (uint j = 0u; j < len; ++j) {
+        const uvec4 kq = k_rows.v[j * (D / 8u) + lane];
+        float dp = dot(bf4(kq.xy), qa) + dot(bf4(kq.zw), qb);
+        const float s = subgroupAdd(dp) * scale;
+        const float m_new = max(run_max, s);
+        const float corr = exp(run_max - m_new);
+        const float w = exp(s - m_new);
+        run_sum = run_sum * corr + w;
+        const uvec4 vq = v_rows.v[j * (D / 8u) + lane];
+        acc0 = acc0 * corr + w * bf4(vq.xy);
+        acc1 = acc1 * corr + w * bf4(vq.zw);
+        run_max = m_new;
+    }
+    const float inv = 1.0 / run_sum;
+    const uint o = (t * NQ + hq) * D + 8u * lane;
+    [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+        BF16_STORE(arg(3), o + i, acc0[i] * inv);
+        BF16_STORE(arg(3), o + 4u + i, acc1[i] * inv);
     }
 }
 #endif

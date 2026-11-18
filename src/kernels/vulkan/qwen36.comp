@@ -4,6 +4,10 @@
 // (glm53_quant.glsl). The arithmetic follows llama.cpp's graph for the
 // architecture (src/models/qwen35moe.cpp, delta-net-base.cpp; ggml's CPU
 // ops), whose converter defined the file's layout.
+// The `_bits` kernels are their namesakes over bfloat bits (common.glsl).
+#if defined(KERNEL_qwen36_attn_prep_bits) || defined(KERNEL_qwen36_attn_gate_bits)
+#define LILY_BF16_BITS
+#endif
 #include "common.glsl"
 #include "glm53_quant.glsl"
 #extension GL_KHR_shader_subgroup_clustered : require
@@ -200,7 +204,7 @@ void main() {
 // 6 k_out bf16 [m][NKV][256], 7 v_out bf16 [m][NKV][256]. Params: 8 NQ,
 // 9 NKV, 10 pos0, 11 rot, 12 base, 13 eps.
 // ---------------------------------------------------------------------------
-#ifdef KERNEL_qwen36_attn_prep
+#if defined(KERNEL_qwen36_attn_prep) || defined(KERNEL_qwen36_attn_prep_bits)
 shared float partial[8];
 shared float normed[256];
 void main() {
@@ -222,7 +226,7 @@ void main() {
     } else {
         const uint i = (t * NKV + kh) * D + tid;
         x = F32(arg(1)).v[i];
-        BF16(arg(7)).v[i] = bfloat16_t(F32(arg(2)).v[i]);
+        BF16_STORE(arg(7), i, F32(arg(2)).v[i]);
     }
     const float sum = subgroupAdd(x * x);
     if (gl_SubgroupInvocationID == 0u) partial[gl_SubgroupID] = sum;
@@ -250,9 +254,9 @@ void main() {
         r = tid < half_rot ? rlo : rhi;
     }
     if (is_q) {
-        BF16(arg(5)).v[(t * NQ + head) * D + tid] = bfloat16_t(r);
+        BF16_STORE(arg(5), (t * NQ + head) * D + tid, r);
     } else {
-        BF16(arg(6)).v[(t * NKV + kh) * D + tid] = bfloat16_t(r);
+        BF16_STORE(arg(6), (t * NKV + kh) * D + tid, r);
     }
 }
 #endif
@@ -263,7 +267,7 @@ void main() {
 // m). Buffers: 0 attn bf16 [m][NQ][256], 1 qg [m][NQ][512], 2 y [m][NQ][256].
 // Params: 3 NQ.
 // ---------------------------------------------------------------------------
-#ifdef KERNEL_qwen36_attn_gate
+#if defined(KERNEL_qwen36_attn_gate) || defined(KERNEL_qwen36_attn_gate_bits)
 void main() {
     if (!LILY_THREAD_IN_GRID) return;
     const uint NQ = arg_u32(3);
@@ -272,7 +276,7 @@ void main() {
     const uint h = c / 256u, d = c % 256u;
     const uint i = t * NQ * 256u + c;
     const float g = F32(arg(1)).v[(t * NQ + h) * 512u + 256u + d];
-    F32(arg(2)).v[i] = float(BF16(arg(0)).v[i]) * qwen36_sigmoid(g);
+    F32(arg(2)).v[i] = BF16_LOAD(arg(0), i) * qwen36_sigmoid(g);
 }
 #endif
 

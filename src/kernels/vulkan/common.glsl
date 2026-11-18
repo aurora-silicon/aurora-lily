@@ -75,6 +75,28 @@ bf16vec4 bf16(vec4 f) {
 bfloat16_t bf16(bfloat16_t f) { return f; }
 #define bfloat16_t(f) bf16(f)
 
+// bfloat as its 16 bits, for the `_bits` variants of bfloat kernels, which
+// run where the bfloat type is not enabled (a GPU without matrix units: an
+// M4's; RADV). bf16_bits rounds as bf16() does and bf16_value widens as
+// float(bfloat16_t) does, exactly, so a variant computes bit for bit what
+// its bfloat kernel does and reads and writes the same buffers. A kernel
+// file defines LILY_BF16_BITS before including this file for its variants;
+// BF16_LOAD and BF16_STORE are then the bits' and otherwise the type's.
+uint16_t bf16_bits(float f) {
+    uint u = floatBitsToUint(f);
+    uint r = u + 0x7FFFu + ((u >> 16) & 1u);
+    if ((u & 0x7FFFFFFFu) > 0x7F800000u) r = u;
+    return uint16_t(r >> 16);
+}
+float bf16_value(uint16_t b) { return uintBitsToFloat(uint(b) << 16); }
+#ifdef LILY_BF16_BITS
+#define BF16_LOAD(address, i) bf16_value(U16(address).v[i])
+#define BF16_STORE(address, i, f) U16(address).v[i] = bf16_bits(f)
+#else
+#define BF16_LOAD(address, i) float(BF16(address).v[i])
+#define BF16_STORE(address, i, f) BF16(address).v[i] = bfloat16_t(f)
+#endif
+
 // A dispatch's arguments: `grid` is its thread grid and `args[i]` the address
 // Metal binds at [[buffer(i)]]: a buffer at its offset, or a `constant T&`
 // param's value. The compiler reads push constants once per dispatch, so

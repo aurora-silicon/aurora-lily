@@ -592,10 +592,148 @@ fn sdpa_prefill_kernel_follows_device() {
         ctx.cooperative_matrix_register_ops()
     );
     let asked = std::env::var("LILY_VK_PREFILL_CM2").is_ok_and(|v| v == "1");
-    if ctx.cooperative_matrix_register_ops() && asked {
+    if !ctx.matrix_units() {
+        assert_eq!(chosen, SDPA_PREFILL_ROWS_KERNEL);
+    } else if ctx.cooperative_matrix_register_ops() && asked {
         assert_eq!(chosen, SDPA_PREFILL_CM2[0]);
     } else {
         assert_eq!(chosen, SDPA_PREFILL_KERNEL);
+    }
+}
+
+/// Prompt attention without matrix units against the CPU: the group sizes
+/// of Qwen3.6 (8) and Agnes 3.0 Flash (6) and one, rows from a zero and a
+/// misaligned base, one row deep into a cache. Runs on any device.
+#[test]
+fn sdpa_prefill_rows_matches_cpu_causal() {
+    let k = SDPA_PREFILL_ROWS_KERNEL;
+    check_sdpa_prefill_with(k, 6, 24, 4, 256, 64, 9, 51);
+    check_sdpa_prefill_with(k, 16, 8, 1, 256, 64, 0, 52);
+    check_sdpa_prefill_with(k, 33, 12, 2, 256, 96, 47, 53);
+    check_sdpa_prefill_with(k, 1, 6, 6, 256, 512, 300, 54);
+}
+
+/// The split decode's `_bits` variants (forced on any device) against the
+/// CPU: lengths of one key, inside one split, on and off the 64-key
+/// splits, many splits; groups of 6 and 8.
+#[test]
+fn sdpa_decode_split64_bits_matches_cpu() {
+    let ctx = MetalContext::new().expect("metal context");
+    FORCE_BITS.with(|f| f.set(true));
+    let splits = sdpa_split_scratch_splits(MAX_SEQ);
+    for (nq, kvh) in [(24, 4), (16, 2)] {
+        let d = 256;
+        let max_seq = 1200;
+        let partials = Tensor::zeros(&ctx, &[nq * splits * d], DType::F32).expect("p");
+        let stats = Tensor::zeros(&ctx, &[nq * splits * 2], DType::F32).expect("s");
+        for len in [1, 7, 64, 65, 300, 1100] {
+            let mut rng = StdRng::seed_from_u64(60 + len as u64);
+            let q: Vec<f32> =
+                (0..nq * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let k: Vec<f32> =
+                (0..kvh * max_seq * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let v: Vec<f32> =
+                (0..kvh * max_seq * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let tq = Tensor::from_f32_as_bf16(&ctx, &q, &[nq, d]).expect("q");
+            let tk = Tensor::from_f32_as_bf16(&ctx, &k, &[kvh, max_seq, d]).expect("k");
+            let tv = Tensor::from_f32_as_bf16(&ctx, &v, &[kvh, max_seq, d]).expect("v");
+            let out = Tensor::zeros(&ctx, &[nq, d], DType::BF16).expect("out");
+            let scale = 1.0 / (d as f32).sqrt();
+            let pass = ctx.begin().expect("pass");
+            sdpa_decode_split64(
+                &ctx,
+                &pass,
+                &tq,
+                &tk,
+                &tv,
+                &out,
+                len,
+                scale,
+                (&partials, &stats),
+            )
+            .expect("sdpa");
+            pass.commit_wait().expect("commit");
+            let (rq, rk, rv) = (
+                cpu_ref::round_bf16(&q),
+                cpu_ref::round_bf16(&k),
+                cpu_ref::round_bf16(&v),
+            );
+            let mut expected = vec![0.0f32; nq * d];
+            for hq in 0..nq {
+                let h = hq / (nq / kvh);
+                let mut w: Vec<f32> = (0..len)
+                    .map(|pos| {
+                        (0..d)
+                            .map(|i| rq[hq * d + i] * rk[(h * max_seq + pos) * d + i])
+                            .sum::<f32>()
+                            * scale
+                    })
+                    .collect();
+                let max = w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                w.iter_mut().for_each(|x| *x = (*x - max).exp());
+                let sum: f32 = w.iter().sum();
+                for i in 0..d {
+                    let acc: f32 = w
+                        .iter()
+                        .enumerate()
+                        .map(|(pos, x)| x * rv[(h * max_seq + pos) * d + i])
+                        .sum();
+                    expected[hq * d + i] = acc / sum;
+                }
+            }
+            cpu_ref::assert_close(&out.to_f32().expect("read"), &expected, 2e-2, 2e-2);
+        }
+    }
+    FORCE_BITS.with(|f| f.set(false));
+}
+
+/// On a device with matrix units, the `_bits` kernels against their bfloat
+/// kernels: the same buffers, bit for bit (the scatter, the split decode
+/// past one split). Without matrix units there is nothing to compare.
+#[test]
+fn bits_kernels_are_bit_identical_to_their_bfloat_kernels() {
+    let ctx = MetalContext::new().expect("metal context");
+    if !ctx.matrix_units() {
+        eprintln!("no matrix units: the bfloat kernels do not run here");
+        return;
+    }
+    let (nq, kvh, d, cap) = (24, 4, 256, 1200);
+    let splits = sdpa_split_scratch_splits(MAX_SEQ);
+    let mut rng = StdRng::seed_from_u64(70);
+    let rows: Vec<f32> =
+        (0..cap * kvh * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let q: Vec<f32> = (0..nq * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let run = |forced: bool, len: usize| -> (Vec<u8>, Vec<u8>) {
+        FORCE_BITS.with(|f| f.set(forced));
+        let kc = KvCache::zeros(&ctx, KvFormat::Bf16, kvh, cap, d).expect("k");
+        let vc = KvCache::zeros(&ctx, KvFormat::Bf16, kvh, cap, d).expect("v");
+        let tr = Tensor::from_f32_as_bf16(&ctx, &rows, &[cap, kvh, d]).expect("rows");
+        let tq = Tensor::from_f32_as_bf16(&ctx, &q, &[nq, d]).expect("q");
+        let out = Tensor::zeros(&ctx, &[nq, d], DType::BF16).expect("out");
+        let partials = Tensor::zeros(&ctx, &[nq * splits * d], DType::F32).expect("p");
+        let stats = Tensor::zeros(&ctx, &[nq * splits * 2], DType::F32).expect("s");
+        let pass = ctx.begin().expect("pass");
+        scatter_kv(&ctx, &pass, &kc, &tr, 0).expect("scatter k");
+        scatter_kv(&ctx, &pass, &vc, &tr, 0).expect("scatter v");
+        pass.memory_barrier().expect("barrier");
+        sdpa_decode_split64(
+            &ctx,
+            &pass,
+            &tq,
+            &kc,
+            &vc,
+            &out,
+            len,
+            0.0625,
+            (&partials, &stats),
+        )
+        .expect("sdpa");
+        pass.commit_wait().expect("commit");
+        FORCE_BITS.with(|f| f.set(false));
+        (kc.values.contents().to_vec(), out.contents().to_vec())
+    };
+    for len in [65, 300, 1100] {
+        assert!(run(false, len) == run(true, len), "length {len}");
     }
 }
 
