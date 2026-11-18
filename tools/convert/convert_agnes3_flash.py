@@ -986,7 +986,13 @@ def model_meta(s: Shape, src: Path, recipe: str, name: str, mtp_file: bool) -> M
     m.u32(a("ssm.time_step_rank"), s.v_heads)
     m.u32(a("ssm.inner_size"), s.v_heads * s.gdn_dim)
     m.array(a("attention.recurrent_layers"), T_BOOL, s.recurrent_out + [False] * (n - s.n_out))
-    m.u32(a("full_attention_interval"), 4)
+    # The interval only where the written trunk follows it: a reader that
+    # derives the layer kinds from it alone (when the list is absent, or
+    # ignored) must not get another pattern than the list's. Leaving out
+    # blocks that are not whole periods breaks it; the Preview's (20-23,
+    # 48-51) are whole periods.
+    if s.recurrent_out == [(i + 1) % 4 != 0 for i in range(s.n_out)]:
+        m.u32(a("full_attention_interval"), 4)
     if mtp_file:
         m.u32(a("nextn_predict_layers"), 1)
     tokenizer_meta(src, s.vocab, m)

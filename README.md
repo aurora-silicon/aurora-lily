@@ -139,7 +139,7 @@ Speculative output equals plain greedy decoding up to rounding ties.
 | 16 GB  | Gemma 4 UD-IQ2_M, `--memory-limit-gb 10.2`      | 11.0 GB                                  | 21 248 (10 496 with the draft model) |
 | 32 GB  | Qwen3.6 Q4_K_M, `--memory-limit-gb 22`          | 23.6 GB                                  | 52 088                               |
 | 32 GB  | Gemma 4 UD-Q5_K_M, `--memory-limit-gb 22`       | 23.6 GB                                  | 55 296                               |
-| 32 GB  | Agnes 3.0 Flash q4_k, `--memory-limit-gb 22`    | 23.6 GB                                  | 78 840 (125 100 at 25 on 36 GB)      |
+| 32 GB  | Agnes 3.0 Flash q4_k, `--memory-limit-gb 22`    | 23.6 GB                                  | 77 428 (123 688 at 25 on 36 GB)      |
 | 64 GB  | Qwen3.6 Q8_0, `--memory-limit-gb 44`            | 47.2 GB                                  | 262 144                              |
 | 64 GB  | Qwen3.8-Flash-Next Q2, `--memory-limit-gb 44.7` | 48.0 GB                                  | 73 720 (163 832 without drafts)      |
 | 128 GB | Qwen3.8-Flash-Next q4-xl                        | 75 GB, plus the 32 GB n-gram table paged | 131 072                              |
