@@ -219,7 +219,7 @@ fn probe<M: LanguageModel>(cli: &Cli) -> Result<Record> {
     let tokens: Vec<u32> = steps.iter().map(|s| s.chosen).collect();
     let text = generator.decode_text(&tokens)?;
     Ok(Record {
-        model_id: M::MODEL_ID,
+        model_id: M::served_id(&cli.model),
         prompt_token_ids: prompt,
         steps,
         text,

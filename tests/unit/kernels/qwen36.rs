@@ -303,6 +303,7 @@ fn attn_prep_and_gate_match_cpu() {
 /// On a device with matrix units, attn_prep and attn_gate's `_bits` kernels
 /// against their bfloat kernels: the same outputs bit for bit, with
 /// Agnes 3.0 Flash's head counts (24 query heads over 4 key heads).
+#[cfg(target_os = "linux")]
 #[test]
 fn attn_prep_and_gate_bits_are_bit_identical() {
     use crate::kernels::attention::FORCE_BITS;

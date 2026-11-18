@@ -604,6 +604,7 @@ fn sdpa_prefill_kernel_follows_device() {
 /// Prompt attention without matrix units against the CPU: the group sizes
 /// of Qwen3.6 (8) and Agnes 3.0 Flash (6) and one, rows from a zero and a
 /// misaligned base, one row deep into a cache. Runs on any device.
+#[cfg(target_os = "linux")]
 #[test]
 fn sdpa_prefill_rows_matches_cpu_causal() {
     let k = SDPA_PREFILL_ROWS_KERNEL;
@@ -615,18 +616,20 @@ fn sdpa_prefill_rows_matches_cpu_causal() {
 
 /// The split decode's `_bits` variants (forced on any device) against the
 /// CPU: lengths of one key, inside one split, on and off the 64-key
-/// splits, many splits; groups of 6 and 8.
+/// splits, many splits, past the 8 192 keys of the bfloat route's scratch
+/// (`sdpa_split64_bits_scratch_splits`); groups of 6 and 8.
+#[cfg(target_os = "linux")]
 #[test]
 fn sdpa_decode_split64_bits_matches_cpu() {
     let ctx = MetalContext::new().expect("metal context");
     FORCE_BITS.with(|f| f.set(true));
-    let splits = sdpa_split_scratch_splits(MAX_SEQ);
+    let splits = sdpa_split64_bits_scratch_splits(MAX_SEQ);
     for (nq, kvh) in [(24, 4), (16, 2)] {
         let d = 256;
-        let max_seq = 1200;
+        let max_seq = 9100;
         let partials = Tensor::zeros(&ctx, &[nq * splits * d], DType::F32).expect("p");
         let stats = Tensor::zeros(&ctx, &[nq * splits * 2], DType::F32).expect("s");
-        for len in [1, 7, 64, 65, 300, 1100] {
+        for len in [1, 7, 64, 65, 300, 1100, 9000] {
             let mut rng = StdRng::seed_from_u64(60 + len as u64);
             let q: Vec<f32> =
                 (0..nq * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
@@ -690,6 +693,7 @@ fn sdpa_decode_split64_bits_matches_cpu() {
 /// On a device with matrix units, the `_bits` kernels against their bfloat
 /// kernels: the same buffers, bit for bit (the scatter, the split decode
 /// past one split). Without matrix units there is nothing to compare.
+#[cfg(target_os = "linux")]
 #[test]
 fn bits_kernels_are_bit_identical_to_their_bfloat_kernels() {
     let ctx = MetalContext::new().expect("metal context");

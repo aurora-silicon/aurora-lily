@@ -817,7 +817,7 @@ impl<M: LanguageModel> Engine<M> {
             ));
             self.timings.record(TimingsEntry {
                 id,
-                model: M::MODEL_ID,
+                model: super::model_id::<M>(),
                 created,
                 timings: measured,
             });
@@ -930,7 +930,7 @@ impl<M: LanguageModel> Engine<M> {
         let out = Output {
             id,
             created,
-            model: M::MODEL_ID,
+            model: super::model_id::<M>(),
             kind: p.kind,
             stream: p.stream,
             collected: Collected::default(),
@@ -943,7 +943,7 @@ impl<M: LanguageModel> Engine<M> {
                 sink.sse(&chunk(
                     &out.id,
                     created,
-                    M::MODEL_ID,
+                    super::model_id::<M>(),
                     json!({"role": "assistant", "content": ""}),
                     None,
                 ));
@@ -1401,7 +1401,7 @@ impl<M: LanguageModel> Engine<M> {
         ));
         self.timings.record(TimingsEntry {
             id: out.id.clone(),
-            model: M::MODEL_ID,
+            model: super::model_id::<M>(),
             created: out.created,
             timings: measured,
         });
@@ -1425,7 +1425,7 @@ impl<M: LanguageModel> Engine<M> {
             kind: p.kind,
             id: &out.id,
             created: out.created,
-            model: M::MODEL_ID,
+            model: super::model_id::<M>(),
             finish_reason,
             usage,
             timings: serde_json::to_value(measured)?,

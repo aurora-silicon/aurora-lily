@@ -458,6 +458,7 @@ class Conversion(unittest.TestCase):
         self.assertEqual(a("block_count"), LAYERS)
         self.assertEqual(a("feed_forward_length"), FF + FP)
         self.assertEqual(a("attention.recurrent_layers"), [True, True, True, False])
+        self.assertEqual(a("full_attention_interval"), 4)
         self.assertEqual(a("rope.dimension_count"), HD // 4)
         self.assertEqual(a("rope.dimension_sections"), [11, 11, 10, 0])
         self.assertEqual((a("ssm.group_count"), a("ssm.time_step_rank"), a("ssm.inner_size")), (KH, VH, VH * GD))
@@ -639,6 +640,8 @@ class Inert(unittest.TestCase):
         meta, table, _ = conv.read_gguf(self.pruned)
         self.assertEqual(meta["qwen35.block_count"], LAYERS - 1)
         self.assertEqual(meta["qwen35.attention.recurrent_layers"], [True, True, False])
+        # Not every fourth layer any more: no interval that would say so.
+        self.assertNotIn("qwen35.full_attention_interval", meta)
         self.assertEqual(meta["qwen35.feed_forward_length"], FF)
         self.assertEqual(table["blk.0.ffn_gate.weight"][0], (H, FF))
         self.assertFalse(any(n.startswith("blk.3.") for n in table))

@@ -559,11 +559,26 @@ pub(crate) fn bits(
     typed: &'static str,
     bits: &'static str,
 ) -> &'static str {
+    if bfloat_kernels(ctx) { typed } else { bits }
+}
+
+/// Whether the device runs the bfloat kernels (it has matrix units, and a
+/// test has not forced the `_bits` variants).
+fn bfloat_kernels(ctx: &MetalContext) -> bool {
     #[cfg(test)]
     if FORCE_BITS.with(std::cell::Cell::get) {
-        return bits;
+        return false;
     }
-    if ctx.matrix_units() { typed } else { bits }
+    ctx.matrix_units()
+}
+
+/// Splits [`sdpa_decode_split64`]'s scratch needs for contexts of up to
+/// `capacity_tokens` keys on a device without the bfloat kernels: every
+/// length takes the split kernel there (the other routes read bfloat
+/// values), 64 keys a split. 4 096 splits for the kernels' 262 144 keys,
+/// 96 MiB of partials for 24 query heads of 256.
+pub fn sdpa_split64_bits_scratch_splits(capacity_tokens: usize) -> usize {
+    capacity_tokens.div_ceil(SDPA_SPLIT64).max(1)
 }
 
 #[cfg(test)]
@@ -1070,8 +1085,9 @@ pub fn sdpa_decode_split64<'c>(
     }
     // Short contexts take sdpa_decode's kernels, which read bfloat values;
     // without matrix units (no bfloat type) the split kernel's `_bits`
-    // variant takes them too, as one split.
-    let short = len <= SDPA_SPLIT64 && ctx.matrix_units();
+    // variant takes them too, as one split, and long ones as many splits as
+    // they need (the caller's scratch: `sdpa_split64_bits_scratch_splits`).
+    let short = len <= SDPA_SPLIT64 && bfloat_kernels(ctx);
     if format != KvFormat::Bf16 || short || !fits || d > 256 {
         return sdpa_decode(ctx, pass, q, k_kv, v_kv, out, len, scale, Some(split_scratch));
     }

@@ -51,16 +51,16 @@ memory whatever the machine (`tools/README.md`).
 ## Running it
 
 ```sh
-# 32 GB: a 78 840-token context
+# 32 GB: a 77 428-token context
 lily --model ~/models/Agnes-3.0-Flash-Q4_K/Agnes-3.0-Flash-Q4_K.gguf \
     --memory-limit-gb 22 --mtp-drafts 1
-# 36 GB: a 125 100-token context
+# 36 GB: a 123 688-token context
 lily --model ~/models/Agnes-3.0-Flash-Q4_K/Agnes-3.0-Flash-Q4_K.gguf \
     --memory-limit-gb 25 --mtp-drafts 1
 ```
 
 The contexts are what `--memory-limit-gb` fits after the weights and the
-scratch (16.7 GB allocated, 69 632 bytes a token of bf16 K/V caches over the
+scratch (16.8 GB allocated, 69 632 bytes a token of bf16 K/V caches over the
 16 attention layers and the MTP block); measured on the server's load line,
 2026-11-17. The API serves the model as `agnes-3.0-flash` (the id comes
 from the file's `general.name`). Thinking is on by default, as Agnes's
@@ -76,10 +76,16 @@ them:
 - Prompt projections take the f32 GEMM (`sgemm.comp`) and the GDN its
   row-parallel scan instead of the chunked one.
 - The attention kernels that use the bfloat type have `_bits` variants that
-  pack and widen bfloats by hand (`common.glsl`): the same caches, and the
-  same results bit for bit (`bits_kernels_are_bit_identical_to_their_bfloat_kernels`,
-  `attn_prep_and_gate_bits_are_bit_identical`, run on a device with matrix
-  units).
+  pack and widen bfloats by hand (`common.glsl`), with the bfloat kernels'
+  rounding and widening: the same caches and, by construction, the same
+  results bit for bit. The tests that compare the two
+  (`bits_kernels_are_bit_identical_to_their_bfloat_kernels`,
+  `attn_prep_and_gate_bits_are_bit_identical`) need a device with matrix
+  units and have not run on one yet; elsewhere they return at once.
+- Decode attention takes the split kernel's variant at every length, so the
+  scratch holds splits of 64 keys for the kernels' whole 262 144 (96 MiB for
+  24 query heads; where the bfloat kernels run, contexts past 8 192 keys
+  take other routes and the scratch is 2 MB).
 - Prompt attention is `sdpa_prefill_rows`: one subgroup a row and query
   head, a key head's group of query heads in one threadgroup, an online
   softmax over the keys.
@@ -99,6 +105,7 @@ Radeon 8060S path, 2026-11-17:
 |---|---|---|---|
 | `q4_k`, 64 layers | 220 tokens of `CONTRIBUTING.md`, the last 100 scored | 97/100 | 3.0819 / 3.0812 |
 | `q4_k --layers 4` | a 42-token Python function, 32 scored | 32/32 | 7.7981 / 7.7961 |
+| `q4_k --layers 4` | 9 000 tokens of `README.md`, the last 100 scored | 100/100 | 7.8892 / 7.8883 |
 
 The three disagreements are near-ties in llama.cpp's own logits (margins
 0.048, 0.049 and 0.171). Speculative decoding with the MTP head gives the
