@@ -67,6 +67,22 @@ from the file's `general.name`). Thinking is on by default, as Agnes's
 template has it, and the model thinks at length; `chat_template_kwargs:
 {"enable_thinking": false}` turns it off for a request.
 
+Agnes accepts `--mtp-drafts 0` for plain decoding and up to
+`--mtp-drafts 3` with the companion MTP file. The server defaults to a
+limit of two. Beyond the first draft, the head can feed back its own
+prediction and hidden state. The trunk verifies the sequence in one pass.
+If it accepts only a prefix, the engine restores the recurrent layers
+from their saved verify inputs. Depths two and three use about 12 MiB of
+additional scratch for the 64-layer model. Compare depths on the same
+prompt with `lily-qwen36 spec --drafts 1|2|3`.
+
+On a Radeon 8060S, interleaved 96-token greedy runs with `q4_k` gave
+median throughput gains for two drafts over one of 17% on a Rust edit,
+11% on Python generation, and 4% on a prose explanation. Each output
+matched plain greedy decoding for all 96 tokens. Three drafts drew about
+even with two on the edit and ran slower on the other prompts. These are
+short-context results (2026-11-17).
+
 ## Without matrix units (M4)
 
 An M4's GPU has no matrix units lily can use and no bfloat type, so Qwen3.6's
@@ -110,6 +126,10 @@ greedy decoding), two interleaved runs a file, 16-inch M5 Max, 2026-11-17:
 A dense 27B model reads all its weights every token, so decode is bounded
 by memory bandwidth (the `q4_k` file is 15.9 GB). Served, a short code
 answer decoded at 36 tokens a second with 47 of 49 drafts accepted.
+
+On the M5 Max, four interleaved short Python generation runs with `q4_k`
+produced 36.0–36.6 tok/s with one draft and 40.1–40.6 tok/s with two
+(plain 23.8–24.1 tok/s). All four matched greedy output for 96/96 tokens.
 
 ## Checks
 

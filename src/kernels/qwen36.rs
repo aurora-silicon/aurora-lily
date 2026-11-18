@@ -692,7 +692,7 @@ pub fn mtp_cat(
 
 /// `x += a`, then `out = rmsnorm(x) * w` (`glm53::add` then
 /// `glm53::rmsnorm`; the residual the same bits, the normed rows within
-/// 1e-6, as [`rmsnorm`]) over `m` rows of `hidden` (2048);
+/// 1e-6, as [`rmsnorm`]) over `m` rows of 2048 or 5120;
 /// with `shared`, `x += a + shared * sigmoid(g)` (`ffn_residual`).
 #[allow(clippy::too_many_arguments)]
 pub fn residual_norm(
@@ -710,7 +710,11 @@ pub fn residual_norm(
     for t in [x, a, w, out] {
         check(&[(t, DType::F32)])?;
     }
-    ensure!(hidden == 2048 && w.numel() >= hidden, "residual norm of rows of {hidden}");
+    ensure!(
+        matches!((hidden, shared.is_some()), (2048, _) | (5120, false))
+            && w.numel() >= hidden,
+        "residual norm of rows of {hidden}"
+    );
     ensure!(
         x.numel() >= m * hidden && a.numel() >= m * hidden && out.numel() >= m * hidden,
         "residual norm of {m} rows"
@@ -720,9 +724,12 @@ pub fn residual_norm(
     let name = if shared.is_some() {
         ensure!(s.numel() >= m * hidden && g.numel() >= m, "residual norm shared rows");
         "qwen36_ffn_residual_norm"
+    } else if hidden == 5120 {
+        "qwen36_add_norm_h5120"
     } else {
         "qwen36_add_norm"
     };
+    let threads = if hidden == 5120 { 256 } else { 1024 };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
@@ -735,7 +742,7 @@ pub fn residual_norm(
             out.binding(),
         ],
         &[&u32_bytes(hidden), &f32_bytes(eps)],
-        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (1024, 1, 1) },
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (threads, 1, 1) },
     )
 }
 
