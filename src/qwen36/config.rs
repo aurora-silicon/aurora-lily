@@ -117,7 +117,13 @@ impl Config {
             ensure!(v.is_finite(), "{k} is {v}");
             Ok(v)
         };
-        let n_layer = u("block_count", MAX_LAYERS)?;
+        let blocks = u("block_count", MAX_LAYERS)?;
+        let drafts = if get(&key("nextn_predict_layers")).is_some() {
+            u("nextn_predict_layers", blocks)?
+        } else {
+            0
+        };
+        let n_layer = blocks - drafts;
         ensure!(n_layer > 0, "{arch}.block_count is 0");
         let recurrent = match get(&key("attention.recurrent_layers")) {
             Some(Value::Array(v)) => {

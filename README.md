@@ -10,6 +10,7 @@ is used daily as a coding-agent backend.
 
 | Memory | Model              | Weights                              | Speculative drafts            |
 |--------|--------------------|--------------------------------------|-------------------------------|
+| 16 GB  | Qwen3.5-4B / 9B    | Q4_K conversion below                | embedded MTP head             |
 | 16 GB  | Gemma 4 26B-A4B    | unsloth's UD-IQ2_M GGUF              | optional: Gemma's draft model |
 | 32 GB  | Qwen3.6-35B-A3B    | ggml-org's Q4_K_M GGUF               | its MTP head                  |
 | 32 GB  | Gemma 4 26B-A4B    | unsloth's UD-Q5_K_M GGUF             | Gemma's draft model           |
@@ -21,7 +22,8 @@ is used daily as a coding-agent backend.
 | 128 GB | GLM 5.3 Flash      | antirez's Q2 GGUF                    | its MTP block                 |
 | 128 GB | DeepSeek V4 Flash  | antirez's Q2 GGUF                    | DSpark                        |
 
-GGUF files load as published, without re-quantization. On the smaller
+For rows marked as conversions, use the model's quantization recipe.
+The other GGUFs load as published. On the smaller
 machines `--memory-limit-gb` keeps everything lily allocates on the GPU
 (weights, scratch and the active session) within the budget the machine
 leaves the GPU, and fits the longest context that budget allows.
@@ -32,7 +34,7 @@ leaves the GPU, and fits the longest context that budget allows.
   measured on a 16-inch M5 Max MacBook Pro with 128 GB. The base M5 and M5
   Pro use the same kernels; their GPUs and memory bandwidth are smaller, so
   expect lower numbers than the tables below.
-- **M4 family** (no matrix units): Gemma 4 runs, with f32 GEMMs and decode
+- **M4 family** (no matrix units): Qwen3.5-4B and 9B run with embedded MTP heads. Gemma 4 runs, with f32 GEMMs and decode
   kernels tuned for the M4's GPU. Agnes 3.0 Flash has a path without matrix
   units too, verified on another GPU without them but not yet measured on
   an M4 ([docs/agnes3.md](docs/agnes3.md)). The other models' kernels need
@@ -107,6 +109,66 @@ Served, the same five requests as the M5 Max table, twice, starting below 60 °C
 - The fanless Air clocks down under sustained load: over the five requests the die reaches 80 °C and
   decode falls from 27 to 19 tok/s. Back-to-back benches drop 1K prefill to 130–155 tok/s.
 - Short prompts mostly measure fixed per-request costs (about 0.8 s each).
+
+#### J713 engine benchmarks
+
+On 2026-11-18, the 16 GB M4 ran the first 1,024 tokens of `src/qwen36/model.rs`
+through the model-specific `bench` commands with 64 greedy output tokens.
+Gemma used its 512-row low-memory prompt setting. The baseline and optimized
+builds used the same GGUF and driver in alternating order. Rates are tokens/s.
+
+| Model | Prefill before | Prefill after | Decode before | Decode after |
+|-------|---------------:|--------------:|--------------:|-------------:|
+| Qwen3.5-4B Q4_K | 163 | 196 | 21.3 | 23.6 |
+| Gemma 4 26B-A4B UD-IQ2_M | 174 | 185 | 26.7 | 27.2 |
+
+At 256 prompt tokens, the optimized builds reached 196 tokens/s prefill on
+Qwen and 178 on Gemma. Small Gemma expert batches reuse their decoded weights
+for 16 input rows. Qwen reads only the eight Q4_K codes its prefill tile
+needs. The full-model greedy digests matched at both lengths. On three
+source-code continuations (48 scored positions per model), Qwen matched
+every reported token NLL, top token and margin. Gemma's full-vocabulary
+f16 log-probability dumps matched byte for byte.
+
+Qwen used Honeykrisp `57df4db849a` with Mesa PRs #370, #371, #372, #374,
+#375, #379, #380, #386 and #388. Gemma used the packaged driver
+`d4ad4a4dce6`. The PR build also passed the GPU kernel checks, but its
+system-memory reserve refused the full Gemma allocation with the desktop
+running. The fanless machine's short-run rates exceed its warm sustained
+rates on some workloads.
+
+#### Qwen3.5 for coding on the 16 GB M4
+
+Start from bartowski's BF16 text GGUF with its embedded MTP layer. Lily's
+fused recurrent projections need a common quantization type. This recipe
+uses Q4_K for those projections and Q8_0 for the vocabulary matrices.
+Use a separate directory for each model. With a recent llama.cpp build:
+
+```sh
+size=4B  # or 9B
+file="Qwen_Qwen3.5-${size}-bf16.gguf"
+curl -fL --retry 3 -o "$file" \
+  "https://huggingface.co/bartowski/Qwen_Qwen3.5-${size}-GGUF/resolve/main/$file"
+llama-quantize --pure --token-embedding-type q8_0 --output-tensor-type q8_0 \
+  --tensor-type ssm_alpha=q4_k --tensor-type ssm_beta=q4_k \
+  "$file" "Qwen3.5-${size}-Q4_K.gguf" Q4_K
+
+# Use the Honeykrisp environment under Running it.
+lily --model "Qwen3.5-${size}-Q4_K.gguf" --max-seq 16384 \
+  --memory-limit-gb 9 --mtp-drafts 2
+```
+
+On the J713, greedy 4B code generation with thinking disabled reached
+23–30 tokens/s with two drafts on binary search and interval merging,
+versus 20–22 tokens/s with drafts disabled. Both settings produced the
+same functions. These are short, single-request decode rates. With two drafts,
+the 4B also passed executable topological-sort and lazy-batching tests.
+The 9B ran these four tasks at 11–18 tokens/s and failed lazy batching.
+Weights and scratch occupied 3.2 GB (4B) and 6.7 GB (9B), before session
+allocations. On a 2,121-token source prompt, prefill reached 113 tokens/s
+on 4B with three drafts and 54 tokens/s on 9B with two. Both missed the
+requested arithmetic result with thinking disabled. With thinking enabled
+and two drafts, 4B returned the correct result, using 512 generated tokens.
 
 ### Quality
 

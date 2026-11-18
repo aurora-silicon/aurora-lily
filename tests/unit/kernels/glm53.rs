@@ -3598,7 +3598,7 @@ fn moe_rows_timing() {
 fn gemv_rows_match_one_row_exactly() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(45);
-    for ty in [GgmlType::Q5K, GgmlType::Q8_0, GgmlType::Iq4Nl] {
+    for ty in [GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q8_0, GgmlType::Iq4Nl] {
         for (cols, rows) in [(2816usize, 72usize), (4096, 40)] {
             let raw = random_blocks(&mut rng, ty, rows * cols);
             let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
@@ -3672,7 +3672,8 @@ fn gemv_g16_edges_match_cpu() {
         let l = GemvLayout { x_group: 4, x_row_stride: 10 * cols, y_row_stride: 40 };
         let x = f32s(&mut rng, m * 10 * cols, -1.0, 1.0);
         let y = out((m - 1) * 40 + w.rows);
-        run(&ctx, |p| gemv_with(&ctx, p, w, &tensor(&ctx, &x), &y, m, l).unwrap());
+        let tx = tensor(&ctx, &x);
+        run(&ctx, |p| gemv_with(&ctx, p, w, &tx, &y, m, l).unwrap());
         let mut want = vec![UNWRITTEN; (m - 1) * 40 + w.rows + TAIL];
         for i in 0..m {
             let yi = cpu.mv_grouped(&x[i * 10 * cols..(i + 1) * 10 * cols], 4);
@@ -3688,7 +3689,8 @@ fn gemv_g16_edges_match_cpu() {
                 GemvLayout { x_group: w.rows, x_row_stride: stride, y_row_stride: 0 };
             let x = f32s(&mut rng, (m - 1) * stride + cols, -1.0, 1.0);
             let y = out(m * w.rows);
-            run(&ctx, |p| gemv_with(&ctx, p, w, &tensor(&ctx, &x), &y, m, l).unwrap());
+            let tx = tensor(&ctx, &x);
+            run(&ctx, |p| gemv_with(&ctx, p, w, &tx, &y, m, l).unwrap());
             let mut want: Vec<f32> = (0..m)
                 .flat_map(|i| cpu.mv(&x[i * stride..i * stride + cols]))
                 .collect();

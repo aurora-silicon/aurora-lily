@@ -211,12 +211,18 @@ impl Qwen36Model {
         let gguf = Gguf::open(path)?;
         let cfg = Config::from_gguf(&gguf)?;
         super::schema::validate(&gguf, &cfg)?;
-        let mapped = Mapped::map(ctx, &gguf)?;
+        let draft_prefix = format!("blk.{}.", cfg.n_layer);
+        let mapped =
+            Mapped::map_only(ctx, &gguf, |t| !t.name.starts_with(&draft_prefix))?;
         let layers = (0..cfg.n_layer)
             .map(|il| load_block(&mapped, &cfg, il, cfg.recurrent[il]))
             .collect::<Result<_>>()?;
         let embed = mapped.q("token_embd.weight")?;
-        let output = mapped.q("output.weight")?;
+        let output = if gguf.tensor("output.weight").is_some() {
+            mapped.q("output.weight")?
+        } else {
+            mapped.q("token_embd.weight")?
+        };
         let output_norm = mapped.f32("output_norm.weight")?;
         let context_cap = cfg.context_length.min(attn::MAX_SEQ);
         Ok(Self {
@@ -242,6 +248,13 @@ impl Qwen36Model {
     pub fn find_mtp(&self, path: &Path) -> Result<Option<std::path::PathBuf>> {
         if let Some(p) = std::env::var_os("LILY_QWEN36_MTP") {
             return Ok(Some(p.into()));
+        }
+        if self
+            .gguf
+            .tensor(&format!("blk.{}.nextn.eh_proj.weight", self.cfg.n_layer))
+            .is_some()
+        {
+            return Ok(Some(path.to_path_buf()));
         }
         let Some(dir) = path.parent() else { return Ok(None) };
         let mut found = Vec::new();
