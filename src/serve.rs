@@ -1008,7 +1008,7 @@ impl<M: LanguageModel> Engine<M> {
             eprintln!(
                 "batching: off, {} cannot batch decode steps in this configuration (the expert cache, \
                  or a --memory-limit-gb fit of one session)",
-                M::MODEL_ID
+                model_id::<M>()
             );
         } else if requested_batch > 1 {
             eprintln!(
@@ -1017,7 +1017,7 @@ impl<M: LanguageModel> Engine<M> {
                     format!(
                         " (--max-batch {} capped by what {} batches)",
                         requested_batch,
-                        M::MODEL_ID
+                        model_id::<M>()
                     )
                 } else {
                     String::new()
@@ -1027,7 +1027,7 @@ impl<M: LanguageModel> Engine<M> {
         let tower = model.vision_tower();
         eprintln!(
             "loaded {} in {:.1}s ({:.1} GB resident{}){}",
-            M::MODEL_ID,
+            model_id::<M>(),
             started.elapsed().as_secs_f64(),
             ctx.current_allocated() as f64 / 1e9,
             match tower {
@@ -1305,7 +1305,7 @@ impl<M: LanguageModel> Engine<M> {
                 }
                 None => eprintln!(
                     "session cache: {} cannot persist sessions; disk tier off",
-                    M::MODEL_ID
+                    model_id::<M>()
                 ),
             }
         }
@@ -1447,7 +1447,7 @@ impl<M: LanguageModel> Engine<M> {
             "{reason}: unloaded {} in {:.1}s ({:.1} GB was resident; {spilled} sessions spilled to disk, \
              {dropped} dropped{}, in {spill_secs:.1}s; {:.2} GB in {allocations} pool allocations \
              released with the context)",
-            M::MODEL_ID,
+            model_id::<M>(),
             started.elapsed().as_secs_f64(),
             resident as f64 / 1e9,
             if faulted {
@@ -1805,7 +1805,7 @@ fn gguf_config(path: &Path) -> Result<Value> {
         config["max_position_embeddings"] =
             serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
     }
-    if arch == crate::qwen36::config::ARCH {
+    if crate::qwen36::config::is_arch(&arch) {
         let stops = crate::qwen36::tokenizer::stop_ids(&g)?;
         config["eos_token_id"] = serde_json::json!(stops);
         config["max_position_embeddings"] =
@@ -2021,7 +2021,7 @@ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
         crate::deepseek4::config::ARCH => {
             run_with::<crate::deepseek4::Ds4Model>(model_dir, options, signals)
         }
-        crate::qwen36::config::ARCH => {
+        crate::qwen36::config::ARCH | crate::qwen36::config::ARCH_DENSE => {
             run_with::<crate::qwen36::Qwen36Model>(model_dir, options, signals)
         }
         crate::gemma4::config::ARCH => {
@@ -2031,7 +2031,8 @@ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
             "unsupported model_type {other:?}; lily serves qwen4_exp \
              (Qwen3.8-Flash-Next), a glm5-next GGUF (GLM 5.3 Flash), a \
              deepseek4 GGUF (DeepSeek V4 Flash), a qwen35moe GGUF \
-             (Qwen3.6-35B-A3B) and a gemma4 GGUF (Gemma 4 26B-A4B)"
+             (Qwen3.6-35B-A3B), a qwen35 GGUF (Agnes 3.0 Flash) and a \
+             gemma4 GGUF (Gemma 4 26B-A4B)"
         ),
     }
 }
@@ -2121,7 +2122,7 @@ fn engine_loop<M: LanguageModel>(
     lifecycle.set(State::Ready);
     eprintln!(
         "ready: serving {} on http://{address}{}",
-        M::MODEL_ID,
+        model_id::<M>(),
         match (settings.idle_unload_secs(), settings.provisional()) {
             (0, "") => String::new(),
             (0, provisional) => format!(" (no idle unload{provisional})"),
@@ -2172,7 +2173,7 @@ fn engine_loop<M: LanguageModel>(
                         Ok(loaded) => {
                             eprintln!(
                                 "reloaded {} in {:.1}s for a waiting request",
-                                M::MODEL_ID,
+                                model_id::<M>(),
                                 started.elapsed().as_secs_f64()
                             );
                             engine = Some(loaded);
@@ -2234,7 +2235,7 @@ fn engine_loop<M: LanguageModel>(
                             eprintln!(
                                 "recovered: reloaded {} in {:.1}s after the GPU fault; resident sessions were \
                                  dropped, clients re-prefill (disk tier entries still apply)",
-                                M::MODEL_ID,
+                                model_id::<M>(),
                                 started.elapsed().as_secs_f64()
                             );
                             engine = Some(loaded);
@@ -2411,11 +2412,21 @@ fn describe_thinking_defaults(
 /// The most shutdown waits for the recorder to write and checkpoint.
 const RECORDER_FINISH: Duration = Duration::from_secs(2);
 
+/// The id this process serves: the checkpoint's ([`LanguageModel::served_id`]),
+/// set once by [`run_with`] before anything reports it.
+static SERVED_ID: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// The served model's id ([`SERVED_ID`]; the type's own before it is set).
+fn model_id<M: LanguageModel>() -> &'static str {
+    SERVED_ID.get().copied().unwrap_or(M::MODEL_ID)
+}
+
 fn run_with<M: LanguageModel + 'static>(
     model_dir: &Path,
     options: ServeOptions,
     signals: signal::Signals,
 ) -> Result<()> {
+    let _ = SERVED_ID.set(M::served_id(model_dir));
     ensure!(
         (1..=CHECKPOINTS_PER_SESSION).contains(&options.checkpoints_per_session),
         "--checkpoints-per-session {}: 1 to {CHECKPOINTS_PER_SESSION}",
@@ -2551,7 +2562,7 @@ fn run_with<M: LanguageModel + 'static>(
     let dashboard = dashboard::Dashboard::new(
         board.clone(),
         dashboard::Config {
-            model: M::MODEL_ID,
+            model: model_id::<M>(),
             runtime: settings.clone(),
             max_batch: options.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
             queue: options.queue,
@@ -2616,7 +2627,7 @@ fn run_with<M: LanguageModel + 'static>(
         jobs,
         lifecycle,
         connections: connections.clone(),
-        model_id: M::MODEL_ID,
+        model_id: model_id::<M>(),
         dashboard,
     });
     for stream in listener.incoming() {

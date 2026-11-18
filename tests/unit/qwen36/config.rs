@@ -163,3 +163,71 @@ fn semantics_the_graph_lacks_are_refused() {
         assert!(Config::from_metadata(&with(k, v), VOCAB).is_ok(), "{k}");
     }
 }
+
+/// The metadata `tools/convert/convert_agnes3_flash.py` writes for Agnes 3.0
+/// Flash (`qwen35`, the dense architecture; the keys lily reads).
+fn dense() -> BTreeMap<String, Value> {
+    let mut m = BTreeMap::new();
+    let mut put = |k: &str, v: Value| {
+        m.insert(k.to_string(), v);
+    };
+    put("general.architecture", Value::Str("qwen35".into()));
+    for (k, v) in [
+        ("block_count", 64u32),
+        ("context_length", 262144),
+        ("embedding_length", 5120),
+        ("feed_forward_length", 17408),
+        ("attention.head_count", 24),
+        ("attention.head_count_kv", 4),
+        ("attention.key_length", 256),
+        ("attention.value_length", 256),
+        ("rope.dimension_count", 64),
+        ("ssm.conv_kernel", 4),
+        ("ssm.state_size", 128),
+        ("ssm.group_count", 16),
+        ("ssm.time_step_rank", 48),
+        ("ssm.inner_size", 6144),
+        ("full_attention_interval", 4),
+    ] {
+        put(&format!("qwen35.{k}"), Value::U32(v));
+    }
+    put("qwen35.rope.freq_base", Value::F32(1e7));
+    put("qwen35.attention.layer_norm_rms_epsilon", Value::F32(1e-6));
+    put(
+        "qwen35.attention.recurrent_layers",
+        Value::Array((0..64).map(|il| Value::Bool(il % 4 != 3)).collect()),
+    );
+    put("tokenizer.ggml.eos_token_id", Value::U32(248046));
+    put("tokenizer.ggml.padding_token_id", Value::U32(248044));
+    m
+}
+
+#[test]
+fn the_dense_header_parses() {
+    let c = Config::from_metadata(&dense(), VOCAB).unwrap();
+    assert_eq!(format!("{c:?}"), format!("{:?}", Config::agnes3_flash()));
+    assert!(!c.is_moe() && Config::qwen36_35b_a3b().is_moe());
+    assert!(is_arch("qwen35") && is_arch("qwen35moe") && !is_arch("qwen3"));
+}
+
+#[test]
+fn dense_shapes_and_mixtures_are_refused() {
+    let dense_with = |k: &str, v: Value| {
+        let mut m = dense();
+        m.insert(k.to_string(), v);
+        m
+    };
+    // The MLP width: whole Q4_K blocks, 1024 and up.
+    for ff in [1000u32, 512] {
+        let e = err(&dense_with("qwen35.feed_forward_length", Value::U32(ff)), VOCAB);
+        assert!(e.contains("feed_forward_length"), "{ff}: {e}");
+    }
+    let mut m = dense();
+    m.remove("qwen35.feed_forward_length");
+    assert!(err(&m, VOCAB).contains("feed_forward_length"));
+    // Expert metadata in a dense file is a mixture lily does not guess at.
+    let e = err(&dense_with("qwen35.expert_count", Value::U32(8)), VOCAB);
+    assert!(e.contains("expert_count"), "{e}");
+    let e = err(&dense_with("general.architecture", Value::Str("qwen3".into())), VOCAB);
+    assert!(e.contains("architecture"), "{e}");
+}

@@ -350,8 +350,37 @@ impl LanguageModel for Qwen36Model {
 
     const MODEL_ID: &'static str = "qwen3.6-35b-a3b";
 
+    /// Qwen3.6's id for a `qwen35moe` file; a dense `qwen35` file's from its
+    /// `general.name`, lowercased with dashes for spaces ("Agnes 3.0 Flash"
+    /// is `agnes-3.0-flash`), or `qwen3.5` without one. Leaked once: a
+    /// process serves one model.
+    fn served_id(path: &Path) -> &'static str {
+        let Ok(g) = crate::gguf::Gguf::open(path) else { return Self::MODEL_ID };
+        if g.architecture().ok() != Some(super::config::ARCH_DENSE) {
+            return Self::MODEL_ID;
+        }
+        let name = g.str("general.name").unwrap_or("qwen3.5");
+        let mut id = String::new();
+        for c in name.chars().flat_map(char::to_lowercase) {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                id.push(c);
+            } else if !id.is_empty() && !id.ends_with('-') {
+                id.push('-');
+            }
+        }
+        let id = id.trim_end_matches('-');
+        if id.is_empty() {
+            "qwen3.5"
+        } else {
+            Box::leak(id.to_string().into_boxed_str())
+        }
+    }
+
     fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
         let mut model = Qwen36Model::load(ctx, path)?;
+        // The logs name the file's architecture (`qwen35moe` for Qwen3.6,
+        // `qwen35` for the dense models).
+        let arch = model.cfg.arch;
         model.draft_min_prob = DRAFT_MIN_PROB;
         model.memory_limit = options.memory_limit;
         if model.memory_limit.is_some() {
@@ -361,10 +390,10 @@ impl LanguageModel for Qwen36Model {
             match model.find_mtp(path)? {
                 Some(p) => {
                     model.load_mtp(ctx, &p)?;
-                    eprintln!("qwen3.6: MTP head from {}", p.display());
+                    eprintln!("{arch}: MTP head from {}", p.display());
                 }
                 None => eprintln!(
-                    "qwen3.6: no mtp-*.gguf beside {}: decoding without drafts",
+                    "{arch}: no mtp-*.gguf beside {}: decoding without drafts",
                     path.display()
                 ),
             }
@@ -382,7 +411,7 @@ impl LanguageModel for Qwen36Model {
                 + crate::serve::DECODE_CHECKPOINTS_PER_SESSION;
             let context = model.fit_context(limit, allocated as u64, checkpoints)?;
             eprintln!(
-                "qwen3.6: --memory-limit-gb {:.1} ({:.1} GB) leaves {:.2} GB after {:.1} GB of weights and \
+                "{arch}: --memory-limit-gb {:.1} ({:.1} GB) leaves {:.2} GB after {:.1} GB of weights and \
                  scratch: contexts of up to {context} tokens (one session of {:.2} GB with \
                  {checkpoints} snapshots); --max-seq is capped there",
                 limit as f64 / (1u64 << 30) as f64,
