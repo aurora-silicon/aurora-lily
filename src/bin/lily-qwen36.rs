@@ -60,6 +60,8 @@ enum Cmd {
     /// interface, against plain greedy decoding of the same prompt (the
     /// first `prompt_len` ids of a file).
     Spec {
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=3))]
+        drafts: u8,
         #[arg(long)]
         model: PathBuf,
         #[arg(long)]
@@ -120,8 +122,8 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Spec { model, ids, prompt_len, n, runs } => {
-            spec(&model, &read_ids(&ids)?, prompt_len, n, runs)
+        Cmd::Spec { model, ids, prompt_len, n, runs, drafts } => {
+            spec(&model, &read_ids(&ids)?, prompt_len, n, runs, usize::from(drafts))
         }
         Cmd::Bench { model, ids, prompt_len, n, runs } => {
             bench(&model, &read_ids(&ids)?, prompt_len, n, runs)
@@ -363,6 +365,7 @@ fn spec(
     prompt_len: usize,
     n: usize,
     runs: usize,
+    drafts: usize,
 ) -> Result<()> {
     use lily::engine::{Draw, LanguageModel, LoadOptions};
     use lily::kernels::sample::SamplingParams;
@@ -372,9 +375,10 @@ fn spec(
         ids.len()
     );
     let ctx = MetalContext::new()?;
-    let opts = LoadOptions { mtp_drafts: 1, ..Default::default() };
+    let opts = LoadOptions { mtp_drafts: drafts, ..Default::default() };
     let model = <Qwen36Model as LanguageModel>::load(&ctx, path, &opts)?;
     anyhow::ensure!(model.mtp.is_some(), "no MTP head found");
+    anyhow::ensure!(drafts <= model.max_drafts(), "unsupported draft depth {drafts}");
     let cap = prompt_len + n + 16;
     let greedy = SamplingParams::greedy();
     let mut st = LanguageModel::new_state(&model, &ctx, cap)?;
@@ -428,7 +432,7 @@ fn spec(
         let t0 = Instant::now();
         let (mut drafted, mut accepted, mut steps) = (0usize, 0usize, 0usize);
         let mut proposals =
-            model.draft_initial(&ctx, &mut st, &mut sc, out[0], 1, &greedy, 1)?;
+            model.draft_initial(&ctx, &mut st, &mut sc, out[0], drafts, &greedy, 1)?;
         while out.len() < n {
             let pending = *out.last().expect("one");
             let (draws, pass) = model.verify(
@@ -439,7 +443,7 @@ fn spec(
                 &proposals,
                 &greedy,
                 out.len(),
-                1,
+                drafts,
             )?;
             let mut kept = 0;
             for (j, &t) in draws.iter().enumerate() {

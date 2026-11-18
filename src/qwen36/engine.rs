@@ -335,12 +335,47 @@ impl Qwen36Model {
 const DRAFT_MIN_PROB: f32 = 0.3;
 
 impl Qwen36Model {
-    /// The MTP head's draft from its drafted row `j` as a proposal list:
-    /// empty when its probability is below [`Qwen36Model::draft_min_prob`].
-    fn proposal(&self, scratch: &Scratch, j: usize) -> Result<Vec<u32>> {
-        let p = scratch.mtp_prob.to_f32()?[j];
-        let draft = scratch.mtp_io.to_u32()?[1 + j];
-        Ok(if p >= self.draft_min_prob { vec![draft] } else { Vec::new() })
+    /// Chain additional proposals from the head's own normed hidden row.
+    /// The next verify pass overwrites these provisional KV rows with the
+    /// verified pairs. Only verified pairs advance the saved head position.
+    fn proposals(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Qwen36State,
+        scratch: &Scratch,
+        mut row: usize,
+        limit: usize,
+    ) -> Result<Vec<u32>> {
+        let room = state.max_capacity.saturating_sub(state.pos + 2);
+        let limit = limit.min(self.max_drafts()).min(room);
+        let mut result = Vec::with_capacity(limit);
+        while result.len() < limit {
+            let confidence = scratch.mtp_prob.to_f32()?[row];
+            if confidence < self.draft_min_prob {
+                break;
+            }
+            result.push(scratch.mtp_io.to_u32()?[1 + row]);
+            // Each extra token costs a serial head pass. Spend it only when
+            // the preceding draft is confident enough to reach that token.
+            if result.len() == limit || confidence < 0.85 {
+                break;
+            }
+            let next = state.mtp.as_ref().expect("loaded MTP head").pos;
+            let pos = next + result.len() - 1;
+            if result.len() == 1 {
+                // Grow before writing provisional rows: growth copies only
+                // committed KV rows through the head's saved position.
+                state.ensure_capacity(ctx, next + limit - 1)?;
+            }
+            let token = scratch.mtp_io.view(1 + row, &[1])?;
+            let hidden = self.cfg.hidden;
+            let hin = scratch.mtp_hn.view(row * hidden, &[hidden])?;
+            let pass = self.begin(ctx)?;
+            self.encode_mtp(ctx, &pass, state, scratch, &token, &hin, pos, 1, 1)?;
+            pass.commit_wait()?;
+            row = 0;
+        }
+        Ok(result)
     }
 }
 
@@ -382,6 +417,8 @@ impl LanguageModel for Qwen36Model {
         // `qwen35` for the dense models).
         let arch = model.cfg.arch;
         model.draft_min_prob = DRAFT_MIN_PROB;
+        let max_depth = if model.cfg.is_moe() { 1 } else { super::model::MAX_ROWS - 1 };
+        model.draft_depth = options.mtp_drafts.min(max_depth);
         model.memory_limit = options.memory_limit;
         if model.memory_limit.is_some() {
             model.prefill_rows = PREFILL_ROWS_LIMITED;
@@ -426,9 +463,9 @@ impl LanguageModel for Qwen36Model {
         Ok(model)
     }
 
-    /// One draft a step: the MTP block predicts one token ahead.
+    /// Dense checkpoints can feed the MTP head recursively.
     fn max_drafts(&self) -> usize {
-        usize::from(self.mtp.is_some())
+        if self.mtp.is_some() { self.draft_depth } else { 0 }
     }
 
     fn draft_initial(
@@ -437,7 +474,7 @@ impl LanguageModel for Qwen36Model {
         state: &mut Qwen36State,
         scratch: &mut Scratch,
         first: u32,
-        _drafts: usize,
+        drafts: usize,
         _params: &SamplingParams,
         _step0: usize,
     ) -> Result<Vec<u32>> {
@@ -466,7 +503,7 @@ impl LanguageModel for Qwen36Model {
         if let Some(m) = &mut state.mtp {
             m.pos = p + 1;
         }
-        self.proposal(scratch, 0)
+        self.proposals(ctx, state, scratch, 0, drafts)
     }
 
     fn verify<'a>(
@@ -478,10 +515,10 @@ impl LanguageModel for Qwen36Model {
         drafts: &[u32],
         params: &SamplingParams,
         step0: usize,
-        _next_drafts: usize,
+        next_drafts: usize,
     ) -> Result<(Vec<u32>, PendingPass<'a>)> {
         let rows = 1 + drafts.len();
-        ensure!(rows <= 2, "Qwen3.6 verifies one draft a step, got {}", drafts.len());
+        ensure!(drafts.len() <= self.max_drafts(), "too many drafts: {}", drafts.len());
         ensure!(state.spec.is_none(), "a verify pass is already pending");
         state.ensure_capacity(ctx, state.pos + rows)?;
         // And the head's row after them, where the context leaves one.
@@ -533,7 +570,13 @@ impl LanguageModel for Qwen36Model {
             Ok(())
         })?;
         let draws = scratch.draws.to_u32()?[..rows].to_vec();
-        state.spec = Some((state.pos, rows, draws.clone(), fold));
+        state.spec = Some(super::model::VerifiedRows {
+            pos: state.pos,
+            rows,
+            draws: draws.clone(),
+            folded: fold,
+            next_drafts,
+        });
         state.pos += rows;
         Ok((draws, ctx.begin()?.commit()?))
     }
@@ -548,15 +591,21 @@ impl LanguageModel for Qwen36Model {
         draft: PendingPass<'_>,
     ) -> Result<Vec<u32>> {
         draft.wait()?;
-        let (pos0, rows, draws, folded) = state
-            .spec
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("no verify pass pending"))?;
+        let super::model::VerifiedRows { pos: pos0, rows, draws, folded, next_drafts } =
+            state
+                .spec
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("no verify pass pending"))?;
         ensure!(accepted < rows, "{accepted} accepted of {} drafts", rows - 1);
         state.pos = pos0 + 1 + accepted;
         if accepted + 1 < rows {
             // Back to the state after row 0.
             state.take_gdn_snapshots();
+            if accepted > 0 {
+                // The snapshot is after the pending token. Rebuild the
+                // accepted prefix when a later draft was rejected.
+                self.replay_gdn(ctx, state, scratch, accepted)?;
+            }
         }
         for &token in &draws[accepted + 1..] {
             scratch.sampler().uncount(token);
@@ -597,7 +646,13 @@ impl LanguageModel for Qwen36Model {
         }
         // The draft of the last pair: the verify pass's row `accepted` when
         // it ran the head, else this pass's only drafted row.
-        self.proposal(scratch, if folded { accepted } else { 0 })
+        self.proposals(
+            ctx,
+            state,
+            scratch,
+            if folded { accepted } else { 0 },
+            next_drafts,
+        )
     }
 
     /// The file's context, or less: what the attention kernel or the

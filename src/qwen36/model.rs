@@ -112,6 +112,8 @@ pub struct Qwen36Model {
     pub context_cap: usize,
     /// A draft less probable than this under the MTP head is not proposed.
     pub draft_min_prob: f32,
+    /// Requested depth, capped to the number of drafts the verifier supports.
+    pub(super) draft_depth: usize,
     /// Rows a prompt step takes (and its scratch holds).
     pub prefill_rows: usize,
 }
@@ -230,6 +232,7 @@ impl Qwen36Model {
             memory_limit: None,
             context_cap,
             draft_min_prob: 0.0,
+            draft_depth: 1,
             prefill_rows: PREFILL_ROWS,
         })
     }
@@ -380,7 +383,13 @@ impl Qwen36Model {
     }
 
     pub fn new_scratch(&self, ctx: &MetalContext) -> Result<Scratch> {
-        Scratch::new(ctx, &self.cfg, self.prefill_rows, self.fused_experts())
+        Scratch::new(
+            ctx,
+            &self.cfg,
+            self.prefill_rows,
+            self.fused_experts(),
+            self.mtp.is_some() && self.draft_depth > 1,
+        )
     }
 
     /// Whether every routed expert stack (the MTP block's too) is Q4_K or
@@ -424,6 +433,14 @@ pub struct MtpState {
     pub pos: usize,
 }
 
+pub(super) struct VerifiedRows {
+    pub pos: usize,
+    pub rows: usize,
+    pub draws: Vec<u32>,
+    pub folded: bool,
+    pub next_drafts: usize,
+}
+
 /// A session: caches and recurrent state at position `pos`.
 pub struct Qwen36State {
     pub pos: usize,
@@ -437,7 +454,7 @@ pub struct Qwen36State {
     /// rows, and whether it also ran the MTP head over its rows' pairs (the
     /// next drafts in `mtp_io`), until `finish_speculation` decides what
     /// stays.
-    pub(crate) spec: Option<(usize, usize, Vec<u32>, bool)>,
+    pub(super) spec: Option<VerifiedRows>,
 }
 
 impl Qwen36State {
@@ -532,6 +549,27 @@ impl Qwen36State {
     }
 }
 
+/// GDN projections consumed by the recurrent update. During a wide verify
+/// each recurrent layer retains its own rows until the accepted prefix is known.
+struct GdnInputs {
+    qkv: Tensor,
+    z: Tensor,
+    ga: Tensor,
+    gb: Tensor,
+}
+
+impl GdnInputs {
+    fn new(ctx: &MetalContext, cfg: &Config, rows: usize) -> Result<Self> {
+        let f = |width| Tensor::zeros(ctx, &[rows * width], DType::F32);
+        Ok(Self {
+            qkv: f(cfg.gdn_qkv())?,
+            z: f(cfg.gdn_inner())?,
+            ga: f(cfg.gdn_v_heads)?,
+            gb: f(cfg.gdn_v_heads)?,
+        })
+    }
+}
+
 /// Per-step intermediates, for up to [`Qwen36Model::prefill_rows`] rows.
 pub struct Scratch {
     pub tokens: Tensor,
@@ -542,10 +580,8 @@ pub struct Scratch {
     /// The mixer's (GDN or attention) output projection.
     mix: Tensor,
     // GDN
-    qkv: Tensor,
-    z: Tensor,
-    ga: Tensor,
-    gb: Tensor,
+    gdn_input: GdnInputs,
+    replay: Vec<Option<GdnInputs>>,
     c: Tensor,
     o: Tensor,
     y: Tensor,
@@ -583,7 +619,7 @@ pub struct Scratch {
     /// `[rows][2 hidden]`: normed embedding | normed hidden.
     cat: Tensor,
     /// The MTP head's normed last row.
-    mtp_hn: Tensor,
+    pub(super) mtp_hn: Tensor,
     /// U32[1 + MAX_ROWS]: the MTP step's input token (0) and its greedy
     /// drafts (1..), one a drafted row.
     pub mtp_io: Tensor,
@@ -610,6 +646,7 @@ impl Scratch {
         cfg: &Config,
         rows: usize,
         fused_experts: bool,
+        wide_verify: bool,
     ) -> Result<Self> {
         let r = rows;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
@@ -655,10 +692,16 @@ impl Scratch {
             xn: f(r * h)?,
             xbf: b(xbf)?,
             mix: f(r * h)?,
-            qkv: f(r * ch)?,
-            z: f(r * inner)?,
-            ga: f(r * cfg.gdn_v_heads)?,
-            gb: f(r * cfg.gdn_v_heads)?,
+            gdn_input: GdnInputs::new(ctx, cfg, r)?,
+            replay: cfg
+                .recurrent
+                .iter()
+                .map(|&recurrent| {
+                    (wide_verify && recurrent)
+                        .then(|| GdnInputs::new(ctx, cfg, MAX_ROWS))
+                        .transpose()
+                })
+                .collect::<Result<_>>()?,
             c: f(r * ch)?,
             o: f(r * inner)?,
             y: f(r * inner)?,
@@ -883,6 +926,7 @@ impl Qwen36Model {
                 pass,
                 sc,
                 &self.layers[il],
+                if snap.is_some() && m > 2 { sc.replay[il].as_ref() } else { None },
                 &st.layers[il],
                 st.pos,
                 snap,
@@ -908,6 +952,7 @@ impl Qwen36Model {
         pass: &ComputePass<'_>,
         sc: &Scratch,
         l: &LayerW,
+        replay: Option<&GdnInputs>,
         ls: &LayerState,
         pos0: usize,
         snap: Option<usize>,
@@ -924,7 +969,16 @@ impl Qwen36Model {
             (Mixer::Gdn(w), LayerState::Gdn { conv, s, conv_alt, s_alt }) => {
                 let snap =
                     snap.map(|row| GdnSnapshot { row, conv: conv_alt, s: s_alt });
-                self.gdn(ctx, pass, sc, w, &GdnState { conv, s }, snap.as_ref(), m)?;
+                self.gdn(
+                    ctx,
+                    pass,
+                    sc,
+                    replay.unwrap_or(&sc.gdn_input),
+                    w,
+                    &GdnState { conv, s },
+                    snap.as_ref(),
+                    m,
+                )?;
             }
             (Mixer::Attn(w), LayerState::Attn { k: kc, v: vc }) => {
                 self.attention(ctx, pass, sc, w, kc, vc, pos0, m)?;
@@ -954,9 +1008,9 @@ impl Qwen36Model {
     }
 
     /// Whether residual adds and the RMSNorm after them are one kernel
-    /// (`k::residual_norm`, rows of 2048).
+    /// (`k::residual_norm`).
     fn fuse_norm(&self) -> bool {
-        self.cfg.hidden == 2048
+        self.cfg.hidden == 2048 || (self.cfg.hidden == 5120 && !self.cfg.is_moe())
     }
 
     /// `out = rmsnorm(x) * w` over `m` rows of the hidden width.
@@ -1018,7 +1072,9 @@ impl Qwen36Model {
         self.proj(ctx, pass, &[(&w.eh_proj, &sc.x)], &sc.cat, xb, m)?;
         pass.memory_barrier()?;
         let ls = LayerState::Attn { k: ms.k.clone(), v: ms.v.clone() };
-        self.encode_block(ctx, pass, sc, &w.layer, &ls, pos0, None, m, false, None)?;
+        self.encode_block(
+            ctx, pass, sc, &w.layer, None, &ls, pos0, None, m, false, None,
+        )?;
         if drafts == 0 {
             return Ok(());
         }
@@ -1171,6 +1227,7 @@ impl Qwen36Model {
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
         sc: &Scratch,
+        input: &GdnInputs,
         w: &GdnW,
         st: &GdnState<'_>,
         snap: Option<&GdnSnapshot<'_>>,
@@ -1182,10 +1239,10 @@ impl Qwen36Model {
             ctx,
             pass,
             &[
-                (&w.qkv, &sc.qkv),
-                (&w.gate, &sc.z),
-                (&w.alpha, &sc.ga),
-                (&w.beta, &sc.gb),
+                (&w.qkv, &input.qkv),
+                (&w.gate, &input.z),
+                (&w.alpha, &input.ga),
+                (&w.beta, &input.gb),
             ],
             &sc.xn,
             xb,
@@ -1207,10 +1264,10 @@ impl Qwen36Model {
                 &p,
                 st,
                 snap,
-                &sc.qkv,
-                &sc.ga,
-                &sc.gb,
-                &sc.z,
+                &input.qkv,
+                &input.ga,
+                &input.gb,
+                &input.z,
                 &sc.y,
                 m,
                 cfg.gdn_k_heads,
@@ -1231,10 +1288,10 @@ impl Qwen36Model {
                 st,
                 snap,
                 chunk.as_ref(),
-                &sc.qkv,
-                &sc.ga,
-                &sc.gb,
-                &sc.z,
+                &input.qkv,
+                &input.ga,
+                &input.gb,
+                &input.z,
                 &sc.c,
                 &sc.o,
                 &sc.y,
@@ -1247,11 +1304,68 @@ impl Qwen36Model {
         if m <= MAX_ROWS {
             // The step only read the conv window; it moves beside the output
             // projection, which does not read it.
-            k::gdn_conv_window(ctx, pass, &p, st, snap, &sc.qkv, m)?;
+            k::gdn_conv_window(ctx, pass, &p, st, snap, &input.qkv, m)?;
         }
         let xb = self.bf16_input(ctx, pass, sc, &sc.y, cfg.gdn_inner(), m)?;
         self.proj(ctx, pass, &[(&w.out, &sc.mix)], &sc.y, xb, m)?;
         pass.memory_barrier()
+    }
+
+    /// Restore the accepted rows after swapping in the row-zero snapshot.
+    /// KV rows are already in place. Only the recurrent state and its
+    /// convolution window need updating, using the original verify inputs.
+    pub(super) fn replay_gdn(
+        &self,
+        ctx: &MetalContext,
+        st: &Qwen36State,
+        sc: &Scratch,
+        rows: usize,
+    ) -> Result<()> {
+        let pass = self.begin(ctx)?;
+        let cfg = &self.cfg;
+        for ((layer, state), input) in
+            self.layers.iter().zip(&st.layers).zip(&sc.replay)
+        {
+            let (Mixer::Gdn(w), LayerState::Gdn { conv, s, .. }) =
+                (&layer.mixer, state)
+            else {
+                continue;
+            };
+            let input = input
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing GDN verify inputs"))?;
+            let after_first = |t: &Tensor, width| t.view(width, &[rows * width]);
+            let qkv = after_first(&input.qkv, cfg.gdn_qkv())?;
+            let ga = after_first(&input.ga, cfg.gdn_v_heads)?;
+            let gb = after_first(&input.gb, cfg.gdn_v_heads)?;
+            let z = after_first(&input.z, cfg.gdn_inner())?;
+            let p = GdnParams {
+                conv_w: &w.conv,
+                ssm_a: &w.ssm_a,
+                dt_bias: &w.dt_bias,
+                norm: &w.norm,
+            };
+            let state = GdnState { conv, s };
+            k::gdn_step(
+                ctx,
+                &pass,
+                &p,
+                &state,
+                None,
+                &qkv,
+                &ga,
+                &gb,
+                &z,
+                &sc.y,
+                rows,
+                cfg.gdn_k_heads,
+                cfg.rms_eps,
+            )?;
+            pass.memory_barrier()?;
+            k::gdn_conv_window(ctx, &pass, &p, &state, None, &qkv, rows)?;
+        }
+        pass.commit_wait()?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

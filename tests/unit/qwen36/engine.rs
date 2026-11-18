@@ -140,16 +140,18 @@ fn speculate(
     n: usize,
     rest_every: Option<usize>,
 ) -> Run {
+    let depth = model.max_drafts();
     let greedy = SamplingParams::greedy();
     let mut out = vec![first];
     let mut log = Vec::new();
-    let mut proposals = model.draft_initial(ctx, st, sc, first, 1, &greedy, 1).unwrap();
+    let mut proposals =
+        model.draft_initial(ctx, st, sc, first, depth, &greedy, 1).unwrap();
     let mut step = 0;
     while out.len() < n && st.pos < st.max_capacity {
         let pending = *out.last().unwrap();
         log.push((st.pos, proposals.clone()));
         let (draws, pass) = model
-            .verify(ctx, st, sc, pending, &proposals, &greedy, out.len(), 1)
+            .verify(ctx, st, sc, pending, &proposals, &greedy, out.len(), depth)
             .unwrap();
         let mut kept = 0;
         for (j, &t) in draws.iter().enumerate() {
@@ -164,8 +166,9 @@ fn speculate(
         proposals = model.finish_speculation(ctx, st, sc, kept, !rest, pass).unwrap();
         if rest {
             let last = *out.last().unwrap();
-            proposals =
-                model.draft_initial(ctx, st, sc, last, 1, &greedy, out.len()).unwrap();
+            proposals = model
+                .draft_initial(ctx, st, sc, last, depth, &greedy, out.len())
+                .unwrap();
         }
     }
     Run { tokens: out, proposals: log }
@@ -176,7 +179,7 @@ fn speculate(
 fn speculation_at_rest_restores_and_forks_like_plain_decoding() {
     let path = std::env::var("LILY_QWEN36_GGUF").expect("LILY_QWEN36_GGUF");
     let ctx = MetalContext::new().unwrap();
-    let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
+    let options = LoadOptions { mtp_drafts: 3, ..Default::default() };
     let model = <Qwen36Model as LanguageModel>::load(
         &ctx,
         std::path::Path::new(&path),
@@ -550,4 +553,68 @@ fn forced_draft_outcomes_follow_plain_decoding() {
     let k = f.tokens.len().min(plain.len());
     assert_eq!(&f.tokens[..k], &plain[..k], "forced sampled speculation");
     assert!(f.rejected >= 1 && f.suppressed >= 1);
+}
+
+/// Stop after every possible prefix of a four-row verify, including the two
+/// partial accepts which must replay only the accepted GDN projections.
+#[test]
+#[ignore = "requires LILY_AGNES_GGUF with its MTP head"]
+fn dense_wide_verify_restores_each_accepted_prefix() {
+    let path = std::env::var("LILY_AGNES_GGUF").expect("LILY_AGNES_GGUF");
+    let ctx = MetalContext::new().unwrap();
+    let options = LoadOptions { mtp_drafts: 3, ..Default::default() };
+    let model =
+        <Qwen36Model as LanguageModel>::load(&ctx, path.as_ref(), &options).unwrap();
+    assert_eq!(model.max_drafts(), 3);
+    let mut scratch = model.new_scratch(&ctx).unwrap();
+    let mut state = model.new_state(&ctx, 32).unwrap();
+    let prompt = [100, 111, 120, 103, 113, 110, 101, 112];
+    let greedy = SamplingParams::greedy();
+    let prefill = |state: &mut Qwen36State, sc: &mut Scratch| {
+        state.reset();
+        let draw = Draw { params: &greedy, step: 0 };
+        LanguageModel::prefill(&model, &ctx, state, sc, &prompt, Some(draw)).unwrap();
+        sc.next_token.to_u32().unwrap()[0]
+    };
+    let mut plain = vec![prefill(&mut state, &mut scratch)];
+    for _ in 0..9 {
+        model
+            .forward(
+                &ctx,
+                &mut state,
+                &mut scratch,
+                &[*plain.last().unwrap()],
+                Logits::Last,
+            )
+            .unwrap();
+        plain.push(argmax(&scratch.logits_last.to_f32().unwrap()));
+    }
+    for accepted in 0..=3 {
+        let pending = prefill(&mut state, &mut scratch);
+        model
+            .draft_initial(&ctx, &mut state, &mut scratch, pending, 3, &greedy, 1)
+            .unwrap();
+        let mut drafts = plain[1..4].to_vec();
+        if accepted < 3 {
+            drafts[accepted] = (drafts[accepted] + 1) % model.cfg.vocab as u32;
+        }
+        let (draws, pass) = model
+            .verify(&ctx, &mut state, &mut scratch, pending, &drafts, &greedy, 1, 3)
+            .unwrap();
+        assert_eq!(&draws[..=accepted], &plain[1..=accepted + 1]);
+        model
+            .finish_speculation(&ctx, &mut state, &mut scratch, accepted, false, pass)
+            .unwrap();
+        assert_eq!(state.pos, prompt.len() + accepted + 1);
+        for pair in plain[accepted + 1..].windows(2) {
+            model
+                .forward(&ctx, &mut state, &mut scratch, &pair[..1], Logits::Last)
+                .unwrap();
+            assert_eq!(
+                argmax(&scratch.logits_last.to_f32().unwrap()),
+                pair[1],
+                "after keeping {accepted} drafts"
+            );
+        }
+    }
 }

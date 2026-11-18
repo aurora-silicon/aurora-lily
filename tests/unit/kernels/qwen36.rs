@@ -598,13 +598,13 @@ fn residual_norm_matches_add_then_rmsnorm() {
     use crate::kernels::glm53::{add, rmsnorm};
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(79);
-    for (m, h) in [(1, 2048), (3, 2048), (2, 2048)] {
+    for (m, h) in [(1, 2048), (3, 2048), (2, 2048), (1, 5120), (3, 5120)] {
         let x = f32s(&mut rng, m * h, -3.0, 3.0);
         let a = f32s(&mut rng, m * h, -1.0, 1.0);
         let sh = f32s(&mut rng, m * h, -1.0, 1.0);
         let g = f32s(&mut rng, m, -2.0, 2.0);
         let w = tensor(&ctx, &f32s(&mut rng, h, 0.5, 1.5));
-        for fused_shared in [false, true] {
+        for &fused_shared in if h == 5120 { &[false][..] } else { &[false, true][..] } {
             let (xa, xb) = (tensor(&ctx, &x), tensor(&ctx, &x));
             let (at, st, gt) = (tensor(&ctx, &a), tensor(&ctx, &sh), tensor(&ctx, &g));
             let (oa, ob) =
@@ -630,6 +630,8 @@ fn residual_norm_matches_add_then_rmsnorm() {
             for (k, (p, q)) in u.iter().zip(&v).enumerate() {
                 assert_eq!(p.to_bits(), q.to_bits(), "x m {m} {fused_shared} at {k}");
             }
+            let cpu = crate::cpu_ref::rmsnorm(&u, &w.to_f32().unwrap(), h, 1e-6);
+            assert_close(&ob.to_f32().unwrap(), &cpu, 1e-5, 1e-5);
             let want = oa.to_f32().unwrap();
             assert_close(&ob.to_f32().unwrap(), &want, 1e-6, 1e-6);
             assert_close(&oc.to_f32().unwrap(), &want, 1e-6, 1e-6);
