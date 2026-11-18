@@ -581,6 +581,43 @@ pub fn sdpa_split64_bits_scratch_splits(capacity_tokens: usize) -> usize {
     capacity_tokens.div_ceil(SDPA_SPLIT64).max(1)
 }
 
+/// Splits a model's [`sdpa_decode_split64`] scratch holds for every context
+/// up to the kernels' [`MAX_SEQ`], for `nq` query heads over `kvh` key heads
+/// of `d`. Without the bfloat kernels: [`sdpa_split64_bits_scratch_splits`].
+/// With them, contexts past the split kernel's take [`sdpa_decode`]'s
+/// routes: the fixed block's 128 splits (Qwen3.6's eight query heads a key
+/// head), or else one split per 256 keys, as many as the longest context
+/// needs (Agnes 3.0 Flash's six: 1 024 splits, 24 MiB for 24 heads of 256).
+pub fn sdpa_decode_scratch_splits(
+    ctx: &MetalContext,
+    nq: usize,
+    kvh: usize,
+    d: usize,
+) -> usize {
+    if !ctx.matrix_units() {
+        return sdpa_split64_bits_scratch_splits(MAX_SEQ);
+    }
+    decode_scratch_splits_with_matrix_units(nq, kvh, d)
+}
+
+fn decode_scratch_splits_with_matrix_units(nq: usize, kvh: usize, d: usize) -> usize {
+    let base = sdpa_split_scratch_splits(MAX_SEQ);
+    let longest = sdpa_split_route(
+        MAX_SEQ,
+        d,
+        nq / kvh.max(1),
+        nq,
+        kvh,
+        GQA_FOLD_MIN_CONTEXT,
+        SDPA_FIXED_BLOCK_CROSSOVER,
+    );
+    if longest == SdpaSplitRoute::FixedBlock {
+        base
+    } else {
+        base.max(MAX_SEQ.div_ceil(SDPA_SPLIT))
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Tests: [`bits`] takes the `_bits` variant on any device, so a device

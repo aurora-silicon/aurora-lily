@@ -580,6 +580,15 @@ class Conversion(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not converted"):
             conv.main(["--src", str(extra), "--dst", str(root / "x"), "--dry-run"])
 
+    def test_writes_nothing_when_an_output_exists(self):
+        # An old MTP file of the same name: refused before the trunk is written.
+        dst = Path(self.tmp.name) / "stale"
+        dst.mkdir()
+        (dst / "mtp-Agnes-3.0-Flash-Q4_K.gguf").write_bytes(b"old")
+        with self.assertRaisesRegex(ValueError, "exist"):
+            conv.main(["--src", str(self.src), "--dst", str(dst), "--jobs", "1"])
+        self.assertFalse((dst / "Agnes-3.0-Flash-Q4_K.gguf").exists())
+
     def test_refuses_a_directory_with_another_mtp_file(self):
         # lily takes the first mtp-*.gguf beside a model.
         with self.assertRaisesRegex(ValueError, "directory of its own"):
