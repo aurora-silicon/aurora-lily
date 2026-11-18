@@ -381,7 +381,12 @@ pub fn attn_prep(
         "k/v of {m} rows"
     );
     ensure!(rot.is_multiple_of(2) && rot <= d, "rotary dims {rot}");
-    let pipeline = ctx.pipeline("qwen36_attn_prep", SOURCE, MslVersion::V3_1)?;
+    let name = crate::kernels::attention::bits(
+        ctx,
+        "qwen36_attn_prep",
+        "qwen36_attn_prep_bits",
+    );
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[
@@ -422,7 +427,12 @@ pub fn attn_gate(
         attn.numel() >= m * n && y.numel() >= m * n && qg.numel() >= 2 * m * n,
         "gate"
     );
-    let pipeline = ctx.pipeline("qwen36_attn_gate", SOURCE, MslVersion::V3_1)?;
+    let name = crate::kernels::attention::bits(
+        ctx,
+        "qwen36_attn_gate",
+        "qwen36_attn_gate_bits",
+    );
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[attn.binding(), qg.binding(), y.binding()],

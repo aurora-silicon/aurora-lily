@@ -373,7 +373,8 @@ pub fn scatter_kv<'t, 'c>(
     let grid = Grid::Threads { grid: (m * kvh * d, 1, 1), threadgroup: (256, 1, 1) };
     match format {
         KvFormat::Bf16 => {
-            let pipeline = ctx.pipeline("scatter_kv_bf16", SOURCE, MslVersion::V3_1)?;
+            let name = bits(ctx, "scatter_kv_bf16", "scatter_kv_bf16_bits");
+            let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
             pass.dispatch_with(
                 &pipeline,
                 &[cache.values.binding(), rows.binding()],
@@ -550,9 +551,32 @@ pub fn kv_dequant_q8<'c>(
     )
 }
 
+/// `typed`, a kernel over bfloat values, or `bits`, its variant over bfloat
+/// bits (common.glsl's `_bits` kernels: the same results bit for bit), where
+/// the device does not enable the bfloat type (without matrix units: an M4).
+pub(crate) fn bits(
+    ctx: &MetalContext,
+    typed: &'static str,
+    bits: &'static str,
+) -> &'static str {
+    #[cfg(test)]
+    if FORCE_BITS.with(std::cell::Cell::get) {
+        return bits;
+    }
+    if ctx.matrix_units() { typed } else { bits }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`bits`] takes the `_bits` variant on any device, so a device
+    /// with matrix units can compare the two.
+    pub(crate) static FORCE_BITS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Causal prefill SDPA: `q`/`out` are `[M, NQ, D]`; token `m` attends to cache
 /// positions `0..base_len + m + 1` (the chunk's own K/V must already be
-/// scattered).
+/// scattered). Without matrix units, `sdpa_prefill_rows`: a subgroup a row and
+/// query head, an online softmax over the keys.
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa_prefill<'t>(
     ctx: &MetalContext,
@@ -612,6 +636,24 @@ pub(crate) fn sdpa_prefill_with(
         d == FA_D,
         "head dim {d} is not the compiled flash-attention head dim {FA_D}"
     );
+    if kernel == SDPA_PREFILL_ROWS_KERNEL {
+        let group = nq / kvh;
+        ensure!(group <= 8, "{group} query heads a key head (the rows kernel takes 8)");
+        let pipeline = ctx.pipeline(kernel, SOURCE, MslVersion::V3_1)?;
+        return pass.dispatch_with(
+            &pipeline,
+            &[q.binding(), k_cache.binding(), v_cache.binding(), out.binding()],
+            &[
+                Param::U32(max_seq as u32),
+                base_len.param(),
+                Param::U32(m as u32),
+                Param::U32(nq as u32),
+                Param::U32(group as u32),
+                Param::F32(scale),
+            ],
+            Grid::Threadgroups { groups: (m, kvh, 1), threadgroup: (32 * group, 1, 1) },
+        );
+    }
     let pipeline = ctx.pipeline(kernel, SOURCE, MslVersion::V4_0)?;
     pass.dispatch_with(
         &pipeline,
@@ -635,6 +677,9 @@ pub(crate) fn sdpa_prefill_with(
 }
 
 const SDPA_PREFILL_KERNEL: &str = "sdpa_prefill_nax_qdev128";
+/// Prompt attention without matrix units (attention.comp's
+/// `sdpa_prefill_rows`): its own geometry, the same arguments.
+pub(crate) const SDPA_PREFILL_ROWS_KERNEL: &str = "sdpa_prefill_rows";
 /// The same tile with the scores in registers (attention_cm2.comp), on
 /// VK_NV_cooperative_matrix2's conversions, reductions and per-element
 /// operations; same arguments and geometry.
@@ -649,6 +694,9 @@ const SDPA_PREFILL_CM2_KERNEL: &str = "sdpa_prefill_cm2";
 /// either way, 2026-11-11), and its rounding changes the output, so it is
 /// off by default.
 pub(crate) fn sdpa_prefill_kernel(ctx: &MetalContext) -> &'static str {
+    if !ctx.matrix_units() {
+        return SDPA_PREFILL_ROWS_KERNEL;
+    }
     #[cfg(target_os = "linux")]
     {
         static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1020,7 +1068,11 @@ pub fn sdpa_decode_split64<'c>(
             "sdpa_decode_split64_q8",
         );
     }
-    if format != KvFormat::Bf16 || len <= SDPA_SPLIT64 || !fits || d > 256 {
+    // Short contexts take sdpa_decode's kernels, which read bfloat values;
+    // without matrix units (no bfloat type) the split kernel's `_bits`
+    // variant takes them too, as one split.
+    let short = len <= SDPA_SPLIT64 && ctx.matrix_units();
+    if format != KvFormat::Bf16 || short || !fits || d > 256 {
         return sdpa_decode(ctx, pass, q, k_kv, v_kv, out, len, scale, Some(split_scratch));
     }
     ensure!(
@@ -1029,7 +1081,11 @@ pub fn sdpa_decode_split64<'c>(
         partials.dtype()
     );
     let group = nq / kvh;
-    let stage1 = ctx.pipeline("sdpa_decode_split64_bf16", SOURCE, MslVersion::V3_1)?;
+    let stage1 = ctx.pipeline(
+        bits(ctx, "sdpa_decode_split64_bf16", "sdpa_decode_split64_bf16_bits"),
+        SOURCE,
+        MslVersion::V3_1,
+    )?;
     pass.dispatch_at(
         &stage1,
         &[
@@ -1050,7 +1106,11 @@ pub fn sdpa_decode_split64<'c>(
         Grid::Threadgroups { groups: (nq, splits, 1), threadgroup: (256, 1, 1) },
     )?;
     pass.level_barrier(&[partials, stats])?;
-    let stage2 = ctx.pipeline("sdpa_decode_combine", SOURCE, MslVersion::V3_1)?;
+    let stage2 = ctx.pipeline(
+        bits(ctx, "sdpa_decode_combine", "sdpa_decode_combine_bits"),
+        SOURCE,
+        MslVersion::V3_1,
+    )?;
     pass.dispatch_at(
         &stage2,
         &[partials.binding(), stats.binding(), out.binding()],

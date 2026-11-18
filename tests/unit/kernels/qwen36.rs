@@ -300,6 +300,45 @@ fn attn_prep_and_gate_match_cpu() {
     assert_close(&y.to_f32().unwrap(), &y_r, 1e-6, 1e-5);
 }
 
+/// On a device with matrix units, attn_prep and attn_gate's `_bits` kernels
+/// against their bfloat kernels: the same outputs bit for bit, with
+/// Agnes 3.0 Flash's head counts (24 query heads over 4 key heads).
+#[test]
+fn attn_prep_and_gate_bits_are_bit_identical() {
+    use crate::kernels::attention::FORCE_BITS;
+    let ctx = ctx();
+    if !ctx.matrix_units() {
+        eprintln!("no matrix units: the bfloat kernels do not run here");
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(39);
+    let (m, nq, nkv, d) = (5, 24, 4, HEAD_DIM);
+    let qg = tensor(&ctx, &f32s(&mut rng, m * nq * 2 * d, -2.0, 2.0));
+    let kx = tensor(&ctx, &f32s(&mut rng, m * nkv * d, -2.0, 2.0));
+    let vx = tensor(&ctx, &f32s(&mut rng, m * nkv * d, -2.0, 2.0));
+    let qn = tensor(&ctx, &f32s(&mut rng, d, 0.5, 1.5));
+    let kn = tensor(&ctx, &f32s(&mut rng, d, 0.5, 1.5));
+    let outputs = |forced: bool| -> Vec<Vec<u8>> {
+        FORCE_BITS.with(|f| f.set(forced));
+        let qo = zeros(&ctx, m * nq * d, DType::BF16);
+        let ko = zeros(&ctx, m * nkv * d, DType::BF16);
+        let vo = zeros(&ctx, m * nkv * d, DType::BF16);
+        let y = zeros(&ctx, m * nq * d, DType::F32);
+        run(&ctx, |pass| {
+            attn_prep(
+                &ctx, pass, &qg, &kx, &vx, &qn, &kn, &qo, &ko, &vo, m, nq, nkv, 77, 64,
+                1e7, 1e-6,
+            )
+            .unwrap();
+            pass.memory_barrier().unwrap();
+            attn_gate(&ctx, pass, &qo, &qg, &y, m, nq).unwrap();
+        });
+        FORCE_BITS.with(|f| f.set(false));
+        [&qo, &ko, &vo, &y].iter().map(|t| t.contents().to_vec()).collect()
+    };
+    assert!(outputs(false) == outputs(true));
+}
+
 #[test]
 fn router_matches_cpu() {
     let ctx = ctx();
