@@ -1,9 +1,9 @@
 # lily on Linux
 
-Fast local inference of mixture-of-experts language models on Apple Silicon
-running Linux. lily is a compact inference server with hand-written GPU
-kernels; this fork runs it on Linux through Vulkan (Mesa's Honeykrisp
-driver) and serves five model families, from a 16 GB laptop to a 128 GB
+Fast local inference of mixture-of-experts and hybrid language models on
+Apple Silicon running Linux. lily is a compact inference server with
+hand-written GPU kernels; this fork runs it on Linux through Vulkan (Mesa's
+Honeykrisp driver) and serves six models, from a 16 GB laptop to a 128 GB
 workstation. The server is OpenAI-compatible (`/v1/chat/completions`,
 `/v1/completions`, `/v1/models`, tools, `reasoning_content`, streaming) and
 is used daily as a coding-agent backend.
@@ -13,8 +13,10 @@ is used daily as a coding-agent backend.
 | 16 GB  | Gemma 4 26B-A4B    | unsloth's UD-IQ2_M GGUF              | optional: Gemma's draft model |
 | 32 GB  | Qwen3.6-35B-A3B    | ggml-org's Q4_K_M GGUF               | its MTP head                  |
 | 32 GB  | Gemma 4 26B-A4B    | unsloth's UD-Q5_K_M GGUF             | Gemma's draft model           |
+| 32 GB  | Agnes 3.0 Flash    | lily's q4_k conversion               | its MTP head                  |
 | 64 GB  | Qwen3.6-35B-A3B    | ggml-org's Q8_0 GGUF                 | its MTP head                  |
 | 64 GB  | Qwen3.8-Flash-Next | antirez's Q2 GGUF                    | its MTP head                  |
+| 64 GB  | Agnes 3.0 Flash    | lily's q8_0 conversion               | its MTP head                  |
 | 128 GB | Qwen3.8-Flash-Next | lily's 4-bit conversions (q4-xl, q4) | its MTP head                  |
 | 128 GB | GLM 5.3 Flash      | antirez's Q2 GGUF                    | its MTP block                 |
 | 128 GB | DeepSeek V4 Flash  | antirez's Q2 GGUF                    | DSpark                        |
@@ -31,10 +33,12 @@ leaves the GPU, and fits the longest context that budget allows.
   Pro use the same kernels; their GPUs and memory bandwidth are smaller, so
   expect lower numbers than the tables below.
 - **M4 family** (no matrix units): Gemma 4 runs, with f32 GEMMs and decode
-  kernels tuned for the M4's GPU. The other models' kernels need matrix
-  units and are refused on these GPUs. Mesa offers the M4 8 x 8 cooperative
-  matrices, which run on the same ALUs as its FMAs; lily's matrix kernels
-  need the M5's 16 x 16 ones, so the M4 keeps the f32 path.
+  kernels tuned for the M4's GPU. Agnes 3.0 Flash has a path without matrix
+  units too, verified on another GPU without them but not yet measured on
+  an M4 ([docs/agnes3.md](docs/agnes3.md)). The other models' kernels need
+  matrix units and are refused on these GPUs. Mesa offers the M4 8 x 8
+  cooperative matrices, which run on the same ALUs as its FMAs; lily's
+  matrix kernels need the M5's 16 x 16 ones, so the M4 keeps the f32 path.
 
 ## Speed
 
@@ -135,6 +139,7 @@ Speculative output equals plain greedy decoding up to rounding ties.
 | 16 GB  | Gemma 4 UD-IQ2_M, `--memory-limit-gb 10.2`      | 11.0 GB                                  | 21 248 (10 496 with the draft model) |
 | 32 GB  | Qwen3.6 Q4_K_M, `--memory-limit-gb 22`          | 23.6 GB                                  | 52 088                               |
 | 32 GB  | Gemma 4 UD-Q5_K_M, `--memory-limit-gb 22`       | 23.6 GB                                  | 55 296                               |
+| 32 GB  | Agnes 3.0 Flash q4_k, `--memory-limit-gb 22`    | 23.6 GB                                  | 78 840 (125 100 at 25 on 36 GB)      |
 | 64 GB  | Qwen3.6 Q8_0, `--memory-limit-gb 44`            | 47.2 GB                                  | 262 144                              |
 | 64 GB  | Qwen3.8-Flash-Next Q2, `--memory-limit-gb 44.7` | 48.0 GB                                  | 73 720 (163 832 without drafts)      |
 | 128 GB | Qwen3.8-Flash-Next q4-xl                        | 75 GB, plus the 32 GB n-gram table paged | 131 072                              |
@@ -219,6 +224,11 @@ instance lock before mapping weights.
 - **Qwen3.6-35B-A3B**: Gated DeltaNet and gated attention at 3:1, 256
   experts with 8 active and a gated shared expert, an MTP head loaded from
   ggml-org's separate MTP file.
+- **[Agnes 3.0 Flash](https://huggingface.co/Agnes-AI/Agnes-3.0-Flash)**: the
+  open-weight Preview, Qwen3.5's dense decoder (Gated DeltaNet and gated
+  attention at 3:1, a SwiGLU MLP, an MTP layer) with 64 trained layers of its
+  72; lily serves `tools/convert/convert_agnes3_flash.py`'s GGUFs through the
+  Qwen3.6 code ([docs/agnes3.md](docs/agnes3.md)).
 - **Gemma 4 26B-A4B**: 25 sliding-window and 5 global attention layers, a
   dense GeGLU MLP and 128 experts with 8 active in every layer; drafts from
   Gemma's own draft model, which reads the target's caches
@@ -299,10 +309,11 @@ weights are ignored by default and take `LILY_MODEL_DIR_FLASH` (Qwen3.8-Flash-Ne
   implementation GLM 5.3 Flash and DeepSeek V4 Flash follow, the quantized
   GGUFs lily loads, and the official continuation fixtures lily is scored on.
 - **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT): the graphs
-  Qwen3.6 and Gemma 4 follow (and Gemma's draft loop), and the reference
-  their scores are checked against; **ggml** for the GGUF block formats
-  (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, Q2_K, IQ2_XXS, IQ2_S, IQ4_NL, MXFP4), which
-  lily's decoders reproduce bit for bit.
+  Qwen3.6, Agnes 3.0 Flash and Gemma 4 follow (and Gemma's draft loop), and
+  the reference their scores are checked against; **ggml** for the GGUF
+  block formats (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, Q2_K, IQ2_XXS, IQ2_S, IQ4_NL,
+  MXFP4), which lily's decoders reproduce bit for bit, and the reference
+  quantizers lily's converter ports.
 
 ## License
 
