@@ -510,13 +510,21 @@ fn bench(
             "--prefill-rows {r}: runs of {MAX_ROWS} to {PREFILL_ROWS} rows"
         );
     }
-    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
-    let text = std::fs::read_to_string(text)?;
-    let mut ids = vec![2u32];
-    ids.extend(tok.encode("<|turn>user\nContinue this text.\n\n")?);
-    let body = tok.encode(&text)?;
-    ensure!(body.len() + ids.len() >= prompt_len, "text has {} tokens", body.len());
-    ids.extend_from_slice(&body[..prompt_len - ids.len()]);
+    let ids = {
+        let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
+        let text = std::fs::read_to_string(text)?;
+        let mut ids = vec![2u32];
+        ids.extend(tok.encode("<|turn>user\nContinue this text.\n\n")?);
+        let body = tok.encode(&text)?;
+        ensure!(
+            (ids.len()..=body.len() + ids.len()).contains(&prompt_len),
+            "prompt length {prompt_len} outside {}..={}",
+            ids.len(),
+            body.len() + ids.len()
+        );
+        ids.extend_from_slice(&body[..prompt_len - ids.len()]);
+        ids
+    };
     let ctx = MetalContext::new()?;
     let mut model = Gemma4Model::load(&ctx, path)?;
     if let Some(r) = prefill_rows {

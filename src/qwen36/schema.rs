@@ -162,5 +162,10 @@ pub fn validate_specs(g: &Gguf, specs: &[Spec], groups: &[Vec<String>]) -> Resul
 pub fn validate(g: &Gguf, c: &Config) -> Result<()> {
     let groups: Vec<Vec<String>> =
         (0..c.n_layer).flat_map(|il| fused_groups(c, il, c.recurrent[il])).collect();
-    validate_specs(g, &expected(c), &groups)
+    let mut specs = expected(c);
+    if g.tensor("output.weight").is_none() && !c.is_moe() {
+        // Dense Qwen checkpoints can tie the LM head to the token embedding.
+        specs.retain(|s| s.name != "output.weight");
+    }
+    validate_specs(g, &specs, &groups)
 }

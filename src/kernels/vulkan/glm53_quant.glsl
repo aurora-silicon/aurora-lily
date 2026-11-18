@@ -57,35 +57,31 @@ void glm53_decode_q8_0(uint64_t row, uint t, out float w[32]) {
 // blocks, 16-byte aligned in these rows). Task t: block t / 8, sub-block
 // j = t % 8: 6-bit scale and min, the low (even j) or high nibbles of bytes
 // 32 * (j / 2).. ---
+vec2 glm53_q4k_factors(uint64_t b, uint j) {
+    const uvec4 header = U32x4(b).v[0];
+    const uint shift = 8u * (j & 3u);
+    const uint scale_byte = header.y >> shift, min_byte = header.z >> shift;
+    const uint extra = header.w >> shift;
+    const uint sc = j < 4u ? scale_byte & 63u : (extra & 15u) | ((scale_byte >> 2u) & 48u);
+    const uint mn = j < 4u ? min_byte & 63u : ((extra >> 4u) & 15u) | ((min_byte >> 2u) & 48u);
+    return vec2(glm53_h2f(header.x & 0xffffu) * float(sc), glm53_h2f(header.x >> 16u) * float(mn));
+}
+
 void glm53_decode_q4_k(uint64_t row, uint t, out float w[32]) {
     const uint64_t b = row + uint64_t(t >> 3u) * 144u;
     const uint j = t & 7u;
-    const uint dd = U32(b).v[0];
-    const float d = glm53_h2f(dd & 0xffffu);
-    const float dmin = glm53_h2f(dd >> 16u);
-    // Scale bytes q[0..12] as three words.
-    const uvec3 sw = uvec3(U32(b + 4u).v[0], U32(b + 8u).v[0], U32(b + 12u).v[0]);
-    #define Q4K_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
-    uint sc, m;
-    if (j < 4u) {
-        sc = Q4K_BYTE(j) & 63u;
-        m = Q4K_BYTE(j + 4u) & 63u;
-    } else {
-        sc = (Q4K_BYTE(j + 4u) & 0xfu) | ((Q4K_BYTE(j - 4u) >> 6u) << 4u);
-        m = (Q4K_BYTE(j + 4u) >> 4u) | ((Q4K_BYTE(j) >> 6u) << 4u);
-    }
-    #undef Q4K_BYTE
-    const float scale = d * float(sc);
-    const float minv = dmin * float(m);
+    const vec2 factors = glm53_q4k_factors(b, j);
     const uint shift = (j & 1u) * 4u;
     const uint64_t qs = b + 16u + (j >> 1u) * 32u;
     [[unroll]] for (uint q = 0u; q < 2u; q++) {
         const uvec4 v = U32x4(qs + 16u * q).v[0];
         [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            const uint word = v[c] >> shift;
-            [[unroll]] for (uint k = 0u; k < 4u; k++) {
-                w[16u * q + 4u * c + k] = scale * float((word >> (8u * k)) & 0xfu) - minv;
-            }
+            const uint word = (v[c] >> shift) & 0x0f0f0f0fu;
+            const u16vec2 even = unpack16(word & 0x00ff00ffu);
+            const u16vec2 odd = unpack16((word >> 8u) & 0x00ff00ffu);
+            const vec4 codes = vec4(even.x, odd.x, even.y, odd.y);
+            [[unroll]] for (uint k = 0u; k < 4u; k++)
+                w[16u * q + 4u * c + k] = factors.x * codes[k] - factors.y;
         }
     }
 }

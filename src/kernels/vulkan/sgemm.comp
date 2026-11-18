@@ -7,7 +7,8 @@
 //
 // A threadgroup of 256 computes a tile of Y (sgemm_tile.glsl), a thread 8
 // activation rows x 4 weight rows: 64 x 128, or 32 x 256 for an expert's
-// pairs that fit 32 rows. Every output is one f32 FMA chain over k in
+// pairs that fit 32 rows. Small IQ expert tiles keep the decoded weights
+// in registers (32 x 128). Every output is one f32 FMA chain over k in
 // order, whatever the tile.
 #if defined(KERNEL_sgemm_q4_0) || defined(KERNEL_sgemm_q5_k) || defined(KERNEL_sgemm_q6_k) || \
     defined(KERNEL_sgemm_iq4_nl) || defined(KERNEL_sgemm_iq2_s) || \
@@ -95,6 +96,15 @@ void sg_decode8(uint64_t row, uint k, out float w[8]) {
         w[2u * i] = d * sg_iq4nl((pair >> shift) & 0xfu);
         w[2u * i + 1u] = d * sg_iq4nl((pair >> (8u + shift)) & 0xfu);
     }
+#elif defined(KERNEL_sgemm_q4_k)
+    // The tile needs eight consecutive codes of a 32-value sub-block.
+    // Load its packed header once and just the two words containing those codes.
+    const uint64_t b = row + uint64_t(k >> 8u) * 144u;
+    const uint j = (k >> 5u) & 7u;
+    const vec2 factors = glm53_q4k_factors(b, j);
+    const uvec2 q = U32x2(b + 16u + 32u * (j >> 1u) + (k & 31u)).v[0] >> (4u * (j & 1u));
+    [[unroll]] for (uint i = 0u; i < 8u; i++)
+        w[i] = factors.x * float((q[i >> 2u] >> (8u * (i & 3u))) & 15u) - factors.y;
 #elif defined(KERNEL_sgemm_q5_k) || defined(KERNEL_sgemm_moe_q5_k)
     // Values k .. k + 8 of their 32-value sub-block j: nibbles of bytes
     // 32 (j / 2) + l .., high bit j of bytes l .. (l = k % 32).
@@ -165,6 +175,63 @@ uint64_t sg_y_row(uint i) {
 #define SGT_KS 32u
 #include "sgemm_tile.glsl"
 #ifdef SG_MOE
+#if defined(KERNEL_sgemm_moe_iq2_xxs) || defined(KERNEL_sgemm_moe_iq2_s) || defined(KERNEL_sgemm_moe_iq4_nl)
+#define SG_REGISTER_EXPERT
+#ifdef KERNEL_sgemm_moe_iq4_nl
+shared uint sg_iq4_pairs[256];
+#endif
+
+// Up to 32 routed pairs x 128 columns. A lane holds one weight row's
+// decoded block in registers and reuses it for 16 activation rows. The
+// two halves of the subgroup supply consecutive vec4s of each input row.
+void sg_expert_32(uint n0, uint rows, uint64_t W, uint N, uint K, uint row_bytes) {
+#ifdef KERNEL_sgemm_moe_iq4_nl
+    const uint byte = gl_LocalInvocationIndex;
+    sg_iq4_pairs[byte] = packHalf2x16(vec2(sg_iq4nl(byte & 15u), sg_iq4nl(byte >> 4u)));
+    barrier();
+#endif
+    const uint lane = gl_SubgroupInvocationID, sg = gl_SubgroupID;
+    const uint m0 = 16u * (sg / 4u);
+    if (m0 >= rows) return;
+    const uint col = 32u * (sg % 4u) + lane;
+    const uint64_t w_row = W + uint64_t(min(col, N - n0 - 1u)) * row_bytes;
+    const uint64_t x_row = arg(0) + 4u * sg_x_row(min(m0 + lane % 16u, rows - 1u));
+    float acc[16];
+    [[unroll]] for (uint i = 0u; i < 16u; i++) acc[i] = 0.0;
+    for (uint k0 = 0u; k0 < K; k0 += 32u) {
+        float w[32];
+#ifdef KERNEL_sgemm_moe_iq4_nl
+        const uint64_t b = w_row + uint64_t(k0 >> 5u) * 18u;
+        const float d = glm53_h2f(uint(U16(b).v[0]));
+        [[unroll]] for (uint i = 0u; i < 8u; i++) {
+            const uint pair = uint(U16(b + 2u).v[i]);
+            const vec2 a = unpackHalf2x16(sg_iq4_pairs[pair & 255u]);
+            const vec2 c = unpackHalf2x16(sg_iq4_pairs[pair >> 8u]);
+            w[2u * i] = d * a.x;
+            w[2u * i + 16u] = d * a.y;
+            w[2u * i + 1u] = d * c.x;
+            w[2u * i + 17u] = d * c.y;
+        }
+#else
+        glm53_decode(SG_TYPE, w_row, k0 >> 5u, w);
+#endif
+        [[unroll]] for (uint h = 0u; h < 4u; h++) {
+            const vec4 xr = F32x4(x_row + 4u * (k0 + 8u * h + 4u * (lane / 16u))).v[0];
+            [[unroll]] for (uint k = 0u; k < 8u; k++) {
+                [[unroll]] for (uint i = 0u; i < 16u; i++) {
+                    const float x = subgroupBroadcast(xr[k % 4u], i + 16u * (k / 4u));
+                    acc[i] = fma(w[8u * h + k], x, acc[i]);
+                }
+            }
+        }
+    }
+    if (n0 + col >= N) return;
+    [[unroll]] for (uint i = 0u; i < 16u; i++) {
+        if (m0 + i < rows)
+            F32(arg(2) + 4u * (sg_y_row(m0 + i) + n0 + col)).v[0] = acc[i];
+    }
+}
+#else
 // An expert tile of at most 32 pairs: 32 rows x 256 weight rows, K steps of
 // 16, so that every subgroup computes (on 64-row tiles half would idle).
 #define SGT_NAME sg_tile_32
@@ -172,6 +239,7 @@ uint64_t sg_y_row(uint i) {
 #define SGT_TW 256u
 #define SGT_KS 16u
 #include "sgemm_tile.glsl"
+#endif
 #endif
 
 void main() {
@@ -186,9 +254,14 @@ void main() {
     const uint64_t W = arg(1) + (uint64_t(expert) * N + n0) * row_bytes;
     if (rows > 32u) {
         sg_tile_64(n0, rows, W, N, K, row_bytes);
+#ifdef SG_REGISTER_EXPERT
+    } else {
+        sg_expert_32(n0, rows, W, N, K, row_bytes);
+#else
     } else if ((gl_WorkGroupID.x & 1u) == 0u) {
         // Weight rows n0 .. n0 + 256: the odd column of the grid idles.
         sg_tile_32(n0, rows, W, N, K, row_bytes);
+#endif
     }
 #else
     sg_m0 = gl_WorkGroupID.y * 64u;

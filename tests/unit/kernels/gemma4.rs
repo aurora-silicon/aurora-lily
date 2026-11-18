@@ -708,11 +708,9 @@ fn grouped_f32_matches_cpu(
     }
 }
 
-/// Without matrix units a grouped-expert tile of up to 32 pairs is 32 rows
-/// x 256 weight rows and a larger one 64 x 128 (sgemm.comp): experts of
-/// exactly 32, 33, 64 and 65 pairs (65: a full tile and one of one pair),
-/// at gate/up widths (2 x 192) and hidden sizes (320) that end inside a
-/// tile, against f32 CPU sums.
+/// Small IQ expert tiles compute 16 activation rows per subgroup. Exercise
+/// both sides of that boundary and the transitions to the 64-row tile and
+/// a second tile, with output widths that end partway through a tile.
 #[test]
 fn moe_grouped_tile_shapes_without_matrix_units_match_cpu() {
     let ctx = ctx();
@@ -720,15 +718,14 @@ fn moe_grouped_tile_shapes_without_matrix_units_match_cpu() {
         return;
     }
     let mut rng = StdRng::seed_from_u64(32);
-    let (ff, ne, used, m) = (192, 12, 8, 70);
-    // Row i: experts 0 .. 3 while i < 32, 33, 64, 65, the rest of its
-    // slots from experts 4 .. 11.
-    let firsts = [32, 33, 64, 65];
+    let (ff, ne, used, m) = (192, 16, 8, 70);
+    let firsts = [15, 16, 17, 31, 32, 33, 64, 65];
     let mut sel = Vec::with_capacity(m * used);
     for i in 0..m {
         let row: Vec<u32> =
-            (0..4).filter(|&e| i < firsts[e]).map(|e| e as u32).collect();
-        let rest = (0..used - row.len()).map(|j| (4 + (i + j) % 8) as u32);
+            (0..firsts.len()).filter(|&e| i < firsts[e]).map(|e| e as u32).collect();
+        let rest = (0..used - row.len())
+            .map(|j| (firsts.len() + (i + j) % (ne - firsts.len())) as u32);
         sel.extend(row.iter().copied().chain(rest));
     }
     for (e, &n) in firsts.iter().enumerate() {
@@ -736,6 +733,7 @@ fn moe_grouped_tile_shapes_without_matrix_units_match_cpu() {
     }
     for (gt, dt, hid) in [
         (GgmlType::Iq2Xxs, GgmlType::Iq4Nl, 512),
+        (GgmlType::Iq2S, GgmlType::Iq4Nl, 512),
         (GgmlType::Q8_0, GgmlType::Q8_0, 320),
     ] {
         grouped_f32_matches_cpu(&ctx, &mut rng, gt, dt, (hid, ff, ne, used, m), &sel);

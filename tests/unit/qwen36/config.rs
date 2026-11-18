@@ -231,3 +231,15 @@ fn dense_shapes_and_mixtures_are_refused() {
     let e = err(&dense_with("general.architecture", Value::Str("qwen3".into())), VOCAB);
     assert!(e.contains("architecture"), "{e}");
 }
+
+#[test]
+fn inline_draft_block_is_excluded_from_the_trunk() {
+    let mut m = dense();
+    m.insert("qwen35.block_count".into(), Value::U32(65));
+    m.insert("qwen35.nextn_predict_layers".into(), Value::U32(1));
+    let c = Config::from_metadata(&m, VOCAB).unwrap();
+    assert_eq!(c.n_layer, 64);
+    assert_eq!(c.recurrent, Config::agnes3_flash().recurrent);
+    m.insert("qwen35.nextn_predict_layers".into(), Value::U32(66));
+    assert!(Config::from_metadata(&m, VOCAB).is_err());
+}

@@ -237,6 +237,11 @@ vec3 glm53_task_dot2_sum(in float w[32], in float wb[32], uint64_t x) {
     return vec3(acc, acc_b, sx);
 }
 #endif
+#ifdef GEMV_Q8_0
+// Q8_0 blocks are 34 bytes apart. The four pairs in a load can start at
+// any two-byte boundary, including the codes immediately after the scale.
+layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer Q8Pairs { u16vec4 v[]; };
+#endif
 void main() {
     const uint64_t X = arg(0);
     const uint K = arg_u32(9);
@@ -296,10 +301,13 @@ void main() {
         const uint64_t b = row + uint64_t(t) * 34u;
         const float d = glm53_h2f(uint(U16(b).v[0]));
         float w[32];
-        [[unroll]] for (uint i = 0u; i < 16u; i++) {
-            const uint pair = uint(U16(b + 2u).v[i]);
-            w[2u * i] = float(int(pair << 24) >> 24);
-            w[2u * i + 1u] = float(int(pair << 16) >> 24);
+        [[unroll]] for (uint h = 0u; h < 4u; h++) {
+            const u16vec4 pairs = Q8Pairs(b + 2u).v[h];
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                const uint pair = uint(pairs[c]);
+                w[8u * h + 2u * c] = float(int(pair << 24) >> 24);
+                w[8u * h + 2u * c + 1u] = float(int(pair << 16) >> 24);
+            }
         }
         const uint64_t xt = X + 4u * (uint64_t(g) * K + t * GLM53_TASK);
         acc0 += d * glm53_task_dot(w, xt);

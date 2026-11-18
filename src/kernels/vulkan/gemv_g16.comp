@@ -47,18 +47,11 @@ float g16_q5k_lane(uint64_t W, uint hd4, uint q4, uint qh4, uint j0, uint ssh, b
     const uvec4 lo = (qs & 0x0f0f0f0fu) | ((hb << 4u) & 0x10101010u);
     const uvec4 hi = ((qs >> 4u) & 0x0f0f0f0fu) | ((hb << 3u) & 0x10101010u);
     const uint a = hd.y >> ssh, bb = hd.z >> ssh, cc = hd.w >> ssh;
-    uint sc0, mn0, sc1, mn1;
-    if (hi_sc) {
-        sc0 = (cc & 0xfu) | ((a >> 2u) & 0x30u);
-        mn0 = ((cc >> 4u) & 0xfu) | ((bb >> 2u) & 0x30u);
-        sc1 = ((cc >> 8u) & 0xfu) | ((a >> 10u) & 0x30u);
-        mn1 = ((cc >> 12u) & 0xfu) | ((bb >> 10u) & 0x30u);
-    } else {
-        sc0 = a & 63u;
-        mn0 = bb & 63u;
-        sc1 = (a >> 8u) & 63u;
-        mn1 = (bb >> 8u) & 63u;
-    }
+    // The two adjacent sub-blocks have the same layout in adjacent bytes.
+    const uint scales = hi_sc ? (cc & 0x0f0fu) | ((a >> 2u) & 0x3030u) : a & 0x3f3fu;
+    const uint mins = hi_sc ? ((cc >> 4u) & 0x0f0fu) | ((bb >> 2u) & 0x3030u) : bb & 0x3f3fu;
+    const uint sc0 = scales & 63u, mn0 = mins & 63u;
+    const uint sc1 = scales >> 8u, mn1 = mins >> 8u;
     precise float s0 = 0.0, s1 = 0.0;
     [[unroll]] for (uint c = 0u; c < 4u; c++) {
         // Codes 0, 2 and 1, 3 of the word as 16-bit halves.
