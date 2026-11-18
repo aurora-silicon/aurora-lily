@@ -100,8 +100,8 @@ them:
   units, and pass on an M5 Max (2026-11-17); elsewhere they return at once.
 - Decode attention takes the split kernel's variant at every length, so the
   scratch holds splits of 64 keys for the kernels' whole 262 144 (96 MiB for
-  24 query heads; where the bfloat kernels run, contexts past 8 192 keys
-  take other routes and the scratch is 2 MB).
+  24 query heads). With matrix units, Agnes uses 24 MiB of partials and
+  selects another route above 65 536 keys.
 - Prompt attention is `sdpa_prefill_rows`: one subgroup a row and query
   head, a key head's group of query heads in one threadgroup, an online
   softmax over the keys.
@@ -129,7 +129,9 @@ answer decoded at 36 tokens a second with 47 of 49 drafts accepted.
 
 On the M5 Max, four interleaved short Python generation runs with `q4_k`
 produced 36.0–36.6 tok/s with one draft and 40.1–40.6 tok/s with two
-(plain 23.8–24.1 tok/s). All four matched greedy output for 96/96 tokens.
+(plain 23.8–24.1 tok/s). All four matched greedy output for 96/96 tokens. The benchmark times the
+whole final verification step, including preparation of the next proposal,
+and reports only the requested continuation length.
 
 ## Checks
 
