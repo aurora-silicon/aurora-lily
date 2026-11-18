@@ -31,7 +31,7 @@ fn spec(name: String, dims: &[usize], types: &'static [GgmlType]) -> Spec {
 }
 
 /// The tensors of trunk-style block `il` (also the MTP block's, `blk.40`):
-/// attention of the kind `recurrent` says, the MoE.
+/// attention of the kind `recurrent` says, the MoE or the dense MLP.
 pub fn block(c: &Config, il: usize, recurrent: bool) -> Vec<Spec> {
     let h = c.hidden;
     let n = |s: &str| format!("blk.{il}.{s}");
@@ -63,6 +63,14 @@ pub fn block(c: &Config, il: usize, recurrent: bool) -> Vec<Spec> {
             spec(n("attn_output.weight"), &[c.n_head * c.head_dim, h], DENSE),
         ]);
     }
+    if !c.is_moe() {
+        v.extend([
+            spec(n("ffn_gate.weight"), &[h, c.ff_dense], DENSE),
+            spec(n("ffn_up.weight"), &[h, c.ff_dense], DENSE),
+            spec(n("ffn_down.weight"), &[c.ff_dense, h], DENSE),
+        ]);
+        return v;
+    }
     v.extend([
         spec(n("ffn_gate_inp.weight"), &[h, c.n_expert], F32),
         spec(n("ffn_gate_exps.weight"), &[h, c.ff_expert, c.n_expert], BLOCKS),
@@ -91,14 +99,18 @@ pub fn expected(c: &Config) -> Vec<Spec> {
 }
 
 /// Groups of tensors read in one fused dispatch (one block type each).
-pub fn fused_groups(il: usize, recurrent: bool) -> Vec<Vec<String>> {
+pub fn fused_groups(c: &Config, il: usize, recurrent: bool) -> Vec<Vec<String>> {
     let group = |names: &[&str]| -> Vec<String> {
         names.iter().map(|s| format!("blk.{il}.{s}.weight")).collect()
     };
-    let mut v = vec![
-        group(&["ffn_gate_exps", "ffn_up_exps"]),
-        group(&["ffn_gate_shexp", "ffn_up_shexp"]),
-    ];
+    let mut v = if c.is_moe() {
+        vec![
+            group(&["ffn_gate_exps", "ffn_up_exps"]),
+            group(&["ffn_gate_shexp", "ffn_up_shexp"]),
+        ]
+    } else {
+        vec![group(&["ffn_gate", "ffn_up"])]
+    };
     if recurrent {
         v.push(group(&["attn_qkv", "attn_gate", "ssm_alpha", "ssm_beta"]));
     } else {
@@ -149,6 +161,6 @@ pub fn validate_specs(g: &Gguf, specs: &[Spec], groups: &[Vec<String>]) -> Resul
 /// [`validate_specs`] for the trunk.
 pub fn validate(g: &Gguf, c: &Config) -> Result<()> {
     let groups: Vec<Vec<String>> =
-        (0..c.n_layer).flat_map(|il| fused_groups(il, c.recurrent[il])).collect();
+        (0..c.n_layer).flat_map(|il| fused_groups(c, il, c.recurrent[il])).collect();
     validate_specs(g, &expected(c), &groups)
 }

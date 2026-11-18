@@ -1,16 +1,29 @@
-//! Qwen3.6-35B-A3B's shape, read from the GGUF metadata (`qwen35moe.*`, the
-//! architecture llama.cpp's converter writes for Qwen3.5/3.6 MoE models)
-//! and checked against what lily's kernels are written for.
+//! The shape of a Qwen3.5-family hybrid model, read from the GGUF metadata
+//! and checked against what lily's kernels are written for: `qwen35moe.*`
+//! (the architecture llama.cpp's converter writes for Qwen3.5/3.6 MoE
+//! models, Qwen3.6-35B-A3B) or `qwen35.*` (the dense ones; Agnes 3.0 Flash
+//! as `tools/convert/convert_agnes3_flash.py` writes it). The two differ
+//! only in the MLP: routed experts with a gated shared expert, or one
+//! SwiGLU.
 
 use anyhow::{Context, Result, ensure};
 
 use crate::gguf::{Gguf, Value};
 
-/// The GGUF architecture name.
+/// The GGUF architecture name of the MoE models.
 pub const ARCH: &str = "qwen35moe";
+/// The GGUF architecture name of the dense models.
+pub const ARCH_DENSE: &str = "qwen35";
+
+/// Whether `arch` is one of the architectures this module loads.
+pub fn is_arch(arch: &str) -> bool {
+    arch == ARCH || arch == ARCH_DENSE
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// [`ARCH`] (MoE) or [`ARCH_DENSE`].
+    pub arch: &'static str,
     /// Trunk layers (the MTP block, in a separate file, is not counted).
     pub n_layer: usize,
     pub hidden: usize,
@@ -22,10 +35,14 @@ pub struct Config {
     pub head_dim: usize,
     pub rope_dim: usize,
     pub rope_theta: f32,
+    /// The MoE's experts, experts a token, and the routed and shared
+    /// experts' widths (all 0 in a dense model).
     pub n_expert: usize,
     pub n_expert_used: usize,
     pub ff_expert: usize,
     pub ff_shared: usize,
+    /// The dense MLP's width (0 in a MoE model).
+    pub ff_dense: usize,
     /// Gated DeltaNet: key heads (q and k), value heads, head width (keys
     /// and values alike), causal conv taps.
     pub gdn_k_heads: usize,
@@ -68,9 +85,15 @@ impl Config {
         vocab: u64,
     ) -> Result<Self> {
         let get = |k: &str| meta.get(k);
-        let arch = get("general.architecture").and_then(Value::as_str);
-        ensure!(arch == Some(ARCH), "GGUF architecture {arch:?}, expected {ARCH:?}");
-        let key = |k: &str| format!("{ARCH}.{k}");
+        let arch = match get("general.architecture").and_then(Value::as_str) {
+            Some(ARCH) => ARCH,
+            Some(ARCH_DENSE) => ARCH_DENSE,
+            other => anyhow::bail!(
+                "GGUF architecture {other:?}, expected {ARCH:?} or {ARCH_DENSE:?}"
+            ),
+        };
+        let moe = arch == ARCH;
+        let key = |k: &str| format!("{arch}.{k}");
         let int = |k: &str| -> Result<u64> {
             get(k)
                 .with_context(|| format!("GGUF metadata {k} missing"))?
@@ -82,7 +105,7 @@ impl Config {
         // Bounded to `max` before it sizes anything.
         let u = |k: &str, max: usize| -> Result<usize> {
             let v = int(&key(k))?;
-            ensure!(v <= max as u64, "{ARCH}.{k} is {v}, lily takes at most {max}");
+            ensure!(v <= max as u64, "{arch}.{k} is {v}, lily takes at most {max}");
             Ok(v as usize)
         };
         let f = |k: &str| -> Result<f32> {
@@ -95,7 +118,7 @@ impl Config {
             Ok(v)
         };
         let n_layer = u("block_count", MAX_LAYERS)?;
-        ensure!(n_layer > 0, "{ARCH}.block_count is 0");
+        ensure!(n_layer > 0, "{arch}.block_count is 0");
         let recurrent = match get(&key("attention.recurrent_layers")) {
             Some(Value::Array(v)) => {
                 ensure!(
@@ -113,7 +136,7 @@ impl Config {
                     .collect::<Result<Vec<_>>>()?
             }
             Some(other) => {
-                anyhow::bail!("{ARCH}.attention.recurrent_layers is {other:?}")
+                anyhow::bail!("{arch}.attention.recurrent_layers is {other:?}")
             }
             // llama.cpp's default: every `full_attention_interval`-th layer
             // is full attention.
@@ -133,7 +156,7 @@ impl Config {
         if let Some(v) = get(&key("rope.scaling.type")) {
             ensure!(
                 v.as_str() == Some("none"),
-                "{ARCH}.rope.scaling.type {v:?} is not supported"
+                "{arch}.rope.scaling.type {v:?} is not supported"
             );
         }
         for k in ["rope.scaling.factor", "attention.scale"] {
@@ -144,25 +167,42 @@ impl Config {
                 } else {
                     v == 1.0 || v == 0.0
                 };
-                ensure!(neutral, "{ARCH}.{k} {v} is not supported");
+                ensure!(neutral, "{arch}.{k} {v} is not supported");
             }
         }
         if get(&key("expert_weights_scale")).is_some() {
             let v = f("expert_weights_scale")?;
             ensure!(
                 v == 0.0 || v == 1.0,
-                "{ARCH}.expert_weights_scale {v} is not supported"
+                "{arch}.expert_weights_scale {v} is not supported"
             );
         }
         if get(&key("expert_gating_func")).is_some() {
             // LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX.
             let v = int(&key("expert_gating_func"))?;
-            ensure!(v == 1, "{ARCH}.expert_gating_func {v} is not softmax");
+            ensure!(v == 1, "{arch}.expert_gating_func {v} is not softmax");
         }
         let v_heads = u("ssm.time_step_rank", 1024)?;
         let inner = u("ssm.inner_size", 1 << 20)?;
         ensure!(v_heads > 0 && inner % v_heads == 0, "ssm.inner_size {inner}");
+        // The MLP: experts (`qwen35moe`) or one SwiGLU (`qwen35`).
+        let (n_expert, n_expert_used, ff_expert, ff_shared, ff_dense) = if moe {
+            (
+                u("expert_count", 1 << 12)?,
+                u("expert_used_count", 1 << 12)?,
+                u("expert_feed_forward_length", 1 << 16)?,
+                u("expert_shared_feed_forward_length", 1 << 16)?,
+                0,
+            )
+        } else {
+            ensure!(
+                get(&key("expert_count")).is_none(),
+                "{arch} (dense) metadata has {arch}.expert_count"
+            );
+            (0, 0, 0, 0, u("feed_forward_length", 1 << 17)?)
+        };
         let c = Self {
+            arch,
             n_layer,
             hidden: u("embedding_length", 1 << 16)?,
             vocab: vocab as usize,
@@ -172,10 +212,11 @@ impl Config {
             head_dim: u("attention.key_length", 1 << 12)?,
             rope_dim: u("rope.dimension_count", 1 << 12)?,
             rope_theta: f("rope.freq_base")?,
-            n_expert: u("expert_count", 1 << 12)?,
-            n_expert_used: u("expert_used_count", 1 << 12)?,
-            ff_expert: u("expert_feed_forward_length", 1 << 16)?,
-            ff_shared: u("expert_shared_feed_forward_length", 1 << 16)?,
+            n_expert,
+            n_expert_used,
+            ff_expert,
+            ff_shared,
+            ff_dense,
             gdn_k_heads: u("ssm.group_count", 1024)?,
             gdn_v_heads: v_heads,
             gdn_dim: u("ssm.state_size", 1 << 12)?,
@@ -202,6 +243,7 @@ impl Config {
     /// small variants from it).
     pub fn qwen36_35b_a3b() -> Self {
         Self {
+            arch: ARCH,
             n_layer: 40,
             hidden: 2048,
             vocab: 248320,
@@ -215,6 +257,7 @@ impl Config {
             n_expert_used: 8,
             ff_expert: 512,
             ff_shared: 512,
+            ff_dense: 0,
             gdn_k_heads: 16,
             gdn_v_heads: 32,
             gdn_dim: 128,
@@ -224,6 +267,42 @@ impl Config {
             eos: 248046,
             pad: 248044,
         }
+    }
+
+    /// Agnes 3.0 Flash's shape as `tools/convert/convert_agnes3_flash.py`
+    /// writes it (64 layers once the untrained ones are left out; tests
+    /// build small variants from it).
+    pub fn agnes3_flash() -> Self {
+        Self {
+            arch: ARCH_DENSE,
+            n_layer: 64,
+            hidden: 5120,
+            vocab: 248320,
+            rms_eps: 1e-6,
+            n_head: 24,
+            n_head_kv: 4,
+            head_dim: 256,
+            rope_dim: 64,
+            rope_theta: 1e7,
+            n_expert: 0,
+            n_expert_used: 0,
+            ff_expert: 0,
+            ff_shared: 0,
+            ff_dense: 17408,
+            gdn_k_heads: 16,
+            gdn_v_heads: 48,
+            gdn_dim: 128,
+            gdn_conv: 4,
+            recurrent: (0..64).map(|il| il % 4 != 3).collect(),
+            context_length: 262144,
+            eos: 248046,
+            pad: 248044,
+        }
+    }
+
+    /// Whether the MLP is the MoE (else one SwiGLU of [`Self::ff_dense`]).
+    pub fn is_moe(&self) -> bool {
+        self.arch == ARCH
     }
 
     /// The shapes the kernels take, checked before anything is mapped.
@@ -284,6 +363,29 @@ impl Config {
             "rms epsilon {}",
             self.rms_eps
         );
+        ensure!(self.context_length > 0, "context_length 0");
+        for (name, id) in [("eos", self.eos), ("pad", self.pad)] {
+            ensure!(
+                (id as usize) < self.vocab,
+                "{name} token {id} is outside the vocabulary of {}",
+                self.vocab
+            );
+        }
+        if !self.is_moe() {
+            // The down projection's rows (Q4_K blocks of 256), and a width
+            // the decode GEMVs split over subgroups (as the shared
+            // expert's of 1024 and up).
+            ensure!(
+                self.ff_dense >= 1024 && self.ff_dense.is_multiple_of(256),
+                "feed_forward_length {} (lily takes multiples of 256 from 1024)",
+                self.ff_dense
+            );
+            ensure!(
+                self.n_expert == 0 && self.ff_expert == 0 && self.ff_shared == 0,
+                "a dense model with expert shapes"
+            );
+            return Ok(());
+        }
         // The router takes at most 256 experts; the grouped prompt GEMMs a
         // power of two used; the decode down kernel rows of 256 or 512.
         ensure!(
@@ -308,14 +410,6 @@ impl Config {
             "expert_shared_feed_forward_length {}",
             self.ff_shared
         );
-        ensure!(self.context_length > 0, "context_length 0");
-        for (name, id) in [("eos", self.eos), ("pad", self.pad)] {
-            ensure!(
-                (id as usize) < self.vocab,
-                "{name} token {id} is outside the vocabulary of {}",
-                self.vocab
-            );
-        }
         Ok(())
     }
 

@@ -6,7 +6,10 @@
 //! The graph is llama.cpp's `qwen35moe` (`src/models/qwen35moe.cpp`), which
 //! defines what the file's tensors mean: 40 layers, three Gated DeltaNet
 //! layers then one gated full-attention layer, each followed by a MoE of
-//! 256 experts (top 8, softmax) plus a sigmoid-gated shared expert.
+//! 256 experts (top 8, softmax) plus a sigmoid-gated shared expert. Its
+//! dense sibling `qwen35` (`src/models/qwen35.cpp`; Agnes 3.0 Flash) has the
+//! same blocks with one SwiGLU in place of the MoE, which runs as the shared
+//! expert does without its gate.
 
 use std::path::Path;
 
@@ -62,7 +65,15 @@ enum Mixer {
     Attn(AttnW),
 }
 
-struct FfnW {
+/// The MLP: the MoE ([`MoeW`]) or one SwiGLU. One a layer, built at load
+/// and only borrowed after, so the variants' sizes do not matter.
+#[allow(clippy::large_enum_variant)]
+enum FfnW {
+    Moe(MoeW),
+    Dense { gate: QWeight, up: QWeight, down: QWeight },
+}
+
+struct MoeW {
     router: QWeight,
     sh_gate_inp: QWeight,
     gate: QWeight,
@@ -130,7 +141,7 @@ pub struct MtpW {
     pub path: std::path::PathBuf,
 }
 
-fn load_block(m: &Mapped, il: usize, recurrent: bool) -> Result<LayerW> {
+fn load_block(m: &Mapped, cfg: &Config, il: usize, recurrent: bool) -> Result<LayerW> {
     let n = |s: &str| format!("blk.{il}.{s}");
     let q = |s: &str| m.q(&n(s));
     let f = |s: &str| m.f32(&n(s));
@@ -160,15 +171,23 @@ fn load_block(m: &Mapped, il: usize, recurrent: bool) -> Result<LayerW> {
         attn_norm: f("attn_norm.weight")?,
         post_norm: f("post_attention_norm.weight")?,
         mixer,
-        ffn: FfnW {
-            router: q("ffn_gate_inp.weight")?,
-            sh_gate_inp: q("ffn_gate_inp_shexp.weight")?,
-            gate: q("ffn_gate_exps.weight")?,
-            up: q("ffn_up_exps.weight")?,
-            down: q("ffn_down_exps.weight")?,
-            sh_gate: q("ffn_gate_shexp.weight")?,
-            sh_up: q("ffn_up_shexp.weight")?,
-            sh_down: q("ffn_down_shexp.weight")?,
+        ffn: if cfg.is_moe() {
+            FfnW::Moe(MoeW {
+                router: q("ffn_gate_inp.weight")?,
+                sh_gate_inp: q("ffn_gate_inp_shexp.weight")?,
+                gate: q("ffn_gate_exps.weight")?,
+                up: q("ffn_up_exps.weight")?,
+                down: q("ffn_down_exps.weight")?,
+                sh_gate: q("ffn_gate_shexp.weight")?,
+                sh_up: q("ffn_up_shexp.weight")?,
+                sh_down: q("ffn_down_shexp.weight")?,
+            })
+        } else {
+            FfnW::Dense {
+                gate: q("ffn_gate.weight")?,
+                up: q("ffn_up.weight")?,
+                down: q("ffn_down.weight")?,
+            }
         },
     })
 }
@@ -192,7 +211,7 @@ impl Qwen36Model {
         super::schema::validate(&gguf, &cfg)?;
         let mapped = Mapped::map(ctx, &gguf)?;
         let layers = (0..cfg.n_layer)
-            .map(|il| load_block(&mapped, il, cfg.recurrent[il]))
+            .map(|il| load_block(&mapped, &cfg, il, cfg.recurrent[il]))
             .collect::<Result<_>>()?;
         let embed = mapped.q("token_embd.weight")?;
         let output = mapped.q("output.weight")?;
@@ -230,7 +249,7 @@ impl Qwen36Model {
                 continue;
             }
             let g = Gguf::open(&p)?;
-            let arch = super::config::ARCH;
+            let arch = self.cfg.arch;
             if g.architecture()? == arch
                 && g.u64(&format!("{arch}.embedding_length"))? as usize
                     == self.cfg.hidden
@@ -245,7 +264,7 @@ impl Qwen36Model {
     /// Maps the MTP block of `path` (its `blk.<n_layer>` tensors only).
     pub fn load_mtp(&mut self, ctx: &MetalContext, path: &Path) -> Result<()> {
         let g = Gguf::open(path)?;
-        let arch = super::config::ARCH;
+        let arch = self.cfg.arch;
         ensure!(g.architecture()? == arch, "{} is not a {arch} GGUF", path.display());
         ensure!(
             g.u64(&format!("{arch}.nextn_predict_layers"))? == 1,
@@ -268,13 +287,13 @@ impl Qwen36Model {
         super::schema::validate_specs(
             &g,
             &specs,
-            &super::schema::fused_groups(il, false),
+            &super::schema::fused_groups(&self.cfg, il, false),
         )?;
         let prefix = format!("blk.{il}.");
         let mapped = Mapped::map_only(ctx, &g, |t| t.name.starts_with(&prefix))?;
         let n = |s: &str| format!("blk.{il}.nextn.{s}.weight");
         self.mtp = Some(MtpW {
-            layer: load_block(&mapped, il, false)?,
+            layer: load_block(&mapped, &self.cfg, il, false)?,
             eh_proj: mapped.q(&n("eh_proj"))?,
             enorm: mapped.f32(&n("enorm"))?,
             hnorm: mapped.f32(&n("hnorm"))?,
@@ -369,8 +388,10 @@ impl Qwen36Model {
     /// ([`g::moe_grouped_fused`]): the scratch then holds no separate gate
     /// and up outputs.
     fn fused_experts(&self) -> bool {
-        let fusable =
-            |l: &LayerW| matches!(l.ffn.gate.ty, GgmlType::Q4K | GgmlType::Q8_0);
+        let fusable = |l: &LayerW| match &l.ffn {
+            FfnW::Moe(f) => matches!(f.gate.ty, GgmlType::Q4K | GgmlType::Q8_0),
+            FfnW::Dense { .. } => false,
+        };
         self.layers.iter().all(fusable)
             && self.mtp.as_ref().is_none_or(|m| fusable(&m.layer))
     }
@@ -545,7 +566,10 @@ pub struct Scratch {
     rw: Tensor,
     moe_mid: Tensor,
     moe_out: Tensor,
-    moe_group: g::MoeGroupScratch,
+    /// The grouped expert GEMMs' scratch (MoE models only).
+    moe_group: Option<g::MoeGroupScratch>,
+    /// The shared expert's (MoE) or the MLP's (dense) gate, up and
+    /// SwiGLU rows, and the down projection's output.
     sfg: Tensor,
     sfu: Tensor,
     sfm: Tensor,
@@ -596,12 +620,20 @@ impl Scratch {
         let inner = cfg.gdn_inner();
         let hq = cfg.n_head * cfg.head_dim;
         let kv = cfg.kv_width();
-        let used = cfg.n_expert_used;
+        // A dense model's MoE buffers are a placeholder element each.
+        let used = cfg.n_expert_used.max(1);
+        let experts = cfg.n_expert.max(1);
+        let ff_mlp = if cfg.is_moe() { cfg.ff_shared } else { cfg.ff_dense };
         // The split decode's partials, for any context (bounded: 2 MB).
         let splits = attn::sdpa_split_scratch_splits(attn::MAX_SEQ);
-        let widest = [2 * h, inner, hq, cfg.ff_shared].into_iter().max().unwrap_or(h);
+        // A prompt run's bfloat inputs feed the matrix-unit GEMMs only;
+        // without matrix units the projections read f32 (two values keep
+        // the buffer valid).
+        let widest = [2 * h, inner, hq, ff_mlp].into_iter().max().unwrap_or(h);
+        let xbf = if ctx.matrix_units() { r * widest } else { 2 };
         let logits = f(MAX_ROWS * cfg.vocab)?;
-        let gchunk = if r >= k::GDN_CHUNK_MIN_ROWS {
+        // The chunked GDN runs on the matrix units only (`k::gdn`).
+        let gchunk = if r >= k::GDN_CHUNK_MIN_ROWS && ctx.matrix_units() {
             let shapes = k::gdn_chunk_shapes(r, cfg.gdn_k_heads, cfg.gdn_v_heads);
             let t = |i: usize| Tensor::zeros(ctx, &[shapes[i].0], shapes[i].1);
             Some([t(0)?, t(1)?, t(2)?, t(3)?, t(4)?])
@@ -614,7 +646,7 @@ impl Scratch {
             tokens: u(r)?,
             x: f(r * h)?,
             xn: f(r * h)?,
-            xbf: b(r * widest)?,
+            xbf: b(xbf)?,
             mix: f(r * h)?,
             qkv: f(r * ch)?,
             z: f(r * inner)?,
@@ -632,20 +664,33 @@ impl Scratch {
             attn: Tensor::zeros(ctx, &[r, cfg.n_head, cfg.head_dim], DType::BF16)?,
             split_partials: f(cfg.n_head * splits * cfg.head_dim)?,
             split_stats: f(cfg.n_head * splits * 2)?,
-            rlogits: f(r * cfg.n_expert)?,
+            rlogits: f(r * experts)?,
             shg: f(r)?,
             rsel: u(r * used)?,
             rw: f(r * used)?,
-            moe_mid: f(r * used * cfg.ff_expert)?,
-            moe_out: f(r * h)?,
-            moe_group: if fused_experts {
-                g::MoeGroupScratch::fused(ctx, r, used, cfg.n_expert, cfg.ff_expert, h)?
-            } else {
-                g::MoeGroupScratch::new(ctx, r * used, cfg.n_expert, cfg.ff_expert, h)?
+            moe_mid: f(if cfg.is_moe() { r * used * cfg.ff_expert } else { 1 })?,
+            moe_out: f(if cfg.is_moe() { r * h } else { 1 })?,
+            moe_group: match (cfg.is_moe(), fused_experts) {
+                (false, _) => None,
+                (true, true) => Some(g::MoeGroupScratch::fused(
+                    ctx,
+                    r,
+                    used,
+                    cfg.n_expert,
+                    cfg.ff_expert,
+                    h,
+                )?),
+                (true, false) => Some(g::MoeGroupScratch::new(
+                    ctx,
+                    r * used,
+                    cfg.n_expert,
+                    cfg.ff_expert,
+                    h,
+                )?),
             },
-            sfg: f(r * cfg.ff_shared)?,
-            sfu: f(r * cfg.ff_shared)?,
-            sfm: f(r * cfg.ff_shared)?,
+            sfg: f(r * ff_mlp)?,
+            sfu: f(r * ff_mlp)?,
+            sfm: f(r * ff_mlp)?,
             sout: f(r * h)?,
             hidden_norm: f(MAX_ROWS * h)?,
             hbuf: f((r + 1) * h)?,
@@ -1083,15 +1128,19 @@ impl Qwen36Model {
         }
         for &(w, y) in sets {
             match xb {
-                Some(xb) if g::gemm_bx_takes(w) => g::gemm_bx(ctx, pass, w, xb, y, m)?,
+                Some(xb) if g::gemm_bx_takes(w) && ctx.matrix_units() => {
+                    g::gemm_bx(ctx, pass, w, xb, y, m)?
+                }
+                // Without matrix units `g::gemm` is the f32 sgemm.
                 _ => g::gemm(ctx, pass, w, x, y, m)?,
             }
         }
         Ok(())
     }
 
-    /// For a prompt run: `x`'s `m` rows of `width` rounded to bfloat into
-    /// `sc.xbf` (the GEMMs round their input to bfloat anyway).
+    /// For a prompt run on matrix units: `x`'s `m` rows of `width` rounded
+    /// to bfloat into `sc.xbf` (the GEMMs round their input to bfloat
+    /// anyway). Without matrix units the f32 GEMM reads `x` itself.
     fn bf16_input<'s>(
         &self,
         ctx: &MetalContext,
@@ -1101,7 +1150,7 @@ impl Qwen36Model {
         width: usize,
         m: usize,
     ) -> Result<Option<&'s Tensor>> {
-        if m <= MAX_ROWS {
+        if m <= MAX_ROWS || !ctx.matrix_units() {
             return Ok(None);
         }
         g::to_bf16(ctx, pass, x, &sc.xbf, m * width)?;
@@ -1293,8 +1342,72 @@ impl Qwen36Model {
         m: usize,
         next_norm: Option<&Tensor>,
     ) -> Result<()> {
+        match f {
+            FfnW::Moe(f) => self.moe(ctx, pass, sc, f, m, next_norm),
+            FfnW::Dense { gate, up, down } => {
+                self.dense_ffn(ctx, pass, sc, [gate, up, down], m, next_norm)
+            }
+        }
+    }
+
+    /// The dense MLP (`qwen35`): gate and up in one dispatch, SwiGLU, down,
+    /// the residual (with `next_norm`, also the next block's input norm).
+    /// The shared expert's path of [`Self::moe`] without its gate.
+    #[allow(clippy::too_many_arguments)]
+    fn dense_ffn(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        sc: &Scratch,
+        [gate, up, down]: [&QWeight; 3],
+        m: usize,
+        next_norm: Option<&Tensor>,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        let ff = cfg.ff_dense;
+        let xb = self.bf16_input(ctx, pass, sc, &sc.xn, cfg.hidden, m)?;
+        self.proj(ctx, pass, &[(gate, &sc.sfg), (up, &sc.sfu)], &sc.xn, xb, m)?;
+        pass.memory_barrier()?;
+        g::swiglu(ctx, pass, &sc.sfg, &sc.sfu, &sc.sfm, m * ff, 0.0)?;
+        pass.memory_barrier()?;
+        let xb = self.bf16_input(ctx, pass, sc, &sc.sfm, ff, m)?;
+        self.proj(ctx, pass, &[(down, &sc.sout)], &sc.sfm, xb, m)?;
+        pass.memory_barrier()?;
+        match next_norm {
+            Some(w) => k::residual_norm(
+                ctx,
+                pass,
+                &sc.x,
+                &sc.sout,
+                None,
+                w,
+                &sc.xn,
+                m,
+                cfg.hidden,
+                cfg.rms_eps,
+            )?,
+            None => g::add(ctx, pass, &sc.x, &sc.sout, &sc.x, m * cfg.hidden)?,
+        }
+        pass.memory_barrier()
+    }
+
+    /// The MoE (`qwen35moe`): router, routed experts and the gated shared
+    /// expert, the residual.
+    fn moe(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        sc: &Scratch,
+        f: &MoeW,
+        m: usize,
+        next_norm: Option<&Tensor>,
+    ) -> Result<()> {
         let cfg = &self.cfg;
         let used = cfg.n_expert_used;
+        let moe_group = sc
+            .moe_group
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("a MoE step without the MoE scratch"))?;
         let xb = self.bf16_input(ctx, pass, sc, &sc.xn, cfg.hidden, m)?;
         if m <= MAX_ROWS {
             let sets = [(&f.router, &sc.rlogits), (&f.sh_gate_inp, &sc.shg)];
@@ -1348,7 +1461,7 @@ impl Qwen36Model {
                 &sc.rsel,
                 &sc.rw,
                 &sc.moe_out,
-                &sc.moe_group,
+                moe_group,
                 m,
                 used,
                 cfg.n_expert,

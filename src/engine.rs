@@ -632,6 +632,13 @@ pub trait LanguageModel: Sized {
     /// The id the OpenAI-compatible API exposes.
     const MODEL_ID: &'static str;
 
+    /// The id for the checkpoint at `path`: [`Self::MODEL_ID`], unless the
+    /// type serves several models (`qwen36`'s dense `qwen35` files carry
+    /// their own name). Read before the model loads.
+    fn served_id(_path: &Path) -> &'static str {
+        Self::MODEL_ID
+    }
+
     fn load(ctx: &MetalContext, dir: &Path, options: &LoadOptions) -> Result<Self>;
 
     /// Checkpoint-declared context window; zero means unspecified.

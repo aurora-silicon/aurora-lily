@@ -219,7 +219,9 @@ fn run() -> Result<()> {
     match checkpoint_model_type(&cli.model)?.as_str() {
         "qwen4_exp" => bench::<Qwen4ExpModel>(&cli),
         lily::glm53::config::ARCH => bench::<lily::glm53::Glm53Model>(&cli),
-        lily::qwen36::config::ARCH => bench::<lily::qwen36::Qwen36Model>(&cli),
+        lily::qwen36::config::ARCH | lily::qwen36::config::ARCH_DENSE => {
+            bench::<lily::qwen36::Qwen36Model>(&cli)
+        }
         other => anyhow::bail!("unsupported model_type {other:?}"),
     }
 }
@@ -678,7 +680,7 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         "schema_version": 1,
         "meta": {
             "engine": "lily",
-            "model_id": M::MODEL_ID,
+            "model_id": M::served_id(&cli.model),
             "source_id": option_env!("LILY_BENCH_SOURCE_ID").unwrap_or("unknown"),
             "crate_version": env!("CARGO_PKG_VERSION"),
             "harness": "src/bin/lily-bench.rs",
@@ -895,7 +897,7 @@ fn bench_speculative<M: LanguageModel>(
     let digest = fnv1a(&tokens[1..]);
     let report = serde_json::json!({
         "schema_version": 1,
-        "meta": {"engine": "lily", "model_id": M::MODEL_ID, "harness": "src/bin/lily-bench.rs", "crate_version": env!("CARGO_PKG_VERSION")},
+        "meta": {"engine": "lily", "model_id": M::served_id(&cli.model), "harness": "src/bin/lily-bench.rs", "crate_version": env!("CARGO_PKG_VERSION")},
         "workload": {"prompt_len": cli.prompt_len, "prompt": cli.prompt_text.as_ref().map_or("synthetic".to_string(), |p| p.display().to_string()), "decode_steps": cli.decode_steps, "decode_mode": format!("speculative_{}_drafts", cli.drafts), "sampling": if cli.sample { "server_defaults" } else { "greedy" }, "seed": cli.seed, "kernel_profile_diagnostic": ctx.profiling()},
         "results": {
             "prefill": {"wall_secs": prefill_secs, "tok_s": cli.prompt_len as f64 / prefill_secs},
@@ -1134,7 +1136,7 @@ fn bench_batched<M: LanguageModel>(
         tokens.iter().map(|t| format!("{:016x}", fnv1a(&t[1..]))).collect();
     let report = serde_json::json!({
         "schema_version": 1,
-        "meta": {"engine": "lily", "model_id": M::MODEL_ID, "harness": "src/bin/lily-bench.rs", "crate_version": env!("CARGO_PKG_VERSION")},
+        "meta": {"engine": "lily", "model_id": M::served_id(&cli.model), "harness": "src/bin/lily-bench.rs", "crate_version": env!("CARGO_PKG_VERSION")},
         "workload": {
             "prompt_len": cli.prompt_len,
             "prompt": cli.prompt_text.as_ref().map_or("synthetic".to_string(), |p| p.display().to_string()),

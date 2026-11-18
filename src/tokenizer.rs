@@ -156,7 +156,7 @@ impl Tokenizer {
             t.add_stop_tokens(&crate::qwen4exp::tokenizer::stop_ids(&g)?);
             return Ok(t);
         }
-        if g.architecture()? == crate::qwen36::config::ARCH {
+        if crate::qwen36::config::is_arch(g.architecture()?) {
             return Self::from_gguf_qwen36(&g);
         }
         if g.architecture()? == crate::gemma4::config::ARCH {
