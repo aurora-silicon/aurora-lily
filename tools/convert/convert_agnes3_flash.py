@@ -1169,14 +1169,17 @@ def main(argv: list[str] | None = None) -> None:
     others = sorted(p.name for p in args.dst.glob("mtp-*.gguf") if p.name not in ours) if args.dst.is_dir() else []
     if others:
         raise ValueError(f"{args.dst} already holds {others}; use a directory of its own for each conversion")
+    # Every output is checked before any is written: a trunk written beside
+    # an old MTP file of the same name would be served with it.
+    existing = [str(args.dst / fname) for fname, _, _ in files if (args.dst / fname).exists()]
+    if existing:
+        raise ValueError(f"{', '.join(existing)} exist; remove them first")
     args.dst.mkdir(parents=True, exist_ok=True)
     errors: list[tuple[float, str, str]] = []
     jobs = max(1, args.jobs)
     with ProcessPoolExecutor(jobs) if jobs > 1 else _NoPool() as pool:
         for fname, meta, tensors in files:
             out = args.dst / fname
-            if out.exists():
-                raise ValueError(f"{out} exists; remove it first")
             print(f"writing {out}")
             write_gguf(out, meta, tensors, pool if jobs > 1 else None, jobs, errors)
     errors.sort(reverse=True)

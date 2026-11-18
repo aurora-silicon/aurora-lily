@@ -17,6 +17,46 @@ fn split_scratch_tracks_surviving_routes() {
     assert_eq!(sdpa_split_scratch_splits(MAX_SEQ), 128);
 }
 
+/// With matrix units, the decode scratch holds what every length's route
+/// takes up to the kernels' limit: the split kernel's 64-key splits while
+/// they fit, then the fixed block (eight query heads a key head) or the
+/// per-head 256-key splits (six: Agnes 3.0 Flash, whose 32 769th key needed
+/// a 129th split of 128). Pure arithmetic: runs on any device.
+#[test]
+fn decode_scratch_covers_every_route_to_max_seq() {
+    for (nq, kvh) in [(16, 2), (24, 4), (16, 4), (8, 8)] {
+        let d = 256;
+        let splits = decode_scratch_splits_with_matrix_units(nq, kvh, d);
+        for len in [64, 65, 8192, 8193, 32768, 32769, 100_000, MAX_SEQ] {
+            let need = if len.div_ceil(SDPA_SPLIT64) <= splits {
+                len.div_ceil(SDPA_SPLIT64)
+            } else {
+                match sdpa_split_route(
+                    len,
+                    d,
+                    nq / kvh,
+                    nq,
+                    kvh,
+                    GQA_FOLD_MIN_CONTEXT,
+                    SDPA_FIXED_BLOCK_CROSSOVER,
+                ) {
+                    SdpaSplitRoute::FixedBlock => SDPA_MLX_BLOCKS,
+                    _ => len.div_ceil(SDPA_SPLIT),
+                }
+            };
+            assert!(
+                need <= splits,
+                "{nq}/{kvh} heads at {len} keys: {need} of {splits}"
+            );
+        }
+    }
+    // Qwen3.6's sizing is what it was.
+    assert_eq!(
+        decode_scratch_splits_with_matrix_units(16, 2, 256),
+        sdpa_split_scratch_splits(MAX_SEQ)
+    );
+}
+
 #[test]
 fn production_split_route_boundaries_are_pinned() {
     let route = |len| {

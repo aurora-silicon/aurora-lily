@@ -624,15 +624,15 @@ impl Scratch {
         let used = cfg.n_expert_used.max(1);
         let experts = cfg.n_expert.max(1);
         let ff_mlp = if cfg.is_moe() { cfg.ff_shared } else { cfg.ff_dense };
-        // The split decode's partials, for any context: bounded (2 MB) where
-        // contexts past its splits take the bfloat decode kernels; without
-        // matrix units the split kernel takes every length, 64 keys a split
-        // (96 MiB for Agnes 3.0 Flash's 24 heads).
-        let splits = if ctx.matrix_units() {
-            attn::sdpa_split_scratch_splits(attn::MAX_SEQ)
-        } else {
-            attn::sdpa_split64_bits_scratch_splits(attn::MAX_SEQ)
-        };
+        // The split decode's partials, for any context the kernels take
+        // (`attn::sdpa_decode_scratch_splits`: 2 MB for Qwen3.6, 24 MiB for
+        // Agnes 3.0 Flash with matrix units and 96 MiB without).
+        let splits = attn::sdpa_decode_scratch_splits(
+            ctx,
+            cfg.n_head,
+            cfg.n_head_kv,
+            cfg.head_dim,
+        );
         // A prompt run's bfloat inputs feed the matrix-unit GEMMs only;
         // without matrix units the projections read f32 (two values keep
         // the buffer valid).
