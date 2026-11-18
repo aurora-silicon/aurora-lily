@@ -1,0 +1,105 @@
+# Agnes 3.0 Flash
+
+lily serves Agnes 3.0 Flash, the open-weight Preview checkpoint of
+[Agnes-AI/Agnes-3.0-Flash](https://huggingface.co/Agnes-AI/Agnes-3.0-Flash)
+(Apache 2.0), as a GGUF of llama.cpp's `qwen35` architecture that
+`tools/convert/convert_agnes3_flash.py` writes from the published BF16
+weights. No GGUF of it is published. The model runs through the Qwen3.6
+code (`src/qwen36/`), which loads both `qwen35moe` (Qwen3.6-35B-A3B) and
+`qwen35` (the dense models) files; llama.cpp's `qwen35` graph is the
+reference its results are checked against. The vision tower is not
+converted: lily serves text.
+
+## The model
+
+Agnes's text decoder is Qwen3.5's dense one: Gated DeltaNet layers with a
+gated full-attention layer every fourth (24 query heads over 4 KV heads of
+256, partial interleaved rotary over 64 dimensions), 48 GDN value heads over
+16 key heads of 128, a SwiGLU MLP, the Qwen3.5 tokenizer and chat template,
+and one MTP layer. To that it adds a second, 2048-wide SwiGLU in every
+layer's MLP.
+
+The Preview is not trained everywhere (measured 2026-11-17): every layer's
+second SwiGLU, and the whole of layers 20-23 and 48-51, hold initial values
+(projections of RMS 0.02 with no zeros, where trained ones are 30 % zeros)
+with output projections near 1e-30. They add nothing to the residual
+stream. The converter leaves them out after checking that every output
+projection of the part is below 1e-20, so the file is a 64-layer model with
+a 17 408-wide MLP: Qwen3.5-27B's shape, 27B parameters, 3.0 GB smaller at
+4 bits than the 72-layer form and as much less read a decoded token.
+`--keep-inert` converts everything (the branch then folded into the main
+MLP, 19 456 wide).
+
+## Files
+
+| file | trunk | MTP file | for |
+|---|---|---|---|
+| `--recipe q4_k` (default) | 15.87 GB | 2.32 GB | 32 GB and 36 GB machines |
+| `--recipe q8_0` | 28.60 GB | 3.16 GB | 64 GB and up |
+
+`q4_k` stores every matrix as Q4_K but `attn_k`, `attn_v` and the LM head
+(Q8_0); `q8_0` stores every matrix as Q8_0. The MTP file (`mtp-*.gguf`)
+goes beside the trunk, one conversion a directory: lily takes the first
+`mtp-*.gguf` it finds there. Converting takes some minutes and 7.3 GiB of
+memory whatever the machine (`tools/README.md`).
+
+```sh
+.venv/bin/python tools/convert/convert_agnes3_flash.py \
+    --src ~/models/Agnes-3.0-Flash --dst ~/models/Agnes-3.0-Flash-Q4_K
+```
+
+## Running it
+
+```sh
+# 32 GB: a 78 840-token context
+lily --model ~/models/Agnes-3.0-Flash-Q4_K/Agnes-3.0-Flash-Q4_K.gguf \
+    --memory-limit-gb 22 --mtp-drafts 1
+# 36 GB: a 125 100-token context
+lily --model ~/models/Agnes-3.0-Flash-Q4_K/Agnes-3.0-Flash-Q4_K.gguf \
+    --memory-limit-gb 25 --mtp-drafts 1
+```
+
+The contexts are what `--memory-limit-gb` fits after the weights and the
+scratch (16.7 GB allocated, 69 632 bytes a token of bf16 K/V caches over the
+16 attention layers and the MTP block); measured on the server's load line,
+2026-11-17. The API serves the model as `agnes-3.0-flash` (the id comes
+from the file's `general.name`). Thinking is on by default, as Agnes's
+template has it, and the model thinks at length; `chat_template_kwargs:
+{"enable_thinking": false}` turns it off for a request.
+
+## Without matrix units (M4)
+
+An M4's GPU has no matrix units lily can use and no bfloat type, so Qwen3.6's
+matrix-unit kernels are refused there. The dense model has a path without
+them:
+
+- Prompt projections take the f32 GEMM (`sgemm.comp`) and the GDN its
+  row-parallel scan instead of the chunked one.
+- The attention kernels that use the bfloat type have `_bits` variants that
+  pack and widen bfloats by hand (`common.glsl`): the same caches, and the
+  same results bit for bit (`bits_kernels_are_bit_identical_to_their_bfloat_kernels`,
+  `attn_prep_and_gate_bits_are_bit_identical`, run on a device with matrix
+  units).
+- Prompt attention is `sdpa_prefill_rows`: one subgroup a row and query
+  head, a key head's group of query heads in one threadgroup, an online
+  softmax over the keys.
+
+This path is verified on a Radeon 8060S (RADV, which has no bfloat type
+either: lily treats it as a GPU without matrix units), not yet on an M4.
+There, with the `q4_k` file (2026-11-17): a 2 048-token prompt at 140-150
+tokens a second, 13.2 tokens a second decoded plain and 18-21 with one MTP
+draft a step (78-95 % of drafts accepted). These are not Apple numbers.
+
+## Checks
+
+Against llama.cpp (CPU backend, the same file), teacher-forced, on the
+Radeon 8060S path, 2026-11-17:
+
+| file | text | argmax agreement | NLL per token, lily / llama.cpp |
+|---|---|---|---|
+| `q4_k`, 64 layers | 220 tokens of `CONTRIBUTING.md`, the last 100 scored | 97/100 | 3.0819 / 3.0812 |
+| `q4_k --layers 4` | a 42-token Python function, 32 scored | 32/32 | 7.7981 / 7.7961 |
+
+The three disagreements are near-ties in llama.cpp's own logits (margins
+0.048, 0.049 and 0.171). Speculative decoding with the MTP head gives the
+same tokens as plain greedy decoding (64 of 64; `lily-qwen36 spec`).
