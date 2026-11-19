@@ -42,7 +42,7 @@ leaves the GPU, and fits the longest context that budget allows.
   cooperative matrices, which run on the same ALUs as its FMAs; lily's
   matrix kernels need the M5's 16 x 16 ones, so the M4 keeps the f32 path.
 - **M1 to M3 families** (no matrix units either): these take the same path
-  as the M4, selected the same way, so the same models run and the others
+  as the M4, selected the same way, so the same models are offered and the others
   are refused. Measured once on a 16-inch M1 Max (64 GB, Linux, Mesa
   Honeykrisp) with Gemma 4 UD-IQ2_M: about 42 tokens/s decode and about
   300 tokens/s prefill on a 4 452-token prompt, loaded in 4.9 s
