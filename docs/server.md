@@ -310,7 +310,13 @@ preloads regardless.
 
 Thinking is on by default. `reasoning_effort` (`none`, `low`, `medium`,
 `high`) sets it per request; `--thinking` and `--reasoning-effort` set the
-server's default.
+server's default. A checkpoint whose vocabulary has no `</think>` (Gemma 4's
+GGUFs) gets none of the thinking controls below, so no budget can end its
+reasoning. A request bounded by `max_tokens` could then spend all of it
+reasoning and return an empty `content`. There thinking is off by default:
+`--thinking true` turns the default back on, and a request's
+`enable_thinking` or `reasoning_effort` turns it on for that request. The
+startup line says so (`thinking controls: unavailable ...`).
 
 ### Thinking controls
 

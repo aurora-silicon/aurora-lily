@@ -10,6 +10,22 @@ fn call_ids_are_stable_per_request_and_index() {
 }
 
 #[test]
+fn thinking_defaults_off_where_no_control_can_end_the_block() {
+    // The vocabulary has </think>: the flag decides, given or not.
+    assert!(default_thinking(true, false, true));
+    assert!(default_thinking(true, true, true));
+    assert!(!default_thinking(false, true, true));
+    // No </think> (Gemma 4's GGUF): off by default, on when asked for.
+    assert!(!default_thinking(true, false, false));
+    assert!(default_thinking(true, true, false));
+    assert!(!default_thinking(false, true, false));
+    assert!(
+        describe_thinking_defaults(&api::ThinkingDefaults::default(), None)
+            .contains("chat thinking is off")
+    );
+}
+
+#[test]
 fn chunks_carry_the_openai_shape() {
     let c = chunk("id", 7, "m", json!({"content": "hi"}), Some("stop"));
     assert_eq!(c["object"], "chat.completion.chunk");

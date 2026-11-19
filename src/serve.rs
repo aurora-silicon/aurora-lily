@@ -2370,13 +2370,25 @@ fn thinking_tokens(
     .context("the thinking controls' texts")
 }
 
+/// Whether chat prompts open a reasoning block by default. Without the
+/// thinking controls (the vocabulary lacks `</think>`) no budget can end the
+/// block, so a request bounded by `max_tokens` can spend all of it there and
+/// return empty `content`. The default is then off, unless `--thinking` was
+/// given; a request's `enable_thinking` or `reasoning_effort` still turns it
+/// on.
+fn default_thinking(flag: bool, given: bool, controls: bool) -> bool {
+    flag && (controls || given)
+}
+
 /// The startup line's account of the thinking controls' defaults.
 fn describe_thinking_defaults(
     d: &api::ThinkingDefaults,
     tokens: Option<&ThinkingTokens>,
 ) -> String {
     let Some(tokens) = tokens else {
-        return "unavailable (the vocabulary lacks </think>)".to_owned();
+        return "unavailable (the vocabulary lacks </think>), so chat thinking is off \
+                unless --thinking or the request turns it on"
+            .to_owned();
     };
     let b = d.budgets;
     let budget = if b == api::ThinkingBudgets::default() {
@@ -2445,12 +2457,6 @@ fn run_with<M: LanguageModel + 'static>(
     let generator = Arc::new(generator);
     // The limits the runtime settings hold the same values to.
     options.thinking_controls.validate()?;
-    let defaults = Defaults {
-        sampling: sampling_defaults(model_dir, &options.sampling)?,
-        thinking: options.thinking,
-        reasoning_effort: options.reasoning_effort.clone(),
-        thinking_controls: options.thinking_controls,
-    };
     // A bad texts file fails the start; a vocabulary without the markers
     // only turns the controls off.
     let texts = match &options.thinking_texts {
@@ -2458,6 +2464,18 @@ fn run_with<M: LanguageModel + 'static>(
         None => ThinkingTexts::default(),
     };
     let thinking_tokens = thinking_tokens(generator.tokenizer(), &texts)?.map(Arc::new);
+    let thinking_given =
+        options.flags.iter().any(|f| f.name == "thinking" && f.given.is_some());
+    let defaults = Defaults {
+        sampling: sampling_defaults(model_dir, &options.sampling)?,
+        thinking: default_thinking(
+            options.thinking,
+            thinking_given,
+            thinking_tokens.is_some(),
+        ),
+        reasoning_effort: options.reasoning_effort.clone(),
+        thinking_controls: options.thinking_controls,
+    };
     // The settings view's listing and the runtime settings from the same
     // command line; the database's overrides come over them once the
     // recorder opened it.
