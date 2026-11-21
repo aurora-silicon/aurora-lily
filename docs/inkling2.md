@@ -71,8 +71,11 @@ Optional add-ons (automatically discovered beside the model GGUF):
   `BF16`).
 - `lily-inkling2`: bring-up, profiling, and benchmark tool (`fit`, `chat`, `bench`, `profile`).
 
-## Measured throughput (16 GB M4 Air, Linux Vulkan / Borealis)
+## Measured throughput (16 GB M4 Air, Linux 7.3.0 / Borealis)
 
-- `Inkling-2-Mini-UD-Q2_K_XL.gguf` + `dspark-Inkling-2-Mini-Q8_0.gguf` (`--mtp-drafts 3`):
-  **17.8 tok/s** end-to-end decode (50/66 drafts accepted, 19.5 tok/s GPU steady-state),
-  **13.0 tok/s** plain decode (`77.2 ms/tok`), **49.9 tok/s** prefill (256 tokens, 64-row chunks).
+- `Inkling-2-Mini-UD-Q2_K_XL.gguf` (9.14 GB) + `dspark-Inkling-2-Mini-Q8_0.gguf` (0.40 GB)
+  with `--memory-limit-gb 10.6 --mtp-drafts 3 --checkpoints-per-session 1 --decode-checkpoint-tokens 0 --pin-weights off`
+  (11.4 GB on the GPU, up to 37 852 tokens of context with 1 snapshot and DSpark):
+  **17.8 tok/s** end-to-end decode (73 generated tokens, 50/66 drafts accepted, 19.5 tok/s GPU steady-state,
+  identical greedy token IDs to plain decode), **13.0 tok/s** plain decode (`77.2 ms/tok`),
+  **49.9 tok/s** prefill (256 tokens, 64-row chunks).
