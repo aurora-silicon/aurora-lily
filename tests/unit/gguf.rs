@@ -399,3 +399,34 @@ fn a_header_past_the_memory_budget_is_refused() {
     let e = format!("{:#}", r.err().expect("accepted"));
     assert!(e.contains("more memory"), "{e}");
 }
+
+#[test]
+fn inkling2_quant_types_row_bytes_and_values() {
+    assert_eq!(GgmlType::Nvfp4.row_bytes(1152).unwrap(), 648);
+    assert_eq!(GgmlType::Q2_0.row_bytes(1152).unwrap(), 324);
+    assert_eq!(GgmlType::Iq2Xs.row_bytes(2304).unwrap(), 666);
+    assert_eq!(GgmlType::Iq3Xxs.row_bytes(2304).unwrap(), 882);
+    assert_eq!(GgmlType::Iq1S.row_bytes(2304).unwrap(), 450);
+    assert_eq!(GgmlType::Iq4Xs.row_bytes(2304).unwrap(), 1224);
+
+    // UE4M3 edge cases: 0 and 0x7f -> 0.0, 0x38 (exp=7, man=0 -> 1.0) -> 0.5.
+    assert_eq!(ue4m3_to_f32(0), 0.0);
+    assert_eq!(ue4m3_to_f32(0x7f), 0.0);
+    assert_eq!(ue4m3_to_f32(0x38), 0.5);
+
+    // Q2_0: d=2.0, byte 0xE4 = 0b11_10_01_00 -> [-1, 0, +1, +2] * 2.0
+    let mut blk = vec![0u8; 18];
+    blk[0..2].copy_from_slice(&half::f16::from_f32(2.0).to_bits().to_le_bytes());
+    blk[2] = 0xe4;
+    let mut out = vec![0.0f32; 64];
+    dequantize(GgmlType::Q2_0, &blk, &mut out).unwrap();
+    assert_eq!(&out[..4], &[-2.0, 0.0, 2.0, 4.0]);
+
+    // NVFP4: sub-block 0 scale 0x38 (d=0.5), byte 0 = 0x73 (lo=3 -> 3*0.5=1.5, hi=7 -> 12*0.5=6.0).
+    let mut nv = vec![0u8; 36];
+    nv[0] = 0x38;
+    nv[4] = 0x73;
+    dequantize(GgmlType::Nvfp4, &nv, &mut out).unwrap();
+    assert_eq!(out[0], 1.5);
+    assert_eq!(out[8], 6.0);
+}

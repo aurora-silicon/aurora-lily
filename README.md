@@ -12,13 +12,17 @@ is used daily as a coding-agent backend.
 |--------|--------------------|--------------------------------------|-------------------------------|
 | 16 GB  | Qwen3.5-4B / 9B    | Q4_K conversion below                | embedded MTP head             |
 | 16 GB  | Gemma 4 26B-A4B    | unsloth's UD-IQ2_M GGUF              | optional: Gemma's draft model |
+| 16 GB  | Inkling 2 Mini     | unsloth's UD-Q2_K_XL / UD-IQ2_XXS    | optional: DSpark (Q8_0)       |
 | 32 GB  | Qwen3.6-35B-A3B    | ggml-org's Q4_K_M GGUF               | its MTP head                  |
 | 32 GB  | Gemma 4 26B-A4B    | unsloth's UD-Q5_K_M GGUF             | Gemma's draft model           |
+| 32 GB  | Inkling 2 Mini     | ggml-org's IQ4_NL / unsloth UD-Q4_K_XL | DSpark (Q8_0)               |
 | 32 GB  | Agnes 3.0 Flash    | lily's q4_k conversion               | its MTP head                  |
 | 64 GB  | Qwen3.6-35B-A3B    | ggml-org's Q8_0 GGUF                 | its MTP head                  |
+| 64 GB  | Inkling 2 Mini     | ggml-org's Q8_0 GGUF                 | DSpark (Q8_0 / BF16)          |
 | 64 GB  | Qwen3.8-Flash-Next | antirez's Q2 GGUF                    | its MTP head                  |
 | 64 GB  | Agnes 3.0 Flash    | lily's q8_0 conversion               | its MTP head                  |
 | 128 GB | Qwen3.8-Flash-Next | lily's 4-bit conversions (q4-xl, q4) | its MTP head                  |
+| 128 GB | Inkling 2 Mini     | ggml-org's BF16 GGUF                 | DSpark (BF16)                 |
 | 128 GB | GLM 5.3 Flash      | antirez's Q2 GGUF                    | its MTP block                 |
 | 128 GB | DeepSeek V4 Flash  | antirez's Q2 GGUF                    | DSpark                        |
 

@@ -90,11 +90,14 @@ pub mod ablate {
 }
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod deepseek4;
-pub mod gguf;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod gemma4;
+pub mod gguf;
+pub mod gguf_tables;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod glm53;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod inkling2;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod moe_ffn;
 pub mod npy;

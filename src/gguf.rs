@@ -32,12 +32,18 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     Iq2Xxs = 16,
-    /// Integer tables (DeepSeek V4's hash routing); decoded as exact f32.
-    I32 = 26,
+    Iq2Xs = 17,
+    Iq3Xxs = 18,
+    Iq1S = 19,
     Iq4Nl = 20,
     Iq2S = 22,
+    Iq4Xs = 23,
+    /// Integer tables (DeepSeek V4's hash routing); decoded as exact f32.
+    I32 = 26,
     Bf16 = 30,
     Mxfp4 = 39,
+    Nvfp4 = 40,
+    Q2_0 = 42,
 }
 
 impl GgmlType {
@@ -52,11 +58,17 @@ impl GgmlType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             16 => Self::Iq2Xxs,
-            26 => Self::I32,
+            17 => Self::Iq2Xs,
+            18 => Self::Iq3Xxs,
+            19 => Self::Iq1S,
             20 => Self::Iq4Nl,
             22 => Self::Iq2S,
+            23 => Self::Iq4Xs,
+            26 => Self::I32,
             30 => Self::Bf16,
             39 => Self::Mxfp4,
+            40 => Self::Nvfp4,
+            42 => Self::Q2_0,
             _ => return None,
         })
     }
@@ -66,12 +78,17 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 | Self::Bf16 | Self::I32 => 1,
             Self::Q4_0 | Self::Q8_0 | Self::Iq4Nl | Self::Mxfp4 => 32,
+            Self::Nvfp4 | Self::Q2_0 => 64,
             Self::Q2K
             | Self::Q4K
             | Self::Q5K
             | Self::Q6K
             | Self::Iq2Xxs
-            | Self::Iq2S => QK_K,
+            | Self::Iq2Xs
+            | Self::Iq3Xxs
+            | Self::Iq1S
+            | Self::Iq2S
+            | Self::Iq4Xs => QK_K,
         }
     }
 
@@ -80,15 +97,20 @@ impl GgmlType {
         match self {
             Self::F32 | Self::I32 => 4,
             Self::F16 | Self::Bf16 => 2,
-            Self::Q4_0 | Self::Iq4Nl => 18,
+            Self::Q4_0 | Self::Iq4Nl | Self::Q2_0 => 18,
             Self::Q8_0 => 34,
             Self::Q2K => 84,
             Self::Q4K => 144,
             Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Iq2Xxs => 66,
+            Self::Iq2Xs => 74,
+            Self::Iq3Xxs => 98,
+            Self::Iq1S => 50,
             Self::Mxfp4 => 17,
+            Self::Nvfp4 => 36,
             Self::Iq2S => 82,
+            Self::Iq4Xs => 136,
         }
     }
 
@@ -115,11 +137,17 @@ impl GgmlType {
             Self::Q5K => "Q5_K",
             Self::Q6K => "Q6_K",
             Self::Iq2Xxs => "IQ2_XXS",
+            Self::Iq2Xs => "IQ2_XS",
+            Self::Iq3Xxs => "IQ3_XXS",
+            Self::Iq1S => "IQ1_S",
             Self::I32 => "I32",
             Self::Iq4Nl => "IQ4_NL",
             Self::Iq2S => "IQ2_S",
+            Self::Iq4Xs => "IQ4_XS",
             Self::Bf16 => "BF16",
             Self::Mxfp4 => "MXFP4",
+            Self::Nvfp4 => "NVFP4",
+            Self::Q2_0 => "Q2_0",
         }
     }
 }
@@ -614,15 +642,156 @@ pub fn dequantize(ty: GgmlType, raw: &[u8], out: &mut [f32]) -> Result<()> {
             GgmlType::Q4K => dequant_q4_k(blk, dst),
             GgmlType::Q2K => dequant_q2_k(blk, dst),
             GgmlType::Iq2Xxs => dequant_iq2_xxs(blk, dst),
+            GgmlType::Iq2Xs => dequant_iq2_xs(blk, dst),
+            GgmlType::Iq3Xxs => dequant_iq3_xxs(blk, dst),
+            GgmlType::Iq1S => dequant_iq1_s(blk, dst),
             GgmlType::Mxfp4 => dequant_mxfp4(blk, dst),
+            GgmlType::Nvfp4 => dequant_nvfp4(blk, dst),
+            GgmlType::Q2_0 => dequant_q2_0(blk, dst),
             GgmlType::Q4_0 => dequant_q4_0(blk, dst),
             GgmlType::Q5K => dequant_q5_k(blk, dst),
             GgmlType::Q6K => dequant_q6_k(blk, dst),
             GgmlType::Iq4Nl => dequant_iq4_nl(blk, dst),
             GgmlType::Iq2S => dequant_iq2_s(blk, dst),
+            GgmlType::Iq4Xs => dequant_iq4_xs(blk, dst),
         }
     }
     Ok(())
+}
+
+/// Doubled E2M1 table shared by MXFP4 and NVFP4 (ggml's `kvalues_fp4`).
+pub const KVALUES_FP4: [i8; 16] =
+    [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// Unsigned E4M3 scale divided by 2 (matches ggml's `ggml_ue4m3_to_fp32`,
+/// because [`KVALUES_FP4`] stores doubled E2M1 values).
+pub fn ue4m3_to_f32(x: u8) -> f32 {
+    if x == 0 || x == 0x7f {
+        return 0.0;
+    }
+    let exp = i32::from((x >> 3) & 0xf);
+    let man = f32::from(x & 0x7);
+    let raw = if exp == 0 {
+        man * f32::from_bits((127 - 9) << 23)
+    } else {
+        (1.0 + man / 8.0) * f32::from_bits(((127 + exp - 7) as u32) << 23)
+    };
+    raw * 0.5
+}
+
+/// NVFP4 (ggml's `block_nvfp4`): 4 UE4M3 scales (one per 16 values) and 32
+/// bytes of packed E2M1 nibbles (64 values total).
+fn dequant_nvfp4(b: &[u8], out: &mut [f32]) {
+    let qs = &b[4..36];
+    for s in 0..4 {
+        let d = ue4m3_to_f32(b[s]);
+        let yb = &mut out[s * 16..(s + 1) * 16];
+        for j in 0..8 {
+            let byte = qs[s * 8 + j];
+            yb[j] = f32::from(KVALUES_FP4[usize::from(byte & 0xf)]) * d;
+            yb[j + 8] = f32::from(KVALUES_FP4[usize::from(byte >> 4)]) * d;
+        }
+    }
+}
+
+/// Q2_0 (ggml's `block_q2_0`): f16 d, 16 bytes of 2-bit codes (64 values):
+/// `((q) - 1) * d` where 00=-1, 01=0, 10=+1, 11=+2.
+fn dequant_q2_0(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    let qs = &b[2..18];
+    for j in 0..64 {
+        let q = (qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+        out[j] = f32::from(i16::from(q) - 1) * d;
+    }
+}
+
+/// IQ2_XS: f16 d, 32 u16 grid+sign words, 8 scale bytes (nibble per 16 values).
+fn dequant_iq2_xs(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    let scales = &b[66..74];
+    for ib32 in 0..8 {
+        let db = [
+            d * (0.5 + f32::from(scales[ib32] & 0xf)) * 0.25,
+            d * (0.5 + f32::from(scales[ib32] >> 4)) * 0.25,
+        ];
+        for l in 0..4 {
+            let w = le_u16(b, 2 + 2 * (4 * ib32 + l));
+            let grid =
+                crate::gguf_tables::IQ2XS_GRID[usize::from(w & 511)].to_le_bytes();
+            let signs = KSIGNS_IQ2XS[usize::from(w >> 9)];
+            let dl = db[l / 2];
+            for j in 0..8 {
+                let sign = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                out[ib32 * 32 + l * 8 + j] = dl * f32::from(grid[j]) * sign;
+            }
+        }
+    }
+}
+
+/// IQ3_XXS: f16 d, 64 bytes of 4-element grid indices, 32 bytes of scales+signs.
+fn dequant_iq3_xxs(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    let qs = &b[2..66];
+    let sas = &b[66..98];
+    for ib32 in 0..8 {
+        let aux = u32::from_le_bytes(sas[4 * ib32..4 * ib32 + 4].try_into().unwrap());
+        let db = d * (0.5 + ((aux >> 28) as f32)) * 0.5;
+        for l in 0..4 {
+            let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+            let g1 = crate::gguf_tables::IQ3XXS_GRID[usize::from(qs[8 * ib32 + 2 * l])]
+                .to_le_bytes();
+            let g2 = crate::gguf_tables::IQ3XXS_GRID
+                [usize::from(qs[8 * ib32 + 2 * l + 1])]
+            .to_le_bytes();
+            let base = ib32 * 32 + l * 8;
+            for j in 0..4 {
+                let s1 = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                let s2 = if signs & (1 << (j + 4)) != 0 { -1.0 } else { 1.0 };
+                out[base + j] = db * f32::from(g1[j]) * s1;
+                out[base + j + 4] = db * f32::from(g2[j]) * s2;
+            }
+        }
+    }
+}
+
+/// IQ1_S: f16 d, 32 bytes of low grid indices, 8 u16 high+scale+delta words.
+fn dequant_iq1_s(b: &[u8], out: &mut [f32]) {
+    const DELTA: f32 = 0.125;
+    let d = f16_at(b, 0);
+    let qs = &b[2..34];
+    for ib in 0..8 {
+        let qh = le_u16(b, 34 + 2 * ib);
+        let dl = d * f32::from(2 * ((qh >> 12) & 7) + 1);
+        let delta = if qh & 0x8000 != 0 { -DELTA } else { DELTA };
+        for l in 0..4 {
+            let idx =
+                usize::from(qs[4 * ib + l]) | ((usize::from(qh >> (3 * l)) & 7) << 8);
+            let grid = crate::gguf_tables::IQ1S_GRID[idx].to_le_bytes();
+            let base = ib * 32 + l * 8;
+            for j in 0..8 {
+                out[base + j] = dl * (f32::from(grid[j] as i8) + delta);
+            }
+        }
+    }
+}
+
+/// IQ4_XS: f16 d, u16 scales_h, 4 bytes scales_l, 128 bytes of nibbles.
+fn dequant_iq4_xs(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    let scales_h = le_u16(b, 2);
+    let scales_l = &b[4..8];
+    let qs = &b[8..136];
+    for ib in 0..8 {
+        let ls = i32::from((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf)
+            | (i32::from((scales_h >> (2 * ib)) & 3) << 4);
+        let dl = d * ((ls - 32) as f32);
+        let base = ib * 32;
+        let q = &qs[ib * 16..ib * 16 + 16];
+        for j in 0..16 {
+            out[base + j] = dl * f32::from(KVALUES_IQ4NL[usize::from(q[j] & 0xf)]);
+            out[base + j + 16] = dl * f32::from(KVALUES_IQ4NL[usize::from(q[j] >> 4)]);
+        }
+    }
 }
 
 /// MXFP4 (ggml's `block_mxfp4`): an E8M0 exponent byte `e`, then 16 bytes of
@@ -630,9 +799,14 @@ pub fn dequantize(ty: GgmlType, raw: &[u8], out: &mut [f32]) -> Result<()> {
 /// the high one. Value = `KVALUES_MXFP4[code] * 2^(e - 128)` (ggml's
 /// `ggml_e8m0_to_fp32_half`: the table holds twice the E2M1 values).
 fn dequant_mxfp4(b: &[u8], out: &mut [f32]) {
-    const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    const KVALUES_MXFP4: [i8; 16] =
+        [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
     let e = u32::from(b[0]);
-    let d = if e < 2 { f32::from_bits(0x0020_0000 << e) } else { f32::from_bits((e - 1) << 23) };
+    let d = if e < 2 {
+        f32::from_bits(0x0020_0000 << e)
+    } else {
+        f32::from_bits((e - 1) << 23)
+    };
     for j in 0..16 {
         out[j] = f32::from(KVALUES_MXFP4[usize::from(b[1 + j] & 0xf)]) * d;
         out[j + 16] = f32::from(KVALUES_MXFP4[usize::from(b[1 + j] >> 4)]) * d;

@@ -98,7 +98,7 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
             ]
         };
     }
-    const NAMES: [[&str; GEMV_MAX_ROWS]; 12] = [
+    const NAMES: [[&str; GEMV_MAX_ROWS]; 19] = [
         rows!("q8_0"),
         rows!("q4_k"),
         rows!("q2_k"),
@@ -111,6 +111,13 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
         rows!("q6_k"),
         rows!("iq4_nl"),
         rows!("iq2_s"),
+        rows!("mxfp4"),
+        rows!("nvfp4"),
+        rows!("q2_0"),
+        rows!("iq2_xs"),
+        rows!("iq3_xxs"),
+        rows!("iq1_s"),
+        rows!("iq4_xs"),
     ];
     if m > GEMV_MAX_ROWS {
         const WIDE: [[&str; 4]; 2] = [
@@ -140,12 +147,19 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
         GgmlType::Bf16 => 4,
         GgmlType::F32 => 5,
         GgmlType::F16 => 6,
-        GgmlType::I32 | GgmlType::Mxfp4 => anyhow::bail!("no GEMV over {ty:?}"),
+        GgmlType::I32 => anyhow::bail!("no GEMV over {ty:?}"),
         GgmlType::Q4_0 => 7,
         GgmlType::Q5K => 8,
         GgmlType::Q6K => 9,
         GgmlType::Iq4Nl => 10,
         GgmlType::Iq2S => 11,
+        GgmlType::Mxfp4 => 12,
+        GgmlType::Nvfp4 => 13,
+        GgmlType::Q2_0 => 14,
+        GgmlType::Iq2Xs => 15,
+        GgmlType::Iq3Xxs => 16,
+        GgmlType::Iq1S => 17,
+        GgmlType::Iq4Xs => 18,
     };
     Ok(NAMES[t][m - 1])
 }
@@ -165,6 +179,15 @@ fn g16_gemv_name(
         return None;
     }
     let (names, rows) = match ty {
+        GgmlType::Q4K if cols.is_multiple_of(256) => (
+            [
+                "g16_gemv_q4_k_m1",
+                "g16_gemv_q4_k_m2",
+                "g16_gemv_q4_k_m3",
+                "g16_gemv_q4_k_m4",
+            ],
+            if m == 1 { 4 } else { 1 },
+        ),
         GgmlType::Q5K if cols.is_multiple_of(256) => (
             [
                 "g16_gemv_q5_k_m1",
@@ -172,7 +195,7 @@ fn g16_gemv_name(
                 "g16_gemv_q5_k_m3",
                 "g16_gemv_q5_k_m4",
             ],
-            if m == 1 { 4 } else { 2 },
+            if m == 1 { 4 } else { 1 },
         ),
         _ => return None,
     };
@@ -370,7 +393,10 @@ fn gemv_dispatch(
     let name = match g16 {
         Some((name, _)) => name,
         None if r2 => gemv_r2_name(m)?,
-        None if r == 2 => "glm53_gemv_q5_k_m1_r2",
+        None if r == 2 => match w0.ty {
+            GgmlType::Q4K => "glm53_gemv_q4_k_m1_r2",
+            _ => "glm53_gemv_q5_k_m1_r2",
+        },
         None => gemv_name(w0.ty, m)?,
     };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
@@ -401,7 +427,11 @@ const GEMV_R2_MIN_ROWS: usize = 32768;
 /// groups at `m` rows over weights of up to `rows` rows: two for a wide
 /// Q5_K at one row (they share the x loads), else one.
 fn gemv_rows_per_subgroup(ty: GgmlType, m: usize, rows: usize) -> usize {
-    if ty == GgmlType::Q5K && m == 1 && rows >= GEMV_R2_MIN_ROWS { 2 } else { 1 }
+    if ty == GgmlType::Q5K && m == 1 && rows >= GEMV_R2_MIN_ROWS {
+        2
+    } else {
+        1
+    }
 }
 
 /// Rows (of activations) at which [`gemm`] takes over from the GEMV.
@@ -433,6 +463,13 @@ fn gemm_name(ty: GgmlType) -> Result<&'static str> {
         GgmlType::Q6K => "glm53_gemm_q6_k",
         GgmlType::Iq4Nl => "glm53_gemm_iq4_nl",
         GgmlType::Iq2S => "glm53_gemm_iq2_s",
+        GgmlType::Mxfp4 => "glm53_gemm_mxfp4",
+        GgmlType::Nvfp4 => "glm53_gemm_nvfp4",
+        GgmlType::Q2_0 => "glm53_gemm_q2_0",
+        GgmlType::Iq2Xs => "glm53_gemm_iq2_xs",
+        GgmlType::Iq3Xxs => "glm53_gemm_iq3_xxs",
+        GgmlType::Iq1S => "glm53_gemm_iq1_s",
+        GgmlType::Iq4Xs => "glm53_gemm_iq4_xs",
         other => anyhow::bail!("no GLM GEMM over {other:?}"),
     })
 }
@@ -453,7 +490,19 @@ pub fn gemm_with(
 ) -> Result<()> {
     check_f32(&[x])?;
     if !ctx.matrix_units() {
-        return gemm_any(ctx, pass, w, x, y, m, n, l, sgemm_name(w.ty)?, (64, 128), 256);
+        return gemm_any(
+            ctx,
+            pass,
+            w,
+            x,
+            y,
+            m,
+            n,
+            l,
+            sgemm_name(w.ty)?,
+            (64, 128),
+            256,
+        );
     }
     gemm_any(ctx, pass, w, x, y, m, n, l, gemm_name(w.ty)?, (64, 64), 128)
 }
@@ -470,6 +519,14 @@ fn sgemm_name(ty: GgmlType) -> Result<&'static str> {
         GgmlType::Iq4Nl => "sgemm_iq4_nl",
         GgmlType::Iq2S => "sgemm_iq2_s",
         GgmlType::Iq2Xxs => "sgemm_iq2_xxs",
+        GgmlType::Mxfp4 => "sgemm_mxfp4",
+        GgmlType::Nvfp4 => "sgemm_nvfp4",
+        GgmlType::Q2_0 => "sgemm_q2_0",
+        GgmlType::Iq2Xs => "sgemm_iq2_xs",
+        GgmlType::Iq3Xxs => "sgemm_iq3_xxs",
+        GgmlType::Iq1S => "sgemm_iq1_s",
+        GgmlType::Iq4Xs => "sgemm_iq4_xs",
+        GgmlType::Bf16 => "sgemm_bf16",
         GgmlType::F16 => "sgemm_f16",
         GgmlType::F32 => "sgemm_f32",
         other => anyhow::bail!("no GEMM without matrix units over {other:?}"),
@@ -527,7 +584,9 @@ pub fn gemm_bx_with(
     // 2048 x 4096) were 10-20% slower. The same products in the same order.
     let sg4 = m <= 128 && n >= 8192 && l.batches == 1;
     let (name, rows, threads) = match (w.ty, sg4) {
-        (GgmlType::Q8_0, false) => ("glm53_gemm_q8_0_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Q8_0, false) => {
+            ("glm53_gemm_q8_0_bx", GEMM_BX_ROWS, GEMM_BX_THREADS)
+        }
         (GgmlType::Q4K, false) => ("glm53_gemm_q4_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
         (GgmlType::Q8_0, true) => ("glm53_gemm_q8_0_bx4", 128, 128),
         (GgmlType::Q4K, true) => ("glm53_gemm_q4_k_bx4", 128, 128),
@@ -553,8 +612,10 @@ pub fn gemm_bx_takes(w: &QWeight) -> bool {
 
 /// Whether [`gemm_bx_with`] takes weights of this type (F16 too).
 pub fn gemm_bx_with_takes(w: &QWeight) -> bool {
-    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::F16)
-        && w.cols.is_multiple_of(8)
+    matches!(
+        w.ty,
+        GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::F16
+    ) && w.cols.is_multiple_of(8)
 }
 
 /// `out` = the first `n` values of `x` as bfloat (rounded to nearest even),
@@ -821,8 +882,26 @@ pub fn moe_grouped_dot(
 ) -> Result<()> {
     let tiles = if m * used >= 48 * experts { MoeTiles::R128 } else { MoeTiles::R64 };
     moe_grouped_with(
-        ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
-        experts, limit, true, false, tiles, MOE_DOT_ROWS,
+        ctx,
+        pass,
+        gate,
+        up,
+        down,
+        ff,
+        hidden,
+        x,
+        sel,
+        weights,
+        out,
+        sc,
+        m,
+        used,
+        experts,
+        limit,
+        true,
+        false,
+        tiles,
+        MOE_DOT_ROWS,
     )
 }
 
@@ -1110,14 +1189,24 @@ pub fn moe_gate_up_xh(
     check_f32(&[weights, mid])?;
     ensure!(xh.dtype() == DType::F16, "f16 expert activations");
     ensure!(
-        gate.ty == GgmlType::Iq2Xxs && up.ty == gate.ty && gate.cols == up.cols && gate.rows == up.rows,
+        gate.ty == GgmlType::Iq2Xxs
+            && up.ty == gate.ty
+            && gate.cols == up.cols
+            && gate.rows == up.rows,
         "f16-activation gate/up of {:?} experts",
         gate.ty
     );
-    ensure!(gate.rows.is_multiple_of(ff) && gate.cols.is_multiple_of(32), "expert shape");
+    ensure!(
+        gate.rows.is_multiple_of(ff) && gate.cols.is_multiple_of(32),
+        "expert shape"
+    );
     ensure!(sel.dtype() == DType::U32 && sel.numel() >= m * used, "selection");
-    ensure!(xh.numel() >= m * gate.cols && mid.numel() >= m * used * ff, "expert buffers");
-    let pipeline = ctx.pipeline("glm53_moe_gate_up_iq2_xxs_xh", SOURCE, MslVersion::V3_1)?;
+    ensure!(
+        xh.numel() >= m * gate.cols && mid.numel() >= m * used * ff,
+        "expert buffers"
+    );
+    let pipeline =
+        ctx.pipeline("glm53_moe_gate_up_iq2_xxs_xh", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &[

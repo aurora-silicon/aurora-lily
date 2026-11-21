@@ -32,9 +32,16 @@ float glm53_precise_mul(float a, float b) {
 #define GLM53_Q5_K 13u
 #define GLM53_Q6_K 14u
 #define GLM53_IQ2_XXS 16u
+#define GLM53_IQ2_XS 17u
+#define GLM53_IQ3_XXS 18u
+#define GLM53_IQ1_S 19u
 #define GLM53_IQ4_NL 20u
 #define GLM53_IQ2_S 22u
+#define GLM53_IQ4_XS 23u
 #define GLM53_BF16 30u
+#define GLM53_MXFP4 39u
+#define GLM53_NVFP4 40u
+#define GLM53_Q2_0 42u
 
 float glm53_h2f(uint bits) { return unpackHalf2x16(bits).x; }
 
@@ -295,6 +302,176 @@ void glm53_decode_iq2_s(uint64_t row, uint t, out float w[32]) {
 
 #endif
 
+#ifdef GLM53_INKLING_TYPES
+// Doubled E2M1 table shared by MXFP4 and NVFP4 (ggml kvalues_fp4).
+float glm53_fp4_value(uint c) {
+    const uint mag = c & 7u;
+    const float v = mag < 4u ? float(mag) : (mag == 4u ? 4.0 : (mag == 5u ? 6.0 : (mag == 6u ? 8.0 : 12.0)));
+    return (c & 8u) != 0u ? -v : v;
+}
+
+// Unsigned E4M3 scale divided by 2 (ggml ggml_ue4m3_to_fp32).
+float glm53_ue4m3_to_f32(uint x) {
+    if (x == 0u || x == 0x7fu) return 0.0;
+    const uint exp = (x >> 3u) & 0xfu;
+    const float man = float(x & 7u);
+    const float raw = exp == 0u
+        ? man * uintBitsToFloat((127u - 9u) << 23u)
+        : (1.0 + man * 0.125) * uintBitsToFloat((127u + exp - 7u) << 23u);
+    return raw * 0.5;
+}
+
+// --- MXFP4: 1 byte E8M0 exponent, 16 nibble bytes (17-byte blocks, 32 values). ---
+void glm53_decode_mxfp4(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t) * 17u;
+    const uint e = uint(U8(b).v[0]);
+    const float d = e < 2u ? uintBitsToFloat(0x00200000u << e) : uintBitsToFloat((e - 1u) << 23u);
+    [[unroll]] for (uint j = 0u; j < 16u; j++) {
+        const uint byte = uint(U8(b + 1u).v[j]);
+        w[j] = glm53_fp4_value(byte & 0xfu) * d;
+        w[j + 16u] = glm53_fp4_value(byte >> 4u) * d;
+    }
+}
+
+// --- NVFP4: 4 UE4M3 scales, 32 nibble bytes (36-byte blocks, 64 values = 2 tasks). ---
+void glm53_decode_nvfp4(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t >> 1u) * 36u;
+    const uint half_idx = t & 1u;
+    const uint sw = U32(b).v[0];
+    [[unroll]] for (uint sb = 0u; sb < 2u; sb++) {
+        const uint s = 2u * half_idx + sb;
+        const float d = glm53_ue4m3_to_f32((sw >> (8u * s)) & 0xffu);
+        const uint64_t qs = b + 4u + 8u * s;
+        [[unroll]] for (uint q = 0u; q < 2u; q++) {
+            const uint word = U32(qs).v[q];
+            [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                const uint byte = (word >> (8u * k)) & 0xffu;
+                w[16u * sb + 4u * q + k] = glm53_fp4_value(byte & 0xfu) * d;
+                w[16u * sb + 4u * q + k + 8u] = glm53_fp4_value(byte >> 4u) * d;
+            }
+        }
+    }
+}
+
+// --- Q2_0: f16 d, 16 bytes of 2-bit codes (18-byte blocks, 64 values = 2 tasks). ---
+void glm53_decode_q2_0(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t >> 1u) * 18u;
+    const uint half_idx = t & 1u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint64_t qs = b + 2u + 8u * half_idx;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(U16(qs).v[i]);
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            const uint q = (pair >> (2u * k)) & 3u;
+            w[8u * i + k] = float(int(q) - 1) * d;
+        }
+    }
+}
+
+// --- IQ4_XS: f16 d, u16 scales_h, 4 bytes scales_l, 128 nibble bytes (136-byte blocks). ---
+float glm53_iq4xs_value(uint c) {
+    const uint w = c < 8u ? (c < 4u ? 0xBFAD9881u : 0xF6EADDCFu)
+                          : (c < 12u ? 0x26190D01u : 0x71594535u);
+    return float(bitfieldExtract(int(w), int(8u * (c & 3u)), 8));
+}
+
+void glm53_decode_iq4_xs(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 136u;
+    const uint ib = t & 7u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint sh = uint(U16(b + 2u).v[0]);
+    const uint sl = U32(b + 4u).v[0];
+    const uint ls = ((sl >> (4u * ib)) & 0xfu) | (((sh >> (2u * ib)) & 3u) << 4u);
+    const float dl = d * float(int(ls) - 32);
+    const uint64_t qs = b + 8u + 16u * ib;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        const uint pair = uint(U16(qs).v[i]);
+        [[unroll]] for (uint k = 0u; k < 2u; k++) {
+            const uint byte = (pair >> (8u * k)) & 0xffu;
+            w[2u * i + k] = dl * glm53_iq4xs_value(byte & 0xfu);
+            w[2u * i + k + 16u] = dl * glm53_iq4xs_value(byte >> 4u);
+        }
+    }
+}
+
+// --- IQ2_XS: f16 d, 32 u16 grid+sign words, 8 scale bytes (74-byte blocks). ---
+uint glm53_iq2xs_grid[1024] = uint[1024](
+#include "glm53_iq2xs_grid.glsl"
+);
+
+void glm53_decode_iq2_xs(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 74u;
+    const uint ib = t & 7u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint scb = (uint(U16(b + 66u).v[ib >> 1u]) >> (8u * (ib & 1u))) & 0xffu;
+    const float db0 = d * (0.5 + float(scb & 0xfu)) * 0.25;
+    const float db1 = d * (0.5 + float(scb >> 4u)) * 0.25;
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const uint q = uint(U16(b + 2u).v[4u * ib + l]);
+        const uint g = q & 511u;
+        const uint s7 = q >> 9u;
+        const uint signs = s7 | ((bitCount(s7) & 1u) << 7u);
+        const uint lo = glm53_iq2xs_grid[2u * g];
+        const uint hi = glm53_iq2xs_grid[2u * g + 1u];
+        const float dl = l < 2u ? db0 : db1;
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            const float v = dl * float(((k < 4u ? lo : hi) >> (8u * (k & 3u))) & 0xffu);
+            w[8u * l + k] = ((signs >> k) & 1u) != 0u ? -v : v;
+        }
+    }
+}
+
+// --- IQ3_XXS: f16 d, 64 grid bytes, 32 scale+sign bytes (98-byte blocks). ---
+uint glm53_iq3xxs_grid[256] = uint[256](
+#include "glm53_iq3xxs_grid.glsl"
+);
+
+void glm53_decode_iq3_xxs(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 98u;
+    const uint ib = t & 7u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint aux = uint(U16(b + 66u).v[2u * ib]) | (uint(U16(b + 66u).v[2u * ib + 1u]) << 16u);
+    const float db = d * (0.5 + float(aux >> 28u)) * 0.5;
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const uint s7 = (aux >> (7u * l)) & 127u;
+        const uint signs = s7 | ((bitCount(s7) & 1u) << 7u);
+        const uint pair = uint(U16(b + 2u).v[4u * ib + l]);
+        const uint g1 = glm53_iq3xxs_grid[pair & 0xffu];
+        const uint g2 = glm53_iq3xxs_grid[pair >> 8u];
+        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+            const float v1 = db * float((g1 >> (8u * k)) & 0xffu);
+            const float v2 = db * float((g2 >> (8u * k)) & 0xffu);
+            w[8u * l + k] = ((signs >> k) & 1u) != 0u ? -v1 : v1;
+            w[8u * l + k + 4u] = ((signs >> (k + 4u)) & 1u) != 0u ? -v2 : v2;
+        }
+    }
+}
+
+// --- IQ1_S: f16 d, 32 low grid bytes, 8 u16 high+scale+delta words (50-byte blocks). ---
+uint glm53_iq1s_grid[4096] = uint[4096](
+#include "glm53_iq1s_grid.glsl"
+);
+
+void glm53_decode_iq1_s(uint64_t row, uint t, out float w[32]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 50u;
+    const uint ib = t & 7u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint qh = uint(U16(b + 34u).v[ib]);
+    const float dl = d * float(2u * ((qh >> 12u) & 7u) + 1u);
+    const float delta = (qh & 0x8000u) != 0u ? -0.125 : 0.125;
+    const uint qs = uint(U16(b + 2u).v[2u * ib]) | (uint(U16(b + 2u).v[2u * ib + 1u]) << 16u);
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const uint idx = ((qs >> (8u * l)) & 0xffu) | (((qh >> (3u * l)) & 7u) << 8u);
+        const uint lo = glm53_iq1s_grid[2u * idx];
+        const uint hi = glm53_iq1s_grid[2u * idx + 1u];
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            const int g = bitfieldExtract(int(k < 4u ? lo : hi), int(8u * (k & 3u)), 8);
+            w[8u * l + k] = dl * (float(g) + delta);
+        }
+    }
+}
+#endif
+
 // --- BF16, F16 and F32 rows (16-byte aligned here). ---
 void glm53_decode_bf16(uint64_t row, uint t, out float w[32]) {
     const uint64_t b = row + uint64_t(t) * 64u;
@@ -337,6 +514,15 @@ void glm53_decode(uint ty, uint64_t row, uint t, out float w[32]) {
     else if (ty == GLM53_Q6_K) glm53_decode_q6_k(row, t, w);
     else if (ty == GLM53_IQ4_NL) glm53_decode_iq4_nl(row, t, w);
     else if (ty == GLM53_IQ2_S) glm53_decode_iq2_s(row, t, w);
+#endif
+#ifdef GLM53_INKLING_TYPES
+    else if (ty == GLM53_MXFP4) glm53_decode_mxfp4(row, t, w);
+    else if (ty == GLM53_NVFP4) glm53_decode_nvfp4(row, t, w);
+    else if (ty == GLM53_Q2_0) glm53_decode_q2_0(row, t, w);
+    else if (ty == GLM53_IQ2_XS) glm53_decode_iq2_xs(row, t, w);
+    else if (ty == GLM53_IQ3_XXS) glm53_decode_iq3_xxs(row, t, w);
+    else if (ty == GLM53_IQ1_S) glm53_decode_iq1_s(row, t, w);
+    else if (ty == GLM53_IQ4_XS) glm53_decode_iq4_xs(row, t, w);
 #endif
     else if (ty == GLM53_Q2_K) glm53_decode_q2_k(row, t, w);
     else if (ty == GLM53_IQ2_XXS) glm53_decode_iq2_xxs(row, t, w);
