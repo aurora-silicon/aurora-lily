@@ -836,7 +836,7 @@ mod procfs {
     /// not the file pages it maps (the n-gram table's page cache), as on
     /// macOS. The GPU buffers are in `RssShmem` only on a kernel whose GPU
     /// driver charges the pages it holds to the process that created them
-    /// (the Asahi driver of the aurora kernels does); on another, the
+    /// (the aurora GPU driver does); on another, the
     /// buffers' pages are mapped as device memory and this figure leaves them
     /// out. `compressed` is `VmSwap`: the process's pages in swap, zswap's
     /// compressed pool included, the nearest to macOS's compressor.

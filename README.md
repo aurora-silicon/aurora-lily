@@ -230,7 +230,7 @@ You need:
   (aurora-silicon/linux #1752); on the M5 Max, the GPU mailbox interrupt fix
   (#1844) for full decode speed.
 - Mesa's Honeykrisp from aurora-silicon/mesa `aurora-wip`, with the M5's
-  matrix units enabled (`ASAHI_M5_COOPERATIVE_MATRIX=1`; the M4 needs no
+  matrix units enabled (`AURORA_M5_COOPERATIVE_MATRIX=1`; the M4 needs no
   setting). The AGX compiler
   pull requests #370 to #375, #379 and #380 are in the build measured above;
   they add 2–15% to prefill.
@@ -240,9 +240,9 @@ Weights are mapped read-only from the page cache rather than copied, and the
 GPU heap needs more than half of RAM:
 
 ```sh
-export VK_ICD_FILENAMES=$MESA/share/vulkan/icd.d/asahi_icd.aarch64.json
+export VK_ICD_FILENAMES=$MESA/share/vulkan/icd.d/aurora_icd.aarch64.json
 export LD_LIBRARY_PATH=$MESA/lib
-export ASAHI_M5_COOPERATIVE_MATRIX=1 heap_memory_percent=0.84
+export AURORA_M5_COOPERATIVE_MATRIX=1 heap_memory_percent=0.84
 export hk_host_memory_read_only=true hk_host_memory_import_read_only=true
 
 cargo build --release --locked

@@ -194,7 +194,7 @@ include!("gpu_stats.rs");
 /// two command buffers holds the second back about 0.2 ms (which is why
 /// only a pass's ends are stamped unless asked): wall times under it are
 /// close to, not exactly, production's. The kernel driver's own trace
-/// events (`asahi_g17_complete`) carry every job's start and end without
+/// events (`aurora_g17_complete`) carry every job's start and end without
 /// that cost, and its `seq` is the queue serial here.
 ///
 /// Events, as `secs kind label pass a b`:
