@@ -3,8 +3,8 @@
 Fast local inference of mixture-of-experts and hybrid language models on
 Apple Silicon running Linux. lily is a compact inference server with
 hand-written GPU kernels; this fork runs it on Linux through Vulkan (Mesa's
-Honeykrisp driver) and serves six models, from a 16 GB laptop to a 128 GB
-workstation. The server is OpenAI-compatible (`/v1/chat/completions`,
+Borealis driver) and serves eight model families, from a 16 GB laptop to a
+128 GB workstation. The server is OpenAI-compatible (`/v1/chat/completions`,
 `/v1/completions`, `/v1/models`, tools, `reasoning_content`, streaming) and
 is used daily as a coding-agent backend.
 
@@ -38,13 +38,16 @@ leaves the GPU, and fits the longest context that budget allows.
   measured on a 16-inch M5 Max MacBook Pro with 128 GB. The base M5 and M5
   Pro use the same kernels; their GPUs and memory bandwidth are smaller, so
   expect lower numbers than the tables below.
-- **M4 family** (no matrix units): Qwen3.5-4B and 9B run with embedded MTP heads. Gemma 4 runs, with f32 GEMMs and decode
-  kernels tuned for the M4's GPU. Agnes 3.0 Flash has a path without matrix
-  units too, verified on another GPU without them but not yet measured on
-  an M4 ([docs/agnes3.md](docs/agnes3.md)). The other models' kernels need
-  matrix units and are refused on these GPUs. Mesa offers the M4 8 x 8
-  cooperative matrices, which run on the same ALUs as its FMAs; lily's
-  matrix kernels need the M5's 16 x 16 ones, so the M4 keeps the f32 path.
+- **M4 family** (no matrix units): Qwen3.5-4B and 9B run with embedded MTP
+  heads. Gemma 4 and Inkling 2 Mini run with f32 GEMMs and decode kernels
+  tuned for the M4's GPU (Inkling 2 Mini also runs its DSpark speculative
+  drafter on the GPU, [docs/inkling2.md](docs/inkling2.md)). Agnes 3.0 Flash
+  has a path without matrix units too, verified on another GPU without them
+  but not yet measured on an M4 ([docs/agnes3.md](docs/agnes3.md)). The
+  other models' kernels need matrix units and are refused on these GPUs.
+  Mesa offers the M4 8 x 8 cooperative matrices, which run on the same ALUs
+  as its FMAs; lily's matrix kernels need the M5's 16 x 16 ones, so the M4
+  keeps the f32 path.
 - **M1 to M3 families** (no matrix units either): these take the same path
   as the M4, selected the same way, so the same models are offered and the others
   are refused. Measured once on a 16-inch M1 Max (64 GB, Linux, Mesa
@@ -99,10 +102,31 @@ Neither project publishes M5 Max numbers for the other models.
 
 ### Linux, M4 (16 GB)
 
-Gemma 4 UD-IQ2_M on an M4 MacBook Air (16 GB, 10-core CPU, 8-core GPU, fanless) with the 16 GB command
-below (`--memory-limit-gb 10.2`: 512-row prompt runs, 21 760 tokens of context, 10.1 GB on the GPU).
-Measured 2026-11-15 on `main` (9211b45) with #34, Mesa `aurora-wip` (19fff1a) plus the
-AGX compiler pull requests #370 to #375, #379 to #381 and #386, on AC.
+Measured on a 16 GB M4 MacBook Air (J713, 10-core CPU, 8-core GPU, fanless, on AC).
+
+#### Inkling 2 Mini
+
+`Inkling-2-Mini-UD-Q2_K_XL.gguf` (9.14 GB) with `dspark-Inkling-2-Mini-Q8_0.gguf` (0.40 GB) beside it,
+using the 16 GB command below (`--memory-limit-gb 10.6`: 11.4 GB on the GPU, up to 37 852 tokens of
+context with 1 snapshot and DSpark; see [docs/inkling2.md](docs/inkling2.md)). Measured 2026-11-21 on
+`main` (`10d70c2`, [#44](https://github.com/aurora-silicon/aurora-lily/pull/44)) with Linux 7.3.0 and
+Mesa Borealis:
+
+| Mode                                            |     Decode |    Prefill | Notes                                                         |
+|-------------------------------------------------|-----------:|-----------:|---------------------------------------------------------------|
+| Served `/v1/chat/completions`, `--mtp-drafts 3` | 17.8 tok/s |          – | 73 generated tokens, 50/66 drafts accepted (75.8%), 19.5 tok/s GPU steady-state |
+| `lily-inkling2 profile`, `--mtp-drafts 0`       | 13.0 tok/s |          – | 77.2 ms/tok plain decode                                      |
+| `lily-inkling2 bench`, 256-token prompt         |          – | 49.9 tok/s | 64-row chunks                                                 |
+
+- On the tested greedy chat request (73 generated tokens), DSpark (`--mtp-drafts 3`) produced the same
+  token IDs as plain decode (`--mtp-drafts 0`).
+- As with Gemma 4 below, the fanless Air throttles under sustained load, so long runs may measure lower.
+
+#### Gemma 4 26B-A4B
+
+Gemma 4 UD-IQ2_M with the 16 GB command below (`--memory-limit-gb 10.2`: 512-row prompt runs,
+21 760 tokens of context, 10.1 GB on the GPU). Measured 2026-11-15 on `main` (9211b45) with #34,
+Mesa `aurora-wip` (19fff1a) plus the AGX compiler pull requests #370 to #375, #379 to #381 and #386.
 
 Served, the same five requests as the M5 Max table, twice, starting below 60 °C:
 
@@ -164,7 +188,7 @@ llama-quantize --pure --token-embedding-type q8_0 --output-tensor-type q8_0 \
   --tensor-type ssm_alpha=q4_k --tensor-type ssm_beta=q4_k \
   "$file" "Qwen3.5-${size}-Q4_K.gguf" Q4_K
 
-# Use the Honeykrisp environment under Running it.
+# Use the Borealis environment under Running it.
 lily --model "Qwen3.5-${size}-Q4_K.gguf" --max-seq 16384 \
   --memory-limit-gb 9 --mtp-drafts 2
 ```
@@ -207,19 +231,22 @@ Speculative output equals plain greedy decoding up to rounding ties.
 
 ### Memory
 
-| Memory | Configuration                                   | Allocated on the GPU                     | Longest context                      |
-|--------|-------------------------------------------------|------------------------------------------|--------------------------------------|
-| 16 GB  | Gemma 4 UD-IQ2_M, `--memory-limit-gb 10.2`      | 11.0 GB                                  | 21 248 (10 496 with the draft model) |
-| 32 GB  | Qwen3.6 Q4_K_M, `--memory-limit-gb 22`          | 23.6 GB                                  | 52 088                               |
-| 32 GB  | Gemma 4 UD-Q5_K_M, `--memory-limit-gb 22`       | 23.6 GB                                  | 55 296                               |
-| 32 GB  | Agnes 3.0 Flash q4_k, `--memory-limit-gb 22`    | 23.6 GB                                  | 77 428 (123 688 at 25 on 36 GB)      |
-| 64 GB  | Qwen3.6 Q8_0, `--memory-limit-gb 44`            | 47.2 GB                                  | 262 144                              |
-| 64 GB  | Qwen3.8-Flash-Next Q2, `--memory-limit-gb 44.7` | 48.0 GB                                  | 73 720 (163 832 without drafts)      |
-| 128 GB | Qwen3.8-Flash-Next q4-xl                        | 75 GB, plus the 32 GB n-gram table paged | 131 072                              |
-| 128 GB | GLM 5.3 Flash Q2                                | 100 GB                                   | 65 536                               |
-| 128 GB | DeepSeek V4 Flash Q2                            | 95 GB                                    | 65 536                               |
+| Memory | Configuration                                                | Allocated on the GPU                     | Longest context                      |
+|--------|--------------------------------------------------------------|------------------------------------------|--------------------------------------|
+| 16 GB  | Gemma 4 UD-IQ2_M, `--memory-limit-gb 10.2`                   | 11.0 GB                                  | 21 248 (10 496 with the draft model) |
+| 16 GB  | Inkling 2 Mini UD-Q2_K_XL, `--memory-limit-gb 10.6` (M4 Air) | 11.4 GB                                  | 37 852 (with DSpark, 1 snapshot)     |
+| 32 GB  | Qwen3.6 Q4_K_M, `--memory-limit-gb 22`                       | 23.6 GB                                  | 52 088                               |
+| 32 GB  | Gemma 4 UD-Q5_K_M, `--memory-limit-gb 22`                    | 23.6 GB                                  | 55 296                               |
+| 32 GB  | Agnes 3.0 Flash q4_k, `--memory-limit-gb 22`                 | 23.6 GB                                  | 77 428 (123 688 at 25 on 36 GB)      |
+| 64 GB  | Qwen3.6 Q8_0, `--memory-limit-gb 44`                         | 47.2 GB                                  | 262 144                              |
+| 64 GB  | Qwen3.8-Flash-Next Q2, `--memory-limit-gb 44.7`              | 48.0 GB                                  | 73 720 (163 832 without drafts)      |
+| 128 GB | Qwen3.8-Flash-Next q4-xl                                     | 75 GB, plus the 32 GB n-gram table paged | 131 072                              |
+| 128 GB | GLM 5.3 Flash Q2                                             | 100 GB                                   | 65 536                               |
+| 128 GB | DeepSeek V4 Flash Q2                                         | 95 GB                                    | 65 536                               |
 
-`--memory-limit-gb` counts GiB. A memory-limited configuration serves one request at a time.
+`--memory-limit-gb` counts GiB (the GPU column is decimal GB). Except for the M4 Air row, fits are
+measured on the M5 Max; on the M4 Air above, Gemma 4 uses 512-row prompt runs and fits 21 760 tokens
+in 10.1 GB. A memory-limited configuration serves one request at a time.
 
 ## Running it
 
@@ -229,7 +256,7 @@ You need:
   kernel (`integration/aurora`), including the GPU compute-time allowance
   (aurora-silicon/linux #1752); on the M5 Max, the GPU mailbox interrupt fix
   (#1844) for full decode speed.
-- Mesa's Honeykrisp from aurora-silicon/mesa `aurora-wip`, with the M5's
+- Mesa's Borealis from aurora-silicon/mesa `aurora-wip`, with the M5's
   matrix units enabled (`ASAHI_M5_COOPERATIVE_MATRIX=1`; the M4 needs no
   setting). The AGX compiler
   pull requests #370 to #375, #379 and #380 are in the build measured above;
@@ -255,6 +282,11 @@ models and support files are found beside the model):
 # 16 GB: Gemma 4, everything under 11 GB (add --mtp-drafts 2 with the draft model)
 ./target/release/lily --model ~/models/gemma-4-26B-A4B-it-UD-IQ2_M.gguf \
   --memory-limit-gb 10.2 --mtp-drafts 0 --checkpoints-per-session 1 \
+  --decode-checkpoint-tokens 0 --pin-weights off
+
+# 16 GB: Inkling 2 Mini UD-Q2_K_XL with DSpark beside the model (docs/inkling2.md)
+./target/release/lily --model ~/models/Inkling-2-Mini-UD-Q2_K_XL.gguf \
+  --memory-limit-gb 10.6 --mtp-drafts 3 --checkpoints-per-session 1 \
   --decode-checkpoint-tokens 0 --pin-weights off
 
 # 32 GB: Qwen3.6 Q4_K_M, or Gemma 4 UD-Q5_K_M with
@@ -294,6 +326,8 @@ instance lock before mapping weights.
   (105.5 GB), made by `tools/convert/convert_qwen38_flash_next.py`
   ([format](docs/qwen38-flash-next-checkpoint-format.md)), and antirez's Q2
   GGUF for 64 GB machines ([docs/qwen38-q2.md](docs/qwen38-q2.md)).
+- **Qwen3.5-4B / 9B**: dense Gated DeltaNet and gated attention models with
+  embedded MTP heads, served through the Qwen3.6 code for 16 GB machines.
 - **Qwen3.6-35B-A3B**: Gated DeltaNet and gated attention at 3:1, 256
   experts with 8 active and a gated shared expert, an MTP head loaded from
   ggml-org's separate MTP file.
@@ -306,6 +340,11 @@ instance lock before mapping weights.
   dense GeGLU MLP and 128 experts with 8 active in every layer; drafts from
   Gemma's own draft model, which reads the target's caches
   ([docs/gemma4.md](docs/gemma4.md)).
+- **Inkling 2 Mini**: 26.4B total / ~3.4B–5.4B active looped MoE (24 physical
+  layers with layers 6–17 looped 3× for 48 logical visits, 128 routed experts
+  with 8 active and SITU activation, relative-position attention with zero
+  sink, and causal short convolutions); optional GPU DSpark speculative
+  drafter ([docs/inkling2.md](docs/inkling2.md)).
 - **GLM 5.3 Flash**: KDA linear attention and DSA sparse attention at 3:1,
   288 experts with one shared, four hyper-connection streams and a built-in
   MTP block ([docs/glm53.md](docs/glm53.md)).
@@ -382,11 +421,12 @@ weights are ignored by default and take `LILY_MODEL_DIR_FLASH` (Qwen3.8-Flash-Ne
   implementation GLM 5.3 Flash and DeepSeek V4 Flash follow, the quantized
   GGUFs lily loads, and the official continuation fixtures lily is scored on.
 - **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT): the graphs
-  Qwen3.6, Agnes 3.0 Flash and Gemma 4 follow (and Gemma's draft loop), and
-  the reference their scores are checked against; **ggml** for the GGUF
-  block formats (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, Q2_K, IQ2_XXS, IQ2_S, IQ4_NL,
-  MXFP4), which lily's decoders reproduce bit for bit, and the reference
-  quantizers lily's converter ports.
+  Qwen3.6, Agnes 3.0 Flash, Gemma 4 and Inkling 2 Mini follow (plus Gemma's
+  draft loop and Inkling 2's DSpark drafter), and the reference Qwen3.6 and
+  Gemma 4 are scored against; **ggml** for the GGUF block formats (Q8_0, Q4_0,
+  Q4_K, Q5_K, Q6_K, Q2_K, Q2_0, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+  IQ4_NL, IQ4_XS, MXFP4, NVFP4), which lily's decoders reproduce bit for
+  bit, and the reference quantizers lily's converter ports.
 
 ## License
 
