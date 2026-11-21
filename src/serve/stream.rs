@@ -291,6 +291,17 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                         }
                         self.think_open_settled = true;
                     }
+                    if self.tool_grammar == ToolGrammar::Inkling2 && !self.raw {
+                        const TEXT_OPEN: &str = "<|message_model|><|content_text|>";
+                        if let Some(rest) = self.buf.strip_prefix(TEXT_OPEN) {
+                            self.buf = rest.to_string();
+                        } else if !self.phase_started
+                            && TEXT_OPEN.starts_with(&self.buf)
+                            && !final_flush
+                        {
+                            return events;
+                        }
+                    }
                     let tools_on = self.tools.is_some() && !self.raw;
                     let (tool_start, _) = self.tool_grammar.markers();
                     let tool_idx =
@@ -300,6 +311,19 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                         .iter()
                         .filter_map(|s| self.buf.find(s.as_str()))
                         .min();
+                    if self.tool_grammar == ToolGrammar::Inkling2 && !self.raw {
+                        if let Some(end_idx) = self.buf.find("<|end_message|>")
+                            && tool_idx.is_none_or(|t| end_idx < t)
+                            && stop_idx.is_none_or(|s| end_idx < s)
+                        {
+                            let before = self.buf[..end_idx].to_string();
+                            let rest =
+                                self.buf[end_idx + "<|end_message|>".len()..].to_string();
+                            self.emit_text(&mut events, &before, Phase::Content);
+                            self.buf = rest;
+                            continue;
+                        }
+                    }
                     if let Some(stop) = stop_idx
                         && tool_idx.is_none_or(|t| stop <= t)
                     {
@@ -330,6 +354,10 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                             let before = &self.buf[..self.buf.len() - partial];
                             hold = (partial + trailing_whitespace(before))
                                 .max(trailing_whitespace(&self.buf));
+                        }
+                        if self.tool_grammar == ToolGrammar::Inkling2 && !self.raw {
+                            hold = hold
+                                .max(partial_suffix_len(&self.buf, "<|end_message|>"));
                         }
                         let stop_hold = self
                             .stop_strings

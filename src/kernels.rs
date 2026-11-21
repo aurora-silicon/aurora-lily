@@ -4,13 +4,14 @@ use crate::metal::Param;
 use crate::tensor::Tensor;
 
 pub mod attention;
+pub mod deepseek4;
 pub mod elementwise;
 pub mod gdn;
 pub mod gemm;
-pub mod deepseek4;
 pub mod gemma4;
 pub mod glm53;
 pub mod hc;
+pub mod inkling2;
 pub mod moe;
 pub mod norm;
 pub mod ple;

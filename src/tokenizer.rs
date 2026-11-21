@@ -165,11 +165,27 @@ impl Tokenizer {
                 tokenizers::Tokenizer::from_bytes(gt::tokenizer_json(&g)?.as_bytes())
                     .map_err(|e| anyhow::anyhow!("{e}"))
                     .context("building the GGUF's tokenizer")?;
-            let mut t = Self::new(inner, &serde_json::Value::Null, gt::chat_template(&g)?)?;
+            let mut t =
+                Self::new(inner, &serde_json::Value::Null, gt::chat_template(&g)?)?;
             t.add_stop_tokens(&gt::stop_ids(&g)?);
             t.legacy_nothink_rewrite = false;
             t.tool_grammar = crate::serve::tools::ToolGrammar::Gemma;
             t.bos_token = Some("<bos>".to_string());
+            return Ok(t);
+        }
+        if g.architecture()? == crate::inkling2::config::ARCH_LOOP
+            || g.architecture()? == crate::inkling2::config::ARCH_PLAIN
+        {
+            use crate::inkling2::tokenizer as it;
+            let inner =
+                tokenizers::Tokenizer::from_bytes(it::tokenizer_json(&g)?.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .context("building the GGUF's tokenizer")?;
+            let mut t =
+                Self::new(inner, &serde_json::Value::Null, it::chat_template(&g)?)?;
+            t.add_stop_tokens(&it::stop_ids(&g)?);
+            t.legacy_nothink_rewrite = false;
+            t.tool_grammar = crate::serve::tools::ToolGrammar::Inkling2;
             return Ok(t);
         }
         let deepseek = g.architecture()? == crate::deepseek4::config::ARCH;

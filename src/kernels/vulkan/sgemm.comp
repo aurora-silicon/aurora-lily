@@ -16,6 +16,16 @@
     defined(KERNEL_sgemm_moe_iq4_nl)
 #define GLM53_EXT_TYPES
 #endif
+#if defined(KERNEL_sgemm_mxfp4) || defined(KERNEL_sgemm_nvfp4) || \
+    defined(KERNEL_sgemm_q2_0) || defined(KERNEL_sgemm_iq2_xs) || \
+    defined(KERNEL_sgemm_iq3_xxs) || defined(KERNEL_sgemm_iq1_s) || \
+    defined(KERNEL_sgemm_iq4_xs) || \
+    defined(KERNEL_sgemm_moe_mxfp4) || defined(KERNEL_sgemm_moe_nvfp4) || \
+    defined(KERNEL_sgemm_moe_q2_0) || defined(KERNEL_sgemm_moe_iq2_xs) || \
+    defined(KERNEL_sgemm_moe_iq3_xxs) || defined(KERNEL_sgemm_moe_iq1_s) || \
+    defined(KERNEL_sgemm_moe_iq4_xs)
+#define GLM53_INKLING_TYPES
+#endif
 #include "common.glsl"
 #include "glm53_quant.glsl"
 
@@ -35,6 +45,22 @@
 #define SG_TYPE GLM53_IQ2_S
 #elif defined(KERNEL_sgemm_iq2_xxs) || defined(KERNEL_sgemm_moe_iq2_xxs)
 #define SG_TYPE GLM53_IQ2_XXS
+#elif defined(KERNEL_sgemm_mxfp4) || defined(KERNEL_sgemm_moe_mxfp4)
+#define SG_TYPE GLM53_MXFP4
+#elif defined(KERNEL_sgemm_nvfp4) || defined(KERNEL_sgemm_moe_nvfp4)
+#define SG_TYPE GLM53_NVFP4
+#elif defined(KERNEL_sgemm_q2_0) || defined(KERNEL_sgemm_moe_q2_0)
+#define SG_TYPE GLM53_Q2_0
+#elif defined(KERNEL_sgemm_iq2_xs) || defined(KERNEL_sgemm_moe_iq2_xs)
+#define SG_TYPE GLM53_IQ2_XS
+#elif defined(KERNEL_sgemm_iq3_xxs) || defined(KERNEL_sgemm_moe_iq3_xxs)
+#define SG_TYPE GLM53_IQ3_XXS
+#elif defined(KERNEL_sgemm_iq1_s) || defined(KERNEL_sgemm_moe_iq1_s)
+#define SG_TYPE GLM53_IQ1_S
+#elif defined(KERNEL_sgemm_iq4_xs) || defined(KERNEL_sgemm_moe_iq4_xs)
+#define SG_TYPE GLM53_IQ4_XS
+#elif defined(KERNEL_sgemm_bf16) || defined(KERNEL_sgemm_moe_bf16)
+#define SG_TYPE GLM53_BF16
 #elif defined(KERNEL_sgemm_f16)
 #define SG_TYPE GLM53_F16
 #elif defined(KERNEL_sgemm_f32)
@@ -43,7 +69,11 @@
 
 #if defined(KERNEL_sgemm_moe_iq2_xxs) || defined(KERNEL_sgemm_moe_iq2_s) || \
     defined(KERNEL_sgemm_moe_q5_k) || defined(KERNEL_sgemm_moe_iq4_nl) || \
-    defined(KERNEL_sgemm_moe_q8_0)
+    defined(KERNEL_sgemm_moe_q8_0) || defined(KERNEL_sgemm_moe_bf16) || \
+    defined(KERNEL_sgemm_moe_mxfp4) || defined(KERNEL_sgemm_moe_nvfp4) || \
+    defined(KERNEL_sgemm_moe_q2_0) || defined(KERNEL_sgemm_moe_iq2_xs) || \
+    defined(KERNEL_sgemm_moe_iq3_xxs) || defined(KERNEL_sgemm_moe_iq1_s) || \
+    defined(KERNEL_sgemm_moe_iq4_xs)
 #define SG_MOE
 #endif
 

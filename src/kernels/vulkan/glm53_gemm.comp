@@ -22,6 +22,12 @@
     defined(KERNEL_glm53_gemm_q6_k_bx)
 #define GLM53_EXT_TYPES
 #endif
+#if defined(KERNEL_glm53_gemm_mxfp4) || defined(KERNEL_glm53_gemm_nvfp4) || \
+    defined(KERNEL_glm53_gemm_q2_0) || defined(KERNEL_glm53_gemm_iq2_xs) || \
+    defined(KERNEL_glm53_gemm_iq3_xxs) || defined(KERNEL_glm53_gemm_iq1_s) || \
+    defined(KERNEL_glm53_gemm_iq4_xs)
+#define GLM53_INKLING_TYPES
+#endif
 #include "common.glsl"
 #include "glm53_quant.glsl"
 #include "matmul.glsl"
@@ -124,7 +130,11 @@ uint glm53_bf16_bits(float f) {
 // and Q6_K, which decode their 8 directly.
 #if defined(KERNEL_glm53_gemm_q4_0) || defined(KERNEL_glm53_gemm_q5_k) || \
     defined(KERNEL_glm53_gemm_q6_k) || defined(KERNEL_glm53_gemm_iq4_nl) || \
-    defined(KERNEL_glm53_gemm_iq2_s)
+    defined(KERNEL_glm53_gemm_iq2_s) || \
+    defined(KERNEL_glm53_gemm_mxfp4) || defined(KERNEL_glm53_gemm_nvfp4) || \
+    defined(KERNEL_glm53_gemm_q2_0) || defined(KERNEL_glm53_gemm_iq2_xs) || \
+    defined(KERNEL_glm53_gemm_iq3_xxs) || defined(KERNEL_glm53_gemm_iq1_s) || \
+    defined(KERNEL_glm53_gemm_iq4_xs)
 #define GEMM_GENERIC
 #endif
 
@@ -179,6 +189,20 @@ uint gm_round_w(float f) { return floatBitsToUint(f) + 0x8000u; }
 #define GEMM_TYPE GLM53_IQ4_NL
 #elif defined(KERNEL_glm53_gemm_iq2_s)
 #define GEMM_TYPE GLM53_IQ2_S
+#elif defined(KERNEL_glm53_gemm_mxfp4)
+#define GEMM_TYPE GLM53_MXFP4
+#elif defined(KERNEL_glm53_gemm_nvfp4)
+#define GEMM_TYPE GLM53_NVFP4
+#elif defined(KERNEL_glm53_gemm_q2_0)
+#define GEMM_TYPE GLM53_Q2_0
+#elif defined(KERNEL_glm53_gemm_iq2_xs)
+#define GEMM_TYPE GLM53_IQ2_XS
+#elif defined(KERNEL_glm53_gemm_iq3_xxs)
+#define GEMM_TYPE GLM53_IQ3_XXS
+#elif defined(KERNEL_glm53_gemm_iq1_s)
+#define GEMM_TYPE GLM53_IQ1_S
+#elif defined(KERNEL_glm53_gemm_iq4_xs)
+#define GEMM_TYPE GLM53_IQ4_XS
 #elif defined(KERNEL_glm53_gemm_q4_k)
 #define GEMM_TYPE GLM53_Q4_K
 #elif defined(KERNEL_glm53_gemm_bf16)

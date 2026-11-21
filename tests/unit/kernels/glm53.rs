@@ -48,10 +48,21 @@ fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
                 let v = half::f16::from_f32(rng.gen_range(-0.1..0.1));
                 blk.copy_from_slice(&v.to_bits().to_le_bytes());
             }
-            GgmlType::I32 | GgmlType::Mxfp4 => unreachable!(),
-            GgmlType::Q4_0 | GgmlType::Iq4Nl | GgmlType::Iq2S => {
-                put_f16(blk, 0, rng.gen_range(0.001..0.01))
+            GgmlType::I32 => unreachable!(),
+            GgmlType::Mxfp4 => blk[0] = rng.gen_range(118..124),
+            GgmlType::Nvfp4 => {
+                for b in &mut blk[..4] {
+                    *b = rng.gen_range(16..64);
+                }
             }
+            GgmlType::Q2_0
+            | GgmlType::Iq2Xs
+            | GgmlType::Iq3Xxs
+            | GgmlType::Iq1S
+            | GgmlType::Iq4Xs
+            | GgmlType::Q4_0
+            | GgmlType::Iq4Nl
+            | GgmlType::Iq2S => put_f16(blk, 0, rng.gen_range(0.001..0.01)),
             GgmlType::Q5K => {
                 put_f16(blk, 0, rng.gen_range(0.001..0.01));
                 put_f16(blk, 2, rng.gen_range(0.001..0.01));
@@ -60,6 +71,67 @@ fn random_blocks(rng: &mut StdRng, ty: GgmlType, values: usize) -> Vec<u8> {
         }
     }
     b
+}
+
+#[test]
+fn gemv_and_gemm_match_cpu_for_inkling2_types() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(45);
+    for ty in [
+        GgmlType::Mxfp4,
+        GgmlType::Nvfp4,
+        GgmlType::Q2_0,
+        GgmlType::Iq2Xs,
+        GgmlType::Iq3Xxs,
+        GgmlType::Iq1S,
+        GgmlType::Iq4Xs,
+        GgmlType::Bf16,
+    ] {
+        for (cols, rows) in [(2304usize, 72usize), (1152, 64)] {
+            if !cols.is_multiple_of(ty.block_values()) {
+                continue;
+            }
+            let raw = random_blocks(&mut rng, ty, rows * cols);
+            let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+            let cpu = mat(ty, &raw, rows, cols);
+            for m in 1..=GEMV_MAX_ROWS {
+                let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+                let tx = tensor(&ctx, &x);
+                let y = zeros(&ctx, m * rows);
+                run(&ctx, |p| gemv(&ctx, p, &w, &tx, &y, m).unwrap());
+                let expected: Vec<f32> =
+                    (0..m).flat_map(|i| cpu.mv(&x[i * cols..(i + 1) * cols])).collect();
+                assert_close(&y.to_f32().unwrap(), &expected, 1e-4, 1e-4);
+            }
+            if cols.is_multiple_of(64) {
+                let m = 37;
+                let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+                let tx = tensor(&ctx, &x);
+                let y = zeros(&ctx, m * rows);
+                run(&ctx, |p| gemm(&ctx, p, &w, &tx, &y, m).unwrap());
+                let expected: Vec<f32> = if ctx.matrix_units() {
+                    let bf = |v: f32| half::bf16::from_f32(v).to_f32();
+                    let bfw =
+                        |v: f32| f32::from_bits((v.to_bits() + 0x8000) & 0xffff_0000);
+                    let xbf: Vec<f32> = x.iter().map(|&v| bf(v)).collect();
+                    let wbf: Vec<f32> = cpu.w.iter().map(|&v| bfw(v)).collect();
+                    let wbf_ref = wbf.as_slice();
+                    (0..m)
+                        .flat_map(|i| {
+                            let xr = &xbf[i * cols..(i + 1) * cols];
+                            (0..rows).map(move |r| {
+                                let wr = &wbf_ref[r * cols..(r + 1) * cols];
+                                wr.iter().zip(xr).map(|(&a, &b)| a * b).sum::<f32>()
+                            })
+                        })
+                        .collect()
+                } else {
+                    (0..m).flat_map(|i| cpu.mv(&x[i * cols..(i + 1) * cols])).collect()
+                };
+                assert_close(&y.to_f32().unwrap(), &expected, 1e-3, 1e-3);
+            }
+        }
+    }
 }
 
 /// Gemma 4's block types through the GEMV (every row count) and the
@@ -102,11 +174,8 @@ fn gemv_and_gemm_match_cpu_for_gemma4_types() {
                 // activations to nearest even.
                 let bf = |v: f32| half::bf16::from_f32(v).to_f32();
                 let bfw = |v: f32| f32::from_bits((v.to_bits() + 0x8000) & 0xffff_0000);
-                let wb = r::Mat {
-                    rows,
-                    cols,
-                    w: cpu.w.iter().map(|&v| bfw(v)).collect(),
-                };
+                let wb =
+                    r::Mat { rows, cols, w: cpu.w.iter().map(|&v| bfw(v)).collect() };
                 let xb: Vec<f32> = x.iter().map(|&v| bf(v)).collect();
                 let expected: Vec<f32> =
                     (0..m).flat_map(|i| wb.mv(&xb[i * cols..(i + 1) * cols])).collect();
@@ -224,7 +293,8 @@ fn moe_xh_matches_f32_kernel() {
     let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
     let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
-    let sel: Vec<u32> = (0..m * used).map(|s| ((s * 7 + s / used) % experts) as u32).collect();
+    let sel: Vec<u32> =
+        (0..m * used).map(|s| ((s * 7 + s / used) % experts) as u32).collect();
     let tsel =
         Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
             .unwrap();
@@ -232,7 +302,8 @@ fn moe_xh_matches_f32_kernel() {
     let (mid, mid_h) = (zeros(&ctx, m * used * ff), zeros(&ctx, m * used * ff));
     let xh = Tensor::zeros(&ctx, &[m * hidden], DType::F16).unwrap();
     run(&ctx, |p| {
-        moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid, m, used, 10.0).unwrap();
+        moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid, m, used, 10.0)
+            .unwrap();
         crate::kernels::deepseek4::x_f16_iq2(&ctx, p, &x, &xh, m, hidden).unwrap();
         p.memory_barrier().unwrap();
         moe_gate_up_xh(&ctx, p, &gw, &uw, ff, &xh, &tsel, &tw, &mid_h, m, used, 10.0)
@@ -356,7 +427,12 @@ fn gemv_r2_matches_gemv() {
         (w, mat(GgmlType::Q8_0, &raw, rows, cols))
     };
     // Both kernels' outputs (`y_old`, `y_new`) of weight `w` against f64.
-    let check = |w: &r::Mat, x: &[f32], m: usize, l: GemvLayout, y_old: &Tensor, y_new: &Tensor| {
+    let check = |w: &r::Mat,
+                 x: &[f32],
+                 m: usize,
+                 l: GemvLayout,
+                 y_old: &Tensor,
+                 y_new: &Tensor| {
         let stride = if l.y_row_stride == 0 { w.rows } else { l.y_row_stride };
         let (yo, yn) = (y_old.to_f32().unwrap(), y_new.to_f32().unwrap());
         let (mut e_old, mut e_new, mut norm) = (0f64, 0f64, 0f64);
@@ -369,17 +445,27 @@ fn gemv_r2_matches_gemv() {
                     sum += t;
                     mag += t.abs();
                 }
-                let (o, nw) = (f64::from(yo[i * stride + n]), f64::from(yn[i * stride + n]));
+                let (o, nw) =
+                    (f64::from(yo[i * stride + n]), f64::from(yn[i * stride + n]));
                 let bound = mag * 2f64.powi(-20);
-                assert!((o - sum).abs() <= bound, "old ({i}, {n}): {o} vs {sum} (bound {bound})");
-                assert!((nw - sum).abs() <= bound, "new ({i}, {n}): {nw} vs {sum} (bound {bound})");
+                assert!(
+                    (o - sum).abs() <= bound,
+                    "old ({i}, {n}): {o} vs {sum} (bound {bound})"
+                );
+                assert!(
+                    (nw - sum).abs() <= bound,
+                    "new ({i}, {n}): {nw} vs {sum} (bound {bound})"
+                );
                 e_old += (o - sum).powi(2);
                 e_new += (nw - sum).powi(2);
                 norm += sum * sum;
             }
         }
         let (e_old, e_new) = ((e_old / norm).sqrt(), (e_new / norm).sqrt());
-        assert!(e_new <= 1.5 * e_old + 1e-12, "relative L2: new {e_new:e}, old {e_old:e}");
+        assert!(
+            e_new <= 1.5 * e_old + 1e-12,
+            "relative L2: new {e_new:e}, old {e_old:e}"
+        );
     };
     let sets: Vec<Vec<(QWeight, r::Mat)>> = vec![
         vec![mk(&mut rng, 96, true), mk(&mut rng, 37, false)],
@@ -393,14 +479,17 @@ fn gemv_r2_matches_gemv() {
                 .iter()
                 .map(|(w, _)| (zeros(&ctx, m * w.rows), zeros(&ctx, m * w.rows)))
                 .collect();
-            let a: Vec<(&QWeight, &Tensor)> = ws.iter().zip(&ys).map(|((w, _), y)| (w, &y.0)).collect();
-            let b: Vec<(&QWeight, &Tensor)> = ws.iter().zip(&ys).map(|((w, _), y)| (w, &y.1)).collect();
+            let a: Vec<(&QWeight, &Tensor)> =
+                ws.iter().zip(&ys).map(|((w, _), y)| (w, &y.0)).collect();
+            let b: Vec<(&QWeight, &Tensor)> =
+                ws.iter().zip(&ys).map(|((w, _), y)| (w, &y.1)).collect();
             run(&ctx, |p| {
                 gemv_sets(&ctx, p, &a, &tx, m).unwrap();
                 gemv_sets_r2(&ctx, p, &b, &tx, m).unwrap();
             });
             for ((w, cpu), (y, z)) in ws.iter().zip(&ys) {
-                let l = GemvLayout { x_group: w.rows, x_row_stride: cols, y_row_stride: 0 };
+                let l =
+                    GemvLayout { x_group: w.rows, x_row_stride: cols, y_row_stride: 0 };
                 check(cpu, &x, m, l, y, z);
             }
         }
@@ -424,7 +513,11 @@ fn gemv_r2_matches_gemv() {
     let m = 6;
     let x = f32s(&mut rng, m * groups * cols, -2.0, 2.0);
     let tx = tensor(&ctx, &x);
-    let l = GemvLayout { x_group: per, x_row_stride: groups * cols, y_row_stride: groups * per };
+    let l = GemvLayout {
+        x_group: per,
+        x_row_stride: groups * cols,
+        y_row_stride: groups * per,
+    };
     let (y, z) = (zeros(&ctx, m * groups * per), zeros(&ctx, m * groups * per));
     run(&ctx, |p| {
         gemv_with(&ctx, p, &wg, &tx, &y, m, l).unwrap();
@@ -2203,7 +2296,8 @@ fn moe_timing() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(16);
-    let used: usize = std::env::var("LILY_MOE_USED").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let used: usize =
+        std::env::var("LILY_MOE_USED").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let (experts, hidden, ff) = (16, 4096, 2048);
     let mk = |rng: &mut StdRng, ty, cols, rows| {
         let raw = random_blocks(rng, ty, rows * cols);
@@ -2227,7 +2321,9 @@ fn moe_timing() {
     let mid = zeros(&ctx, used * ff);
     let out = zeros(&ctx, hidden);
     let xh = Tensor::zeros(&ctx, &[hidden], DType::F16).unwrap();
-    run(&ctx, |p| crate::kernels::deepseek4::x_f16_iq2(&ctx, p, &x, &xh, 1, hidden).unwrap());
+    run(&ctx, |p| {
+        crate::kernels::deepseek4::x_f16_iq2(&ctx, p, &x, &xh, 1, hidden).unwrap()
+    });
     for (label, part) in [("gate_up", 0), ("down", 1), ("gate_up f16 x", 2)] {
         let mut best = f64::MAX;
         for _ in 0..5 {
@@ -2239,8 +2335,10 @@ fn moe_timing() {
                         &ctx, &pass, g, u, ff, &x, &tsel, &tw, &mid, 1, used, 10.0,
                     )
                     .unwrap(),
-                    1 => moe_down(&ctx, &pass, d, hidden, &mid, &tsel, None, &out, 1, used)
-                        .unwrap(),
+                    1 => moe_down(
+                        &ctx, &pass, d, hidden, &mid, &tsel, None, &out, 1, used,
+                    )
+                    .unwrap(),
                     _ => moe_gate_up_xh(
                         &ctx, &pass, g, u, ff, &xh, &tsel, &tw, &mid, 1, used, 10.0,
                     )
@@ -2251,7 +2349,8 @@ fn moe_timing() {
             pass.commit_wait().unwrap();
             best = best.min(t.elapsed().as_secs_f64());
         }
-        let bytes = if part % 2 == 0 { 2 * used * ff * 1056 } else { used * hidden * 672 };
+        let bytes =
+            if part % 2 == 0 { 2 * used * ff * 1056 } else { used * hidden * 672 };
         let per = best / repeat as f64;
         println!(
             "moe {label:24} {:8.1} us  {:6.1} GB/s",
@@ -2649,7 +2748,8 @@ fn gemm_bx_split_groups_match_batched() {
     let mut rng = StdRng::seed_from_u64(83);
     let (groups, per, cols, m) = (8, 128, 256, 300);
     let raw = random_blocks(&mut rng, GgmlType::Q8_0, groups * per * cols);
-    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, groups * per).unwrap();
+    let w =
+        QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, groups * per).unwrap();
     let x = tensor(&ctx, &f32s(&mut rng, m * groups * cols, -1.0, 1.0));
     let xb = Tensor::zeros(&ctx, &[m * groups * cols], DType::BF16).unwrap();
     let (y, ys) = (zeros(&ctx, m * groups * per), zeros(&ctx, m * groups * per));
@@ -3366,29 +3466,62 @@ fn deepseek4_q2_k_gate_up_scratch() {
     let uw = mk(&mut rng, hidden, experts * ff);
     let dw = mk(&mut rng, ff, experts * hidden);
     let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
-    let sel: Vec<u32> = (0..m * used).map(|s| ((s * 5 + s / used) % experts) as u32).collect();
+    let sel: Vec<u32> =
+        (0..m * used).map(|s| ((s * 5 + s / used) % experts) as u32).collect();
     let tsel =
         Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
             .unwrap();
     let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
     let dims = (used, experts, ff, hidden);
-    let gs = moe_group_scratch(&ctx, m, dims, separate_gate_up([GgmlType::Q2K])).unwrap();
+    let gs =
+        moe_group_scratch(&ctx, m, dims, separate_gate_up([GgmlType::Q2K])).unwrap();
     let compact = moe_group_scratch(&ctx, m, dims, false).unwrap();
     let (out, refused) = (zeros(&ctx, m * hidden), zeros(&ctx, m * hidden));
     let (mid, want) = (zeros(&ctx, m * used * ff), zeros(&ctx, m * hidden));
     let mut err = None;
     run(&ctx, |p| {
         moe_grouped_tiles(
-            &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m, used,
-            experts, 10.0, MoeTiles::R64,
+            &ctx,
+            p,
+            &gw,
+            &uw,
+            &dw,
+            ff,
+            hidden,
+            &x,
+            &tsel,
+            &tw,
+            &out,
+            &gs,
+            m,
+            used,
+            experts,
+            10.0,
+            MoeTiles::R64,
         )
         .unwrap();
         err = moe_grouped_tiles(
-            &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &refused, &compact, m,
-            used, experts, 10.0, MoeTiles::R64,
+            &ctx,
+            p,
+            &gw,
+            &uw,
+            &dw,
+            ff,
+            hidden,
+            &x,
+            &tsel,
+            &tw,
+            &refused,
+            &compact,
+            m,
+            used,
+            experts,
+            10.0,
+            MoeTiles::R64,
         )
         .err();
-        moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid, m, used, 10.0).unwrap();
+        moe_gate_up(&ctx, p, &gw, &uw, ff, &x, &tsel, &tw, &mid, m, used, 10.0)
+            .unwrap();
         p.memory_barrier().unwrap();
         moe_down(&ctx, p, &dw, hidden, &mid, &tsel, None, &want, m, used).unwrap();
     });
@@ -3794,7 +3927,11 @@ fn ds4_q_b_against_f64() {
                 (0..m * cols)
                     .map(|i| {
                         let sign = if i % 4 == 0 { 1.0 } else { -1.0 };
-                        if i % 2 == 0 { sign * rng.gen_range(20.0..30.0) } else { rng.gen_range(-0.01..0.01) }
+                        if i % 2 == 0 {
+                            sign * rng.gen_range(20.0..30.0)
+                        } else {
+                            rng.gen_range(-0.01..0.01)
+                        }
                     })
                     .collect(),
             ),
@@ -3805,18 +3942,23 @@ fn ds4_q_b_against_f64() {
                 let row = &raw[n * t.row_bytes()..(n + 1) * t.row_bytes()];
                 for b in 0..cols / 32 {
                     let blk = &row[b * 34..(b + 1) * 34];
-                    let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f64();
+                    let d =
+                        f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f64();
                     for i in 0..m {
                         let xs = &x[i * cols + b * 32..i * cols + b * 32 + 32];
-                        let s: f64 =
-                            blk[2..].iter().zip(xs).map(|(&q, &v)| f64::from(q as i8) * f64::from(v)).sum();
+                        let s: f64 = blk[2..]
+                            .iter()
+                            .zip(xs)
+                            .map(|(&q, &v)| f64::from(q as i8) * f64::from(v))
+                            .sum();
                         want[i * rows + n] += d * s;
                     }
                 }
             }
             let tx = tensor(&ctx, &x);
             for rows_in in [1usize, m] {
-                let (old, new) = (zeros(&ctx, rows_in * rows), zeros(&ctx, rows_in * rows));
+                let (old, new) =
+                    (zeros(&ctx, rows_in * rows), zeros(&ctx, rows_in * rows));
                 run(&ctx, |p| {
                     gemv_sets(&ctx, p, &[(&w, &old)], &tx, rows_in).unwrap();
                     gemv_sets_r2(&ctx, p, &[(&w, &new)], &tx, rows_in).unwrap();
@@ -3837,7 +3979,10 @@ fn ds4_q_b_against_f64() {
                 println!(
                     "q_b layer {layer:2} {label:10} rows {rows_in}: rel L2 old {eo:.3e} new {en:.3e}, max abs old {mo:.3e} new {mn:.3e}"
                 );
-                assert!(en <= 1.5 * eo + 1e-9, "layer {layer} {label} rows {rows_in}: {en} vs {eo}");
+                assert!(
+                    en <= 1.5 * eo + 1e-9,
+                    "layer {layer} {label} rows {rows_in}: {en} vs {eo}"
+                );
             }
         }
     }

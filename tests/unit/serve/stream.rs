@@ -604,3 +604,72 @@ fn gemma_tool_call_block_is_a_call() {
     assert_eq!(calls[0].name, "get_weather");
     assert_eq!(calls[0].arguments, r#"{"city":"Paris"}"#);
 }
+
+#[test]
+fn inkling2_reasoning_followed_by_text_or_xml_tool_call() {
+    const TOK: &[&str] = &[
+        "<|message_model|><|content_thinking|>",
+        "Let me check.",
+        "<|end_message|>",
+        "<|message_model|><|content_text|>",
+        "Paris.",
+        "<|message_model|><|content_xml|>",
+        "<function=get_weather><parameter=city>Paris</parameter></function>",
+    ];
+    let tools = ToolSchema::from_request(&[serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+        }
+    })])
+    .unwrap();
+    let mut p = OutputParser::new(
+        detok(TOK),
+        ParserConfig {
+            thinking_open: true,
+            tools: Some(tools.clone()),
+            stop_strings: vec![],
+            raw: false,
+            tool_call_ends_thinking: false,
+        },
+    )
+    .with_tool_grammar(ToolGrammar::Inkling2);
+    let (r, c, calls) = text_of(&run(&mut p, &[0, 1, 2, 3, 4, 2]));
+    assert_eq!((r.as_str(), c.as_str()), ("Let me check.", "Paris."));
+    assert!(calls.is_empty());
+
+    let mut p = OutputParser::new(
+        detok(TOK),
+        ParserConfig {
+            thinking_open: true,
+            tools: Some(tools),
+            stop_strings: vec![],
+            raw: false,
+            tool_call_ends_thinking: false,
+        },
+    )
+    .with_tool_grammar(ToolGrammar::Inkling2);
+    let (r, c, calls) = text_of(&run(&mut p, &[0, 1, 2, 5, 6, 2]));
+    assert_eq!((r.as_str(), c.as_str()), ("Let me check.", ""));
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "get_weather");
+    assert_eq!(calls[0].arguments, r#"{"city":"Paris"}"#);
+
+    // User stop string before <|end_message|> takes precedence over message terminator.
+    const STOP_TOK: &[&str] = &["<|message_model|><|content_text|>", "answerSTOP<|end_message|>"];
+    let mut p = OutputParser::new(
+        detok(STOP_TOK),
+        ParserConfig {
+            thinking_open: false,
+            tools: None,
+            stop_strings: vec!["STOP".into()],
+            raw: false,
+            tool_call_ends_thinking: false,
+        },
+    )
+    .with_tool_grammar(ToolGrammar::Inkling2);
+    let (_, c, _) = text_of(&run(&mut p, &[0, 1]));
+    assert_eq!(c, "answer");
+    assert!(p.stopped);
+}

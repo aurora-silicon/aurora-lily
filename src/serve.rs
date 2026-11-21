@@ -1804,6 +1804,13 @@ fn gguf_config(path: &Path) -> Result<Value> {
         config["eos_token_id"] = serde_json::json!(stops);
         config["max_position_embeddings"] =
             serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
+    } else if arch == crate::inkling2::config::ARCH_LOOP
+        || arch == crate::inkling2::config::ARCH_PLAIN
+    {
+        let stops = crate::inkling2::tokenizer::stop_ids(&g)?;
+        config["eos_token_id"] = serde_json::json!(stops);
+        config["max_position_embeddings"] =
+            serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
     }
     if crate::qwen36::config::is_arch(&arch) {
         let stops = crate::qwen36::tokenizer::stop_ids(&g)?;
@@ -2027,12 +2034,16 @@ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
         crate::gemma4::config::ARCH => {
             run_with::<crate::gemma4::Gemma4Model>(model_dir, options, signals)
         }
+        crate::inkling2::config::ARCH_LOOP | crate::inkling2::config::ARCH_PLAIN => {
+            run_with::<crate::inkling2::Inkling2Model>(model_dir, options, signals)
+        }
         other => anyhow::bail!(
             "unsupported model_type {other:?}; lily serves qwen4_exp \
              (Qwen3.8-Flash-Next), a glm5-next GGUF (GLM 5.3 Flash), a \
              deepseek4 GGUF (DeepSeek V4 Flash), a qwen35moe GGUF \
-             (Qwen3.6-35B-A3B), a qwen35 GGUF (Agnes 3.0 Flash) and a \
-             gemma4 GGUF (Gemma 4 26B-A4B)"
+             (Qwen3.6-35B-A3B), a qwen35 GGUF (Agnes 3.0 Flash), a \
+             gemma4 GGUF (Gemma 4 26B-A4B) and an inkling2_loop/inkling2 GGUF \
+             (Inkling 2 Mini)"
         ),
     }
 }

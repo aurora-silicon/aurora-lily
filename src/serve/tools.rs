@@ -96,6 +96,8 @@ pub enum ToolGrammar {
     /// `<tool_call|>`, strings quoted by `<|"|>` ([`parse_gemma_tool_call`]),
     /// its reasoning in `<|channel>thought\n...<channel|>`.
     Gemma,
+    /// Inkling 2's `<|message_model|><|content_thinking|>...<|end_message|><|message_model|><|content_text|>...<|end_message|>`.
+    Inkling2,
 }
 
 impl ToolGrammar {
@@ -105,6 +107,7 @@ impl ToolGrammar {
             Self::Qwen | Self::Glm => ("<tool_call>", "</tool_call>"),
             Self::Dsml => ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"),
             Self::Gemma => ("<|tool_call>", "<tool_call|>"),
+            Self::Inkling2 => ("<|message_model|><|content_xml|>", "<|end_message|>"),
         }
     }
 
@@ -112,6 +115,7 @@ impl ToolGrammar {
     pub fn think_end(self) -> &'static str {
         match self {
             Self::Gemma => "<channel|>",
+            Self::Inkling2 => "<|end_message|>",
             _ => "</think>",
         }
     }
@@ -121,6 +125,7 @@ impl ToolGrammar {
     pub fn think_open(self) -> Option<&'static str> {
         match self {
             Self::Gemma => Some("<|channel>thought"),
+            Self::Inkling2 => Some("<|message_model|><|content_thinking|>"),
             _ => None,
         }
     }
@@ -146,7 +151,7 @@ pub fn parse_tool_call_as(
     tools: &[ToolSchema],
 ) -> Result<ParsedToolCall> {
     match grammar {
-        ToolGrammar::Qwen => parse_tool_call(block, tools),
+        ToolGrammar::Qwen | ToolGrammar::Inkling2 => parse_tool_call(block, tools),
         ToolGrammar::Glm => parse_glm_tool_call(block, tools),
         ToolGrammar::Gemma => parse_gemma_tool_call(block, tools),
         ToolGrammar::Dsml => {
