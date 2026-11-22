@@ -32,9 +32,21 @@ pub fn tokenizer_json(g: &Gguf) -> Result<String> {
     )
 }
 
-/// The file's chat template without `{% generation %}` / `{% endgeneration %}` tags.
+/// The file's chat template without `{% generation %}` / `{% endgeneration %}`
+/// tags and with `enable_thinking: false` mapped to thinking effort `0` plus an
+/// open `<|message_model|><|content_text|>` generation prompt.
+///
+/// Inkling 2's GGUF template reads only `reasoning_effort` (defaulting to
+/// `0.9` when omitted) and ends the prompt without opening a model content
+/// block, so `--thinking false`, `enable_thinking: false`, and
+/// `reasoning_effort: "none"` would otherwise still emit a
+/// `<|content_thinking|>` block.
 pub fn chat_template(g: &Gguf) -> Result<String> {
-    let mut t = g.str("tokenizer.chat_template")?.to_string();
+    patch_chat_template(g.str("tokenizer.chat_template")?)
+}
+
+fn patch_chat_template(raw: &str) -> Result<String> {
+    let mut t = raw.to_string();
     for tag in ["generation", "endgeneration"] {
         for (open, close) in
             [("{%-", "-%}"), ("{%-", "%}"), ("{%", "-%}"), ("{%", "%}")]
@@ -43,6 +55,17 @@ pub fn chat_template(g: &Gguf) -> Result<String> {
         }
     }
     ensure!(!t.contains("generation %}"), "unhandled generation tag in the template");
+    if !t.contains("enable_thinking") {
+        const EFFORT_FALLBACK: &str = "{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}";
+        const EFFORT_WITH_THINKING: &str = "{%- set eff = 0.0 if enable_thinking is defined and not enable_thinking else (reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9) -%}";
+        const NOTHINK_GEN_PROMPT: &str = "{%- if add_generation_prompt is defined and add_generation_prompt and enable_thinking is defined and not enable_thinking -%}{{- \"<|message_model|><|content_text|>\" -}}{%- endif -%}";
+        ensure!(
+            t.contains(EFFORT_FALLBACK),
+            "Inkling 2 chat template lacks its reasoning_effort fallback"
+        );
+        t = t.replace(EFFORT_FALLBACK, EFFORT_WITH_THINKING);
+        t.push_str(NOTHINK_GEN_PROMPT);
+    }
     Ok(t)
 }
 
@@ -51,3 +74,7 @@ pub fn stop_ids(g: &Gguf) -> Result<Vec<u32>> {
     let c = super::config::Config::from_gguf(g)?;
     Ok(vec![c.eos, c.pad])
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/inkling2/tokenizer.rs"]
+mod tests;
