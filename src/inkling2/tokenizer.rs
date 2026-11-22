@@ -55,16 +55,17 @@ fn patch_chat_template(raw: &str) -> Result<String> {
         }
     }
     ensure!(!t.contains("generation %}"), "unhandled generation tag in the template");
-    if !t.contains("enable_thinking") {
-        const EFFORT_FALLBACK: &str = "{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}";
-        const EFFORT_WITH_THINKING: &str = "{%- set eff = 0.0 if enable_thinking is defined and not enable_thinking else (reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9) -%}";
-        const NOTHINK_GEN_PROMPT: &str = "{%- if add_generation_prompt is defined and add_generation_prompt and enable_thinking is defined and not enable_thinking -%}{{- \"<|message_model|><|content_text|>\" -}}{%- endif -%}";
-        ensure!(
-            t.contains(EFFORT_FALLBACK),
-            "Inkling 2 chat template lacks its reasoning_effort fallback"
-        );
+    const EFFORT_FALLBACK: &str = "{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}";
+    const EFFORT_WITH_THINKING: &str = "{%- set eff = 0.0 if enable_thinking is defined and not enable_thinking else (reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9) -%}";
+    const NOTHINK_GEN_PROMPT: &str = "{%- if add_generation_prompt is defined and add_generation_prompt and enable_thinking is defined and not enable_thinking -%}{{- \"<|message_model|><|content_text|>\" -}}{%- endif -%}";
+    if t.contains(EFFORT_FALLBACK) {
         t = t.replace(EFFORT_FALLBACK, EFFORT_WITH_THINKING);
         t.push_str(NOTHINK_GEN_PROMPT);
+    } else {
+        eprintln!(
+            "warning: Inkling 2 chat template lacks the expected reasoning_effort fallback; \
+             enable_thinking: false may not disable reasoning"
+        );
     }
     Ok(t)
 }

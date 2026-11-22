@@ -6,6 +6,7 @@ use super::patch_chat_template;
 /// Minimal extract of Inkling 2 Mini's GGUF `tokenizer.chat_template`
 /// covering `emit_thinking_effort()` and `{% generation %}` stripping.
 const INKLING2_TEMPLATE: &str = concat!(
+    r#"{# enable_thinking #}"#,
     r#"{%- set effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, "xhigh": 0.99, "max": 0.99} -%}"#,
     r#"{%- macro emit_thinking_effort() -%}"#,
     r#"{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}"#,
@@ -77,8 +78,12 @@ fn enable_thinking_false_sets_effort_zero_and_opens_text() {
 }
 
 #[test]
-fn patch_passes_through_existing_enable_thinking_and_rejects_unknown_shape() {
+fn patch_passes_through_unmatched_templates_after_stripping_generation_tags() {
     let already_wired = "{%- if enable_thinking -%}on{%- else -%}off{%- endif -%}";
     assert_eq!(patch_chat_template(already_wired).unwrap(), already_wired);
-    assert!(patch_chat_template("{{ messages }}").is_err());
+    assert_eq!(
+        patch_chat_template("{%- generation -%}{{ messages }}{%- endgeneration -%}")
+            .unwrap(),
+        "{{ messages }}"
+    );
 }
