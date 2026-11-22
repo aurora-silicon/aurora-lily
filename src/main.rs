@@ -1,6 +1,6 @@
 //! Lily's OpenAI-compatible API server.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use clap::parser::ValueSource;
@@ -9,7 +9,7 @@ use lily::engine::VisionMode;
 use lily::qwen4exp::NgramStorage;
 use lily::serve::api::{ThinkingBudgets, ThinkingDefaults};
 use lily::serve::dashboard::settings::FlagValue;
-use lily::serve::{SamplingOverrides, ServeOptions, parse_duration_secs};
+use lily::serve::{ApiKey, SamplingOverrides, ServeOptions, parse_duration_secs};
 
 /// The thinking budget by reasoning effort unless `--thinking-budget` says
 /// otherwise: on the 2026-10-07 agent replay (a 56K-token opencode turn at
@@ -42,9 +42,24 @@ struct Cli {
     #[arg(long)]
     model: PathBuf,
 
-    /// HTTP listen address.
+    /// HTTP listen address. An address that is not loopback needs
+    /// `--api-key-file`.
     #[arg(long, default_value = "127.0.0.1:8000")]
     bind: String,
+
+    /// A file that holds the bearer token the OpenAI routes require
+    /// (`Authorization: Bearer <key>`; `/health` stays open): its text
+    /// without the final line ending, printable ASCII without spaces. Keep
+    /// it readable by this account only. A key is required when `--bind`
+    /// is not a loopback address; optional on loopback, where the API
+    /// needs none.
+    #[arg(long, value_name = "PATH", conflicts_with = "api_key")]
+    api_key_file: Option<PathBuf>,
+
+    /// The bearer token itself. Other accounts of the machine can read a
+    /// process's command line: prefer `--api-key-file`.
+    #[arg(long, value_name = "KEY")]
+    api_key: Option<String>,
 
     /// Maximum prompt plus completion length per request. With the expert
     /// cache (a machine that cannot hold the checkpoint, or `--memory-limit-gb`)
@@ -394,6 +409,15 @@ fn default_disk_cache_dir() -> Result<PathBuf> {
     Ok(cache.join("lily").join("sessions"))
 }
 
+/// The API key from `--api-key-file` or, without one, `--api-key` (clap
+/// refuses both together).
+fn api_key(file: Option<&Path>, given: Option<String>) -> Result<Option<ApiKey>> {
+    match file {
+        Some(path) => ApiKey::from_file(path).map(Some),
+        None => Ok(given.map(ApiKey::new)),
+    }
+}
+
 /// Every argument of the command line as the dashboard's settings view
 /// shows it: the text given (a switch given without a value reads `true`)
 /// and clap's default, `--disk-cache-dir`'s computed one included.
@@ -404,6 +428,10 @@ fn flag_values(matches: &ArgMatches) -> Vec<FlagValue> {
             let name = arg.get_id().as_str();
             let given = (matches.value_source(name) == Some(ValueSource::CommandLine))
                 .then(|| {
+                    if name == "api_key" {
+                        // Never listed: the settings view shows it is set.
+                        return "(set)".to_owned();
+                    }
                     matches
                         .get_raw(name)
                         .and_then(|mut values| values.next())
@@ -500,6 +528,7 @@ fn run() -> Result<()> {
         stats_db: lily::serve::recorder::stats_db(cli.stats_db.as_deref())
             .map_err(anyhow::Error::msg)?,
         machine_stats: cli.machine_stats,
+        api_key: api_key(cli.api_key_file.as_deref(), cli.api_key)?,
     };
     lily::serve::run(&cli.model, options)
 }
@@ -592,5 +621,59 @@ mod tests {
         assert!(
             default("disk_cache_dir").is_some_and(|d| d.ends_with("lily/sessions"))
         );
+    }
+
+    /// The API key never reaches the settings listing, only that it is set.
+    #[test]
+    fn flag_values_never_carry_the_api_key() {
+        let matches = Cli::command()
+            .try_get_matches_from(["lily", "--model", "m", "--api-key", "s3cret-key"])
+            .expect("parse");
+        let flags = flag_values(&matches);
+        let key = flags.iter().find(|f| f.name == "api_key").expect("api_key");
+        assert_eq!(key.given.as_deref(), Some("(set)"));
+        assert!(!format!("{flags:?}").contains("s3cret-key"));
+    }
+
+    /// `--api-key-file` gives the key its file holds, and the settings
+    /// listing names the file, never what is in it; with `--api-key` as
+    /// well the command line is refused.
+    #[test]
+    fn the_api_key_comes_from_its_file() {
+        let file = std::env::temp_dir()
+            .join(format!("lily-main-api-key-{}", std::process::id()));
+        std::fs::write(&file, "s3cret-key\n").expect("write");
+        let path = file.to_str().expect("utf-8");
+        let matches = Cli::command()
+            .try_get_matches_from(["lily", "--model", "m", "--api-key-file", path])
+            .expect("parse");
+        let cli = Cli::from_arg_matches(&matches).expect("cli");
+        let key = api_key(cli.api_key_file.as_deref(), cli.api_key)
+            .expect("read")
+            .expect("a key");
+        assert_eq!(key, ApiKey::new("s3cret-key".to_owned()));
+        let flags = flag_values(&matches);
+        let flag = |name: &str| flags.iter().find(|f| f.name == name).expect(name);
+        assert_eq!(flag("api_key_file").given.as_deref(), Some(path));
+        assert_eq!(flag("api_key").given, None);
+        assert!(!format!("{flags:?}").contains("s3cret-key"));
+        // Neither flag: no key. The flag alone: the key as given.
+        assert_eq!(api_key(None, None).expect("none"), None);
+        assert_eq!(
+            api_key(None, Some("k3y".to_owned())).expect("given"),
+            Some(ApiKey::new("k3y".to_owned()))
+        );
+        let both = Cli::command().try_get_matches_from([
+            "lily",
+            "--model",
+            "m",
+            "--api-key-file",
+            path,
+            "--api-key",
+            "k3y",
+        ]);
+        assert!(both.is_err(), "both flags together are refused");
+        std::fs::remove_file(&file).expect("remove");
+        assert!(api_key(Some(&file), None).is_err(), "a missing file is an error");
     }
 }

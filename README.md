@@ -310,7 +310,9 @@ models and support files are found beside the model):
   --max-seq 65536 --cache-bytes 9G --pin-weights off --mtp-drafts 5 --max-batch 1
 ```
 
-The server listens on `127.0.0.1:8000` unless `--bind` says otherwise. Only
+The server listens on `127.0.0.1:8000` unless `--bind` says otherwise; an
+address that is not loopback needs `--api-key-file` ([docs/server.md](docs/server.md),
+"Who may call it"). Only
 one model fits in 128 GB at a time; every loader takes a machine-wide
 instance lock before mapping weights.
 

@@ -30,6 +30,14 @@
 //! never wakes the engine. The settings it can change without a restart
 //! live in one shared [`runtime::RuntimeSettings`], which each consumer
 //! reads when it needs a value (docs/server.md, "Runtime settings").
+//!
+//! The OpenAI routes pass [`api_guard`] before anything reaches the engine:
+//! on a loopback listener the `Host` must be lily's own address (or the
+//! request carry the API key), a POST must say `Content-Type:
+//! application/json`, an `Origin` must be lily's own (or, again, the request
+//! carry the key), and with an API key
+//! (required for a bind that is not loopback) every route but `/health`
+//! needs `Authorization: Bearer <key>`.
 
 pub mod api;
 pub mod batch;
@@ -344,6 +352,56 @@ pub struct ServeOptions {
     /// Whether to sample the machine's power, GPU and temperatures
     /// (`--machine-stats`).
     pub machine_stats: machine::MachineStats,
+    /// The bearer token the OpenAI routes require (`--api-key-file` or
+    /// `--api-key`; `None`: none, allowed on a loopback bind only,
+    /// [`check_bind_auth`]).
+    pub api_key: Option<ApiKey>,
+}
+
+/// The API key. Its `Debug` says only that there is one, so the options
+/// that hold it can be printed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKey(String);
+
+impl ApiKey {
+    /// `key` as given on the command line (`--api-key`).
+    pub fn new(key: String) -> Self {
+        Self(key)
+    }
+
+    /// The key in the file at `path` (`--api-key-file`): the file's text
+    /// without the line ending it may close with. An empty file (or one
+    /// that holds only a line ending) is an error, as is one that cannot
+    /// be read; what the key may hold is [`check_bind_auth`]'s to say.
+    pub fn from_file(path: &std::path::Path) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --api-key-file {}", path.display()))?;
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            eprintln!(
+                "warning: --api-key-file {} is accessible to its group or to others \
+                 (mode {:o}); chmod 600 keeps the key to this account",
+                path.display(),
+                meta.permissions().mode() & 0o777
+            );
+        }
+        let key = text.strip_suffix('\n').unwrap_or(&text);
+        let key = key.strip_suffix('\r').unwrap_or(key);
+        ensure!(!key.is_empty(), "--api-key-file {} is empty", path.display());
+        Ok(Self(key.to_owned()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKey(set)")
+    }
 }
 
 // --- lifecycle ---------------------------------------------------------------
@@ -2080,6 +2138,10 @@ struct Front {
     model_id: &'static str,
     /// The dashboard's routes, answered from what the engine publishes.
     dashboard: dashboard::Dashboard,
+    /// The listener is bound to a loopback address ([`api_guard`]).
+    loopback_listener: bool,
+    /// `--api-key-file` or `--api-key` ([`api_guard`]).
+    api_key: Option<ApiKey>,
 }
 
 /// The engine thread's body: the first load, then requests until a stop is
@@ -2453,6 +2515,7 @@ fn run_with<M: LanguageModel + 'static>(
         .with_context(|| {
             format!("bind address {} resolved to nothing", options.bind)
         })?;
+    check_bind_auth(address, options.api_key.as_ref().map(ApiKey::as_str))?;
     let mut generator = Generator::from_model_dir(model_dir)?;
     generator.add_stop_tokens(&checkpoint_eos_ids(model_dir)?);
     let generator = Arc::new(generator);
@@ -2642,6 +2705,8 @@ fn run_with<M: LanguageModel + 'static>(
         connections: connections.clone(),
         model_id: model_id::<M>(),
         dashboard,
+        loopback_listener: address.ip().to_canonical().is_loopback(),
+        api_key: options.api_key.clone(),
     });
     for stream in listener.incoming() {
         if shutdown.requested() {
@@ -2738,6 +2803,19 @@ fn handle(front: &Front, mut stream: TcpStream) {
             eprintln!("response error: {error:#}");
         }
         return;
+    }
+    if is_api_route(&path) {
+        let local = stream.local_addr().ok();
+        let gate = ApiGate {
+            loopback_listener: front.loopback_listener,
+            local,
+            port: local.map_or(0, |a| a.port()),
+            api_key: front.api_key.as_ref().map(ApiKey::as_str),
+        };
+        if let Err((status, why)) = api_guard(&request, &path, &gate) {
+            refuse(stream, &what, status, "invalid_request_error", why);
+            return;
+        }
     }
     match (request.method.as_str(), path.as_str()) {
         ("GET", "/health") => {
@@ -2908,6 +2986,130 @@ fn handle(front: &Front, mut stream: TcpStream) {
         }
         _ => refuse(stream, &what, 404, "invalid_request_error", "not found"),
     }
+}
+
+// --- the OpenAI routes' guard -------------------------------------------------
+
+/// The routes [`api_guard`] covers: everything [`handle`] answers itself.
+fn is_api_route(path: &str) -> bool {
+    matches!(
+        path,
+        "/health"
+            | "/v1/models"
+            | "/v1/timings"
+            | "/v1/chat/completions"
+            | "/v1/completions"
+    )
+}
+
+/// What [`api_guard`] judges a request by besides the request itself. Not
+/// `Debug`: it holds the key.
+#[derive(Clone, Copy)]
+struct ApiGate<'a> {
+    /// The listener is bound to a loopback address: clients reach it under
+    /// lily's own address, so a `Host` that names anything else is not a
+    /// request addressed to lily.
+    loopback_listener: bool,
+    /// The address the connection was accepted on (the listener's own;
+    /// `None` when the socket could not say).
+    local: Option<SocketAddr>,
+    /// The port lily listens on (its own `Host` and `Origin` carry it).
+    port: u16,
+    /// `--api-key-file` or `--api-key`.
+    api_key: Option<&'a str>,
+}
+
+/// Whether `host` (the `Host` header) names a loopback listener's own
+/// address: what the dashboard takes ([`dashboard::host_allowed`]:
+/// `127.0.0.1`, `localhost` and `[::1]` with the port) or the address the
+/// listener is bound to (`--bind 127.0.0.2:8000`), under the dashboard's
+/// rule for the port ([`dashboard::names_host`]).
+fn api_host_allowed(host: Option<&str>, gate: &ApiGate<'_>) -> bool {
+    if dashboard::host_allowed(host, gate.port) {
+        return true;
+    }
+    let Some(host) = host.map(str::trim) else { return false };
+    let bound = gate.local.map(|local| match local.ip().to_canonical() {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    });
+    bound.is_some_and(|bound| dashboard::names_host(host, &bound, gate.port))
+}
+
+/// The OpenAI routes' guard, the dashboard's checks
+/// ([`dashboard::host_allowed`], [`dashboard::write_guard`],
+/// [`dashboard::origin_allowed`]) plus the API key: on a loopback listener
+/// the `Host` must be lily's own address ([`api_host_allowed`], 403) unless
+/// the request carries the API key (the `Host` test is for clients without
+/// a credential; one that holds the key may come through a forwarded port
+/// or a proxy under another name), an `Origin` must be lily's own (403)
+/// unless the request carries the API key (a browser attaches no bearer
+/// token by itself, so a page that sends the key was given it), a POST must
+/// be `Content-Type: application/json` (415; a browser sends that
+/// to another origin only after a CORS preflight, which lily never
+/// answers), and with an API key every route but `/health` needs
+/// `Authorization: Bearer <key>` (401). Returns the status and why.
+fn api_guard(
+    request: &http::Request,
+    path: &str,
+    gate: &ApiGate<'_>,
+) -> Result<(), (u16, &'static str)> {
+    let keyed = gate
+        .api_key
+        .is_some_and(|key| bearer_matches(request.header("Authorization"), key));
+    if gate.loopback_listener
+        && !keyed
+        && !api_host_allowed(request.header("Host"), gate)
+    {
+        return Err((403, "the API answers under its own loopback address only"));
+    }
+    if !keyed && !dashboard::origin_allowed(request.header("Origin"), gate.port) {
+        return Err((403, "requests from other origins are refused"));
+    }
+    if request.method == "POST"
+        && let Err(why) =
+            dashboard::write_guard(request.header("Content-Type"), None, gate.port)
+    {
+        return Err((415, why));
+    }
+    if gate.api_key.is_some() && path != "/health" && !keyed {
+        return Err((401, "missing or wrong API key (Authorization: Bearer <key>)"));
+    }
+    Ok(())
+}
+
+/// Whether `authorization` is `Bearer <key>`, compared in time that does
+/// not depend on where the two differ.
+fn bearer_matches(authorization: Option<&str>, key: &str) -> bool {
+    let Some(given) = authorization.and_then(|value| {
+        let (scheme, token) = value.trim().split_once(' ')?;
+        scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+    }) else {
+        return false;
+    };
+    let (given, key) = (given.as_bytes(), key.as_bytes());
+    given.len() == key.len()
+        && given.iter().zip(key).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+/// Refuses to serve a bind that is not loopback without an API key: the
+/// API would otherwise answer anyone who can reach the address.
+fn check_bind_auth(address: SocketAddr, api_key: Option<&str>) -> Result<()> {
+    if let Some(key) = api_key {
+        ensure!(!key.trim().is_empty(), "the API key is empty");
+        ensure!(
+            key.bytes().all(|b| b.is_ascii_graphic()),
+            "the API key may only hold printable ASCII without spaces"
+        );
+        return Ok(());
+    }
+    ensure!(
+        address.ip().to_canonical().is_loopback(),
+        "--bind {address} is not a loopback address: the API would answer anyone who can \
+         reach it. Pass --api-key-file <path> (clients then send Authorization: Bearer \
+         <key>) or bind 127.0.0.1"
+    );
+    Ok(())
 }
 
 fn now() -> u64 {

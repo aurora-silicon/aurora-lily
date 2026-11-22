@@ -577,19 +577,24 @@ pub fn is_loopback(peer: Option<SocketAddr>) -> bool {
     peer.is_some_and(|peer| peer.ip().to_canonical().is_loopback())
 }
 
-/// The names lily's own page is reached under on `port`, as `Host` headers
-/// carry them (`Origin` adds the scheme).
-fn own_hosts(port: u16) -> [String; 3] {
-    [format!("127.0.0.1:{port}"), format!("localhost:{port}"), format!("[::1]:{port}")]
+/// The names lily's own page is reached under, as `Host` headers carry
+/// them before the port (`Origin` adds the scheme).
+const OWN_NAMES: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
+
+/// Whether `host` (a `Host` header's value, or an `Origin`'s after the
+/// scheme) is `name` on `port`: `name:port`, or `name` alone when the port
+/// is 80, the one a client leaves out of both. Names compare without case.
+pub fn names_host(host: &str, name: &str, port: u16) -> bool {
+    host.eq_ignore_ascii_case(&format!("{name}:{port}"))
+        || (port == 80 && host.eq_ignore_ascii_case(name))
 }
 
 /// Whether `host` (the `Host` header) names lily's own loopback address on
 /// `port`. A page that DNS-rebound its own name to 127.0.0.1 sends that
 /// name, and is refused.
 pub fn host_allowed(host: Option<&str>, port: u16) -> bool {
-    host.map(str::trim).is_some_and(|host| {
-        own_hosts(port).iter().any(|own| own.eq_ignore_ascii_case(host))
-    })
+    host.map(str::trim)
+        .is_some_and(|host| OWN_NAMES.iter().any(|own| names_host(host, own, port)))
 }
 
 /// The cross-site write guard: `Content-Type` must be the media type
@@ -604,12 +609,21 @@ pub fn write_guard(
     if !media.is_some_and(|m| m.eq_ignore_ascii_case("application/json")) {
         return Err("writes need Content-Type: application/json");
     }
-    if let Some(origin) = origin
-        && !own_hosts(port).iter().any(|own| origin == format!("http://{own}"))
-    {
+    if !origin_allowed(origin, port) {
         return Err("writes are only accepted from lily's own page");
     }
     Ok(())
+}
+
+/// Whether `origin` (the `Origin` header) is absent or lily's own on
+/// `port`. A browser sends it on every cross-origin request, so a page of
+/// another site is told apart from a client that sends none.
+pub fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
+    origin.is_none_or(|origin| {
+        origin
+            .strip_prefix("http://")
+            .is_some_and(|host| OWN_NAMES.iter().any(|own| names_host(host, own, port)))
+    })
 }
 
 /// A file of the app: its content type, its `Cache-Control` and its bytes.

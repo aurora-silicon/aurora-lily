@@ -25,6 +25,33 @@ other OpenAI-compatible servers:
   rates, cached tokens and draft acceptance. `GET /v1/timings` keeps the
   last 32; `tools/opencode-plugin-timings/` shows them in opencode.
 
+### Who may call it
+
+These routes answer only what a client on this machine (or holding the API
+key) sends:
+
+- On a loopback `--bind` (the default `127.0.0.1:8000`) without a key, the
+  `Host` header must be lily's own address and port: `127.0.0.1`,
+  `localhost`, `[::1]` or the `--bind` address, with lily's port (which may
+  be left out when it is 80, here as for the dashboard). Any other `Host`
+  gets 403. A forwarded port must therefore keep the port number (`ssh -L
+  8000:127.0.0.1:8000`, not `-L 9000:127.0.0.1:8000`), or the server runs
+  with an API key: a request that carries the key passes under any `Host`,
+  so forwarded ports and proxies under another name or port work with it.
+- A POST needs `Content-Type: application/json` (charset parameters pass;
+  415 otherwise), and a request that carries an `Origin` other than lily's
+  own gets 403 unless it carries the API key. A browser sends either to
+  another origin only after a CORS preflight, which lily never answers.
+  The OpenAI SDKs and `curl -H 'Content-Type: application/json'` send what
+  is needed.
+- `--api-key-file <path>` makes every route but `/health` require
+  `Authorization: Bearer <key>` (401 otherwise), the key being the file's
+  text without its final line ending (printable ASCII without spaces; an
+  empty file is refused). Keep the file readable by lily's account only
+  (`chmod 600`). A `--bind` that is not a loopback address (`0.0.0.0`, a
+  LAN address) refuses to start without a key. `--api-key <key>` takes the
+  key itself and is kept for a machine with a single account: a command
+  line is visible to the other accounts of the machine, so prefer the file.
 ## The dashboard
 
 `http://127.0.0.1:8000/` (the `--bind` address) serves a dashboard built into
@@ -34,7 +61,8 @@ last 7 days and every setting. It reads `/v1/lily/status`, `/sessions`,
 already publishes and from the recorder's database, so an open page never
 wakes an idle or unloaded engine. Every dashboard route answers loopback
 peers only, under `127.0.0.1`, `localhost` or `[::1]` with lily's port as
-`Host` (403 otherwise, whatever `--bind` says), and forbids framing. A path
+`Host` (the port may be left out when it is 80; 403 otherwise, whatever
+`--bind` says), and forbids framing. A path
 that is not the dashboard's (no `/v1/lily/` route, no file of the app) gets
 the app only when a browser navigates to it: a GET or HEAD of a path with no
 extension, outside `/api/` and `/v1/`, whose `Accept` names `text/html`, so

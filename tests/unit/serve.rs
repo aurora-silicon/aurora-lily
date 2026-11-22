@@ -858,3 +858,291 @@ fn the_settings_views_computed_defaults_never_fail_the_start() {
     assert_eq!(named(&computed, "kv_cache"), Some(SettingValue::Text("q8".into())));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn api_request(method: &str, headers: &[(&str, &str)]) -> http::Request {
+    http::Request {
+        method: method.to_owned(),
+        http11: true,
+        path: "/v1/chat/completions".to_owned(),
+        headers: headers
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+        body: Vec::new(),
+    }
+}
+
+const LOOPBACK: ApiGate<'static> = ApiGate {
+    loopback_listener: true,
+    local: Some(SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8000))),
+    port: 8000,
+    api_key: None,
+};
+
+/// What the openai SDK and `curl -H 'Content-Type: application/json'` send.
+const CLIENT: [(&str, &str); 2] =
+    [("Host", "127.0.0.1:8000"), ("Content-Type", "application/json")];
+
+#[test]
+fn the_api_on_a_loopback_listener_answers_its_own_host_only() {
+    let status = |method: &str, headers: &[(&str, &str)], path: &str| {
+        api_guard(&api_request(method, headers), path, &LOOPBACK).map_err(|(s, _)| s)
+    };
+    assert_eq!(status("POST", &CLIENT, "/v1/chat/completions"), Ok(()));
+    for host in ["localhost:8000", "[::1]:8000", "LOCALHOST:8000"] {
+        let headers = [("Host", host), ("Content-Type", "application/json")];
+        assert_eq!(status("POST", &headers, "/v1/completions"), Ok(()), "{host}");
+        assert_eq!(status("GET", &headers[..1], "/v1/models"), Ok(()), "{host}");
+    }
+    // A foreign host, another port, no port (the port is not 80), nothing.
+    for host in ["other.example:8000", "127.0.0.1:9000", "127.0.0.1", ""] {
+        let headers = [("Host", host), ("Content-Type", "application/json")];
+        for (method, path) in [
+            ("POST", "/v1/chat/completions"),
+            ("GET", "/v1/models"),
+            ("GET", "/v1/timings"),
+            ("GET", "/health"),
+        ] {
+            assert_eq!(status(method, &headers, path), Err(403), "{host} {path}");
+        }
+    }
+    assert_eq!(
+        status("POST", &[("Content-Type", "application/json")], "/v1/completions"),
+        Err(403),
+        "no Host"
+    );
+    // A listener that is not loopback is reached under the machine's names.
+    let lan = ApiGate {
+        loopback_listener: false,
+        local: "192.168.1.20:8000".parse().ok(),
+        port: 8000,
+        api_key: Some("k"),
+    };
+    let headers = [
+        ("Host", "studio.lan:8000"),
+        ("Content-Type", "application/json"),
+        ("Authorization", "Bearer k"),
+    ];
+    assert_eq!(
+        api_guard(&api_request("POST", &headers), "/v1/completions", &lan),
+        Ok(())
+    );
+}
+
+#[test]
+fn api_posts_need_json_and_no_foreign_origin() {
+    let status = |method: &str, headers: &[(&str, &str)]| {
+        api_guard(&api_request(method, headers), "/v1/chat/completions", &LOOPBACK)
+            .map_err(|(s, _)| s)
+    };
+    let host = ("Host", "127.0.0.1:8000");
+    // The content types a browser sends to another origin unasked.
+    for content_type in
+        [None, Some("text/plain"), Some("application/x-www-form-urlencoded")]
+    {
+        let mut headers = vec![host];
+        headers.extend(content_type.map(|c| ("Content-Type", c)));
+        assert_eq!(status("POST", &headers), Err(415), "{content_type:?}");
+    }
+    assert_eq!(
+        status("POST", &[host, ("Content-Type", "application/json; charset=utf-8")]),
+        Ok(())
+    );
+    for origin in ["https://example.com", "http://localhost:3000", "null"] {
+        let headers = [host, ("Content-Type", "application/json"), ("Origin", origin)];
+        assert_eq!(status("POST", &headers), Err(403), "{origin}");
+        assert_eq!(status("GET", &[host, ("Origin", origin)]), Err(403), "{origin}");
+    }
+    let own = [
+        host,
+        ("Content-Type", "application/json"),
+        ("Origin", "http://127.0.0.1:8000"),
+    ];
+    assert_eq!(status("POST", &own), Ok(()));
+}
+
+#[test]
+fn an_api_key_is_required_on_every_route_but_health() {
+    let gate = ApiGate { api_key: Some("s3cret"), ..LOOPBACK };
+    let status = |path: &str, authorization: Option<&str>| {
+        let mut headers = CLIENT.to_vec();
+        headers.extend(authorization.map(|a| ("Authorization", a)));
+        api_guard(&api_request("POST", &headers), path, &gate).map_err(|(s, _)| s)
+    };
+    for path in ["/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/timings"]
+    {
+        assert_eq!(status(path, None), Err(401), "{path}");
+        assert_eq!(status(path, Some("Bearer wrong")), Err(401), "{path}");
+        assert_eq!(status(path, Some("Bearer s3cre")), Err(401), "{path}");
+        assert_eq!(status(path, Some("Basic s3cret")), Err(401), "{path}");
+        assert_eq!(status(path, Some("Bearer s3cret")), Ok(()), "{path}");
+        assert_eq!(status(path, Some("bearer  s3cret ")), Ok(()), "{path}");
+    }
+    assert_eq!(status("/health", None), Ok(()));
+}
+
+#[test]
+fn a_loopback_listener_answers_under_the_address_it_is_bound_to() {
+    let status = |host: &str, gate: &ApiGate<'_>| {
+        api_guard(&api_request("GET", &[("Host", host)]), "/v1/models", gate)
+            .map_err(|(s, _)| s)
+    };
+    // `--bind 127.0.0.2:8000`.
+    let other = ApiGate { local: "127.0.0.2:8000".parse().ok(), ..LOOPBACK };
+    assert_eq!(status("127.0.0.2:8000", &other), Ok(()));
+    assert_eq!(status("localhost:8000", &other), Ok(()));
+    assert_eq!(status("127.0.0.3:8000", &other), Err(403));
+    assert_eq!(status("127.0.0.2:8001", &other), Err(403));
+    assert_eq!(status("127.0.0.2", &other), Err(403), "the port is not 80");
+    assert_eq!(
+        status("127.0.0.2:8000", &LOOPBACK),
+        Err(403),
+        "not this listener's address"
+    );
+    let v6 = ApiGate { local: "[::1]:8000".parse().ok(), ..LOOPBACK };
+    assert_eq!(status("[::1]:8000", &v6), Ok(()));
+    // Port 80 is the one a client leaves out of `Host`.
+    let port_80 = ApiGate { local: "127.0.0.2:80".parse().ok(), port: 80, ..LOOPBACK };
+    for host in
+        ["127.0.0.1", "localhost", "[::1]", "127.0.0.2", "127.0.0.2:80", "LocalHost"]
+    {
+        assert_eq!(status(host, &port_80), Ok(()), "{host}");
+    }
+    assert_eq!(status("other.example", &port_80), Err(403));
+    assert_eq!(status("", &port_80), Err(403));
+    // The origin a page served from port 80 has carries no port either.
+    let same_origin = |origin: &str| {
+        let headers = [("Host", "localhost"), ("Origin", origin)];
+        api_guard(&api_request("GET", &headers), "/v1/models", &port_80)
+            .map_err(|(s, _)| s)
+    };
+    assert_eq!(same_origin("http://localhost"), Ok(()));
+    assert_eq!(same_origin("http://localhost:8000"), Err(403));
+    assert_eq!(same_origin("http://other.example"), Err(403));
+}
+
+#[test]
+fn a_request_with_the_api_key_passes_under_any_host() {
+    let gate = ApiGate { api_key: Some("s3cret"), ..LOOPBACK };
+    let status = |host: &str, authorization: Option<&str>, path: &str| {
+        let mut headers = vec![("Host", host)];
+        headers.extend(authorization.map(|a| ("Authorization", a)));
+        api_guard(&api_request("GET", &headers), path, &gate).map_err(|(s, _)| s)
+    };
+    // A forwarded port or a proxy: another name, another port.
+    for host in ["127.0.0.1:9000", "gateway.example", "gateway.example:443"] {
+        assert_eq!(status(host, Some("Bearer s3cret"), "/v1/models"), Ok(()), "{host}");
+        assert_eq!(status(host, Some("Bearer s3cret"), "/health"), Ok(()), "{host}");
+        assert_eq!(
+            status(host, Some("Bearer wrong"), "/v1/models"),
+            Err(403),
+            "{host}"
+        );
+        assert_eq!(status(host, None, "/v1/models"), Err(403), "{host}");
+        assert_eq!(status(host, None, "/health"), Err(403), "{host}");
+    }
+    assert_eq!(status("127.0.0.1:8000", None, "/v1/models"), Err(401));
+}
+
+/// The `Origin` test is for requests without a credential: a browser
+/// attaches no bearer token by itself, so a page under another name that
+/// sends the key (a proxy serving a UI and the API under one name) passes,
+/// and the same request without the right key does not.
+#[test]
+fn a_request_with_the_api_key_passes_under_any_origin() {
+    let gate = ApiGate { api_key: Some("s3cret"), ..LOOPBACK };
+    let status = |method: &str, host: &str, authorization: Option<&str>| {
+        let mut headers = vec![
+            ("Host", host),
+            ("Origin", "https://gateway.example"),
+            ("Content-Type", "application/json"),
+        ];
+        headers.extend(authorization.map(|a| ("Authorization", a)));
+        api_guard(&api_request(method, &headers), "/v1/chat/completions", &gate)
+            .map_err(|(s, _)| s)
+    };
+    for host in ["gateway.example", "127.0.0.1:8000"] {
+        for method in ["GET", "POST"] {
+            assert_eq!(status(method, host, Some("Bearer s3cret")), Ok(()), "{host}");
+            assert_eq!(status(method, host, Some("Bearer wrong")), Err(403), "{host}");
+            assert_eq!(status(method, host, None), Err(403), "{host}");
+        }
+    }
+    // The key does not stand in for the content type.
+    let untyped = [
+        ("Host", "gateway.example"),
+        ("Origin", "https://gateway.example"),
+        ("Authorization", "Bearer s3cret"),
+    ];
+    assert_eq!(
+        api_guard(&api_request("POST", &untyped), "/v1/chat/completions", &gate)
+            .map_err(|(s, _)| s),
+        Err(415)
+    );
+    // Without a configured key nothing a request carries is one.
+    let unkeyed = [
+        ("Host", "127.0.0.1:8000"),
+        ("Origin", "https://gateway.example"),
+        ("Authorization", "Bearer s3cret"),
+    ];
+    assert_eq!(
+        api_guard(&api_request("GET", &unkeyed), "/v1/models", &LOOPBACK)
+            .map_err(|(s, _)| s),
+        Err(403)
+    );
+}
+
+#[test]
+fn a_bind_that_is_not_loopback_needs_an_api_key() {
+    let at = |s: &str| s.parse::<SocketAddr>().expect("address");
+    for bind in ["127.0.0.1:8000", "[::1]:8000", "127.0.0.2:8000"] {
+        assert!(check_bind_auth(at(bind), None).is_ok(), "{bind}");
+    }
+    for bind in ["0.0.0.0:8000", "[::]:8000", "192.168.1.20:8000"] {
+        let error = check_bind_auth(at(bind), None).expect_err(bind);
+        assert!(format!("{error:#}").contains("--api-key"), "{error:#}");
+        assert!(check_bind_auth(at(bind), Some("k3y")).is_ok(), "{bind}");
+    }
+    assert!(check_bind_auth(at("0.0.0.0:8000"), Some("")).is_err());
+    assert!(check_bind_auth(at("0.0.0.0:8000"), Some("two words")).is_err());
+}
+/// `--api-key-file`: the key is the file's text without its final line
+/// ending; an empty or missing file is an error, and nothing else is cut.
+#[test]
+fn the_api_key_file_gives_the_key_without_its_line_ending() {
+    let dir = std::env::temp_dir().join(format!("lily-api-key-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let file = dir.join("key");
+    let read = |text: &str| {
+        std::fs::write(&file, text).expect("write");
+        ApiKey::from_file(&file)
+    };
+    for text in ["s3cret-key", "s3cret-key\n", "s3cret-key\r\n"] {
+        let key = read(text).expect("a key");
+        assert_eq!(key.as_str(), "s3cret-key", "{text:?}");
+        assert_eq!(key, ApiKey::new("s3cret-key".to_owned()));
+    }
+    for text in ["", "\n", "\r\n"] {
+        let error = read(text).expect_err("no key");
+        assert!(format!("{error:#}").contains("is empty"), "{text:?}: {error:#}");
+    }
+    // Only the line ending goes: a key with a space in it is still refused
+    // as one, not silently shortened.
+    let spaced = read("two words \n\n").expect("read as written");
+    assert_eq!(spaced.as_str(), "two words \n");
+    let at = "0.0.0.0:8000".parse::<SocketAddr>().expect("address");
+    assert!(check_bind_auth(at, Some(spaced.as_str())).is_err());
+    let missing = ApiKey::from_file(&dir.join("missing")).expect_err("no file");
+    assert!(format!("{missing:#}").contains("--api-key-file"), "{missing:#}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The key is not in what `Debug` prints of it or of the options.
+#[test]
+fn the_api_key_is_not_printed() {
+    let key = ApiKey::new("s3cret-key".to_owned());
+    assert_eq!(format!("{key:?}"), "ApiKey(set)");
+    assert!(!format!("{:?}", Some(&key)).contains("s3cret"));
+}
+

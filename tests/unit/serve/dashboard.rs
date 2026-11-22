@@ -207,6 +207,31 @@ fn only_lilys_own_loopback_names_pass_as_host() {
     }
 }
 
+/// Port 80 is the one a client leaves out of `Host` and a browser out of
+/// `Origin`: on it, and only on it, lily's names pass without a port, for
+/// the dashboard as for the API.
+#[test]
+fn on_port_80_lilys_own_names_pass_without_the_port() {
+    for host in ["127.0.0.1", "localhost", "LocalHost", "[::1]", "localhost:80"] {
+        assert!(host_allowed(Some(host), 80), "{host}");
+        assert!(!host_allowed(Some(host), 8000), "{host} on another port");
+    }
+    for host in ["evil.example", "localhost:8000", "localhost.evil.example", ""] {
+        assert!(!host_allowed(Some(host), 80), "{host}");
+    }
+    for origin in ["http://localhost", "http://127.0.0.1", "http://[::1]:80"] {
+        assert!(origin_allowed(Some(origin), 80), "{origin}");
+        assert!(!origin_allowed(Some(origin), 8000), "{origin} on another port");
+    }
+    for origin in ["https://localhost", "http://evil.example", "localhost", "null"] {
+        assert!(!origin_allowed(Some(origin), 80), "{origin}");
+    }
+    assert!(names_host("127.0.0.2", "127.0.0.2", 80));
+    assert!(names_host("127.0.0.2:8000", "127.0.0.2", 8000));
+    assert!(!names_host("127.0.0.2", "127.0.0.2", 8000));
+    assert!(!names_host("127.0.0.2:80", "127.0.0.2", 8000));
+}
+
 #[test]
 fn the_write_guard_wants_json_and_lilys_own_origin() {
     let json = Some("application/json");

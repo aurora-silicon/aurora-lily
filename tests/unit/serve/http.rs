@@ -169,9 +169,10 @@ fn dropping_a_watched_connection_closes_it() {
 
 #[test]
 fn every_status_lily_answers_has_its_reason_phrase() {
-    // The OpenAI routes' and the dashboard's (the settings writes' 409, 413
-    // and 504 among them); the interim probe writes its own head.
-    let statuses = [200, 400, 403, 404, 405, 409, 411, 413, 500, 503, 504];
+    // The OpenAI routes' (the API key's 401 and a wrong content type's 415
+    // among them) and the dashboard's (the settings writes' 409, 413 and
+    // 504 among them); the interim probe writes its own head.
+    let statuses = [200, 400, 401, 403, 404, 405, 409, 411, 413, 415, 500, 503, 504];
     for status in statuses {
         assert!(!reason(status).is_empty(), "{status} has no reason phrase");
     }
