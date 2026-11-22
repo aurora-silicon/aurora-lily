@@ -18,16 +18,20 @@ use lily::serve::{ApiKey, SamplingOverrides, ServeOptions, parse_duration_secs};
 const DEFAULT_THINKING_BUDGET: &str = "low=8000,medium=8000,xhigh=16000";
 
 /// The `--help` epilogue, naming the platform's instance lock
-/// (`lily::instance::DEFAULT_PATH`).
+/// (`lily::instance::default_path`).
 #[cfg(target_os = "macos")]
 const AFTER_HELP: &str = "Only one lily instance runs at a time: a server, lily-bench or lily-probe started \
                   while another one, of any user, holds /Users/Shared/lily-instance.lock refuses \
                   to start and exits with status 75 (EX_TEMPFAIL). Stop the background service first \
                   with tools/service/lily-service.sh stop.";
 #[cfg(target_os = "linux")]
-const AFTER_HELP: &str = "Only one lily instance runs at a time: a server, lily-bench or lily-probe started \
-                  while another one, of any user, holds /tmp/lily-instance.lock refuses to start and \
-                  exits with status 75 (EX_TEMPFAIL). Stop the other instance first.";
+const AFTER_HELP: &str = "Only one lily instance per account runs at a time: a server, lily-bench or \
+                  lily-probe started while another one of the same account holds its instance lock \
+                  (~/.cache/lily/instance.<host>.lock, the home being the user \
+                  database's; /dev/shm/lily-<uid>/instance.lock for an account without a home \
+                  of its own) \
+                  refuses to start and exits with status 75 (EX_TEMPFAIL). Stop the other \
+                  instance first.";
 
 #[derive(Parser)]
 #[command(
