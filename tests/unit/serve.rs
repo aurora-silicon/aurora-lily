@@ -872,11 +872,15 @@ fn api_request(method: &str, headers: &[(&str, &str)]) -> http::Request {
     }
 }
 
+const LOCAL_PEER: Option<SocketAddr> =
+    Some(SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 50_000)));
+
 const LOOPBACK: ApiGate<'static> = ApiGate {
     loopback_listener: true,
     local: Some(SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8000))),
     port: 8000,
     api_key: None,
+    peer: LOCAL_PEER,
 };
 
 /// What the openai SDK and `curl -H 'Content-Type: application/json'` send.
@@ -917,6 +921,7 @@ fn the_api_on_a_loopback_listener_answers_its_own_host_only() {
         local: "192.168.1.20:8000".parse().ok(),
         port: 8000,
         api_key: Some("k"),
+        peer: "192.168.1.30:50000".parse().ok(),
     };
     let headers = [
         ("Host", "studio.lan:8000"),
@@ -1378,4 +1383,29 @@ fn a_full_queue_is_seen_before_a_request_is_parsed() {
     assert!(queue.full(), "the next request would be refused: refuse it unparsed");
     queue.left();
     assert!(!queue.full());
+}
+
+#[test]
+fn the_timings_of_every_client_answer_this_machine_only() {
+    let lan_peer = "192.168.1.30:50000".parse().ok();
+    let lan = ApiGate {
+        loopback_listener: false,
+        local: "192.168.1.20:8000".parse().ok(),
+        port: 8000,
+        api_key: Some("k"),
+        peer: lan_peer,
+    };
+    let headers = [("Host", "studio.lan:8000"), ("Authorization", "Bearer k")];
+    let status = |path: &str, gate: &ApiGate<'_>| {
+        api_guard(&api_request("GET", &headers), path, gate).map_err(|(s, _)| s)
+    };
+    assert_eq!(
+        status("/v1/timings", &lan),
+        Err(403),
+        "a LAN client, even with the key"
+    );
+    assert_eq!(status("/v1/models", &lan), Ok(()), "the other routes stay open to it");
+    assert_eq!(status("/v1/timings", &ApiGate { peer: None, ..lan }), Err(403));
+    let local = ApiGate { peer: LOCAL_PEER, ..lan };
+    assert_eq!(status("/v1/timings", &local), Ok(()));
 }

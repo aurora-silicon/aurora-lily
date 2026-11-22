@@ -66,6 +66,20 @@ key) sends:
   LAN address) refuses to start without a key. `--api-key <key>` takes the
   key itself and is kept for a machine with a single account: a command
   line is visible to the other accounts of the machine, so prefer the file.
+- `GET /v1/timings` lists the recent requests of every client, so it
+  answers loopback peers only (403 otherwise), as the dashboard does.
+
+**One principal.** Lily serves one user (or one set of clients that trust
+each other), not several who must be kept apart. The session cache is
+shared by every client: a prompt resumes from whichever cached
+conversation shares its longest prefix, whoever sent it, and the response
+says how many tokens it reused (`cached_tokens`, and the prefill time).
+`prompt_cache_key` only breaks ties between equally good sessions; it
+does not isolate them. The cache is not partitioned by client, and the
+reused token count is reported to every client. Run one server per
+principal (and keep the API key to the one user) rather than sharing one
+between parties that must be kept apart.
+
 ## The dashboard
 
 `http://127.0.0.1:8000/` (the `--bind` address) serves a dashboard built into

@@ -2884,6 +2884,7 @@ fn handle(front: &Front, stream: TcpStream) {
             local,
             port: local.map_or(0, |a| a.port()),
             api_key: front.api_key.as_ref().map(ApiKey::as_str),
+            peer: stream.peer_addr().ok(),
         };
         if let Err((status, why)) = api_guard(&request, &path, &gate) {
             refuse_unread(stream, &what, status, "invalid_request_error", why);
@@ -3309,6 +3310,8 @@ struct ApiGate<'a> {
     port: u16,
     /// `--api-key-file` or `--api-key`.
     api_key: Option<&'a str>,
+    /// The remote address (`None` when the socket could not say).
+    peer: Option<SocketAddr>,
 }
 
 /// Whether `host` (the `Host` header) names a loopback listener's own
@@ -3340,7 +3343,9 @@ fn api_host_allowed(host: Option<&str>, gate: &ApiGate<'_>) -> bool {
 /// be `Content-Type: application/json` (415; a browser sends that
 /// to another origin only after a CORS preflight, which lily never
 /// answers), and with an API key every route but `/health` needs
-/// `Authorization: Bearer <key>` (401). Returns the status and why.
+/// `Authorization: Bearer <key>` (401). `/v1/timings`, which lists the
+/// recent requests of every client, answers loopback peers only, as the
+/// dashboard does (403). Returns the status and why.
 fn api_guard(
     request: &http::Request,
     path: &str,
@@ -3366,6 +3371,9 @@ fn api_guard(
     }
     if gate.api_key.is_some() && path != "/health" && !keyed {
         return Err((401, "missing or wrong API key (Authorization: Bearer <key>)"));
+    }
+    if path == "/v1/timings" && !dashboard::is_loopback(gate.peer) {
+        return Err((403, "/v1/timings answers this machine only"));
     }
     Ok(())
 }
