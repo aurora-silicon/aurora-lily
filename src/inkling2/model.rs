@@ -123,14 +123,15 @@ pub struct SlotCache {
     pub slots: usize,
     pub k: Tensor,         // F16 [slots, kv_w]
     pub v: Tensor,         // F16 [slots, kv_w]
-    pub k_hist: Tensor,    // F32 [kv_w, n_conv - 1]
-    pub v_hist: Tensor,    // F32 [kv_w, n_conv - 1]
-    pub attn_hist: Tensor, // F32 [H, n_conv - 1]
-    pub ffn_hist: Tensor,  // F32 [H, n_conv - 1]
+    pub k_hist: Tensor,    // F32 [n_conv - 1, kv_w]
+    pub v_hist: Tensor,    // F32 [n_conv - 1, kv_w]
+    pub attn_hist: Tensor, // F32 [n_conv - 1, H]
+    pub ffn_hist: Tensor,  // F32 [n_conv - 1, H]
 }
 
 /// Per-session decode state.
 pub struct Inkling2State {
+    pub id: u64,
     pub pos: usize,
     pub capacity: usize,
     pub slots: Vec<SlotCache>,
@@ -159,6 +160,23 @@ pub struct VerifyPending {
     pub rows: usize,
     pub draws: Vec<u32>,
     pub next_drafts: usize,
+    /// When `Some(gpu_accepted)`, `verify()` already ran GPU rollback, DSpark inject,
+    /// and DSpark propose in the same command buffer assuming `accepted == gpu_accepted`.
+    pub spec_fast_accepted: Option<usize>,
+}
+
+/// Pre-encoded greedy verify + DSpark pass awaiting the next step's `pos_gpu` and `ids`.
+#[cfg(target_os = "linux")]
+pub struct VerifyAhead {
+    pub pass: crate::metal::DetachedPass,
+    pub rows: usize,
+    pub next_drafts: usize,
+    pub rb_key: (u64, u64),
+    pub kv_key: (u64, u64),
+    pub global_grid: (usize, usize),
+    pub swa_grid: (usize, usize),
+    pub dspark_grids: ((usize, usize), (usize, usize)),
+    pub begun: u64,
 }
 
 /// GPU scratch for batched speculative verification (`rows = 1 + drafts`).
@@ -167,8 +185,16 @@ pub struct VerifyScratch {
     pub logits_raw: Tensor,       // F32 [max_rows, vocab_padded]
     pub logits: Tensor,           // F32 [max_rows, vocab_unpadded]
     pub draws_gpu: Tensor,        // U32 [max_rows]
+    pub argmax_val: Tensor,       // F32 [max_rows, 64]
+    pub argmax_idx: Tensor,       // U32 [max_rows, 64]
+    pub spec_meta: Tensor,        // U32 [6]: [accepted, kept, anchor, new_pos, kept-1, swa_start]
+    pub pos_gpu: Tensor,          // U32 [1]: runtime `pos_before` for pre-encoded verify passes
+    pub rb_table: Tensor,         // U32 [n_visits * 4 * 6] (3 u64s per sconv history tensor)
+    pub rb_key: (u64, u64),       // cached (state.id, trace[0][0] addr)
     pub trace: Vec<[Tensor; 4]>,  // per slot: [k, v, attn, ffn] each [max_rows, C, hist_len]
     pub pending: Option<VerifyPending>,
+    #[cfg(target_os = "linux")]
+    pub ahead: Option<VerifyAhead>,
 }
 
 /// Per-engine scratch buffers.
@@ -199,6 +225,7 @@ pub struct Scratch {
     mix_out: Tensor,       // [4, max_rows, H]
     msg_out: Tensor,       // [4, max_rows, H]
     attn_in: [Tensor; 3],  // [max_rows, H]
+    attn_in_bf16: Option<[Tensor; 3]>, // [ATTN_SPLIT_MAX_ROWS, H] BF16 for zero-conversion QKV cmat_bf16_bx
     ctrl_cat: Tensor,      // [max_rows, 2*H]
     ctrl_mid: Tensor,      // [max_rows, rank]
     ctrl_gain: Tensor,     // [max_rows, H]
@@ -221,7 +248,7 @@ pub struct Scratch {
     exp_w: Tensor,         // F32 [max_rows * K]
     sorted_rk: Tensor,     // U32 [max_rows * K]
     moe_tiles: Tensor,     // U32 [max_rows * K * 4]
-    moe_n_tiles: Tensor,   // U32 [1]
+    moe_n_tiles: Tensor,   // U32 [12] ([0]=tot_t, [4..7]=gu indirect, [8..11]=down indirect)
     situ_out: Tensor,               // [max_rows_scalar * K, ff] F32
     down_out: Tensor,               // [max_rows * K, H] F32
     moe_out: Tensor,                // [max_rows, H] F32
@@ -279,6 +306,13 @@ fn linear(
     y: &Tensor,
     rows: usize,
 ) -> Result<()> {
+    if ctx.matrix_units()
+        && w.ty == GgmlType::Bf16
+        && w.cols.is_multiple_of(64)
+        && rows <= 16
+    {
+        return k::gemv_cmat_bf16_sets(ctx, pass, &[(w, y)], x, rows);
+    }
     if rows <= k::gemv_max_rows(w.ty) {
         k::gemv(ctx, pass, w, x, y, rows)
     } else if rows > 12 && w.cols.is_multiple_of(64) {
@@ -309,7 +343,7 @@ fn linear_bx(
     // 256-row `gemm_bx` needs enough N-tiles to saturate the GPU; narrow
     // projections (ctrl.down N=64, router N=128, sinks N=24) get 4x more
     // workgroups and skip the BF16 copy on 64-row `gemm`.
-    if rows > 12
+    if rows > 16
         && w.rows >= 256
         && ctx.matrix_units()
         && k::gemm_bx_takes(w)
@@ -323,9 +357,9 @@ fn linear_bx(
 }
 
 /// Dispatches multiple linear projections sharing the same input `x`, automatically
-/// batching up to 4 same-type projections into one `glm53::gemv_sets` dispatch during
-/// decode/verify (`rows <= gemv_max_rows`), or converting `x` once to BF16 and using
-/// 256-row `glm53::gemm_bx` during prefill on matrix-unit GPUs.
+/// batching up to 4 same-type projections into one `glm53::gemv_sets` (or
+/// `gemv_cmat_bf16_sets` for BF16 on matrix units) dispatch during decode/verify,
+/// or converting `x` once to BF16 and using 256-row `glm53::gemm_bx` during prefill.
 fn linear_multi_bx(
     ctx: &MetalContext,
     pass: &ComputePass,
@@ -334,7 +368,7 @@ fn linear_multi_bx(
     sets: &[(&QWeight, &Tensor)],
     rows: usize,
 ) -> Result<()> {
-    if rows > 12
+    if rows > 16
         && ctx.matrix_units()
         && let Some(xb) = xb
         && let Some((first_w, _)) =
@@ -367,20 +401,27 @@ fn linear_multi(
             continue;
         }
         let (wi, yi) = sets[i];
-        if rows <= k::gemv_max_rows(wi.ty) {
+        let use_cmat = ctx.matrix_units()
+            && wi.ty == GgmlType::Bf16
+            && wi.cols.is_multiple_of(64)
+            && rows <= 16;
+        if use_cmat || rows <= k::gemv_max_rows(wi.ty) {
+            let max_batch = if use_cmat { 8 } else { 4 };
             let mut batch: Vec<(&QWeight, &Tensor)> = vec![(wi, yi)];
             done[i] = true;
             for j in (i + 1)..sets.len() {
                 if !done[j]
                     && sets[j].0.ty == wi.ty
                     && sets[j].0.cols == wi.cols
-                    && batch.len() < 4
+                    && batch.len() < max_batch
                 {
                     batch.push(sets[j]);
                     done[j] = true;
                 }
             }
-            if batch.len() > 1 {
+            if use_cmat {
+                k::gemv_cmat_bf16_sets(ctx, pass, &batch, x, rows)?;
+            } else if batch.len() > 1 {
                 k::gemv_sets(ctx, pass, &batch, x, rows)?;
             } else {
                 k::gemv(ctx, pass, wi, x, yi, rows)?;
@@ -616,7 +657,7 @@ impl Inkling2Model {
 
     /// Output projection for DSpark speculative drafting (fast Q4_0 copy when
     /// available; verification always uses exact `self.output`).
-    pub fn draft_output_weight(&self) -> &QWeight {
+    pub fn draft_output_head(&self) -> &QWeight {
         self.draft_output.as_ref().map_or(&self.output, |(q, _)| q)
     }
 
@@ -672,13 +713,15 @@ impl Inkling2Model {
                 slots: n_slots,
                 k: Tensor::zeros(ctx, &[n_slots, kw], DType::F16)?,
                 v: Tensor::zeros(ctx, &[n_slots, kw], DType::F16)?,
-                k_hist: Tensor::zeros(ctx, &[kw, hist_len], DType::F32)?,
-                v_hist: Tensor::zeros(ctx, &[kw, hist_len], DType::F32)?,
-                attn_hist: Tensor::zeros(ctx, &[h, hist_len], DType::F32)?,
-                ffn_hist: Tensor::zeros(ctx, &[h, hist_len], DType::F32)?,
+                k_hist: Tensor::zeros(ctx, &[hist_len, kw], DType::F32)?,
+                v_hist: Tensor::zeros(ctx, &[hist_len, kw], DType::F32)?,
+                attn_hist: Tensor::zeros(ctx, &[hist_len, h], DType::F32)?,
+                ffn_hist: Tensor::zeros(ctx, &[hist_len, h], DType::F32)?,
             });
         }
+        static NEXT_STATE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Inkling2State {
+            id: NEXT_STATE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             pos: 0,
             capacity: cap,
             slots,
@@ -816,11 +859,12 @@ impl Inkling2Model {
             for slot in 0..self.cfg.n_visits {
                 let p = self.cfg.phys_of_slot(slot);
                 let kw = self.cfg.kv_width(p);
+                let tr_rows = mv + hist_len - 1;
                 trace.push([
-                    Tensor::zeros(ctx, &[mv, kw, hist_len], DType::F32)?,
-                    Tensor::zeros(ctx, &[mv, kw, hist_len], DType::F32)?,
-                    Tensor::zeros(ctx, &[mv, h, hist_len], DType::F32)?,
-                    Tensor::zeros(ctx, &[mv, h, hist_len], DType::F32)?,
+                    Tensor::zeros(ctx, &[tr_rows, kw], DType::F32)?,
+                    Tensor::zeros(ctx, &[tr_rows, kw], DType::F32)?,
+                    Tensor::zeros(ctx, &[tr_rows, h], DType::F32)?,
+                    Tensor::zeros(ctx, &[tr_rows, h], DType::F32)?,
                 ]);
             }
             Some(VerifyScratch {
@@ -836,8 +880,16 @@ impl Inkling2Model {
                     DType::F32,
                 )?,
                 draws_gpu: Tensor::zeros(ctx, &[mv], DType::U32)?,
+                argmax_val: Tensor::zeros(ctx, &[mv, 64], DType::F32)?,
+                argmax_idx: Tensor::zeros(ctx, &[mv, 64], DType::U32)?,
+                spec_meta: Tensor::zeros(ctx, &[6], DType::U32)?,
+                pos_gpu: Tensor::zeros(ctx, &[1], DType::U32)?,
+                rb_table: Tensor::zeros(ctx, &[self.cfg.n_visits * 4 * 6], DType::U32)?,
+                rb_key: (0, 0),
                 trace,
                 pending: None,
+                #[cfg(target_os = "linux")]
+                ahead: None,
             })
         } else {
             None
@@ -885,6 +937,15 @@ impl Inkling2Model {
                 Tensor::zeros(ctx, &[r, h], DType::F32)?,
                 Tensor::zeros(ctx, &[r, h], DType::F32)?,
             ],
+            attn_in_bf16: if ctx.matrix_units() {
+                Some([
+                    Tensor::zeros(ctx, &[r.min(ATTN_SPLIT_MAX_ROWS), h], DType::BF16)?,
+                    Tensor::zeros(ctx, &[r.min(ATTN_SPLIT_MAX_ROWS), h], DType::BF16)?,
+                    Tensor::zeros(ctx, &[r.min(ATTN_SPLIT_MAX_ROWS), h], DType::BF16)?,
+                ])
+            } else {
+                None
+            },
             ctrl_cat: Tensor::zeros(ctx, &[r, 2 * h], DType::F32)?,
             ctrl_mid: Tensor::zeros(ctx, &[3, r, rank], DType::F32)?,
             ctrl_gain: Tensor::zeros(ctx, &[r, h], DType::F32)?,
@@ -919,7 +980,7 @@ impl Inkling2Model {
             exp_w: Tensor::zeros(ctx, &[r * k_exp], DType::F32)?,
             sorted_rk: Tensor::zeros(ctx, &[r * k_exp], DType::U32)?,
             moe_tiles: Tensor::zeros(ctx, &[r * k_exp * 4], DType::U32)?,
-            moe_n_tiles: Tensor::zeros(ctx, &[1], DType::U32)?,
+            moe_n_tiles: Tensor::zeros(ctx, &[12], DType::U32)?,
             situ_out: Tensor::zeros(ctx, &[scalar_moe_rows * k_exp, ff], DType::F32)?,
             down_out: Tensor::zeros(ctx, &[r * k_exp, h], DType::F32)?,
             moe_out: Tensor::zeros(ctx, &[r, h], DType::F32)?,
@@ -932,6 +993,44 @@ impl Inkling2Model {
     /// Encodes `rows` tokens into a single `ComputePass` with zero host-GPU syncs.
     /// When `verify_mode` is true, records per-row short-conv history traces and
     /// computes logits for all `rows` tokens into `sc.verify.logits`.
+    /// Whether all attention layers take the `Param::Gpu`-capable split-K matrix-unit
+    /// path (`kv_prep_dyn` + `attention_mu_split_rel_dyn`) at `(rows, pos)`.
+    pub fn can_use_dyn_pos_verify(
+        &self,
+        ctx: &MetalContext,
+        state: &Inkling2State,
+        rows: usize,
+        pos: usize,
+    ) -> bool {
+        if !(ctx.matrix_units()
+            && rows >= 2
+            && rows <= ATTN_SPLIT_MAX_ROWS
+            && self.cfg.head_dim == 128
+            && self.cfg.rel_len == 16)
+        {
+            return false;
+        }
+        if ik::attn_mu_split_global_key(pos, true)
+            != ik::attn_mu_split_global_key(pos + rows - 1, true)
+            || ik::attn_mu_split_grid_ex(pos, rows, false, self.cfg.window, true).1 == 0
+        {
+            return false;
+        }
+        for &(slot, ip, _) in &self.schedule {
+            let layer = &self.layers[ip];
+            if layer.attn_rel_bias.ty != crate::gguf::GgmlType::F32 {
+                return false;
+            }
+            if layer.is_swa
+                && (state.slots[slot].slots < 128
+                    || ik::attn_mu_split_grid_ex(pos, rows, true, self.cfg.window, true).1 == 0)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn encode_forward_rows(
         &self,
@@ -946,20 +1045,53 @@ impl Inkling2Model {
         capture_dspark: bool,
         verify_mode: bool,
     ) -> Result<()> {
+        self.encode_forward_rows_dyn(
+            ctx,
+            cp,
+            state,
+            sc,
+            rows,
+            ids_override,
+            raw_embd,
+            compute_logits,
+            capture_dspark,
+            verify_mode,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_forward_rows_dyn(
+        &self,
+        ctx: &MetalContext,
+        cp: &ComputePass<'_>,
+        state: &Inkling2State,
+        sc: &Scratch,
+        rows: usize,
+        ids_override: Option<&Tensor>,
+        raw_embd: bool,
+        compute_logits: bool,
+        capture_dspark: bool,
+        verify_mode: bool,
+        pos_gpu: Option<(&Tensor, usize)>,
+    ) -> Result<()> {
         ensure!(
             rows >= 1 && rows <= sc.max_rows,
             "forward_rows {rows} > {}",
             sc.max_rows
         );
+        let pos0 = pos_gpu.map_or(state.pos, |(_, p)| p);
         ensure!(
-            state.pos + rows <= state.capacity,
-            "forward_rows pos {} + {rows} > capacity {}",
-            state.pos,
+            pos0 + rows <= state.capacity,
+            "forward_rows pos {pos0} + {rows} > capacity {}",
             state.capacity
         );
+        let pos_param = pos_gpu.map(|(t, _)| {
+            let (b, o) = t.binding();
+            crate::metal::Param::Gpu(b, o)
+        });
         let h = self.cfg.hidden;
         let row_elems = rows * h;
-        let pos0 = state.pos;
 
         // 1. Embedding + optional token_embd_norm (skipped for image embeddings!).
         if !raw_embd {
@@ -1037,6 +1169,51 @@ impl Inkling2Model {
                 )?;
             }
 
+            let can_cmat_x3 = ctx.matrix_units()
+                && rows <= 16
+                && layer.wq.ty == GgmlType::Bf16
+                && layer.wk.ty == GgmlType::Bf16
+                && layer.wv.ty == GgmlType::Bf16
+                && layer.attn_rel.ty == GgmlType::Bf16
+                && layer.attn_sink_proj.ty == GgmlType::Bf16
+                && layer.attn_gate.ty == GgmlType::Bf16
+                && layer.wq.cols.is_multiple_of(64)
+                && layer.wk.cols == layer.wq.cols
+                && layer.wv.cols == layer.wq.cols
+                && layer.attn_rel.cols == layer.wq.cols
+                && layer.attn_sink_proj.cols == layer.wq.cols
+                && layer.attn_gate.cols == layer.wq.cols
+                && layer.attn_k_conv_proj.as_ref().is_none_or(|w| {
+                    w.ty == GgmlType::Bf16 && w.cols == layer.wq.cols
+                })
+                && layer.attn_v_conv_proj.as_ref().is_none_or(|w| {
+                    w.ty == GgmlType::Bf16 && w.cols == layer.wq.cols
+                });
+            let can_mix_q1_bf16 = h.is_multiple_of(4)
+                && h <= 4096
+                && (h / 4).div_ceil(32) * 32 <= ctx.max_workgroup_invocations()
+                && (h / 4).div_ceil(32) <= 20
+                && plan.attn_ptrs.is_none_or(|(_, ns)| ns <= 8);
+            let use_qkv_bf16 = can_cmat_x3
+                && sc.attn_in_bf16.is_some()
+                && rows <= ATTN_SPLIT_MAX_ROWS
+                && h.is_multiple_of(4)
+                && (!layer.is_swa || has_msg || can_mix_q1_bf16);
+            let qkv_out_0 = if use_qkv_bf16 {
+                &sc.attn_in_bf16.as_ref().unwrap()[0]
+            } else {
+                &sc.attn_in[0]
+            };
+            let qkv_out_1 = if use_qkv_bf16 {
+                &sc.attn_in_bf16.as_ref().unwrap()[1]
+            } else {
+                &sc.attn_in[1]
+            };
+            let qkv_out_2 = if use_qkv_bf16 {
+                &sc.attn_in_bf16.as_ref().unwrap()[2]
+            } else {
+                &sc.attn_in[2]
+            };
             let mix_direct_global =
                 !layer.is_swa && !has_msg && layer.attn_res_query.is_some();
             let mix_direct_msg = has_msg && layer.attn_res_query.is_some();
@@ -1047,19 +1224,43 @@ impl Inkling2Model {
                 let n_q = if layer.is_swa { 1 } else { 3 };
                 let ptrs = sc.ptrs_table.view(off, &[32])?;
                 if layer.is_swa && !has_msg {
-                    // Fuse inp_sa copy + SWA attn_norm right into attn_res_mix!
+                    // Fuse inp_sa copy + SWA attn_norm (+ BF16 conversion) right into attn_res_mix!
                     ik::attn_res_mix_fused(
                         ctx,
                         cp,
                         &ptrs,
                         q_res,
-                        &sc.attn_in[0],
+                        qkv_out_0,
                         Some(&sc.inp_sa),
                         layer.attn_norm.as_ref(),
                         rows,
                         h,
                         n_states,
                         1,
+                        1e-6,
+                        self.cfg.rms_eps,
+                    )?;
+                    swa_norm_fused = true;
+                } else if mix_direct_global
+                    && can_mix_q1_bf16
+                    && let (Some(qn), Some(kn), Some(vn)) = (
+                        layer.attn_q_inp_norm.as_ref(),
+                        layer.attn_k_inp_norm.as_ref(),
+                        layer.attn_v_inp_norm.as_ref(),
+                    )
+                {
+                    // Fuse inp_sa copy + 3-way RMSNorm (+ BF16 conversion) right into attn_res_mix!
+                    ik::attn_res_mix_q3_norm(
+                        ctx,
+                        cp,
+                        &ptrs,
+                        q_res,
+                        Some(&sc.inp_sa),
+                        [qn, kn, vn],
+                        [qkv_out_0, qkv_out_1, qkv_out_2],
+                        rows,
+                        h,
+                        n_states,
                         1e-6,
                         self.cfg.rms_eps,
                     )?;
@@ -1098,6 +1299,7 @@ impl Inkling2Model {
             }
             cp.memory_barrier()?;
 
+            let attn_norm_fused = swa_norm_fused;
             if has_msg {
                 let lc = layer
                     .loop_core
@@ -1216,9 +1418,9 @@ impl Inkling2Model {
                 }
             }
 
-            // Attention input norms (skip if already fused into SWA attn_res_mix!).
-            if swa_norm_fused {
-                // Already normalized inside `attn_res_mix_fused`!
+            // Attention input norms (skip if already fused into SWA attn_res_mix or ctrl_blend3!).
+            if attn_norm_fused {
+                // Already normalized inside `attn_res_mix_fused` or `ctrl_blend3_norm_f32`!
             } else if layer.is_swa && has_msg {
                 let norm = layer
                     .attn_norm
@@ -1229,7 +1431,7 @@ impl Inkling2Model {
                     cp,
                     [&sc.attn_in[0], &sc.attn_in[1], &sc.attn_in[2]],
                     [norm, norm, norm],
-                    [&sc.attn_in[0], &sc.attn_in[1], &sc.attn_in[2]],
+                    [qkv_out_0, qkv_out_1, qkv_out_2],
                     rows,
                     h,
                     self.cfg.rms_eps,
@@ -1244,7 +1446,7 @@ impl Inkling2Model {
                     cp,
                     &sc.attn_in[0],
                     Some(norm),
-                    &sc.attn_in[0],
+                    qkv_out_0,
                     rows,
                     h,
                     self.cfg.rms_eps,
@@ -1270,7 +1472,7 @@ impl Inkling2Model {
                     cp,
                     [&m0, &m1, &m2],
                     [qn, kn, vn],
-                    [&sc.attn_in[0], &sc.attn_in[1], &sc.attn_in[2]],
+                    [qkv_out_0, qkv_out_1, qkv_out_2],
                     rows,
                     h,
                     self.cfg.rms_eps,
@@ -1293,7 +1495,7 @@ impl Inkling2Model {
                     cp,
                     [&sc.attn_in[0], &sc.attn_in[1], &sc.attn_in[2]],
                     [qn, kn, vn],
-                    [&sc.attn_in[0], &sc.attn_in[1], &sc.attn_in[2]],
+                    [qkv_out_0, qkv_out_1, qkv_out_2],
                     rows,
                     h,
                     self.cfg.rms_eps,
@@ -1301,15 +1503,49 @@ impl Inkling2Model {
             }
             cp.memory_barrier()?;
 
-            let inp_q = &sc.attn_in[0];
-            let inp_k =
-                if layer.is_swa && !has_msg { &sc.attn_in[0] } else { &sc.attn_in[1] };
-            let inp_v =
-                if layer.is_swa && !has_msg { &sc.attn_in[0] } else { &sc.attn_in[2] };
+            let inp_q = qkv_out_0;
+            let inp_k = if layer.is_swa && !has_msg { qkv_out_0 } else { qkv_out_1 };
+            let inp_v = if layer.is_swa && !has_msg { qkv_out_0 } else { qkv_out_2 };
 
             // Q, K, V, R, sinks, gate, and optional dynamic conv projections (batched by type).
             let xb = sc.xb.as_ref();
-            if layer.is_swa && !has_msg {
+            if can_cmat_x3 {
+                if let (Some(kp), Some(vp)) =
+                    (&layer.attn_k_conv_proj, &layer.attn_v_conv_proj)
+                {
+                    k::gemv_cmat_bf16_sets_x3(
+                        ctx,
+                        cp,
+                        [inp_q, inp_k, inp_v],
+                        &[
+                            (&layer.wq, &sc.q, 0),
+                            (&layer.wk, &sc.k_raw, 1),
+                            (&layer.wv, &sc.v_raw, 2),
+                            (&layer.attn_rel, &sc.r_proj, 0),
+                            (&layer.attn_sink_proj, &sc.sinks, 0),
+                            (&layer.attn_gate, &sc.attn_gate, 0),
+                            (kp, &sc.k_dyn, 1),
+                            (vp, &sc.v_dyn, 2),
+                        ],
+                        rows,
+                    )?;
+                } else {
+                    k::gemv_cmat_bf16_sets_x3(
+                        ctx,
+                        cp,
+                        [inp_q, inp_k, inp_v],
+                        &[
+                            (&layer.wq, &sc.q, 0),
+                            (&layer.wk, &sc.k_raw, 1),
+                            (&layer.wv, &sc.v_raw, 2),
+                            (&layer.attn_rel, &sc.r_proj, 0),
+                            (&layer.attn_sink_proj, &sc.sinks, 0),
+                            (&layer.attn_gate, &sc.attn_gate, 0),
+                        ],
+                        rows,
+                    )?;
+                }
+            } else if layer.is_swa && !has_msg {
                 linear_multi_bx(
                     ctx,
                     cp,
@@ -1340,7 +1576,7 @@ impl Inkling2Model {
                     rows,
                 )?;
                 // When `xb` is shared across inp_q/inp_k/inp_v, wait before rewriting `xb`.
-                if rows > 12 && ctx.matrix_units() && xb.is_some() {
+                if rows > 16 && ctx.matrix_units() && xb.is_some() {
                     cp.memory_barrier()?;
                 }
                 if let (Some(kp), Some(vp)) =
@@ -1354,7 +1590,7 @@ impl Inkling2Model {
                         &[(&layer.wk, &sc.k_raw), (kp, &sc.k_dyn)],
                         rows,
                     )?;
-                    if rows > 12 && ctx.matrix_units() && xb.is_some() {
+                    if rows > 16 && ctx.matrix_units() && xb.is_some() {
                         cp.memory_barrier()?;
                     }
                     linear_multi_bx(
@@ -1367,7 +1603,7 @@ impl Inkling2Model {
                     )?;
                 } else {
                     linear_bx(ctx, cp, &layer.wk, inp_k, xb, &sc.k_raw, rows)?;
-                    if rows > 12 && ctx.matrix_units() && xb.is_some() {
+                    if rows > 16 && ctx.matrix_units() && xb.is_some() {
                         cp.memory_barrier()?;
                     }
                     linear_bx(ctx, cp, &layer.wv, inp_v, xb, &sc.v_raw, rows)?;
@@ -1395,6 +1631,12 @@ impl Inkling2Model {
             let dyn_w = nkv * self.cfg.sconv_l_cache;
             let rel_w = nh * self.cfg.rel_len;
 
+            let use_wo_bf16 = ctx.matrix_units()
+                && rows <= ATTN_SPLIT_MAX_ROWS
+                && self.cfg.head_dim == 128
+                && layer.wo.ty == GgmlType::Bf16
+                && layer.wo.cols.is_multiple_of(64)
+                && sc.xb.is_some();
             for sub_off in (0..rows).step_by(ATTN_ROWS) {
                 let sub = (rows - sub_off).min(ATTN_ROWS);
                 let sub_pos0 = pos0 + sub_off;
@@ -1415,7 +1657,11 @@ impl Inkling2Model {
                 };
                 let r_sub = sc.r_proj.view(sub_off * rel_w, &[sub, rel_w])?;
                 let sinks_sub = sc.sinks.view(sub_off * nh, &[sub, nh])?;
-                let ao_sub = sc.attn_out.view(sub_off * q_w, &[sub, q_w])?;
+                let ao_sub = if use_wo_bf16 {
+                    sc.xb.as_ref().unwrap().view(sub_off * q_w, &[sub, q_w])?
+                } else {
+                    sc.attn_out.view(sub_off * q_w, &[sub, q_w])?
+                };
                 let gate_sub = sc.attn_gate.view(sub_off * q_w, &[sub, q_w])?;
 
                 if sub_parallel {
@@ -1442,7 +1688,12 @@ impl Inkling2Model {
                         self.cfg.rms_eps,
                     )?;
                 } else {
-                    ik::kv_prep(
+                    let kv_pos = if sub_off == 0 {
+                        pos_param.unwrap_or(crate::metal::Param::U32(sub_pos0 as u32))
+                    } else {
+                        crate::metal::Param::U32(sub_pos0 as u32)
+                    };
+                    ik::kv_prep_dyn(
                         ctx,
                         cp,
                         &k_sub,
@@ -1461,15 +1712,35 @@ impl Inkling2Model {
                         nkv,
                         self.cfg.sconv_l_cache,
                         layer.is_swa,
-                        sub_pos0,
+                        kv_pos,
                         slot_cache.slots,
                         self.cfg.qk_clip,
                         self.cfg.rms_eps,
                     )?;
                 }
-                if self.cfg.rel_len <= 16 {
-                    // Fused R L2 clip + tiled rel_bias in one dispatch for all row counts!
-                    ik::rel_bias_clipped(
+                let use_mu_split = ctx.matrix_units()
+                    && sub >= 1
+                    && sub <= ATTN_SPLIT_MAX_ROWS
+                    && self.cfg.head_dim == 128
+                    && (!layer.is_swa || slot_cache.slots >= 128);
+                let use_scalar_split =
+                    !use_mu_split && sub <= ATTN_SPLIT_MAX_ROWS && self.cfg.head_dim == 128;
+                let fuse_rel_in_attn = use_mu_split
+                    && self.cfg.rel_len == 16
+                    && layer.attn_rel_bias.ty == crate::gguf::GgmlType::F32;
+                let active_ext = if layer.is_swa || (fuse_rel_in_attn && pos_param.is_some()) {
+                    ext
+                } else {
+                    ext.min((sub_pos0 + sub).max(1))
+                };
+                let fuse_rel_in_split = false;
+                if fuse_rel_in_attn || fuse_rel_in_split {
+                    // Relative-position bias (D == 16, F32) is fused into attention;
+                    // just wait for `kv_prep` before reading `k_cache`/`v_cache`.
+                    cp.memory_barrier()?;
+                } else if self.cfg.rel_len <= 16 {
+                    // Fused R L2 clip + tiled rel_bias in one dispatch, trimmed to reachable distances!
+                    ik::rel_bias_clipped_ext(
                         ctx,
                         cp,
                         &r_sub,
@@ -1478,6 +1749,7 @@ impl Inkling2Model {
                         Some(&layer.attn_rel_clip),
                         sub * nh,
                         nh,
+                        active_ext,
                         self.cfg.rel_clip,
                         sub_pos0,
                         lf,
@@ -1500,13 +1772,20 @@ impl Inkling2Model {
                         la,
                     )?;
                     cp.memory_barrier()?;
-                    ik::rel_bias(
+                    ik::rel_bias_clipped_ext(
                         ctx,
                         cp,
                         &r_sub,
                         &layer.attn_rel_bias,
                         &sc.rel_table,
+                        None,
                         sub * nh,
+                        nh,
+                        active_ext,
+                        0.0,
+                        0,
+                        0,
+                        0.0,
                     )?;
                     cp.memory_barrier()?;
                 }
@@ -1533,7 +1812,94 @@ impl Inkling2Model {
                 }
 
                 // Relative-position bias attention with zero sink + fused Q L2 clip + fused sigmoid output gate.
-                if sub <= ATTN_SPLIT_MAX_ROWS && self.cfg.head_dim == 128 {
+                if fuse_rel_in_attn {
+                    let attn_pos = if sub_off == 0 {
+                        pos_param.unwrap_or(crate::metal::Param::U32(sub_pos0 as u32))
+                    } else {
+                        crate::metal::Param::U32(sub_pos0 as u32)
+                    };
+                    ik::attention_mu_split_rel_dyn(
+                        ctx,
+                        cp,
+                        &q_sub,
+                        &slot_cache.k,
+                        &slot_cache.v,
+                        &r_sub,
+                        &layer.attn_rel_bias,
+                        Some(&layer.attn_rel_clip),
+                        &sinks_sub,
+                        &sc.attn_partial,
+                        &ao_sub,
+                        Some(&gate_sub),
+                        Some(&layer.attn_q_clip),
+                        sub,
+                        nh,
+                        nkv,
+                        attn_pos,
+                        sub_pos0,
+                        slot_cache.slots,
+                        layer.is_swa,
+                        self.cfg.window,
+                        active_ext,
+                        self.cfg.qk_clip,
+                        self.cfg.rel_clip,
+                        lf,
+                        la,
+                    )?;
+                } else if use_mu_split {
+                    ik::attention_mu_split(
+                        ctx,
+                        cp,
+                        &q_sub,
+                        &slot_cache.k,
+                        &slot_cache.v,
+                        &sc.rel_table,
+                        &sinks_sub,
+                        &sc.attn_partial,
+                        &ao_sub,
+                        Some(&gate_sub),
+                        Some(&layer.attn_q_clip),
+                        sub,
+                        nh,
+                        nkv,
+                        sub_pos0,
+                        slot_cache.slots,
+                        layer.is_swa,
+                        self.cfg.window,
+                        active_ext,
+                        self.cfg.qk_clip,
+                        lf,
+                        la,
+                    )?;
+                } else if fuse_rel_in_split {
+                    ik::attention_split_rel(
+                        ctx,
+                        cp,
+                        &q_sub,
+                        &slot_cache.k,
+                        &slot_cache.v,
+                        &r_sub,
+                        &layer.attn_rel_bias,
+                        Some(&layer.attn_rel_clip),
+                        &sinks_sub,
+                        &sc.attn_partial,
+                        &ao_sub,
+                        Some(&gate_sub),
+                        Some(&layer.attn_q_clip),
+                        sub,
+                        nh,
+                        nkv,
+                        sub_pos0,
+                        slot_cache.slots,
+                        layer.is_swa,
+                        self.cfg.window,
+                        active_ext,
+                        self.cfg.qk_clip,
+                        self.cfg.rel_clip,
+                        lf,
+                        la,
+                    )?;
+                } else if use_scalar_split {
                     ik::attention_split_fused(
                         ctx,
                         cp,
@@ -1553,7 +1919,7 @@ impl Inkling2Model {
                         slot_cache.slots,
                         layer.is_swa,
                         self.cfg.window,
-                        ext,
+                        active_ext,
                         self.cfg.qk_clip,
                         lf,
                         la,
@@ -1580,7 +1946,7 @@ impl Inkling2Model {
                         slot_cache.slots,
                         layer.is_swa,
                         self.cfg.window,
-                        ext,
+                        active_ext,
                         self.cfg.qk_clip,
                         lf,
                         la,
@@ -1604,7 +1970,7 @@ impl Inkling2Model {
                         slot_cache.slots,
                         layer.is_swa,
                         self.cfg.window,
-                        ext,
+                        active_ext,
                         self.cfg.qk_clip,
                         lf,
                         la,
@@ -1614,7 +1980,18 @@ impl Inkling2Model {
             }
 
             // Output projection, post-attention short conv (+ fused residual add on non-boundary layers).
-            linear_bx(ctx, cp, &layer.wo, &sc.attn_out, xb, &sc.wo_out, rows)?;
+            if use_wo_bf16 {
+                let wo_x = sc.xb.as_ref().unwrap().view(0, &[rows, q_w])?;
+                k::gemv_cmat_bf16_sets_x3(
+                    ctx,
+                    cp,
+                    [&wo_x, &wo_x, &wo_x],
+                    &[(&layer.wo, &sc.wo_out, 0)],
+                    rows,
+                )?;
+            } else {
+                linear_bx(ctx, cp, &layer.wo, &sc.attn_out, xb, &sc.wo_out, rows)?;
+            }
             cp.memory_barrier()?;
             let attn_res = if plan.block_save_idx.is_none() {
                 Some(&sc.inp_sa)
@@ -1809,21 +2186,63 @@ impl Inkling2Model {
                 rows,
             )?;
             cp.memory_barrier()?;
-            ik::router(
-                ctx,
-                cp,
-                &sc.router_logits,
-                layer.exp_probs_b.as_ref(),
-                &sc.exp_ids,
-                &sc.exp_w,
-                rows,
-                self.cfg.n_expert,
-                self.cfg.n_expert_used,
-                self.cfg.route_scale,
-            )?;
-            cp.memory_barrier()?;
 
             let rows_k = rows * self.cfg.n_expert_used;
+            let use_moe_mu = rows > ATTN_SPLIT_MAX_ROWS
+                && ctx.matrix_units()
+                && h.is_multiple_of(64)
+                && self.cfg.ff_expert.is_multiple_of(64)
+                && sc.xb.is_some()
+                && sc.moe_mid_bf16.is_some()
+                && sc.moe_group_tiles.is_some();
+            let fused_router_bucket = rows >= 2
+                && rows <= 8
+                && !use_moe_mu
+                && self.cfg.n_expert <= 256
+                && self.cfg.n_expert_used <= 16;
+            if fused_router_bucket {
+                let gx_gu = self.cfg.ff_expert.div_ceil(32);
+                let gx_down = if matches!(
+                    layer.down_exps.ty,
+                    crate::gguf::GgmlType::Nvfp4 | crate::gguf::GgmlType::Q8_0
+                ) {
+                    h.div_ceil(32)
+                } else {
+                    h.div_ceil(64)
+                };
+                ik::router_bucket_ex(
+                    ctx,
+                    cp,
+                    &sc.router_logits,
+                    layer.exp_probs_b.as_ref(),
+                    &sc.exp_ids,
+                    &sc.exp_w,
+                    &sc.sorted_rk,
+                    &sc.moe_tiles,
+                    &sc.moe_n_tiles,
+                    rows,
+                    self.cfg.n_expert,
+                    self.cfg.n_expert_used,
+                    self.cfg.route_scale,
+                    Some((gx_gu, gx_down)),
+                )?;
+                cp.memory_barrier_indirect()?;
+            } else {
+                ik::router(
+                    ctx,
+                    cp,
+                    &sc.router_logits,
+                    layer.exp_probs_b.as_ref(),
+                    &sc.exp_ids,
+                    &sc.exp_w,
+                    rows,
+                    self.cfg.n_expert,
+                    self.cfg.n_expert_used,
+                    self.cfg.route_scale,
+                )?;
+                cp.memory_barrier()?;
+            }
+
             if rows == 1 {
                 ik::moe_gate_up_situ(
                     ctx,
@@ -1853,10 +2272,7 @@ impl Inkling2Model {
                     self.cfg.n_expert_used,
                     h,
                 )?;
-            } else if rows > ATTN_SPLIT_MAX_ROWS
-                && ctx.matrix_units()
-                && h.is_multiple_of(64)
-                && self.cfg.ff_expert.is_multiple_of(64)
+            } else if use_moe_mu
                 && let (Some(xb), Some(mid_bf16), Some(gtiles)) = (
                     sc.xb.as_ref(),
                     sc.moe_mid_bf16.as_ref(),
@@ -1891,21 +2307,25 @@ impl Inkling2Model {
                     None,
                 )?;
             } else {
-                // Grouped multi-row MoE (up to 4 tokens per expert tile) for prefill & verify.
-                ik::moe_bucket(
-                    ctx,
-                    cp,
-                    &sc.exp_ids,
-                    &sc.sorted_rk,
-                    &sc.moe_tiles,
-                    &sc.moe_n_tiles,
-                    rows_k,
-                    self.cfg.n_expert,
-                )?;
-                cp.memory_barrier()?;
+                // Grouped multi-row MoE (up to 8 tokens per expert tile) for prefill & verify.
+                if !fused_router_bucket {
+                    ik::moe_bucket(
+                        ctx,
+                        cp,
+                        &sc.exp_ids,
+                        &sc.sorted_rk,
+                        &sc.moe_tiles,
+                        &sc.moe_n_tiles,
+                        rows_k,
+                        self.cfg.n_expert,
+                    )?;
+                    cp.memory_barrier()?;
+                }
                 // Worst-case tile count for M_TILE=8: min(rows_k, (rows_k + 7*E) / 8).
-                let max_tiles = rows_k.min((rows_k + 3 * self.cfg.n_expert) / 4);
-                ik::moe_gu_m4(
+                let max_tiles = rows_k.min((rows_k + 7 * self.cfg.n_expert) / 8);
+                let ind_gu = fused_router_bucket.then_some(16);
+                let ind_dn = fused_router_bucket.then_some(32);
+                ik::moe_gu_m4_ex(
                     ctx,
                     cp,
                     &sc.ffn_normed,
@@ -1913,6 +2333,7 @@ impl Inkling2Model {
                     &sc.sorted_rk,
                     &sc.moe_tiles,
                     &sc.moe_n_tiles,
+                    ind_gu,
                     layer.gate_up_scale.as_ref(),
                     &sc.situ_out,
                     max_tiles,
@@ -1922,7 +2343,7 @@ impl Inkling2Model {
                     self.cfg.situ_linear_beta,
                 )?;
                 cp.memory_barrier()?;
-                ik::moe_down_m4(
+                ik::moe_down_m4_ex(
                     ctx,
                     cp,
                     &sc.situ_out,
@@ -1930,68 +2351,97 @@ impl Inkling2Model {
                     &sc.sorted_rk,
                     &sc.moe_tiles,
                     &sc.moe_n_tiles,
+                    ind_dn,
                     &sc.down_out,
                     max_tiles,
                     h,
                 )?;
                 cp.memory_barrier()?;
-                ik::moe_sum(
-                    ctx,
-                    cp,
-                    &sc.down_out,
-                    &sc.exp_ids,
-                    &sc.exp_w,
-                    layer.down_scale.as_ref(),
-                    &sc.moe_out,
-                    rows,
-                    self.cfg.n_expert_used,
-                    h,
-                )?;
+                let fused_sum_sconv = !parallel_sconv;
+                if fused_sum_sconv {
+                    ik::moe_sum_sconv(
+                        ctx,
+                        cp,
+                        &sc.down_out,
+                        &sc.exp_ids,
+                        &sc.exp_w,
+                        layer.down_scale.as_ref(),
+                        &layer.ffn_post_conv,
+                        &slot_cache.ffn_hist,
+                        &sc.cur,
+                        tr.map(|t| &t[3]),
+                        Some(&sc.ffn_inp),
+                        rows,
+                        self.cfg.n_expert_used,
+                        h,
+                        self.cfg.sconv_l_cache,
+                    )?;
+                    cp.memory_barrier()?;
+                } else {
+                    ik::moe_sum(
+                        ctx,
+                        cp,
+                        &sc.down_out,
+                        &sc.exp_ids,
+                        &sc.exp_w,
+                        layer.down_scale.as_ref(),
+                        &sc.moe_out,
+                        rows,
+                        self.cfg.n_expert_used,
+                        h,
+                    )?;
+                    cp.memory_barrier()?;
+                }
             }
-            cp.memory_barrier()?;
-            if parallel_sconv {
-                ik::short_conv_prefill(
-                    ctx,
-                    cp,
-                    &sc.moe_out,
-                    &layer.ffn_post_conv,
-                    None,
-                    &slot_cache.ffn_hist,
-                    &sc.cur,
-                    Some(&sc.ffn_inp),
-                    rows,
-                    h,
-                    self.cfg.sconv_l_cache,
-                    0,
-                )?;
-                cp.memory_barrier()?;
-                // Runs concurrently with the next visit's attn_res_mix (or output mix on the last visit).
-                ik::short_conv_hist_update(
-                    ctx,
-                    cp,
-                    &sc.moe_out,
-                    &slot_cache.ffn_hist,
-                    rows,
-                    h,
-                    hist_len,
-                )?;
-            } else {
-                ik::short_conv_fused(
-                    ctx,
-                    cp,
-                    &sc.moe_out,
-                    &layer.ffn_post_conv,
-                    None,
-                    &slot_cache.ffn_hist,
-                    &sc.cur,
-                    tr.map(|t| &t[3]),
-                    Some(&sc.ffn_inp),
-                    rows,
-                    h,
-                    self.cfg.sconv_l_cache,
-                    0,
-                )?;
-                cp.memory_barrier()?;
+            let skip_ffn_sconv = rows >= 2 && !use_moe_mu && !parallel_sconv;
+            if !skip_ffn_sconv {
+                if rows == 1 || use_moe_mu {
+                    cp.memory_barrier()?;
+                }
+                if parallel_sconv {
+                    ik::short_conv_prefill(
+                        ctx,
+                        cp,
+                        &sc.moe_out,
+                        &layer.ffn_post_conv,
+                        None,
+                        &slot_cache.ffn_hist,
+                        &sc.cur,
+                        Some(&sc.ffn_inp),
+                        rows,
+                        h,
+                        self.cfg.sconv_l_cache,
+                        0,
+                    )?;
+                    cp.memory_barrier()?;
+                    // Runs concurrently with the next visit's attn_res_mix (or output mix on the last visit).
+                    ik::short_conv_hist_update(
+                        ctx,
+                        cp,
+                        &sc.moe_out,
+                        &slot_cache.ffn_hist,
+                        rows,
+                        h,
+                        hist_len,
+                    )?;
+                } else {
+                    ik::short_conv_fused(
+                        ctx,
+                        cp,
+                        &sc.moe_out,
+                        &layer.ffn_post_conv,
+                        None,
+                        &slot_cache.ffn_hist,
+                        &sc.cur,
+                        tr.map(|t| &t[3]),
+                        Some(&sc.ffn_inp),
+                        rows,
+                        h,
+                        self.cfg.sconv_l_cache,
+                        0,
+                    )?;
+                    cp.memory_barrier()?;
+                }
             }
         }
 
@@ -2035,7 +2485,25 @@ impl Inkling2Model {
                     && let Some(vs) = &sc.verify
                 {
                     let all_rows = sc.ffn_normed.view(0, &[rows, h])?;
-                    linear(ctx, cp, &self.output, &all_rows, &vs.logits_raw, rows)?;
+                    if ctx.matrix_units()
+                        && self.output.ty == GgmlType::Bf16
+                        && self.output.cols.is_multiple_of(64)
+                        && rows <= 16
+                        && let Some(xb) = &sc.xb
+                    {
+                        let xb_rows = xb.view(0, &[rows, h])?;
+                        k::to_bf16(ctx, cp, &all_rows, &xb_rows, rows * h)?;
+                        cp.memory_barrier()?;
+                        k::gemv_cmat_bf16_sets(
+                            ctx,
+                            cp,
+                            &[(&self.output, &vs.logits_raw)],
+                            &xb_rows,
+                            rows,
+                        )?;
+                    } else {
+                        linear(ctx, cp, &self.output, &all_rows, &vs.logits_raw, rows)?;
+                    }
                     cp.memory_barrier()?;
                     ik::softcap(
                         ctx,
@@ -2049,7 +2517,24 @@ impl Inkling2Model {
                     )?;
                 } else {
                     let last_row = sc.ffn_normed.view((rows - 1) * h, &[1, h])?;
-                    linear(ctx, cp, &self.output, &last_row, &sc.logits_raw, 1)?;
+                    if ctx.matrix_units()
+                        && self.output.ty == GgmlType::Bf16
+                        && self.output.cols.is_multiple_of(64)
+                        && let Some(xb) = &sc.xb
+                    {
+                        let xb_row = xb.view(0, &[1, h])?;
+                        k::to_bf16(ctx, cp, &last_row, &xb_row, h)?;
+                        cp.memory_barrier()?;
+                        k::gemv_cmat_bf16_sets(
+                            ctx,
+                            cp,
+                            &[(&self.output, &sc.logits_raw)],
+                            &xb_row,
+                            1,
+                        )?;
+                    } else {
+                        linear(ctx, cp, &self.output, &last_row, &sc.logits_raw, 1)?;
+                    }
                     cp.memory_barrier()?;
                     ik::softcap(
                         ctx,
@@ -2352,7 +2837,7 @@ impl Inkling2Model {
                         &cp,
                         ds_state,
                         &anchor_embd,
-                        self.draft_output_weight(),
+                        self.draft_output_head(),
                         self.cfg.vocab_unpadded,
                         4,
                         3,

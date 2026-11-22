@@ -449,11 +449,16 @@ void main() {
     const uint n0 = gl_WorkGroupID.x * 32u;
     const uint64_t W_exp = arg(1) + uint64_t(expert) * uint64_t(2u * N) * uint64_t(row_bytes);
     const uint64_t W = W_exp + uint64_t((quad < 8u ? 0u : N) + n0) * uint64_t(row_bytes);
-    [[unroll]] for (uint r = 0u; r < 4u; r++) wr[r] = W + uint64_t(min(4u * (quad & 7u) + r, N - 1u - n0)) * uint64_t(row_bytes);
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        wr[r] = W + uint64_t(min(4u * (quad & 7u) + r, N - 1u - n0)) * uint64_t(row_bytes);
+    }
 #else
     const uint n0 = gl_WorkGroupID.x * 64u;
-    const uint64_t W = arg(1) + (uint64_t(expert) * uint64_t(N) + uint64_t(n0)) * uint64_t(row_bytes);
-    [[unroll]] for (uint r = 0u; r < 4u; r++) wr[r] = W + uint64_t(min(4u * quad + r, N - 1u - n0)) * uint64_t(row_bytes);
+    const uint64_t W_exp = arg(1) + uint64_t(expert) * uint64_t(N) * uint64_t(row_bytes);
+    const uint64_t W = W_exp + uint64_t(n0) * uint64_t(row_bytes);
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        wr[r] = W + uint64_t(min(4u * quad + r, N - 1u - n0)) * uint64_t(row_bytes);
+    }
 #endif
 
     // Register dot path for small single-tile experts (rows <= dot_rows <= 4).
@@ -464,10 +469,14 @@ void main() {
         uint64_t dwr[4];
 #ifdef I2_GM_GATE_UP
         const uint64_t DW = W_exp + uint64_t((dq < 8u ? 0u : N) + n0) * uint64_t(row_bytes);
-        [[unroll]] for (uint r = 0u; r < 4u; r++) dwr[r] = DW + uint64_t(min(4u * (dq & 7u) + r, N - 1u - n0)) * uint64_t(row_bytes);
+        [[unroll]] for (uint r = 0u; r < 4u; r++) {
+            dwr[r] = DW + uint64_t(min(4u * (dq & 7u) + r, N - 1u - n0)) * uint64_t(row_bytes);
+        }
 #else
-        const uint64_t DW = arg(1) + (uint64_t(expert) * uint64_t(N) + uint64_t(n0)) * uint64_t(row_bytes);
-        [[unroll]] for (uint r = 0u; r < 4u; r++) dwr[r] = DW + uint64_t(min(4u * dq + r, N - 1u - n0)) * uint64_t(row_bytes);
+        const uint64_t DW = W_exp + uint64_t(n0) * uint64_t(row_bytes);
+        [[unroll]] for (uint r = 0u; r < 4u; r++) {
+            dwr[r] = DW + uint64_t(min(4u * dq + r, N - 1u - n0)) * uint64_t(row_bytes);
+        }
 #endif
         if (rows == 1u) {
 #define GM_DR 1u

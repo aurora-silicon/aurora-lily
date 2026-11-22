@@ -277,23 +277,24 @@ pub(crate) fn repack_nvfp4_experts(
     Ok(out)
 }
 
-/// Quantizes a BF16 `[rows, cols]` row-major weight matrix into a compact
-/// `GgmlType::Q4_0` GPU `QWeight` (18 bytes per 32 values) for fast DSpark
-/// speculative drafting. Speculative verification always runs against the
-/// original exact `output` matrix, so this has zero effect on final logits.
-pub(super) fn quantize_bf16_to_q4_0(
+/// Quantizes raw row-major BF16 bytes `[rows, cols]` into a compact
+/// `GgmlType::Q4_0` GPU `QWeight` (18 bytes per 32 values).
+fn quantize_bf16_bytes_to_q4_0(
     ctx: &MetalContext,
-    w: &QWeight,
+    src: &[u8],
+    cols: usize,
+    rows: usize,
+    src_row_bytes: usize,
 ) -> Result<(QWeight, Buffer)> {
-    ensure!(w.ty == GgmlType::Bf16, "quantize_bf16_to_q4_0 expects Bf16, got {:?}", w.ty);
-    ensure!(w.cols.is_multiple_of(32), "Q4_0 cols {} not multiple of 32", w.cols);
-    let rows = w.rows;
-    let cols = w.cols;
+    ensure!(cols.is_multiple_of(32), "Q4_0 cols {cols} not multiple of 32");
+    ensure!(
+        src.len() >= rows * src_row_bytes,
+        "BF16 src {} < {}*{src_row_bytes}",
+        src.len(),
+        rows
+    );
     let blocks_per_row = cols / 32;
     let out_row_bytes = blocks_per_row * 18;
-    let src_row_bytes = w.row_bytes;
-    // SAFETY: `w.t` is host-visible unified/mapped memory and the GPU is idle during load.
-    let src = unsafe { std::slice::from_raw_parts(w.t.contents_ptr(), rows * src_row_bytes) };
     let mut out = vec![0u8; rows * out_row_bytes];
     out.par_chunks_exact_mut(out_row_bytes).enumerate().for_each(|(r, dst_row)| {
         let s_row = &src[r * src_row_bytes..(r + 1) * src_row_bytes];
@@ -329,6 +330,20 @@ pub(super) fn quantize_bf16_to_q4_0(
     let buf = ctx.new_buffer_with_bytes(&out)?;
     let t = Tensor::from_buffer(buf.clone(), &[out.len()], DType::I8)?;
     Ok((QWeight::new(t, GgmlType::Q4_0, cols, rows)?, buf))
+}
+
+/// Quantizes a BF16 `[rows, cols]` row-major weight matrix into a compact
+/// `GgmlType::Q4_0` GPU `QWeight` (18 bytes per 32 values) for fast DSpark
+/// speculative drafting. Speculative verification always runs against the
+/// original exact `output` matrix, so this has zero effect on final logits.
+pub(super) fn quantize_bf16_to_q4_0(
+    ctx: &MetalContext,
+    w: &QWeight,
+) -> Result<(QWeight, Buffer)> {
+    ensure!(w.ty == GgmlType::Bf16, "quantize_bf16_to_q4_0 expects Bf16, got {:?}", w.ty);
+    // SAFETY: `w.t` is host-visible unified/mapped memory and the GPU is idle during load.
+    let src = unsafe { std::slice::from_raw_parts(w.t.contents_ptr(), w.rows * w.row_bytes) };
+    quantize_bf16_bytes_to_q4_0(ctx, src, w.cols, w.rows, w.row_bytes)
 }
 
 /// Repacks Thinking Machines native MXFP8 experts (`F8_E4M3 [E, N, K]` +
@@ -438,14 +453,8 @@ fn load_expert_pair(
             )?;
             let w_u8 = ckpt.read(&w_name)?;
             let s_fp8 = ckpt.read(&s_name)?;
-            let packed = repack_nvfp4_experts(
-                &w_u8,
-                &s_fp8,
-                n_expert,
-                n_rows,
-                cols,
-                deinterleave_gu,
-            )?;
+            let packed =
+                repack_nvfp4_experts(&w_u8, &s_fp8, n_expert, n_rows, cols, deinterleave_gu)?;
             let buf = ctx.new_buffer_with_bytes(&packed)?;
             let t = Tensor::from_buffer(buf.clone(), &[packed.len()], DType::I8)?;
             let qw = QWeight::new(t, GgmlType::Nvfp4, cols, n_expert * n_rows)?;
@@ -821,26 +830,12 @@ pub(super) fn load_dspark(
     };
 
     let ckpt = Checkpoint::open_file(mtp_path)?;
-    let mut map_names = vec![
+    let map_names = vec![
         "markov_head.markov_w1.weight".to_string(),
         "markov_head.rnn_proj.weight".to_string(),
         "markov_head.hidden_out.weight".to_string(),
     ];
-    for i in 0..n_layer {
-        let p = |s: &str| format!("layers.{i}.{s}");
-        map_names.extend([
-            p("self_attn.q_proj.weight"),
-            p("self_attn.k_proj.weight"),
-            p("self_attn.v_proj.weight"),
-            p("self_attn.o_proj.weight"),
-            p("self_attn.k_proj_ctx.weight"),
-            p("self_attn.v_proj_ctx.weight"),
-            p("mlp.gate_proj.weight"),
-            p("mlp.up_proj.weight"),
-            p("mlp.down_proj.weight"),
-        ]);
-    }
-    let st = StMapped::map_names(ctx, &ckpt, &map_names)?;
+    let mut st = StMapped::map_names(ctx, &ckpt, &map_names)?;
 
     let h = cfg.hidden;
     let qw = cfg.n_head * cfg.head_dim;
@@ -879,6 +874,14 @@ pub(super) fn load_dspark(
     }
     let fuse_weights = Tensor::from_f32(ctx, &fuse_flat, &[cfg.n_layer + 1, nt])?;
 
+    let mut load_dflare_w = |name: &str, cols: usize, rows: usize| -> Result<QWeight> {
+        expect_meta(&ckpt, name, SafetensorsDType::BF16, &[rows, cols])?;
+        let raw = ckpt.read(name)?;
+        let (qw, buf) = quantize_bf16_bytes_to_q4_0(ctx, &raw, cols, rows, cols * 2)?;
+        st.push_buffer(buf);
+        Ok(qw)
+    };
+
     let mut layers = Vec::with_capacity(cfg.n_layer);
     for i in 0..cfg.n_layer {
         let p = |s: &str| format!("layers.{i}.{s}");
@@ -894,27 +897,28 @@ pub(super) fn load_dspark(
                 &p("self_attn.k_norm_ctx.weight"),
                 &[head_dim],
             )?,
-            wq: st.bf16_qweight(&p("self_attn.q_proj.weight"), h, qw)?,
-            wk: st.bf16_qweight(&p("self_attn.k_proj.weight"), h, kw)?,
-            wv: st.bf16_qweight(&p("self_attn.v_proj.weight"), h, kw)?,
-            wo: st.bf16_qweight(&p("self_attn.o_proj.weight"), qw, h)?,
-            wk_ctx: st.bf16_qweight(&p("self_attn.k_proj_ctx.weight"), h, kw)?,
-            wv_ctx: st.bf16_qweight(&p("self_attn.v_proj_ctx.weight"), h, kw)?,
-            ffn_gate: st.bf16_qweight(&p("mlp.gate_proj.weight"), h, cfg.ff)?,
-            ffn_up: st.bf16_qweight(&p("mlp.up_proj.weight"), h, cfg.ff)?,
-            ffn_down: st.bf16_qweight(&p("mlp.down_proj.weight"), cfg.ff, h)?,
+            wq: load_dflare_w(&p("self_attn.q_proj.weight"), h, qw)?,
+            wk: load_dflare_w(&p("self_attn.k_proj.weight"), h, kw)?,
+            wv: load_dflare_w(&p("self_attn.v_proj.weight"), h, kw)?,
+            wo: load_dflare_w(&p("self_attn.o_proj.weight"), qw, h)?,
+            wk_ctx: load_dflare_w(&p("self_attn.k_proj_ctx.weight"), h, kw)?,
+            wv_ctx: load_dflare_w(&p("self_attn.v_proj_ctx.weight"), h, kw)?,
+            ffn_gate: load_dflare_w(&p("mlp.gate_proj.weight"), h, cfg.ff)?,
+            ffn_up: load_dflare_w(&p("mlp.up_proj.weight"), h, cfg.ff)?,
+            ffn_down: load_dflare_w(&p("mlp.down_proj.weight"), cfg.ff, h)?,
         });
     }
 
     let max_block = cfg.block_size.max(8);
+    let nl = cfg.n_layer.max(1);
     let scratch = DsparkScratch {
         max_block,
         cur: Tensor::zeros(ctx, &[max_block, h], DType::F32)?,
-        x_h: Tensor::zeros(ctx, &[max_block, h], DType::F32)?,
+        x_h: Tensor::zeros(ctx, &[nl * max_block, h], DType::F32)?,
         post_attn: Tensor::zeros(ctx, &[max_block, h], DType::F32)?,
         q: Tensor::zeros(ctx, &[max_block, qw], DType::F32)?,
-        k: Tensor::zeros(ctx, &[max_block, kw], DType::F32)?,
-        v: Tensor::zeros(ctx, &[max_block, kw], DType::F32)?,
+        k: Tensor::zeros(ctx, &[nl * max_block, kw], DType::F32)?,
+        v: Tensor::zeros(ctx, &[nl * max_block, kw], DType::F32)?,
         attn_partial: Tensor::zeros(
             ctx,
             &[max_block, cfg.n_head, ik::DSPARK_SPLIT_MAX_CHUNKS + 1, 130],
@@ -934,6 +938,16 @@ pub(super) fn load_dspark(
         corr: Tensor::zeros(ctx, &[1, h], DType::F32)?,
         combined: Tensor::zeros(ctx, &[1, h], DType::F32)?,
         logits_raw: Tensor::zeros(ctx, &[target.vocab_padded], DType::F32)?,
+        draft_part_val: Tensor::zeros(
+            ctx,
+            &[target.vocab_unpadded.div_ceil(32).max(1)],
+            DType::F32,
+        )?,
+        draft_part_idx: Tensor::zeros(
+            ctx,
+            &[target.vocab_unpadded.div_ceil(32).max(1)],
+            DType::U32,
+        )?,
         best_toks: Tensor::zeros(ctx, &[max_block], DType::U32)?,
         sampler: SamplerScratch::new(ctx, target.vocab_unpadded)?,
     };

@@ -4023,3 +4023,233 @@ fn ds4_q_b_against_f64() {
         }
     }
 }
+
+#[test]
+fn cmat_bf16_sets_matches_cpu_and_row_invariant() {
+    let ctx = ctx();
+    if !ctx.matrix_units() {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(4242);
+    let k = 256usize;
+    let ns = [12usize, 128, 1024, 2304];
+    let mut raw_ws = Vec::new();
+    let mut qws = Vec::new();
+    let mut fws = Vec::new();
+    for &n in &ns {
+        let mut raw = Vec::with_capacity(n * k * 2);
+        let mut fw = Vec::with_capacity(n * k);
+        for _ in 0..n * k {
+            let v: f32 = rng.gen_range(-1.5..1.5);
+            let b = half::bf16::from_f32(v);
+            raw.extend_from_slice(&b.to_bits().to_le_bytes());
+            fw.push(b.to_f32());
+        }
+        qws.push(QWeight::from_bytes(&ctx, &raw, GgmlType::Bf16, k, n).unwrap());
+        raw_ws.push(raw);
+        fws.push(fw);
+    }
+    let max_m = 8usize;
+    let x = f32s(&mut rng, max_m * k, -1.5, 1.5);
+    let tx = tensor(&ctx, &x);
+    let mut ys_multi_m1 = Vec::new();
+    {
+        let y0 = zeros(&ctx, ns[0]);
+        let y1 = zeros(&ctx, ns[1]);
+        let y2 = zeros(&ctx, ns[2]);
+        let y3 = zeros(&ctx, ns[3]);
+        let x0 = tensor(&ctx, &x[..k]);
+        run(&ctx, |p| {
+            gemv_cmat_bf16_sets(
+                &ctx,
+                p,
+                &[(&qws[0], &y0), (&qws[1], &y1), (&qws[2], &y2), (&qws[3], &y3)],
+                &x0,
+                1,
+            )
+            .unwrap();
+        });
+        ys_multi_m1.push(y0.to_f32().unwrap());
+        ys_multi_m1.push(y1.to_f32().unwrap());
+        ys_multi_m1.push(y2.to_f32().unwrap());
+        ys_multi_m1.push(y3.to_f32().unwrap());
+    }
+    // Single-set narrow (N=128) m=1 vs m=6 must also be bit-exact on row 0.
+    {
+        let y_m1 = zeros(&ctx, ns[1]);
+        let y_m6 = zeros(&ctx, 6 * ns[1]);
+        let x0 = tensor(&ctx, &x[..k]);
+        run(&ctx, |p| gemv_cmat_bf16_sets(&ctx, p, &[(&qws[1], &y_m1)], &x0, 1).unwrap());
+        run(&ctx, |p| gemv_cmat_bf16_sets(&ctx, p, &[(&qws[1], &y_m6)], &tx, 6).unwrap());
+        assert_eq!(&y_m6.to_f32().unwrap()[..ns[1]], &y_m1.to_f32().unwrap()[..]);
+    }
+    for m in [1usize, 4, 6, 8] {
+        let y0 = zeros(&ctx, m * ns[0]);
+        let y1 = zeros(&ctx, m * ns[1]);
+        let y2 = zeros(&ctx, m * ns[2]);
+        let y3 = zeros(&ctx, m * ns[3]);
+        run(&ctx, |p| {
+            gemv_cmat_bf16_sets(
+                &ctx,
+                p,
+                &[(&qws[0], &y0), (&qws[1], &y1), (&qws[2], &y2), (&qws[3], &y3)],
+                &tx,
+                m,
+            )
+            .unwrap();
+        });
+        let outs = [y0.to_f32().unwrap(), y1.to_f32().unwrap(), y2.to_f32().unwrap(), y3.to_f32().unwrap()];
+        for (idx, (&n, out)) in ns.iter().zip(&outs).enumerate() {
+            // Row 0 must be bit-for-bit identical between m=1 and m=4,6,8!
+            assert_eq!(&out[..n], &ys_multi_m1[idx][..], "bit-exact row 0 mismatch set {idx} m={m}");
+            // And match CPU BF16 reference within BF16 rounding tolerance.
+            for r in 0..m {
+                for j in 0..n {
+                    let mut acc = 0.0f64;
+                    for c in 0..k {
+                        let xb = half::bf16::from_f32(x[r * k + c]).to_f32();
+                        acc += f64::from(xb) * f64::from(fws[idx][j * k + c]);
+                    }
+                    let got = out[r * n + j];
+                    assert!(
+                        (f64::from(got) - acc).abs() < 1e-2,
+                        "set {idx} m={m} r={r} j={j}: got {got} want {acc}"
+                    );
+                }
+            }
+        }
+    }
+    // 8-set multi-X dispatch hitting `_n64_sk2` (total_rows >= 4096) across 3 distinct X inputs.
+    {
+        let x0 = f32s(&mut rng, 6 * k, -1.0, 1.0);
+        let x1 = f32s(&mut rng, 6 * k, -1.0, 1.0);
+        let x2 = f32s(&mut rng, 6 * k, -1.0, 1.0);
+        let tx0 = tensor(&ctx, &x0);
+        let tx1 = tensor(&ctx, &x1);
+        let tx2 = tensor(&ctx, &x2);
+        let ns8 = [1024usize, 512, 512, 1024, 512, 512, 72, 24]; // sum = 4192 -> _n64_sk2
+        let xids: [u8; 8] = [0, 1, 2, 0, 1, 2, 0, 1];
+        let mut ws8 = Vec::new();
+        let mut fws8 = Vec::new();
+        let mut ys8 = Vec::new();
+        for &n in &ns8 {
+            let mut raw = Vec::with_capacity(n * k * 2);
+            let mut fw = Vec::with_capacity(n * k);
+            for _ in 0..n * k {
+                let b = half::bf16::from_f32(rng.gen_range(-1.0..1.0));
+                raw.extend_from_slice(&b.to_bits().to_le_bytes());
+                fw.push(b.to_f32());
+            }
+            ws8.push(QWeight::from_bytes(&ctx, &raw, GgmlType::Bf16, k, n).unwrap());
+            fws8.push(fw);
+            ys8.push(zeros(&ctx, 6 * n));
+        }
+        let sets8: Vec<(&QWeight, &Tensor, u8)> =
+            (0..8).map(|i| (&ws8[i], &ys8[i], xids[i])).collect();
+        run(&ctx, |p| gemv_cmat_bf16_sets_x3(&ctx, p, [&tx0, &tx1, &tx2], &sets8, 6).unwrap());
+        let xs_cpu = [&x0, &x1, &x2];
+        for i in 0..8 {
+            let got = ys8[i].to_f32().unwrap();
+            let xv = xs_cpu[usize::from(xids[i])];
+            for r in [0usize, 5] {
+                for j in [0usize, ns8[i] - 1] {
+                    let mut acc = 0.0f64;
+                    for c in 0..k {
+                        let xb = half::bf16::from_f32(xv[r * k + c]).to_f32();
+                        acc += f64::from(xb) * f64::from(fws8[i][j * k + c]);
+                    }
+                    assert!(
+                        (f64::from(got[r * ns8[i] + j]) - acc).abs() < 1e-2,
+                        "x3 set {i} r={r} j={j}: got {} want {acc}",
+                        got[r * ns8[i] + j]
+                    );
+                }
+            }
+        }
+        // Verify BF16-input `_bx` path (`bx_n32_sg4` for >= 4096 rows, `bx_n32_sk2` for 1024..4096)
+        // matches F32-input path (different split-K reduction order => within f32 accumulation ULP).
+        let to_bf16_t = |v: &[f32]| {
+            let mut raw = Vec::with_capacity(v.len() * 2);
+            for &x in v {
+                raw.extend_from_slice(&half::bf16::from_f32(x).to_bits().to_le_bytes());
+            }
+            Tensor::from_bytes(&ctx, &raw, &[v.len()], DType::BF16).unwrap()
+        };
+        let bx0 = to_bf16_t(&x0);
+        let bx1 = to_bf16_t(&x1);
+        let bx2 = to_bf16_t(&x2);
+        let ys8_bx: Vec<Tensor> = ns8.iter().map(|&n| zeros(&ctx, 6 * n)).collect();
+        let sets8_bx: Vec<(&QWeight, &Tensor, u8)> =
+            (0..8).map(|i| (&ws8[i], &ys8_bx[i], xids[i])).collect();
+        run(&ctx, |p| gemv_cmat_bf16_sets_x3(&ctx, p, [&bx0, &bx1, &bx2], &sets8_bx, 6).unwrap());
+        for i in 0..8 {
+            let got = ys8_bx[i].to_f32().unwrap();
+            let want = ys8[i].to_f32().unwrap();
+            let max_diff = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_diff < 1e-4, "cmat_bf16_bx set {i} max_diff={max_diff}");
+        }
+        // Also exercise `bx_n32_sk2` (total_rows = 1536 in 1024..4096).
+        let ys2_bx = [zeros(&ctx, 6 * ns8[0]), zeros(&ctx, 6 * ns8[1])];
+        let sets2_bx = [(&ws8[0], &ys2_bx[0], xids[0]), (&ws8[1], &ys2_bx[1], xids[1])];
+        run(&ctx, |p| gemv_cmat_bf16_sets_x3(&ctx, p, [&bx0, &bx1, &bx2], &sets2_bx, 6).unwrap());
+        for i in 0..2 {
+            let got = ys2_bx[i].to_f32().unwrap();
+            let want = ys8[i].to_f32().unwrap();
+            let max_diff = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_diff < 1e-4, "cmat_bf16_bx_n32_sk2 set {i} max_diff={max_diff}");
+        }
+    }
+}
+
+#[test]
+fn gemv_cmat_q4_0_matches_cpu() {
+    let ctx = MetalContext::new().unwrap();
+    if !ctx.matrix_units() || 256 > ctx.max_workgroup_invocations() {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(0x5140_C0DE);
+    let k = 2304usize;
+    let ns = [512usize, 73usize];
+    let mut ws = Vec::new();
+    let mut fws = Vec::new();
+    for &n in &ns {
+        let raw = random_blocks(&mut rng, GgmlType::Q4_0, n * k);
+        let mut f = vec![0.0f32; n * k];
+        dequantize(GgmlType::Q4_0, &raw, &mut f).unwrap();
+        ws.push(QWeight::from_bytes(&ctx, &raw, GgmlType::Q4_0, k, n).unwrap());
+        fws.push(f);
+    }
+    for m in [1usize, 4, 6] {
+        let x: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let tx = tensor(&ctx, &x);
+        let ys: Vec<Tensor> = ns.iter().map(|&n| zeros(&ctx, m * n)).collect();
+        let sets: Vec<(&QWeight, &Tensor)> =
+            (0..ns.len()).map(|i| (&ws[i], &ys[i])).collect();
+        run(&ctx, |p| gemv_cmat_q4_0_sets(&ctx, p, &sets, &tx, m).unwrap());
+        for i in 0..ns.len() {
+            let got = ys[i].to_f32().unwrap();
+            for r in 0..m {
+                for j in 0..ns[i] {
+                    let mut acc = 0.0f64;
+                    for c in 0..k {
+                        acc += f64::from(x[r * k + c]) * f64::from(fws[i][j * k + c]);
+                    }
+                    let diff = (f64::from(got[r * ns[i] + j]) - acc).abs();
+                    assert!(
+                        diff < 5e-3,
+                        "cmat_q4_0 m={m} set={i} r={r} j={j}: got={} want={acc}",
+                        got[r * ns[i] + j]
+                    );
+                }
+            }
+        }
+    }
+}

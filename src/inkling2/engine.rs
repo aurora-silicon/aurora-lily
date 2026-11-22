@@ -299,10 +299,10 @@ impl LanguageModel for Inkling2Model {
             model.drafts = options.mtp_drafts.min(super::dspark::MAX_DRAFTS);
             model.dspark = Some(d);
             // When the main LM head is BF16 (~926 MB), build a compact Q4_0 copy
-            // (~261 MB) for DSpark drafting only; verification still uses exact BF16.
+            // for DSpark drafting only; verification still uses exact BF16.
             if model.output.ty == crate::gguf::GgmlType::Bf16 {
-                let dq = super::native::quantize_bf16_to_q4_0(ctx, &model.output)?;
-                model.draft_output = Some(dq);
+                model.draft_output =
+                    Some(super::native::quantize_bf16_to_q4_0(ctx, &model.output)?);
             }
         }
 
@@ -476,6 +476,8 @@ impl LanguageModel for Inkling2Model {
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>> {
         let cp = ctx.begin_concurrent()?;
+        #[cfg(target_os = "linux")]
+        cp.set_short();
         let tok_in = scratch.next_token.view(slot_in, &[1])?;
         self.encode_forward_rows(
             ctx,
@@ -525,6 +527,8 @@ impl LanguageModel for Inkling2Model {
         ds.prepare_propose(first)?;
         let anchor_embd = scratch.logits_raw.view(0, &[self.cfg.hidden])?;
         let cp = ctx.begin_concurrent()?;
+        #[cfg(target_os = "linux")]
+        cp.set_short();
         crate::kernels::inkling2::embed(
             ctx,
             &cp,
@@ -550,7 +554,7 @@ impl LanguageModel for Inkling2Model {
             &cp,
             ds_state,
             &anchor_embd,
-            self.draft_output_weight(),
+            self.draft_output_head(),
             self.cfg.vocab_unpadded,
             state.pos,
             drafts,
@@ -577,39 +581,247 @@ impl LanguageModel for Inkling2Model {
         check_tokens(&tokens, self.cfg.vocab_unpadded)?;
 
         let pos_before = state.pos;
+        if let Some(ds_state) = &mut state.dspark {
+            ds_state.ensure_capacity(ctx, pos_before + rows)?;
+        }
+
+        // Update cached GPU short-conv rollback pointer table if session buffers changed.
+        let n_entries = state.slots.len() * 4;
+        let max_hist_floats = self.cfg.hidden.max(
+            (0..self.cfg.n_phys).map(|p| self.cfg.kv_width(p)).max().unwrap_or(self.cfg.hidden),
+        ) * (self.cfg.sconv_l_cache - 1);
+        {
+            let vs_mut = scratch
+                .verify
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("verify scratch not allocated"))?;
+            ensure!(rows <= vs_mut.max_rows, "verify rows {rows} > {}", vs_mut.max_rows);
+            let cur_key = (
+                state.id,
+                vs_mut.trace[0][0].buffer().address() + vs_mut.trace[0][0].binding().1 as u64,
+            );
+            if vs_mut.rb_key != cur_key {
+                let mut entries: Vec<u64> = Vec::with_capacity(n_entries * 3);
+                for (slot, sc_slot) in state.slots.iter().enumerate() {
+                    let tr = &vs_mut.trace[slot];
+                    let kw_c = sc_slot.k_hist.shape()[1] as u64;
+                    let h_c = sc_slot.attn_hist.shape()[1] as u64;
+                    let pairs = [
+                        (&tr[0], &sc_slot.k_hist, kw_c),
+                        (&tr[1], &sc_slot.v_hist, kw_c),
+                        (&tr[2], &sc_slot.attn_hist, h_c),
+                        (&tr[3], &sc_slot.ffn_hist, h_c),
+                    ];
+                    for (t_src, h_dst, c_dim) in pairs {
+                        entries.push(t_src.buffer().address() + t_src.binding().1 as u64);
+                        entries.push(h_dst.buffer().address() + h_dst.binding().1 as u64);
+                        entries.push(c_dim);
+                    }
+                }
+                vs_mut.rb_table.write_bytes(bytemuck::cast_slice(&entries))?;
+                vs_mut.rb_key = cur_key;
+            }
+        }
+
         let vs = scratch
             .verify
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("verify scratch not allocated"))?;
-        ensure!(rows <= vs.max_rows, "verify rows {rows} > {}", vs.max_rows);
+
+        let can_fast_spec = next_drafts > 0
+            && self.dspark.as_ref().is_some_and(|ds| ds.cfg.head_dim == 128)
+            && state.dspark.is_some()
+            && scratch.dspark_cap.is_some();
+        let greedy = params.is_greedy() && !params.uses_penalties();
+        let can_dyn = can_fast_spec
+            && greedy
+            && self.can_use_dyn_pos_verify(ctx, state, rows, pos_before);
 
         scratch.stage_tokens(&tokens)?;
-        let cp = ctx.begin_concurrent()?;
-        self.encode_forward_rows(
-            ctx,
-            &cp,
-            state,
-            scratch,
-            rows,
-            None,
-            false,
-            true,
-            self.dspark.is_some(),
-            true,
-        )?;
-        cp.memory_barrier()?;
-        let vocab = self.cfg.vocab_unpadded;
-        for r in 0..rows {
-            let row_logits = vs.logits.view(r * vocab, &[vocab])?;
-            let out = vs.draws_gpu.view(r, &[1])?;
-            sample_f32(ctx, &cp, &row_logits, &scratch.sampler, params, step0 + r, &out)?;
-            if r + 1 < rows {
-                cp.memory_barrier()?;
+        if can_dyn {
+            vs.pos_gpu.write_bytes(bytemuck::cast_slice(&[pos_before as u32]))?;
+        }
+
+        #[cfg(target_os = "linux")]
+        let use_bk64 = self.cfg.rel_len == 16
+            && self
+                .layers
+                .iter()
+                .any(|l| l.attn_rel_bias.ty == crate::gguf::GgmlType::F32);
+
+        #[cfg(target_os = "linux")]
+        let (cur_rb_key, cur_kv_key, cur_global_grid, cur_swa_grid, cur_dspark_grids) = {
+            let ds_kv_addr = state
+                .dspark
+                .as_ref()
+                .and_then(|d| d.k_ctx.first())
+                .map_or(0u64, |t| t.buffer().address());
+            let kv_key = (
+                state.slots[0].k.buffer().address() ^ (state.capacity as u64),
+                ds_kv_addr,
+            );
+            let global_grid = crate::kernels::inkling2::attn_mu_split_grid_ex(
+                pos_before,
+                rows,
+                false,
+                self.cfg.window,
+                use_bk64,
+            );
+            let swa_grid = crate::kernels::inkling2::attn_mu_split_grid_ex(
+                pos_before,
+                rows,
+                true,
+                self.cfg.window,
+                use_bk64,
+            );
+            let dspark_grids = self
+                .dspark
+                .as_ref()
+                .map_or(((0, 0), (0, 0)), |ds| ds.split_grids(pos_before + rows));
+            (vs.rb_key, kv_key, global_grid, swa_grid, dspark_grids)
+        };
+
+        #[cfg(target_os = "linux")]
+        let ahead_pass = if can_dyn {
+            let ahead = scratch.verify.as_mut().and_then(|v| v.ahead.take());
+            match ahead {
+                Some(a)
+                    if a.rows == rows
+                        && a.next_drafts == next_drafts
+                        && a.rb_key == cur_rb_key
+                        && a.kv_key == cur_kv_key
+                        && a.global_grid == cur_global_grid
+                        && a.swa_grid == cur_swa_grid
+                        && a.dspark_grids == cur_dspark_grids
+                        && a.begun == ctx.passes_begun() =>
+                {
+                    Some(a.pass.attach(ctx)?)
+                }
+                _ => None,
+            }
+        } else {
+            if let Some(v) = scratch.verify.as_mut() {
+                v.ahead = None;
+            }
+            None
+        };
+
+        let pending_pass = {
+            #[cfg(target_os = "linux")]
+            let attached = ahead_pass;
+            #[cfg(not(target_os = "linux"))]
+            let attached: Option<crate::metal::EncodedPass<'_>> = None;
+
+            if let Some(ep) = attached {
+                ep.commit()?
+            } else {
+                let vs = scratch
+                    .verify
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("verify scratch not allocated"))?;
+                let cp = ctx.begin_concurrent()?;
+                #[cfg(target_os = "linux")]
+                cp.set_short();
+                self.encode_verify_body(
+                    ctx,
+                    &cp,
+                    state,
+                    scratch,
+                    vs,
+                    rows,
+                    pos_before,
+                    params,
+                    step0,
+                    next_drafts,
+                    can_fast_spec,
+                    can_dyn,
+                    n_entries,
+                    max_hist_floats,
+                )?;
+                cp.commit()?
+            }
+        };
+
+        // Overlap CPU command-buffer encoding of the next step's verify + DSpark pass
+        // with this step's ~32 ms GPU execution so the next submission starts immediately!
+        #[cfg(target_os = "linux")]
+        if can_dyn
+            && !ctx.profiling()
+            && let (Some(ds), Some(ds_state)) = (&self.dspark, &state.dspark)
+        {
+            let next_pos_est = pos_before + rows;
+            let ds_cap = ds_state.k_ctx.first().map_or(0, |t| t.shape()[0]);
+            if next_pos_est + rows <= state.capacity
+                && next_pos_est + rows <= ds_cap
+                && self.can_use_dyn_pos_verify(ctx, state, rows, next_pos_est)
+            {
+                let vs = scratch
+                    .verify
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("verify scratch not allocated"))?;
+                let cp = ctx.begin_concurrent()?;
+                #[cfg(target_os = "linux")]
+                cp.set_short();
+                self.encode_verify_body(
+                    ctx,
+                    &cp,
+                    state,
+                    scratch,
+                    vs,
+                    rows,
+                    next_pos_est,
+                    params,
+                    step0,
+                    next_drafts,
+                    true,
+                    true,
+                    n_entries,
+                    max_hist_floats,
+                )?;
+                let detached = cp.end()?.detach();
+                let next_global_grid = crate::kernels::inkling2::attn_mu_split_grid_ex(
+                    next_pos_est,
+                    rows,
+                    false,
+                    self.cfg.window,
+                    use_bk64,
+                );
+                let next_swa_grid = crate::kernels::inkling2::attn_mu_split_grid_ex(
+                    next_pos_est,
+                    rows,
+                    true,
+                    self.cfg.window,
+                    use_bk64,
+                );
+                let next_dspark_grids = ds.split_grids(next_pos_est + rows);
+                if let Some(vs_mut) = scratch.verify.as_mut() {
+                    vs_mut.ahead = Some(super::model::VerifyAhead {
+                        pass: detached,
+                        rows,
+                        next_drafts,
+                        rb_key: cur_rb_key,
+                        kv_key: cur_kv_key,
+                        global_grid: next_global_grid,
+                        swa_grid: next_swa_grid,
+                        dspark_grids: next_dspark_grids,
+                        begun: ctx.passes_begun(),
+                    });
+                }
             }
         }
-        cp.commit_wait()?;
 
+        pending_pass.wait()?;
+
+        let vs = scratch
+            .verify
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("verify scratch not allocated"))?;
         let draws = vs.draws_gpu.to_u32()?[..rows].to_vec();
+        let spec_fast_accepted = if can_fast_spec {
+            Some(vs.spec_meta.to_u32()?[0] as usize)
+        } else {
+            None
+        };
 
         if let Some(vs_mut) = scratch.verify.as_mut() {
             vs_mut.pending = Some(super::model::VerifyPending {
@@ -617,10 +829,11 @@ impl LanguageModel for Inkling2Model {
                 rows,
                 draws: draws.clone(),
                 next_drafts,
+                spec_fast_accepted,
             });
         }
         state.pos = pos_before + rows;
-        Ok((draws, ctx.begin()?.commit()?))
+        Ok((draws, PendingPass::already_done(ctx)))
     }
 
     fn finish_speculation(
@@ -641,22 +854,35 @@ impl LanguageModel for Inkling2Model {
         let kept = 1 + accepted;
         ensure!(kept <= pending.rows, "finish_speculation kept {kept} > {}", pending.rows);
 
-        // O(1) rollback of short-conv histories if any draft was rejected.
-        if kept < pending.rows
+        // Fast path: `verify()` already ran GPU rollback, DSpark inject, and DSpark propose
+        // inside its single command buffer for this exact `accepted` count!
+        if pending.spec_fast_accepted == Some(accepted)
+            && propose
+            && pending.next_drafts > 0
+            && let (Some(ds), Some(ds_state)) = (&self.dspark, &mut state.dspark)
+        {
+            state.pos = pending.pos_before + kept;
+            ds_state.pos = state.pos;
+            return ds.read_drafts(pending.next_drafts);
+        }
+
+        // Fallback (EOS/stop cut `accepted < gpu_accepted`, or `!propose`, or non-fast path):
+        // O(1) rollback of short-conv histories from intact `vs.trace`.
+        if (kept < pending.rows || pending.spec_fast_accepted.is_some())
             && let Some(vs) = &scratch.verify
         {
             let row_idx = kept - 1;
             let hist_len = self.cfg.sconv_l_cache - 1;
             for (slot, sc_slot) in state.slots.iter_mut().enumerate() {
                 let tr = &vs.trace[slot];
-                let kw = sc_slot.k_hist.shape()[0];
-                let h = sc_slot.attn_hist.shape()[0];
+                let kw = sc_slot.k_hist.shape()[1];
+                let h = sc_slot.attn_hist.shape()[1];
                 let k_bytes = kw * hist_len * 4;
                 let h_bytes = h * hist_len * 4;
-                let k_src = tr[0].view(row_idx * kw * hist_len, &[kw, hist_len])?;
-                let v_src = tr[1].view(row_idx * kw * hist_len, &[kw, hist_len])?;
-                let a_src = tr[2].view(row_idx * h * hist_len, &[h, hist_len])?;
-                let f_src = tr[3].view(row_idx * h * hist_len, &[h, hist_len])?;
+                let k_src = tr[0].view(row_idx * kw, &[hist_len, kw])?;
+                let v_src = tr[1].view(row_idx * kw, &[hist_len, kw])?;
+                let a_src = tr[2].view(row_idx * h, &[hist_len, h])?;
+                let f_src = tr[3].view(row_idx * h, &[hist_len, h])?;
                 host_copy(&k_src, &sc_slot.k_hist, k_bytes);
                 host_copy(&v_src, &sc_slot.v_hist, k_bytes);
                 host_copy(&a_src, &sc_slot.attn_hist, h_bytes);
@@ -679,6 +905,8 @@ impl LanguageModel for Inkling2Model {
                 ds.prepare_propose(anchor)?;
             }
             let cp = ctx.begin_concurrent()?;
+            #[cfg(target_os = "linux")]
+            cp.set_short();
             ds.encode_inject(
                 ctx,
                 &cp,
@@ -716,7 +944,7 @@ impl LanguageModel for Inkling2Model {
                     &cp,
                     ds_state,
                     &anchor_embd,
-                    self.draft_output_weight(),
+                    self.draft_output_head(),
                     self.cfg.vocab_unpadded,
                     state.pos,
                     pending.next_drafts,
@@ -728,5 +956,145 @@ impl LanguageModel for Inkling2Model {
             }
         }
         Ok(Vec::new())
+    }
+}
+
+impl Inkling2Model {
+    #[allow(clippy::too_many_arguments)]
+    fn encode_verify_body(
+        &self,
+        ctx: &MetalContext,
+        cp: &crate::metal::ComputePass<'_>,
+        state: &Inkling2State,
+        scratch: &Scratch,
+        vs: &super::model::VerifyScratch,
+        rows: usize,
+        pos_est: usize,
+        params: &SamplingParams,
+        step0: usize,
+        next_drafts: usize,
+        can_fast_spec: bool,
+        use_dyn_pos: bool,
+        n_entries: usize,
+        max_hist_floats: usize,
+    ) -> Result<()> {
+        let pos_gpu = use_dyn_pos.then_some((&vs.pos_gpu, pos_est));
+        self.encode_forward_rows_dyn(
+            ctx,
+            cp,
+            state,
+            scratch,
+            rows,
+            None,
+            false,
+            true,
+            self.dspark.is_some(),
+            true,
+            pos_gpu,
+        )?;
+        cp.memory_barrier()?;
+        let vocab = self.cfg.vocab_unpadded;
+        if params.is_greedy() && !params.uses_penalties() {
+            crate::kernels::inkling2::argmax_rows(
+                ctx,
+                cp,
+                &vs.logits,
+                &vs.argmax_val,
+                &vs.argmax_idx,
+                &vs.draws_gpu,
+                rows,
+                vocab,
+            )?;
+        } else {
+            for r in 0..rows {
+                let row_logits = vs.logits.view(r * vocab, &[vocab])?;
+                let out = vs.draws_gpu.view(r, &[1])?;
+                sample_f32(ctx, cp, &row_logits, &scratch.sampler, params, step0 + r, &out)?;
+                if r + 1 < rows {
+                    cp.memory_barrier()?;
+                }
+            }
+        }
+
+        if can_fast_spec
+            && let (Some(ds), Some(ds_state), Some(cap_buf)) =
+                (&self.dspark, &state.dspark, &scratch.dspark_cap)
+        {
+            let pos_param = if use_dyn_pos {
+                let (b, o) = vs.pos_gpu.binding();
+                crate::metal::Param::Gpu(b, o)
+            } else {
+                crate::metal::Param::U32(pos_est as u32)
+            };
+            cp.memory_barrier()?;
+            crate::kernels::inkling2::spec_accept_dyn(
+                ctx,
+                cp,
+                &scratch.ids,
+                &vs.draws_gpu,
+                &vs.spec_meta,
+                ds.best_toks_tensor(),
+                ds.rnn_state_tensor(),
+                rows,
+                pos_param,
+                ds.cfg.markov_rank,
+                ds.cfg.window,
+            )?;
+            cp.memory_barrier()?;
+            let anchor_tok = vs.spec_meta.view(2, &[1])?;
+            let anchor_embd = scratch.logits_raw.view(0, &[self.cfg.hidden])?;
+            crate::kernels::inkling2::sconv_rollback(
+                ctx,
+                cp,
+                &vs.spec_meta,
+                &vs.rb_table,
+                rows,
+                self.cfg.sconv_l_cache - 1,
+                n_entries,
+                max_hist_floats,
+            )?;
+            crate::kernels::inkling2::embed(
+                ctx,
+                cp,
+                &anchor_tok,
+                &self.tok_embd,
+                &anchor_embd,
+                1,
+            )?;
+            ds.encode_inject_dynamic(
+                ctx,
+                cp,
+                ds_state,
+                cap_buf,
+                scratch.max_rows,
+                rows,
+                pos_param,
+                &vs.spec_meta,
+            )?;
+            cp.memory_barrier()?;
+            crate::kernels::inkling2::rms_norm(
+                ctx,
+                cp,
+                &anchor_embd,
+                Some(&self.tok_norm),
+                &anchor_embd,
+                1,
+                self.cfg.hidden,
+                self.cfg.rms_eps,
+            )?;
+            cp.memory_barrier()?;
+            ds.encode_propose_dynamic(
+                ctx,
+                cp,
+                ds_state,
+                &anchor_embd,
+                self.draft_output_head(),
+                vocab,
+                pos_est + rows,
+                &vs.spec_meta,
+                next_drafts,
+            )?;
+        }
+        Ok(())
     }
 }

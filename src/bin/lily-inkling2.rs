@@ -531,7 +531,7 @@ fn run() -> Result<()> {
                                 &cp,
                                 ds_state,
                                 &anchor_embd,
-                                model.draft_output_weight(),
+                                model.draft_output_head(),
                                 model.cfg.vocab_unpadded,
                                 ctx_len,
                                 v_drafts,
