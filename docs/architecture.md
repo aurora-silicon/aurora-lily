@@ -1315,8 +1315,11 @@ There is no limit on how many images a request carries: agent clients
 resend the whole history every turn, so any cap, or dropping old images to
 stay under one, either wedges the session or changes the prompt early on and
 costs a prefill of nearly all of it. What bounds a request is the context
-(about 2 040 tokens a 1920 x 1080 screenshot) and the 1 GiB body limit, near
-400 opencode screenshots of 2.5 MB base64 each. Resending is made cheap by
+(about 2 040 tokens a 1920 x 1080 screenshot) and the body limit, which
+follows it: 32 MiB plus 4 MiB for every image of the largest size the
+context holds (288 MiB by default, [server.md](server.md), "Request
+limits"), more than the 64 opencode screenshots of 2.5 MB base64 each
+that the default context has room for. Resending is made cheap by
 the image memo (`ImageMemo` in `src/serve/api.rs`): the identity
 preprocessing gave an image (grid and digest) is kept under the SHA-256 of
 its data URI, 4 096 entries, oldest first out. A known image costs a hash

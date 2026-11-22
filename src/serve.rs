@@ -90,12 +90,23 @@ use session::SessionStore;
 use timings::TimingsLog;
 use tools::ParsedToolCall;
 
-/// Largest request body. Agent clients resend every image of the history
-/// as base64 on every turn, about 2.5 MB per 2000 x 1182 screenshot, so 32
-/// MiB refused a session after a dozen of them; the context (about 2 000
-/// tokens an image) bounds a request near 130 screenshots, well inside
-/// this. The body buffer is zero-filled pages until read into.
-const MAX_REQUEST_BYTES: usize = 1 << 30;
+/// A request body's allowance per image the context can hold
+/// ([`max_request_bytes`]). Agent clients resend every image of the history
+/// as base64 on every turn, about 2.5 MB per 2000 x 1182 screenshot (an
+/// image the default pixel cap passes nearly untouched, about 2 000 tokens),
+/// so 32 MiB refused a session after a dozen of them.
+const BODY_BYTES_PER_IMAGE: usize = 4 << 20;
+/// A request body's allowance besides its images: the prompt text, tool
+/// schemas and JSON around them, which the context bounds far below this.
+const BODY_BYTES_TEXT: usize = 32 << 20;
+/// No request body is larger than this, whatever the context.
+const BODY_BYTES_CEILING: usize = 1 << 30;
+/// Request bodies held in memory at once, across connections, in units of
+/// the largest one: a body that would take more gets 503.
+const BODIES_IN_FLIGHT: usize = 4;
+/// Open connections beyond `--queue` (the dashboard's polls, `/health`,
+/// requests decoding); past the limit a connection gets 503 at once.
+const EXTRA_CONNECTIONS: usize = 64;
 /// Recurrent-state checkpoints kept per session (the newest ones).
 pub(crate) const CHECKPOINTS_PER_SESSION: usize = 3;
 /// Decode checkpoints a generation holds and a session keeps of its latest
@@ -747,6 +758,30 @@ fn refuse(
     send_error(stream, status, kind, message);
 }
 
+/// [`refuse`] for a request whose body was not read, or not read whole
+/// ([`http::respond_unread`]). A 401 names the scheme it wants.
+fn refuse_unread(
+    stream: TcpStream,
+    request: &str,
+    status: u16,
+    kind: &'static str,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    eprintln!("rejected {request} with {status}: {message}");
+    let body = error_json(kind, message);
+    let length = body.len().to_string();
+    let mut headers = vec![("Content-Length", length.as_str())];
+    if status == 401 {
+        headers.push(("WWW-Authenticate", "Bearer"));
+    }
+    if let Err(error) =
+        http::respond_unread(stream, status, "application/json", &headers, &body)
+    {
+        eprintln!("response error: {error:#}");
+    }
+}
+
 /// What the engine sends the responder thread for one request.
 enum Out {
     Start { status: u16, content_type: &'static str },
@@ -863,6 +898,12 @@ impl EngineQueue {
     /// The engine took the settings nudge (or sending it failed).
     fn settings_taken(&self) {
         self.settings_pending.store(false, Ordering::Release);
+    }
+
+    /// Whether the queue is full now: a request that finds it so is refused
+    /// before its body is read and parsed. [`Self::admit`] decides.
+    fn full(&self) -> bool {
+        self.waiting.load(Ordering::Acquire) >= self.limit
     }
 
     /// Reserves a place for one job; false when the queue is full. A
@@ -2132,9 +2173,6 @@ struct Front {
     max_seq: usize,
     jobs: SyncSender<Cmd>,
     lifecycle: Arc<Lifecycle>,
-    /// Connection threads still running (the listener waits for them a
-    /// little at shutdown so responses in flight get written).
-    connections: Arc<AtomicUsize>,
     model_id: &'static str,
     /// The dashboard's routes, answered from what the engine publishes.
     dashboard: dashboard::Dashboard,
@@ -2142,6 +2180,26 @@ struct Front {
     loopback_listener: bool,
     /// `--api-key-file` or `--api-key` ([`api_guard`]).
     api_key: Option<ApiKey>,
+    /// The largest request body ([`max_request_bytes`]).
+    max_body: usize,
+    /// Request bodies in memory across connections.
+    bodies: BodyBudget,
+}
+
+/// Answers a connection past [`max_connections`] with 503 from the accept
+/// loop, without reading its request: a short write timeout, so a client
+/// that does not read cannot stall the loop. `log` keeps the log to a line
+/// a second.
+fn busy(stream: TcpStream, log: &mut RefusalLog) {
+    stream.set_write_timeout(Some(Duration::from_millis(200))).ok();
+    if let Some(unlogged) = log.due(Instant::now()) {
+        let more = match unlogged {
+            0 => String::new(),
+            n => format!(" ({n} more since the last line)"),
+        };
+        eprintln!("rejected a connection with 503: too many open connections{more}");
+    }
+    send_error(stream, 503, "server_error", "too many open connections; retry later");
 }
 
 /// The engine thread's body: the first load, then requests until a stop is
@@ -2695,14 +2753,20 @@ fn run_with<M: LanguageModel + 'static>(
     }
     eprintln!("listening on http://{address} (loading model)");
 
+    // Connection threads still running (the listener waits for them a
+    // little at shutdown so responses in flight get written).
     let connections = Arc::new(AtomicUsize::new(0));
+    let connection_limit = max_connections(options.queue);
+    let mut busy_log = RefusalLog::default();
+    let max_body = max_request_bytes(max_seq, &images);
     let front = Arc::new(Front {
+        max_body,
+        bodies: BodyBudget::new(max_body.saturating_mul(BODIES_IN_FLIGHT)),
         shared,
         images,
         max_seq,
         jobs,
         lifecycle,
-        connections: connections.clone(),
         model_id: model_id::<M>(),
         dashboard,
         loopback_listener: address.ip().to_canonical().is_loopback(),
@@ -2719,15 +2783,19 @@ fn run_with<M: LanguageModel + 'static>(
                 continue;
             }
         };
+        let Some(slot) = take_connection_slot(&connections, connection_limit) else {
+            busy(stream, &mut busy_log);
+            continue;
+        };
         let front = front.clone();
-        connections.fetch_add(1, Ordering::AcqRel);
+        // The slot goes back when the thread ends, however it ends (and
+        // with the closure when the spawn fails).
         if let Err(error) =
             std::thread::Builder::new().name("lily-http".into()).spawn(move || {
+                let _slot = slot;
                 handle(&front, stream);
-                front.connections.fetch_sub(1, Ordering::AcqRel);
             })
         {
-            connections.fetch_sub(1, Ordering::AcqRel);
             eprintln!("failed to spawn connection thread: {error}");
         }
     }
@@ -2746,14 +2814,18 @@ fn run_with<M: LanguageModel + 'static>(
     Ok(())
 }
 
-fn handle(front: &Front, mut stream: TcpStream) {
-    let request = match http::read_request(&mut stream, MAX_REQUEST_BYTES) {
-        Ok(request) => request,
+fn handle(front: &Front, stream: TcpStream) {
+    let (mut request, body) = match http::read_head_within(
+        &stream,
+        front.max_body,
+        http::Deadlines::default(),
+    ) {
+        Ok(head) => head,
         Err(error) => {
-            refuse(
+            refuse_unread(
                 stream,
                 "request",
-                400,
+                unread_status(&error),
                 "invalid_request_error",
                 format!("{error:#}"),
             );
@@ -2777,6 +2849,20 @@ fn handle(front: &Front, mut stream: TcpStream) {
             peer: stream.peer_addr().ok(),
             port: stream.local_addr().map_or(0, |a| a.port()),
         };
+        // What the head alone decides comes before the body is read.
+        if let Err(response) =
+            front.dashboard.head_guard(route, &request, &path, connection, body.len())
+        {
+            send_dashboard(stream, &request.method, &response, true);
+            return;
+        }
+        let _held = match read_body(&front.bodies, &mut request, body) {
+            Ok(held) => held,
+            Err((status, kind, why)) => {
+                refuse_unread(stream, &what, status, kind, why);
+                return;
+            }
+        };
         let engine = dashboard::EngineNow {
             state,
             waiting: front.shared.queue.waiting.load(Ordering::Acquire),
@@ -2788,20 +2874,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
             connection,
             engine,
         );
-        // A HEAD gets its GET's head, the body's length included.
-        let body: &[u8] = if request.method == "HEAD" { &[] } else { &response.body };
-        let length = response.body.len().to_string();
-        let mut headers = response.headers();
-        headers.push(("Content-Length", &length));
-        if let Err(error) = http::respond_raw(
-            stream,
-            response.status,
-            response.content_type,
-            &headers,
-            body,
-        ) {
-            eprintln!("response error: {error:#}");
-        }
+        send_dashboard(stream, &request.method, &response, false);
         return;
     }
     if is_api_route(&path) {
@@ -2813,7 +2886,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
             api_key: front.api_key.as_ref().map(ApiKey::as_str),
         };
         if let Err((status, why)) = api_guard(&request, &path, &gate) {
-            refuse(stream, &what, status, "invalid_request_error", why);
+            refuse_unread(stream, &what, status, "invalid_request_error", why);
             return;
         }
     }
@@ -2850,10 +2923,52 @@ fn handle(front: &Front, mut stream: TcpStream) {
             }),
         ),
         ("POST", "/v1/chat/completions" | "/v1/completions") => {
+            // What can refuse the request without its body comes before the
+            // body is read, parsed, rendered and tokenized.
+            match state {
+                State::Stopping => {
+                    refuse_unread(
+                        stream,
+                        &what,
+                        503,
+                        "server_error",
+                        "the server is shutting down",
+                    );
+                    return;
+                }
+                State::Loading => {
+                    refuse_unread(
+                        stream,
+                        &what,
+                        503,
+                        "server_error",
+                        "model is still loading",
+                    );
+                    return;
+                }
+                State::Ready | State::Idle | State::Reloading | State::Recovering => {}
+            }
+            let queue = &front.shared.queue;
+            if queue.full() {
+                refuse_unread(
+                    stream,
+                    &what,
+                    503,
+                    "server_error",
+                    "the request queue is full; retry later",
+                );
+                return;
+            }
+            let held = match read_body(&front.bodies, &mut request, body) {
+                Ok(held) => held,
+                Err((status, kind, why)) => {
+                    refuse_unread(stream, &what, status, kind, why);
+                    return;
+                }
+            };
             // Before parsing and tokenizing, so the GPU's return from idle
             // runs meanwhile. Only a loaded engine has a GPU to wake; a busy
             // one takes the message after its request, a no-op then.
-            let queue = &front.shared.queue;
             if state == State::Ready
                 && queue.claim_arrival()
                 && front.jobs.try_send(Cmd::Arrival).is_err()
@@ -2888,6 +3003,7 @@ fn handle(front: &Front, mut stream: TcpStream) {
                         )
                     })
             };
+            release_body(&mut request, held);
             let mut prepared = match prepared {
                 Ok(p) => p,
                 Err(error) => {
@@ -2910,29 +3026,6 @@ fn handle(front: &Front, mut stream: TcpStream) {
                     prepared.prompt.len(),
                     front.max_seq
                 );
-            }
-            match state {
-                State::Stopping => {
-                    refuse(
-                        stream,
-                        &what,
-                        503,
-                        "server_error",
-                        "the server is shutting down",
-                    );
-                    return;
-                }
-                State::Loading => {
-                    refuse(
-                        stream,
-                        &what,
-                        503,
-                        "server_error",
-                        "model is still loading",
-                    );
-                    return;
-                }
-                State::Ready | State::Idle | State::Reloading | State::Recovering => {}
             }
             let (tx, rx) = mpsc::channel();
             let cancelled = Arc::new(AtomicBool::new(false));
@@ -2982,10 +3075,209 @@ fn handle(front: &Front, mut stream: TcpStream) {
             | "/v1/chat/completions"
             | "/v1/completions",
         ) => {
-            refuse(stream, &what, 405, "invalid_request_error", "method not allowed");
+            // The body such a request may carry was not read.
+            refuse_unread(
+                stream,
+                &what,
+                405,
+                "invalid_request_error",
+                "method not allowed",
+            );
         }
-        _ => refuse(stream, &what, 404, "invalid_request_error", "not found"),
+        _ => refuse_unread(stream, &what, 404, "invalid_request_error", "not found"),
     }
+}
+
+/// The status for a request that could not be read: 408 past its deadline
+/// ([`http::timed_out`]), 413 for a body longer than the limit, 400 for
+/// anything malformed.
+fn unread_status(error: &anyhow::Error) -> u16 {
+    if http::timed_out(error) {
+        408
+    } else if error.is::<http::BodyTooLarge>() {
+        413
+    } else {
+        400
+    }
+}
+
+/// Writes a dashboard `response` to a `method` request; `unread` when the
+/// request's body was not read ([`http::respond_unread`]).
+fn send_dashboard(
+    stream: TcpStream,
+    method: &str,
+    response: &dashboard::Response,
+    unread: bool,
+) {
+    // A HEAD gets its GET's head, the body's length included.
+    let body: &[u8] = if method == "HEAD" { &[] } else { &response.body };
+    let length = response.body.len().to_string();
+    let mut headers = response.headers();
+    headers.push(("Content-Length", &length));
+    let (status, content_type) = (response.status, response.content_type);
+    let written = if unread {
+        http::respond_unread(stream, status, content_type, &headers, body)
+    } else {
+        http::respond_raw(stream, status, content_type, &headers, body)
+    };
+    if let Err(error) = written {
+        eprintln!("response error: {error:#}");
+    }
+}
+
+// --- request limits ----------------------------------------------------------
+
+/// The largest request body: [`BODY_BYTES_TEXT`] plus, when images are
+/// accepted, [`BODY_BYTES_PER_IMAGE`] for every image of the largest size
+/// (`max_pixels`) the context of `max_seq` tokens holds, at most
+/// [`BODY_BYTES_CEILING`]. The default 131 072-token context with the
+/// default 2 048-token image cap takes 288 MiB.
+fn max_request_bytes(max_seq: usize, images: &ImagePolicy) -> usize {
+    use crate::qwen4exp::image::FACTOR;
+    if images.available.is_err() {
+        return BODY_BYTES_TEXT;
+    }
+    let tokens_per_image = (images.limits.max_pixels / (FACTOR * FACTOR)).max(1);
+    let images_in_context = max_seq.div_ceil(tokens_per_image);
+    images_in_context
+        .saturating_mul(BODY_BYTES_PER_IMAGE)
+        .saturating_add(BODY_BYTES_TEXT)
+        .min(BODY_BYTES_CEILING)
+}
+
+/// The most connections served at once for a `--queue` of `queue`.
+fn max_connections(queue: usize) -> usize {
+    queue.saturating_mul(2).saturating_add(EXTRA_CONNECTIONS)
+}
+
+/// One of the connection slots counted in its counter, given back on drop:
+/// when the connection's thread ends, a panic included.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Takes one of `limit` connection slots counted in `open`; `None` when all
+/// are taken (the caller answers 503).
+fn take_connection_slot(
+    open: &Arc<AtomicUsize>,
+    limit: usize,
+) -> Option<ConnectionSlot> {
+    open.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        (n < limit).then_some(n + 1)
+    })
+    .ok()
+    .map(|_| ConnectionSlot(open.clone()))
+}
+
+/// Keeps a refusal that can repeat with every connection to one log line a
+/// second.
+#[derive(Debug, Default)]
+struct RefusalLog {
+    last: Option<Instant>,
+    unlogged: usize,
+}
+
+impl RefusalLog {
+    /// Counts a refusal at `now`. `Some` when a line is due, with the
+    /// refusals that went unlogged since the last one.
+    fn due(&mut self, now: Instant) -> Option<usize> {
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+        {
+            self.unlogged += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.unlogged))
+    }
+}
+
+/// Request bodies in memory across connections: the bytes that have
+/// arrived, counted as they arrive ([`read_body`]) and held until the
+/// request is parsed and tokenized ([`release_body`]) or refused. A length
+/// that is only declared takes nothing.
+struct BodyBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+/// One request's bytes in a [`BodyBudget`], given back on drop.
+struct BodyHeld<'a> {
+    budget: &'a BodyBudget,
+    bytes: usize,
+}
+
+impl BodyBudget {
+    fn new(limit: usize) -> Self {
+        Self { used: AtomicUsize::new(0), limit }
+    }
+
+    /// A request's hold on the budget, empty until it [`BodyHeld::grow`]s.
+    fn hold(&self) -> BodyHeld<'_> {
+        BodyHeld { budget: self, bytes: 0 }
+    }
+}
+
+impl BodyHeld<'_> {
+    /// Takes `bytes` more; false (and nothing taken) when that would take
+    /// the budget past its limit.
+    fn grow(&mut self, bytes: usize) -> bool {
+        let limit = self.budget.limit;
+        let fits = self
+            .budget
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|&total| total <= limit)
+            })
+            .is_ok();
+        if fits {
+            self.bytes += bytes;
+        }
+        fits
+    }
+}
+
+impl Drop for BodyHeld<'_> {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// Reads the body of `request`, taking its bytes from `budget` as they
+/// arrive; the status and message to refuse it with otherwise (503 when the
+/// budget has no room for the next bytes, 408 past the request's deadline).
+fn read_body<'a>(
+    budget: &'a BodyBudget,
+    request: &mut http::Request,
+    body: http::Body,
+) -> Result<BodyHeld<'a>, (u16, &'static str, String)> {
+    let mut held = budget.hold();
+    let read = body.read_with(request, &mut |bytes| held.grow(bytes));
+    match read {
+        Ok(()) => Ok(held),
+        Err(error) if error.is::<http::OverBudget>() => Err((
+            503,
+            "server_error",
+            "the server holds too many request bodies; retry later".to_owned(),
+        )),
+        Err(error) => {
+            Err((unread_status(&error), "invalid_request_error", format!("{error:#}")))
+        }
+    }
+}
+
+/// Frees the body of `request` and gives its bytes back to the budget: once
+/// the request is parsed and tokenized nothing reads the body again, and
+/// its wait in the queue and its generation must not count against the
+/// bodies other requests may send.
+fn release_body(request: &mut http::Request, held: BodyHeld<'_>) {
+    request.body = Vec::new();
+    drop(held);
 }
 
 // --- the OpenAI routes' guard -------------------------------------------------

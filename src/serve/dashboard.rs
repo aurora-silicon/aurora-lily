@@ -113,6 +113,8 @@ const LIVE_ROWS_MS: u64 = 60_000;
 /// The largest body a settings write takes (413 past it); the chat routes
 /// keep their own limit.
 pub const MAX_WRITE_BODY: usize = 64 << 10;
+/// The 413's message.
+const WRITE_BODY_TOO_LARGE: &str = "a settings write takes at most 64 KiB of body";
 /// Peers whose refusal is logged; past this many, refusals are not logged.
 const REFUSED_PEERS_LOGGED: usize = 1024;
 
@@ -944,16 +946,8 @@ impl Dashboard {
         connection: Connection,
         engine: EngineNow,
     ) -> Response {
-        let refusal = if !is_loopback(connection.peer) {
-            Some("the dashboard answers this machine only")
-        } else if !host_allowed(request.header("Host"), connection.port) {
-            Some("the dashboard answers under its own loopback address only")
-        } else {
-            None
-        };
-        if let Some(why) = refusal {
-            self.log_refusal(connection.peer, request, path, why);
-            return Response::error(403, why, None);
+        if let Some(refused) = self.refuse_connection(request, path, connection) {
+            return refused;
         }
         // The page counts as open from now (the sampler's 2 s cadence).
         if let Some(machine) = self.board.machine() {
@@ -971,6 +965,57 @@ impl Dashboard {
             },
             Route::Api => self.api(request, path, query, connection.port, engine),
         }
+    }
+
+    /// The 403 for a peer that is not this machine or a `Host` that is not
+    /// lily's own loopback address, logged ([`Self::log_refusal`]).
+    fn refuse_connection(
+        &self,
+        request: &Request,
+        path: &str,
+        connection: Connection,
+    ) -> Option<Response> {
+        let why = if !is_loopback(connection.peer) {
+            "the dashboard answers this machine only"
+        } else if !host_allowed(request.header("Host"), connection.port) {
+            "the dashboard answers under its own loopback address only"
+        } else {
+            return None;
+        };
+        self.log_refusal(connection.peer, request, path, why);
+        Some(Response::error(403, why, None))
+    }
+
+    /// What [`Self::respond`] refuses by the request's head alone, for the
+    /// caller to answer before it reads the body (`body_len`, the declared
+    /// `Content-Length`): the peer and the `Host` (403), a settings write's
+    /// [`write_guard`] (403) and a body past [`MAX_WRITE_BODY`] (413), which
+    /// no dashboard route takes.
+    pub fn head_guard(
+        &self,
+        route: Route,
+        request: &Request,
+        path: &str,
+        connection: Connection,
+        body_len: usize,
+    ) -> Result<(), Response> {
+        if let Some(refused) = self.refuse_connection(request, path, connection) {
+            return Err(refused);
+        }
+        if route == Route::Api
+            && matches!(request.method.as_str(), "PATCH" | "DELETE")
+            && let Err(why) = write_guard(
+                request.header("Content-Type"),
+                request.header("Origin"),
+                connection.port,
+            )
+        {
+            return Err(Response::error(403, why, None));
+        }
+        if body_len > MAX_WRITE_BODY {
+            return Err(Response::error(413, WRITE_BODY_TOO_LARGE, None));
+        }
+        Ok(())
     }
 
     /// Logs a refusal the first time a peer address is refused.
@@ -1015,11 +1060,7 @@ impl Dashboard {
             return Response::error(403, why, None);
         }
         if matches!(method, "PATCH" | "DELETE") && request.body.len() > MAX_WRITE_BODY {
-            return Response::error(
-                413,
-                "a settings write takes at most 64 KiB of body",
-                None,
-            );
+            return Response::error(413, WRITE_BODY_TOO_LARGE, None);
         }
         match (method, segments.as_slice()) {
             ("GET", ["status"]) => Response::json(200, &self.status(engine)),

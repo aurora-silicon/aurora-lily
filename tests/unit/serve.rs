@@ -1106,6 +1106,7 @@ fn a_bind_that_is_not_loopback_needs_an_api_key() {
     assert!(check_bind_auth(at("0.0.0.0:8000"), Some("")).is_err());
     assert!(check_bind_auth(at("0.0.0.0:8000"), Some("two words")).is_err());
 }
+
 /// `--api-key-file`: the key is the file's text without its final line
 /// ending; an empty or missing file is an error, and nothing else is cut.
 #[test]
@@ -1146,3 +1147,235 @@ fn the_api_key_is_not_printed() {
     assert!(!format!("{:?}", Some(&key)).contains("s3cret"));
 }
 
+fn image_policy_for_test(available: bool) -> ImagePolicy {
+    ImagePolicy {
+        limits: ImageLimits::default(),
+        available: if available { Ok(()) } else { Err("off".to_owned()) },
+        memo: Default::default(),
+    }
+}
+
+#[test]
+fn the_body_limit_follows_the_images_the_context_holds() {
+    let with_images = image_policy_for_test(true);
+    // 64 images of 2 048 tokens in 131 072, 4 MiB each, and the text's 32 MiB.
+    assert_eq!(max_request_bytes(131_072, &with_images), 288 << 20);
+    assert_eq!(max_request_bytes(262_144, &with_images), 544 << 20);
+    assert!(max_request_bytes(131_072, &with_images) < 1 << 30);
+    // Without images only the text's allowance.
+    assert_eq!(max_request_bytes(131_072, &image_policy_for_test(false)), 32 << 20);
+    // A tiny image cap fits more images but never passes the ceiling.
+    let mut tiny = image_policy_for_test(true);
+    tiny.limits.max_pixels = 1;
+    assert_eq!(max_request_bytes(262_144, &tiny), BODY_BYTES_CEILING);
+}
+
+#[test]
+fn connections_past_the_limit_get_no_slot_until_one_is_given_back() {
+    assert_eq!(max_connections(32), 128);
+    let open = Arc::new(AtomicUsize::new(0));
+    let mut slots: Vec<_> =
+        (0..3).map(|_| take_connection_slot(&open, 3).expect("a free slot")).collect();
+    assert!(take_connection_slot(&open, 3).is_none(), "a fourth connection is refused");
+    assert_eq!(open.load(Ordering::Acquire), 3, "a refusal takes nothing");
+    slots.pop();
+    assert_eq!(
+        open.load(Ordering::Acquire),
+        2,
+        "a finished connection gives its slot back"
+    );
+    assert!(take_connection_slot(&open, 3).is_some());
+}
+
+#[test]
+fn a_connection_thread_that_panics_gives_its_slot_back() {
+    let open = Arc::new(AtomicUsize::new(0));
+    let slot = take_connection_slot(&open, 1).expect("a free slot");
+    assert!(take_connection_slot(&open, 1).is_none());
+    let thread = std::thread::spawn(move || {
+        let _slot = slot;
+        std::panic::resume_unwind(Box::new("the handler failed"));
+    });
+    assert!(thread.join().is_err(), "the thread panicked");
+    assert_eq!(open.load(Ordering::Acquire), 0);
+    assert!(take_connection_slot(&open, 1).is_some(), "the slot is free again");
+}
+
+#[test]
+fn the_busy_refusal_logs_a_line_a_second_and_counts_the_rest() {
+    let mut log = RefusalLog::default();
+    let start = Instant::now();
+    assert_eq!(log.due(start), Some(0), "the first refusal is logged");
+    assert_eq!(log.due(start + Duration::from_millis(10)), None);
+    assert_eq!(log.due(start + Duration::from_millis(999)), None);
+    assert_eq!(log.due(start + Duration::from_millis(1000)), Some(2));
+    assert_eq!(log.due(start + Duration::from_millis(1500)), None);
+    assert_eq!(log.due(start + Duration::from_secs(5)), Some(1));
+    assert_eq!(log.due(start + Duration::from_secs(9)), Some(0));
+}
+
+#[test]
+fn request_bodies_in_flight_are_bounded_and_given_back() {
+    let budget = BodyBudget::new(100);
+    let mut a = budget.hold();
+    assert!(a.grow(30) && a.grow(30), "bytes are taken as they arrive");
+    let mut b = budget.hold();
+    assert!(!b.grow(41), "past the budget");
+    assert_eq!(budget.used.load(Ordering::Acquire), 60, "a refusal takes nothing");
+    assert!(b.grow(40), "fits exactly");
+    assert!(!a.grow(1));
+    assert!(budget.hold().grow(0), "a request without a body always fits");
+    drop(a);
+    assert_eq!(budget.used.load(Ordering::Acquire), 40);
+    let mut c = budget.hold();
+    assert!(c.grow(60), "a finished request gives its bytes back");
+    assert!(!c.grow(usize::MAX), "no overflow");
+    drop((b, c));
+    assert_eq!(budget.used.load(Ordering::Acquire), 0);
+}
+
+/// A request that has been parsed no longer holds its body or its share of
+/// the budget: while it waits in the queue and is answered, others may
+/// send theirs.
+#[test]
+fn a_parsed_request_gives_its_body_and_budget_back() {
+    const LENGTH: usize = 200_000;
+    let budget = BodyBudget::new(LENGTH);
+    let (server, mut client) = socket_pair();
+    post_with(&mut client, LENGTH, LENGTH);
+    let (mut request, body) = head_of(&server);
+    let held =
+        read_body(&budget, &mut request, body).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(request.body.len(), LENGTH);
+    assert_eq!(budget.used.load(Ordering::Acquire), LENGTH);
+    assert!(!budget.hold().grow(1), "the budget is taken while the body is held");
+    release_body(&mut request, held);
+    assert_eq!(request.body.capacity(), 0, "the bytes are freed");
+    assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    assert!(budget.hold().grow(LENGTH), "the next request's body fits");
+}
+
+/// The server's and the client's end of one loopback connection.
+fn socket_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let client =
+        TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+    let (server, _) = listener.accept().expect("accept");
+    (server, client)
+}
+
+/// A POST's head declaring `length` body bytes, then `sent` of them (from
+/// a thread: the server may stop reading part way).
+fn post_with(client: &mut TcpStream, length: usize, sent: usize) {
+    use std::io::Write as _;
+    let head =
+        format!("POST /v1/completions HTTP/1.1\r\nContent-Length: {length}\r\n\r\n");
+    client.write_all(head.as_bytes()).expect("head");
+    let mut client = client.try_clone().expect("clone");
+    std::thread::spawn(move || {
+        let _ = client.write_all(&vec![b'x'; sent]);
+    });
+}
+
+/// The head read off `server`, as [`handle`] reads it.
+fn head_of(server: &TcpStream) -> (http::Request, http::Body) {
+    let deadlines = http::Deadlines {
+        head: Duration::from_secs(5),
+        total: Duration::from_secs(5),
+        body_idle: Duration::from_secs(5),
+    };
+    http::read_head_within(server, 1 << 20, deadlines).expect("head")
+}
+
+#[test]
+fn a_declared_body_takes_budget_only_as_its_bytes_arrive() {
+    const LENGTH: usize = 300_000;
+    let budget = Arc::new(BodyBudget::new(LENGTH + LENGTH / 2));
+    // Three connections declare a body and send none of it.
+    let idle: Vec<_> = (0..3)
+        .map(|_| {
+            let (server, mut client) = socket_pair();
+            post_with(&mut client, LENGTH, 0);
+            let budget = budget.clone();
+            let reader = std::thread::spawn(move || {
+                let (mut request, body) = head_of(&server);
+                read_body(&budget, &mut request, body)
+                    .map(drop)
+                    .map_err(|(status, ..)| status)
+            });
+            (client, reader)
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        budget.used.load(Ordering::Acquire),
+        0,
+        "nothing arrived, nothing is taken"
+    );
+    // A request that sends its body still fits.
+    let (server, mut client) = socket_pair();
+    post_with(&mut client, LENGTH, LENGTH);
+    let (mut request, body) = head_of(&server);
+    let held = read_body(&budget, &mut request, body)
+        .map_err(|(status, _, why)| (status, why))
+        .expect("a body that arrives fits beside the declared ones");
+    assert_eq!(request.body.len(), LENGTH);
+    assert_eq!(budget.used.load(Ordering::Acquire), LENGTH);
+    // A second whole body does not fit beside it: 503, and what it had
+    // taken goes back.
+    let (server2, mut client2) = socket_pair();
+    post_with(&mut client2, LENGTH, LENGTH);
+    let (mut request2, body2) = head_of(&server2);
+    let refused = read_body(&budget, &mut request2, body2).map(drop);
+    assert_eq!(refused.map_err(|(status, ..)| status), Err(503));
+    assert_eq!(budget.used.load(Ordering::Acquire), LENGTH);
+    drop(held);
+    assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    // The idle ones end when their clients go (400) and held nothing.
+    for (client, reader) in idle {
+        drop(client);
+        assert_eq!(reader.join().expect("reader"), Err(400));
+    }
+    assert_eq!(budget.used.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn a_body_that_stalls_past_its_deadline_is_a_408() {
+    let budget = BodyBudget::new(1 << 20);
+    let (server, mut client) = socket_pair();
+    post_with(&mut client, 1000, 10);
+    let deadlines = http::Deadlines {
+        head: Duration::from_secs(5),
+        total: Duration::from_millis(300),
+        body_idle: Duration::from_secs(5),
+    };
+    let (mut request, body) =
+        http::read_head_within(&server, 1 << 20, deadlines).expect("head");
+    let refused = read_body(&budget, &mut request, body).map(drop);
+    assert_eq!(refused.map_err(|(status, ..)| status), Err(408));
+    assert_eq!(budget.used.load(Ordering::Acquire), 0);
+}
+
+/// A body longer than the limit is a 413, a request past its deadline a
+/// 408, anything else that could not be read a 400.
+#[test]
+fn a_request_that_could_not_be_read_gets_the_status_that_says_why() {
+    let too_large = anyhow::Error::from(http::BodyTooLarge { limit: 1 << 20 });
+    assert_eq!(unread_status(&too_large), 413);
+    assert_eq!(unread_status(&too_large.context("reading the request")), 413);
+    let late = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+    assert_eq!(unread_status(&late.context("reading request body")), 408);
+    assert_eq!(unread_status(&anyhow::anyhow!("malformed header line")), 400);
+}
+
+#[test]
+fn a_full_queue_is_seen_before_a_request_is_parsed() {
+    let queue = EngineQueue::new(2);
+    assert!(!queue.full());
+    assert!(queue.admit());
+    assert!(!queue.full());
+    assert!(queue.admit());
+    assert!(queue.full(), "the next request would be refused: refuse it unparsed");
+    queue.left();
+    assert!(!queue.full());
+}

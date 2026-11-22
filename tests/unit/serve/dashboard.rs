@@ -2250,3 +2250,73 @@ fn what_the_server_builds_has_the_fixtures_shape() {
     keys(&made, "", &mut b);
     assert_eq!(a, b);
 }
+
+/// What the head alone decides is refused before the body is read: the
+/// caller asks with the declared length and reads nothing on a refusal.
+#[test]
+fn the_head_guard_refuses_by_the_head_what_respond_would_refuse() {
+    let (_board, d) = dashboard();
+    let guard = |method: &str,
+                 target: &str,
+                 headers: &[(&str, &str)],
+                 connection: Connection,
+                 body_len: usize| {
+        let route = route(method, target, Some(BROWSER)).expect("a dashboard route");
+        d.head_guard(
+            route,
+            &request(method, target, headers),
+            target,
+            connection,
+            body_len,
+        )
+        .map_err(|response| response.status)
+    };
+    let settings = "/v1/lily/settings";
+    assert_eq!(guard("GET", "/v1/lily/status", &[], LOCAL, 0), Ok(()));
+    assert_eq!(guard("GET", "/", &[], LOCAL, 0), Ok(()));
+    assert_eq!(guard("PATCH", settings, &[JSON], LOCAL, MAX_WRITE_BODY), Ok(()));
+    // A peer that is not this machine, whatever it declares.
+    let remote =
+        Connection { peer: at(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))), port: 8000 };
+    for (method, target) in
+        [("GET", "/v1/lily/status"), ("PATCH", settings), ("GET", "/")]
+    {
+        assert_eq!(
+            guard(method, target, &[JSON], remote, 0),
+            Err(403),
+            "{method} {target}"
+        );
+        assert_eq!(guard(method, target, &[JSON], remote, 1 << 30), Err(403));
+    }
+    // A `Host` that is not lily's own.
+    let other_port = Connection { port: 9000, ..LOCAL };
+    assert_eq!(guard("PATCH", settings, &[JSON], other_port, 10), Err(403));
+    // A write without the JSON content type or from another origin.
+    assert_eq!(guard("PATCH", settings, &[], LOCAL, 10), Err(403));
+    assert_eq!(
+        guard(
+            "DELETE",
+            "/v1/lily/settings/top_p",
+            &[("Content-Type", "text/plain")],
+            LOCAL,
+            0
+        ),
+        Err(403)
+    );
+    let foreign = [JSON, ("Origin", "https://other.example")];
+    assert_eq!(guard("PATCH", settings, &foreign, LOCAL, 10), Err(403));
+    // A declared body past the settings writes' limit, on any route.
+    for (method, target) in [
+        ("PATCH", settings),
+        ("DELETE", "/v1/lily/settings/top_p"),
+        ("GET", "/v1/lily/status"),
+        ("POST", "/v1/lily/status"),
+        ("GET", "/"),
+    ] {
+        assert_eq!(
+            guard(method, target, &[JSON], LOCAL, MAX_WRITE_BODY + 1),
+            Err(413),
+            "{method} {target}"
+        );
+    }
+}

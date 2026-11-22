@@ -14,6 +14,20 @@ other OpenAI-compatible servers:
 - **Images** are base64 data URIs (PNG or JPEG, no count limit beyond the
   context); the server never fetches URLs. A 1920 x 1080 screenshot costs
   about 2 000 prompt tokens. No video.
+- **Request limits.** A body may take 32 MiB plus 4 MiB for every image of
+  the largest size the context holds (288 MiB at the default 131 072 tokens
+  and 2 048-token image cap; 32 MiB without a vision tower); bodies held at
+  once take at most four times that, counted as their bytes arrive and
+  until the request is parsed (503 past it). The request line and headers
+  take at most 64 KiB and 30 s, the whole request 300 s (408 past either);
+  a body declared longer than the limit is a 413. Past `--queue` waiting
+  requests (checked before the body is read) and past twice `--queue` plus
+  64 open connections, the answer is 503. A response written in one piece
+  must be taken by the client within 30 s, and a streamed one is given up
+  when the client has taken nothing for 120 s while bytes wait for it.
+  These limits are per server, not per client: all clients share them, and
+  one that keeps its connections open to their limits leaves fewer for the
+  others.
 - **Message text is always text.** A special token spelled in a message, a
   tool result or a tool definition (`<|im_end|>`, `<|image_pad|>`) is
   tokenized as the characters it is, never as conversation structure or an
