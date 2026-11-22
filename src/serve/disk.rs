@@ -27,9 +27,18 @@
 //! ([`Lineage`], docs/dashboard.md § 4.2), so a session written out and read
 //! back is the same lineage to the dashboard. Meta files written before the
 //! id existed load without one.
+//!
+//! The entries are the conversations' tokens and state, so the tier is this
+//! account's alone: its directories are created `0700` and its files
+//! `0600` whatever the umask, and at open what an earlier lily left under
+//! the root with a looser mode (the directory of every format, its entries
+//! and their files) is made `0700` and `0600` ([`tighten_tier`]).
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -137,6 +146,164 @@ impl Reserved {
     }
 }
 
+/// Creates `path` and its missing parents `0700`.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+}
+
+/// What [`tighten`] is asked to make private.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A directory, to be `0700`.
+    Dir,
+    /// A regular file, to be `0600`.
+    File,
+}
+
+/// Makes the existing `path` private (`0700` for a directory, `0600` for a
+/// regular file) when it is this account's and its group or others have
+/// any access (a tier written before it was private). The path itself is
+/// opened, no link followed, and judged and changed through that
+/// descriptor. Anything else (a link, something of another account, a
+/// refused change) is left as it is, with a line in the log unless
+/// `quiet`: the tier still opens. Returns whether `path` is now this
+/// account's own and private, so the caller knows what it may descend into.
+fn tighten(path: &Path, kind: Kind, quiet: bool) -> bool {
+    let (flags, private) = match kind {
+        Kind::Dir => (libc::O_DIRECTORY, 0o700),
+        // Without waiting, should the name be a FIFO by the time it opens.
+        Kind::File => (libc::O_NONBLOCK, 0o600),
+    };
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(flags | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .and_then(|handle| handle.metadata().map(|meta| (handle, meta)));
+    let (handle, meta) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            if !quiet {
+                eprintln!(
+                    "session cache: {} could not be opened as a {} of its own (a \
+                     link?), its mode is left as it is: {error}",
+                    path.display(),
+                    if kind == Kind::Dir { "directory" } else { "file" },
+                );
+            }
+            return false;
+        }
+    };
+    let is_kind = match kind {
+        Kind::Dir => meta.is_dir(),
+        Kind::File => meta.is_file(),
+    };
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if !is_kind || meta.uid() != uid {
+        if !quiet && meta.mode() & 0o077 != 0 {
+            eprintln!(
+                "session cache: {} belongs to uid {} and its mode {:o} is left as it is",
+                path.display(),
+                meta.uid(),
+                meta.mode() & 0o7777
+            );
+        }
+        return false;
+    }
+    if meta.mode() & 0o077 == 0 {
+        return true;
+    }
+    match handle.set_permissions(fs::Permissions::from_mode(private)) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "session cache: could not make {} private: {error}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+/// The names in the directory `dir` whose own type (a link is a link) is
+/// `kind`; empty when it cannot be listed.
+fn children(dir: &Path, kind: Kind) -> Vec<PathBuf> {
+    let Ok(listing) = fs::read_dir(dir) else { return Vec::new() };
+    listing
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            let wanted = match kind {
+                Kind::Dir => file_type.is_dir(),
+                Kind::File => file_type.is_file(),
+            };
+            wanted.then(|| entry.path())
+        })
+        .collect()
+}
+
+/// Whether the directory `dir` is an entry of the tier: it holds a meta
+/// file and a prefix file of its own.
+fn is_entry(dir: &Path) -> bool {
+    [META, PREFIX].iter().all(|name| {
+        fs::symlink_metadata(dir.join(name)).is_ok_and(|meta| meta.is_file())
+    })
+}
+
+/// Makes the tier under `root` private at open: `current`, the directory
+/// of the format being opened, and every other format's directory that an
+/// earlier lily (or this one, for another checkpoint) filled, each with
+/// its entries and their files ([`tighten`]). The other formats' entries
+/// are never read here, but they hold conversations all the same and
+/// outlive the upgrade until their own format is opened again.
+///
+/// `root` is whatever `--disk-cache-dir` names and may hold other things,
+/// so only what is recognisably the tier's is touched: a directory counts
+/// as another format's when it holds at least one entry ([`is_entry`]),
+/// and beside `current` nothing but such directories, their entries and
+/// the regular files directly in an entry is changed. No link is followed
+/// and nothing of another account is entered.
+fn tighten_tier(root: &Path, current: &Path) {
+    let entries_of = |format_dir: &Path| {
+        children(format_dir, Kind::Dir).into_iter().filter(|dir| is_entry(dir))
+    };
+    // Called for a format's directory that is private by now, so only this
+    // account can change what the names in it refer to.
+    let tighten_entries = |format_dir: &Path| {
+        for entry in entries_of(format_dir) {
+            if !tighten(&entry, Kind::Dir, false) {
+                continue;
+            }
+            for file in children(&entry, Kind::File) {
+                tighten(&file, Kind::File, false);
+            }
+        }
+    };
+    if tighten(current, Kind::Dir, false) {
+        tighten_entries(current);
+    }
+    for format_dir in children(root, Kind::Dir) {
+        // A directory without entries is not the tier's (or holds nothing
+        // to protect); one that cannot be listed says nothing either way.
+        if format_dir != current
+            && entries_of(&format_dir).next().is_some()
+            && tighten(&format_dir, Kind::Dir, true)
+        {
+            tighten_entries(&format_dir);
+        }
+    }
+}
+
+/// Creates (or truncates) the file at `path`, `0600` when it is new.
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)
+}
+
+/// [`fs::write`] through [`create_private_file`].
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    create_private_file(path)?.write_all(bytes)
+}
+
 /// Writes an entry's files into `path` (created): `prefix.bin` from `prefix`
 /// and one `ckpt-<pos>.bin` per position of `checkpoints` from `checkpoint`.
 /// Returns the bytes written. Touches no index, so it may run on any thread;
@@ -147,10 +314,11 @@ pub fn write_files(
     prefix: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
     checkpoint: &mut dyn FnMut(usize, &mut dyn Write) -> Result<()>,
 ) -> Result<u64> {
-    fs::create_dir_all(path)?;
+    create_private_dir(path)?;
     let mut bytes = 0u64;
     {
-        let mut w = BufWriter::with_capacity(8 << 20, File::create(path.join(PREFIX))?);
+        let mut w =
+            BufWriter::with_capacity(8 << 20, create_private_file(&path.join(PREFIX))?);
         prefix(&mut w)?;
         w.flush()?;
         bytes += w.get_ref().metadata()?.len();
@@ -161,7 +329,7 @@ pub fn write_files(
     for &pos in &positions {
         let mut w = BufWriter::with_capacity(
             8 << 20,
-            File::create(path.join(format!("ckpt-{pos}.bin")))?,
+            create_private_file(&path.join(format!("ckpt-{pos}.bin")))?,
         );
         checkpoint(pos, &mut w)?;
         w.flush()?;
@@ -254,8 +422,9 @@ impl DiskStore {
         max_age: Arc<AtomicU64>,
     ) -> Result<Self> {
         let dir = root.join(dir_name(format));
-        fs::create_dir_all(&dir)
+        create_private_dir(&dir)
             .with_context(|| format!("creating {}", dir.display()))?;
+        tighten_tier(root, &dir);
         let mut entries = Vec::new();
         let mut next_id = 1u64;
         for entry in
@@ -552,7 +721,7 @@ impl DiskStore {
             images: images.to_vec(),
             lineage,
         };
-        fs::write(reserved.path.join(META), serde_json::to_vec(&meta)?)?;
+        write_private(&reserved.path.join(META), &serde_json::to_vec(&meta)?)?;
         Ok(Some(DiskEntry {
             id: reserved.id.clone(),
             tokens: meta.tokens,
@@ -609,7 +778,7 @@ impl DiskStore {
                 lineage: entry.lineage,
             };
             if let Ok(json) = serde_json::to_vec(&meta) {
-                let _ = fs::write(dir.join(id).join(META), json);
+                let _ = write_private(&dir.join(id).join(META), &json);
             }
         }
     }

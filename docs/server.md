@@ -328,7 +328,13 @@ q8 runs at the same speed as bf16, at a teacher-forced KL of about 2e-3 to
 4e-3 against it (see [architecture.md](architecture.md), "The 8-bit K/V
 cache"). Each format and each checkpoint (q4, q4-xl, a re-conversion)
 keeps its own disk-tier directory, so sessions persisted under one are not
-read under another.
+read under another. The tier holds the conversations' tokens and state, so
+the directories lily creates for it are `0700` and its files `0600`. At
+the start, what an earlier lily left there with a looser mode is made
+private too: the directory of every format under `--disk-cache-dir`, the
+entries in it and their files. Anything else in that directory is not
+touched, and a directory that is a link or another account's is left as it
+is (with a line in the log when it is the format's own).
 
 On a machine that does not hold the model (the expert cache,
 [low-ram-experts.md](low-ram-experts.md)) the caches are q8 and requests
