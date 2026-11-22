@@ -50,8 +50,175 @@
     defined(KERNEL_inkling2_moe_down_m4_iq4_xs)
 #define GLM53_INKLING_TYPES
 #endif
+#if defined(KERNEL_inkling2_embed_q8_0) || defined(KERNEL_inkling2_embed_q4_k) || \
+    defined(KERNEL_inkling2_embed_q2_k) || defined(KERNEL_inkling2_embed_iq2_xxs) || \
+    defined(KERNEL_inkling2_embed_bf16) || defined(KERNEL_inkling2_embed_f32) || \
+    defined(KERNEL_inkling2_embed_f16) || defined(KERNEL_inkling2_embed_q4_0) || \
+    defined(KERNEL_inkling2_embed_q5_k) || defined(KERNEL_inkling2_embed_q6_k) || \
+    defined(KERNEL_inkling2_embed_iq4_nl) || defined(KERNEL_inkling2_embed_iq2_s) || \
+    defined(KERNEL_inkling2_embed_mxfp4) || defined(KERNEL_inkling2_embed_nvfp4) || \
+    defined(KERNEL_inkling2_embed_q2_0) || defined(KERNEL_inkling2_embed_iq2_xs) || \
+    defined(KERNEL_inkling2_embed_iq3_xxs) || defined(KERNEL_inkling2_embed_iq1_s) || \
+    defined(KERNEL_inkling2_embed_iq4_xs) || \
+    defined(KERNEL_inkling2_moe_q8_0) || defined(KERNEL_inkling2_moe_q4_k) || \
+    defined(KERNEL_inkling2_moe_q2_k) || defined(KERNEL_inkling2_moe_iq2_xxs) || \
+    defined(KERNEL_inkling2_moe_bf16) || defined(KERNEL_inkling2_moe_f32) || \
+    defined(KERNEL_inkling2_moe_f16) || defined(KERNEL_inkling2_moe_q4_0) || \
+    defined(KERNEL_inkling2_moe_q5_k) || defined(KERNEL_inkling2_moe_q6_k) || \
+    defined(KERNEL_inkling2_moe_iq4_nl) || defined(KERNEL_inkling2_moe_iq2_s) || \
+    defined(KERNEL_inkling2_moe_mxfp4) || defined(KERNEL_inkling2_moe_nvfp4) || \
+    defined(KERNEL_inkling2_moe_q2_0) || defined(KERNEL_inkling2_moe_iq2_xs) || \
+    defined(KERNEL_inkling2_moe_iq3_xxs) || defined(KERNEL_inkling2_moe_iq1_s) || \
+    defined(KERNEL_inkling2_moe_iq4_xs) || \
+    defined(KERNEL_inkling2_moe_gu_situ_q4_k) || \
+    defined(KERNEL_inkling2_moe_gu_situ_q2_k) || defined(KERNEL_inkling2_moe_gu_situ_iq2_xxs) || \
+    defined(KERNEL_inkling2_moe_gu_situ_bf16) || defined(KERNEL_inkling2_moe_gu_situ_f32) || \
+    defined(KERNEL_inkling2_moe_gu_situ_f16) || defined(KERNEL_inkling2_moe_gu_situ_q4_0) || \
+    defined(KERNEL_inkling2_moe_gu_situ_q5_k) || defined(KERNEL_inkling2_moe_gu_situ_q6_k) || \
+    defined(KERNEL_inkling2_moe_gu_situ_iq4_nl) || defined(KERNEL_inkling2_moe_gu_situ_iq2_s) || \
+    defined(KERNEL_inkling2_moe_gu_situ_mxfp4) || defined(KERNEL_inkling2_moe_gu_situ_nvfp4) || \
+    defined(KERNEL_inkling2_moe_gu_situ_q2_0) || defined(KERNEL_inkling2_moe_gu_situ_iq2_xs) || \
+    defined(KERNEL_inkling2_moe_gu_situ_iq3_xxs) || defined(KERNEL_inkling2_moe_gu_situ_iq1_s) || \
+    defined(KERNEL_inkling2_moe_gu_situ_iq4_xs) || \
+    defined(KERNEL_inkling2_moe_down_sum_q4_k) || \
+    defined(KERNEL_inkling2_moe_down_sum_q2_k) || defined(KERNEL_inkling2_moe_down_sum_iq2_xxs) || \
+    defined(KERNEL_inkling2_moe_down_sum_bf16) || defined(KERNEL_inkling2_moe_down_sum_f32) || \
+    defined(KERNEL_inkling2_moe_down_sum_f16) || defined(KERNEL_inkling2_moe_down_sum_q4_0) || \
+    defined(KERNEL_inkling2_moe_down_sum_q5_k) || defined(KERNEL_inkling2_moe_down_sum_q6_k) || \
+    defined(KERNEL_inkling2_moe_down_sum_iq4_nl) || defined(KERNEL_inkling2_moe_down_sum_iq2_s) || \
+    defined(KERNEL_inkling2_moe_down_sum_mxfp4) || defined(KERNEL_inkling2_moe_down_sum_nvfp4) || \
+    defined(KERNEL_inkling2_moe_down_sum_q2_0) || defined(KERNEL_inkling2_moe_down_sum_iq2_xs) || \
+    defined(KERNEL_inkling2_moe_down_sum_iq3_xxs) || defined(KERNEL_inkling2_moe_down_sum_iq1_s) || \
+    defined(KERNEL_inkling2_moe_down_sum_iq4_xs) || \
+    defined(KERNEL_inkling2_moe_gu_m4_q4_k) || \
+    defined(KERNEL_inkling2_moe_gu_m4_q2_k) || defined(KERNEL_inkling2_moe_gu_m4_iq2_xxs) || \
+    defined(KERNEL_inkling2_moe_gu_m4_bf16) || defined(KERNEL_inkling2_moe_gu_m4_f32) || \
+    defined(KERNEL_inkling2_moe_gu_m4_f16) || defined(KERNEL_inkling2_moe_gu_m4_q4_0) || \
+    defined(KERNEL_inkling2_moe_gu_m4_q5_k) || defined(KERNEL_inkling2_moe_gu_m4_q6_k) || \
+    defined(KERNEL_inkling2_moe_gu_m4_iq4_nl) || defined(KERNEL_inkling2_moe_gu_m4_iq2_s) || \
+    defined(KERNEL_inkling2_moe_gu_m4_mxfp4) || defined(KERNEL_inkling2_moe_gu_m4_nvfp4) || \
+    defined(KERNEL_inkling2_moe_gu_m4_q2_0) || defined(KERNEL_inkling2_moe_gu_m4_iq2_xs) || \
+    defined(KERNEL_inkling2_moe_gu_m4_iq3_xxs) || defined(KERNEL_inkling2_moe_gu_m4_iq1_s) || \
+    defined(KERNEL_inkling2_moe_gu_m4_iq4_xs) || \
+    defined(KERNEL_inkling2_moe_down_m4_q4_k) || \
+    defined(KERNEL_inkling2_moe_down_m4_q2_k) || defined(KERNEL_inkling2_moe_down_m4_iq2_xxs) || \
+    defined(KERNEL_inkling2_moe_down_m4_bf16) || defined(KERNEL_inkling2_moe_down_m4_f32) || \
+    defined(KERNEL_inkling2_moe_down_m4_f16) || defined(KERNEL_inkling2_moe_down_m4_q4_0) || \
+    defined(KERNEL_inkling2_moe_down_m4_q5_k) || defined(KERNEL_inkling2_moe_down_m4_q6_k) || \
+    defined(KERNEL_inkling2_moe_down_m4_iq4_nl) || defined(KERNEL_inkling2_moe_down_m4_iq2_s) || \
+    defined(KERNEL_inkling2_moe_down_m4_mxfp4) || defined(KERNEL_inkling2_moe_down_m4_nvfp4) || \
+    defined(KERNEL_inkling2_moe_down_m4_q2_0) || defined(KERNEL_inkling2_moe_down_m4_iq2_xs) || \
+    defined(KERNEL_inkling2_moe_down_m4_iq3_xxs) || defined(KERNEL_inkling2_moe_down_m4_iq1_s) || \
+    defined(KERNEL_inkling2_moe_down_m4_iq4_xs)
+#define INKLING2_NEEDS_QUANT
+#endif
+// Keep non-quantized and self-contained Q8_0 kernels free of glm53_quant.glsl's
+// `precise` IQ2_XXS helpers so glslang does not disable FMA across the whole kernel.
 #include "common.glsl"
+#ifdef INKLING2_NEEDS_QUANT
+#if !defined(KERNEL_inkling2_moe_gu_situ_iq2_xxs) && !defined(KERNEL_inkling2_moe_gu_m4_iq2_xxs)
+#define GLM53_NO_IQ2_XXS_DOT
+#endif
 #include "glm53_quant.glsl"
+#ifdef GLM53_INKLING_TYPES
+#include "inkling2_nvfp4_lut.glsl"
+
+// Decodes one 16-element NVFP4 sub-block at `qs` (8 bytes, 4-byte aligned)
+// into 4 vec4s (w0,w1 = low nibbles 0..7; w2,w3 = high nibbles 8..15).
+void i2_nvfp4_decode_sb(uint64_t qs, out vec4 w0, out vec4 w1, out vec4 w2, out vec4 w3) {
+    const uvec2 words = U32x2(qs).v[0];
+    const vec2 a0 = unpackHalf2x16(i2_nvfp4_byte_h[words.x & 0xffu]);
+    const vec2 a1 = unpackHalf2x16(i2_nvfp4_byte_h[(words.x >> 8u) & 0xffu]);
+    const vec2 a2 = unpackHalf2x16(i2_nvfp4_byte_h[(words.x >> 16u) & 0xffu]);
+    const vec2 a3 = unpackHalf2x16(i2_nvfp4_byte_h[words.x >> 24u]);
+    const vec2 b0 = unpackHalf2x16(i2_nvfp4_byte_h[words.y & 0xffu]);
+    const vec2 b1 = unpackHalf2x16(i2_nvfp4_byte_h[(words.y >> 8u) & 0xffu]);
+    const vec2 b2 = unpackHalf2x16(i2_nvfp4_byte_h[(words.y >> 16u) & 0xffu]);
+    const vec2 b3 = unpackHalf2x16(i2_nvfp4_byte_h[words.y >> 24u]);
+    w0 = vec4(a0.x, a1.x, a2.x, a3.x);
+    w1 = vec4(b0.x, b1.x, b2.x, b3.x);
+    w2 = vec4(a0.y, a1.y, a2.y, a3.y);
+    w3 = vec4(b0.y, b1.y, b2.y, b3.y);
+}
+
+// Fast constant-LUT factored-scale NVFP4 dot product over preloaded xv[8].
+float i2_nvfp4_dot_xv(uint64_t row, uint t, in vec4 xv[8]) {
+    const uint64_t b = row + uint64_t(t >> 1u) * 36u;
+    const uint half_idx = t & 1u;
+    const uint sw = U32(b).v[0];
+    float acc = 0.0;
+    [[unroll]] for (uint sb = 0u; sb < 2u; sb++) {
+        const uint s = 2u * half_idx + sb;
+        const float d = i2_ue4m3_lut[(sw >> (8u * s)) & 0xffu];
+        vec4 w0, w1, w2, w3;
+        i2_nvfp4_decode_sb(b + 4u + 8u * s, w0, w1, w2, w3);
+        const float sub_s = dot(w0, xv[4u * sb]) + dot(w1, xv[4u * sb + 1u])
+                          + dot(w2, xv[4u * sb + 2u]) + dot(w3, xv[4u * sb + 3u]);
+        acc += d * sub_s;
+    }
+    return acc;
+}
+#endif
+#else
+#define GLM53_Q8_0 8u
+layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer Q8Pairs { u16vec4 v[]; };
+float i2_q8_dot_xv(uint64_t row, uint t, in vec4 xv[8]) {
+    const uint64_t b = row + uint64_t(t) * 34u;
+    const float d = unpackHalf2x16(uint(U16(b).v[0])).x;
+    vec4 w[8];
+    [[unroll]] for (uint h = 0u; h < 4u; h++) {
+        const u16vec4 pairs = Q8Pairs(b + 2u).v[h];
+        const uint p0 = uint(pairs.x), p1 = uint(pairs.y), p2 = uint(pairs.z), p3 = uint(pairs.w);
+        w[2u * h] = vec4(
+            float(int(p0 << 24) >> 24), float(int(p0 << 16) >> 24),
+            float(int(p1 << 24) >> 24), float(int(p1 << 16) >> 24)
+        );
+        w[2u * h + 1u] = vec4(
+            float(int(p2 << 24) >> 24), float(int(p2 << 16) >> 24),
+            float(int(p3 << 24) >> 24), float(int(p3 << 16) >> 24)
+        );
+    }
+    float s = 0.0;
+    [[unroll]] for (uint q = 0u; q < 8u; q++) s += dot(w[q], xv[q]);
+    return d * s;
+}
+float i2_q8_dot_ptr(uint64_t row, uint t, uint64_t x) {
+    const uint64_t b = row + uint64_t(t) * 34u;
+    const float d = unpackHalf2x16(uint(U16(b).v[0])).x;
+    vec4 w[8];
+    [[unroll]] for (uint h = 0u; h < 4u; h++) {
+        const u16vec4 pairs = Q8Pairs(b + 2u).v[h];
+        const uint p0 = uint(pairs.x), p1 = uint(pairs.y), p2 = uint(pairs.z), p3 = uint(pairs.w);
+        w[2u * h] = vec4(
+            float(int(p0 << 24) >> 24), float(int(p0 << 16) >> 24),
+            float(int(p1 << 24) >> 24), float(int(p1 << 16) >> 24)
+        );
+        w[2u * h + 1u] = vec4(
+            float(int(p2 << 24) >> 24), float(int(p2 << 16) >> 24),
+            float(int(p3 << 24) >> 24), float(int(p3 << 16) >> 24)
+        );
+    }
+    float s = 0.0;
+    [[unroll]] for (uint q = 0u; q < 8u; q++) s += dot(w[q], F32x4(x + 16u * q).v[0]);
+    return d * s;
+}
+void i2_q8_decode_raw(uint64_t row, uint t, out float d, out vec4 w[8]) {
+    const uint64_t b = row + uint64_t(t) * 34u;
+    d = unpackHalf2x16(uint(U16(b).v[0])).x;
+    [[unroll]] for (uint h = 0u; h < 4u; h++) {
+        const u16vec4 pairs = Q8Pairs(b + 2u).v[h];
+        const uint p0 = uint(pairs.x), p1 = uint(pairs.y), p2 = uint(pairs.z), p3 = uint(pairs.w);
+        w[2u * h] = vec4(
+            float(int(p0 << 24) >> 24), float(int(p0 << 16) >> 24),
+            float(int(p1 << 24) >> 24), float(int(p1 << 16) >> 24)
+        );
+        w[2u * h + 1u] = vec4(
+            float(int(p2 << 24) >> 24), float(int(p2 << 16) >> 24),
+            float(int(p3 << 24) >> 24), float(int(p3 << 16) >> 24)
+        );
+    }
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // 1. RMSNorm: y[r, j] = x[r, j] * rsqrt(mean(x^2) + eps) * (has_w ? w[j] : 1)
@@ -147,12 +314,18 @@ void main() {
 // Params: 5 H, 6 n_states (<= 16), 7 n_q (<= 4), 8 eps, 9 has_copy, 10 has_norm, 11 norm_eps.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_inkling2_mix
-shared float mx_sg[5][8];
+shared float mx_sq[16][32];
+shared float mx_dot[4][16][32];
 shared float mx_inv[16];
 shared float mx_w[4][16];
+shared float mx_nsg[32];
 
 void main() {
     const uint r = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint n_sg = gl_NumSubgroups;
     const uint H = arg_u32(5);
     const uint n_states = arg_u32(6);
     const uint n_q = arg_u32(7);
@@ -167,73 +340,253 @@ void main() {
     const uint64_t norm_w = arg(4);
     const uint64_t row_off = uint64_t(r) * uint64_t(H) * 4u;
     const float inv_sqrt_h = inversesqrt(float(H));
+    const uint64_t stride = uint64_t(gl_NumWorkGroups.x) * uint64_t(H) * 4u;
 
-    // Pass 1: RMSNorm inverse scale per state and dot products with each query (1 barrier/state!).
+    if ((H & 3u) == 0u && H <= 4096u && n_states <= 8u) {
+        // Register-resident 1-vec4/thread path: reads every state ONCE (zero Pass-2
+        // global loads) and completes mix in 2 barriers (3 with fused RMSNorm)!
+        const uint H4 = H >> 2u;
+        const bool in_bounds = tid < H4;
+        const vec4 q0 = in_bounds ? F32x4(queries).v[tid] : vec4(0.0);
+        const vec4 q1 = (in_bounds && n_q > 1u) ? F32x4(queries + uint64_t(H) * 4u).v[tid] : vec4(0.0);
+        const vec4 q2 = (in_bounds && n_q > 2u) ? F32x4(queries + uint64_t(2u * H) * 4u).v[tid] : vec4(0.0);
+        const vec4 q3 = (in_bounds && n_q > 3u) ? F32x4(queries + uint64_t(3u * H) * 4u).v[tid] : vec4(0.0);
+
+        vec4 sv[8];
+        vec4 last_v = vec4(0.0);
+        [[unroll]] for (uint s = 0u; s < 8u; s++) {
+            if (s >= n_states) break;
+            const uint64_t st = U64(ptrs).v[s] + row_off;
+            const vec4 v = in_bounds ? F32x4(st).v[tid] : vec4(0.0);
+            sv[s] = v;
+            last_v = v;
+            const float sq = subgroupAdd(dot(v, v));
+            const float d0 = subgroupAdd(dot(v, q0));
+            const float d1 = n_q > 1u ? subgroupAdd(dot(v, q1)) : 0.0;
+            const float d2 = n_q > 2u ? subgroupAdd(dot(v, q2)) : 0.0;
+            const float d3 = n_q > 3u ? subgroupAdd(dot(v, q3)) : 0.0;
+            if (lane == 0u) {
+                mx_sq[s][sg] = sq;
+                mx_dot[0][s][sg] = d0;
+                if (n_q > 1u) mx_dot[1][s][sg] = d1;
+                if (n_q > 2u) mx_dot[2][s][sg] = d2;
+                if (n_q > 3u) mx_dot[3][s][sg] = d3;
+            }
+        }
+        barrier();
+
+        // Parallel per-(q, s) reduction across subgroups, then per-q softmax.
+        if (tid < n_q * n_states) {
+            const uint q = tid / n_states;
+            const uint s = tid % n_states;
+            float tsq = 0.0, td = 0.0;
+            for (uint g = 0u; g < n_sg; g++) {
+                tsq += mx_sq[s][g];
+                td += mx_dot[q][s][g];
+            }
+            const float inv = inversesqrt(tsq / float(H) + eps);
+            if (q == 0u) mx_inv[s] = inv;
+            mx_w[q][s] = td * inv * inv_sqrt_h;
+        }
+        barrier();
+        if (tid < n_q) {
+            const uint q = tid;
+            float logits[8];
+            float mx = -1.0 / 0.0;
+            for (uint s = 0u; s < n_states; s++) {
+                const float lg = mx_w[q][s];
+                logits[s] = lg;
+                mx = max(mx, lg);
+            }
+            float sum = 0.0;
+            for (uint s = 0u; s < n_states; s++) {
+                logits[s] = exp(logits[s] - mx);
+                sum += logits[s];
+            }
+            const float inv_sum = 1.0 / sum;
+            for (uint s = 0u; s < n_states; s++) {
+                mx_w[q][s] = logits[s] * inv_sum * mx_inv[s];
+            }
+        }
+        barrier();
+
+        vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
+        if (in_bounds) {
+            [[unroll]] for (uint s = 0u; s < 8u; s++) {
+                if (s >= n_states) break;
+                const vec4 v = sv[s];
+                a0 += mx_w[0][s] * v;
+                if (n_q > 1u) a1 += mx_w[1][s] * v;
+                if (n_q > 2u) a2 += mx_w[2][s] * v;
+                if (n_q > 3u) a3 += mx_w[3][s] * v;
+            }
+            if (has_copy != 0u) F32x4(copy_dst + row_off).v[tid] = last_v;
+            if (has_norm == 0u) F32x4(out_base + row_off).v[tid] = a0;
+            if (n_q > 1u) F32x4(out_base + stride + row_off).v[tid] = a1;
+            if (n_q > 2u) F32x4(out_base + 2u * stride + row_off).v[tid] = a2;
+            if (n_q > 3u) F32x4(out_base + 3u * stride + row_off).v[tid] = a3;
+        }
+        if (has_norm != 0u) {
+            const float out_sq = subgroupAdd(in_bounds ? dot(a0, a0) : 0.0);
+            if (lane == 0u) mx_nsg[sg] = out_sq;
+            barrier();
+            float tot = 0.0;
+            for (uint g = 0u; g < n_sg; g++) tot += mx_nsg[g];
+            const float inv = inversesqrt(tot / float(H) + norm_eps);
+            if (in_bounds) {
+                F32x4(out_base + row_off).v[tid] = a0 * inv * F32x4(norm_w).v[tid];
+            }
+        }
+        return;
+    }
+
+    // Vectorized F32x4 path for n_states in 9..16 and H <= 4096 (multiple of 4).
+    if ((H & 3u) == 0u && H <= 4096u) {
+        const uint H4 = H >> 2u;
+        const bool in_bounds = tid < H4;
+        const vec4 q0 = in_bounds ? F32x4(queries).v[tid] : vec4(0.0);
+        const vec4 q1 = (in_bounds && n_q > 1u) ? F32x4(queries + uint64_t(H) * 4u).v[tid] : vec4(0.0);
+        const vec4 q2 = (in_bounds && n_q > 2u) ? F32x4(queries + uint64_t(2u * H) * 4u).v[tid] : vec4(0.0);
+        const vec4 q3 = (in_bounds && n_q > 3u) ? F32x4(queries + uint64_t(3u * H) * 4u).v[tid] : vec4(0.0);
+
+        for (uint s = 0u; s < n_states; s++) {
+            const uint64_t st = U64(ptrs).v[s] + row_off;
+            const vec4 v = in_bounds ? F32x4(st).v[tid] : vec4(0.0);
+            const float sq = subgroupAdd(dot(v, v));
+            const float d0 = subgroupAdd(dot(v, q0));
+            const float d1 = n_q > 1u ? subgroupAdd(dot(v, q1)) : 0.0;
+            const float d2 = n_q > 2u ? subgroupAdd(dot(v, q2)) : 0.0;
+            const float d3 = n_q > 3u ? subgroupAdd(dot(v, q3)) : 0.0;
+            if (lane == 0u) {
+                mx_sq[s][sg] = sq;
+                mx_dot[0][s][sg] = d0;
+                if (n_q > 1u) mx_dot[1][s][sg] = d1;
+                if (n_q > 2u) mx_dot[2][s][sg] = d2;
+                if (n_q > 3u) mx_dot[3][s][sg] = d3;
+            }
+        }
+        barrier();
+        if (tid < n_q * n_states) {
+            const uint q = tid / n_states;
+            const uint s = tid % n_states;
+            float tsq = 0.0, td = 0.0;
+            for (uint g = 0u; g < n_sg; g++) {
+                tsq += mx_sq[s][g];
+                td += mx_dot[q][s][g];
+            }
+            const float inv = inversesqrt(tsq / float(H) + eps);
+            if (q == 0u) mx_inv[s] = inv;
+            mx_w[q][s] = td * inv * inv_sqrt_h;
+        }
+        barrier();
+        if (tid < n_q) {
+            const uint q = tid;
+            float logits[16];
+            float mx = -1.0 / 0.0;
+            for (uint s = 0u; s < n_states; s++) {
+                const float lg = mx_w[q][s];
+                logits[s] = lg;
+                mx = max(mx, lg);
+            }
+            float sum = 0.0;
+            for (uint s = 0u; s < n_states; s++) {
+                logits[s] = exp(logits[s] - mx);
+                sum += logits[s];
+            }
+            const float inv_sum = 1.0 / sum;
+            for (uint s = 0u; s < n_states; s++) {
+                mx_w[q][s] = logits[s] * inv_sum * mx_inv[s];
+            }
+        }
+        barrier();
+
+        vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
+        vec4 last_v = vec4(0.0);
+        if (in_bounds) {
+            for (uint s = 0u; s < n_states; s++) {
+                const vec4 v = F32x4(U64(ptrs).v[s] + row_off).v[tid];
+                last_v = v;
+                a0 += mx_w[0][s] * v;
+                if (n_q > 1u) a1 += mx_w[1][s] * v;
+                if (n_q > 2u) a2 += mx_w[2][s] * v;
+                if (n_q > 3u) a3 += mx_w[3][s] * v;
+            }
+            if (has_copy != 0u) F32x4(copy_dst + row_off).v[tid] = last_v;
+            if (has_norm == 0u) F32x4(out_base + row_off).v[tid] = a0;
+            if (n_q > 1u) F32x4(out_base + stride + row_off).v[tid] = a1;
+            if (n_q > 2u) F32x4(out_base + 2u * stride + row_off).v[tid] = a2;
+            if (n_q > 3u) F32x4(out_base + 3u * stride + row_off).v[tid] = a3;
+        }
+        if (has_norm != 0u) {
+            const float out_sq = subgroupAdd(in_bounds ? dot(a0, a0) : 0.0);
+            if (lane == 0u) mx_nsg[sg] = out_sq;
+            barrier();
+            float tot = 0.0;
+            for (uint g = 0u; g < n_sg; g++) tot += mx_nsg[g];
+            const float inv = inversesqrt(tot / float(H) + norm_eps);
+            if (in_bounds) {
+                F32x4(out_base + row_off).v[tid] = a0 * inv * F32x4(norm_w).v[tid];
+            }
+        }
+        return;
+    }
+
+    // General fallback for H > 4096 or non-multiple-of-4 H (256 threads, 8 subgroups).
     for (uint s = 0u; s < n_states; s++) {
         const uint64_t st = U64(ptrs).v[s] + row_off;
         float sq = 0.0;
-        float dot0 = 0.0, dot1 = 0.0, dot2 = 0.0, dot3 = 0.0;
-        for (uint i = gl_LocalInvocationIndex; i < H; i += 256u) {
+        float d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
+        for (uint i = tid; i < H; i += 256u) {
             const float v = F32(st).v[i];
             sq += v * v;
-            dot0 += v * F32(queries).v[i];
-            if (n_q > 1u) dot1 += v * F32(queries + uint64_t(H) * 4u).v[i];
-            if (n_q > 2u) dot2 += v * F32(queries + uint64_t(2u * H) * 4u).v[i];
-            if (n_q > 3u) dot3 += v * F32(queries + uint64_t(3u * H) * 4u).v[i];
+            d0 += v * F32(queries).v[i];
+            if (n_q > 1u) d1 += v * F32(queries + uint64_t(H) * 4u).v[i];
+            if (n_q > 2u) d2 += v * F32(queries + uint64_t(2u * H) * 4u).v[i];
+            if (n_q > 3u) d3 += v * F32(queries + uint64_t(3u * H) * 4u).v[i];
         }
         sq = subgroupAdd(sq);
-        dot0 = subgroupAdd(dot0);
-        if (n_q > 1u) dot1 = subgroupAdd(dot1);
-        if (n_q > 2u) dot2 = subgroupAdd(dot2);
-        if (n_q > 3u) dot3 = subgroupAdd(dot3);
-        if (gl_SubgroupInvocationID == 0u) {
-            mx_sg[0][gl_SubgroupID] = sq;
-            mx_sg[1][gl_SubgroupID] = dot0;
-            if (n_q > 1u) mx_sg[2][gl_SubgroupID] = dot1;
-            if (n_q > 2u) mx_sg[3][gl_SubgroupID] = dot2;
-            if (n_q > 3u) mx_sg[4][gl_SubgroupID] = dot3;
-        }
-        barrier();
-        if (gl_LocalInvocationIndex == 0u) {
-            float tsq = 0.0, td0 = 0.0, td1 = 0.0, td2 = 0.0, td3 = 0.0;
-            for (uint g = 0u; g < 8u; g++) {
-                tsq += mx_sg[0][g];
-                td0 += mx_sg[1][g];
-                if (n_q > 1u) td1 += mx_sg[2][g];
-                if (n_q > 2u) td2 += mx_sg[3][g];
-                if (n_q > 3u) td3 += mx_sg[4][g];
-            }
-            const float inv = inversesqrt(tsq / float(H) + eps);
-            mx_inv[s] = inv;
-            mx_w[0][s] = td0 * inv * inv_sqrt_h;
-            if (n_q > 1u) mx_w[1][s] = td1 * inv * inv_sqrt_h;
-            if (n_q > 2u) mx_w[2][s] = td2 * inv * inv_sqrt_h;
-            if (n_q > 3u) mx_w[3][s] = td3 * inv * inv_sqrt_h;
-        }
-        barrier();
-    }
-
-    // Softmax per query over n_states.
-    if (gl_LocalInvocationIndex < n_q) {
-        const uint q = gl_LocalInvocationIndex;
-        float mx = mx_w[q][0];
-        for (uint s = 1u; s < n_states; s++) mx = max(mx, mx_w[q][s]);
-        float sum = 0.0;
-        for (uint s = 0u; s < n_states; s++) {
-            mx_w[q][s] = exp(mx_w[q][s] - mx);
-            sum += mx_w[q][s];
-        }
-        const float inv_sum = 1.0 / sum;
-        for (uint s = 0u; s < n_states; s++) {
-            mx_w[q][s] *= inv_sum * mx_inv[s];
+        d0 = subgroupAdd(d0);
+        if (n_q > 1u) d1 = subgroupAdd(d1);
+        if (n_q > 2u) d2 = subgroupAdd(d2);
+        if (n_q > 3u) d3 = subgroupAdd(d3);
+        if (lane == 0u) {
+            mx_sq[s][sg] = sq;
+            mx_dot[0][s][sg] = d0;
+            if (n_q > 1u) mx_dot[1][s][sg] = d1;
+            if (n_q > 2u) mx_dot[2][s][sg] = d2;
+            if (n_q > 3u) mx_dot[3][s][sg] = d3;
         }
     }
     barrier();
+    if (tid < n_q) {
+        const uint q = tid;
+        float inv_s[16];
+        float logits[16];
+        float mx = -1.0 / 0.0;
+        for (uint s = 0u; s < n_states; s++) {
+            float tsq = 0.0, td = 0.0;
+            for (uint g = 0u; g < n_sg; g++) {
+                tsq += mx_sq[s][g];
+                td += mx_dot[q][s][g];
+            }
+            const float inv = inversesqrt(tsq / float(H) + eps);
+            inv_s[s] = inv;
+            const float lg = td * inv * inv_sqrt_h;
+            logits[s] = lg;
+            mx = max(mx, lg);
+        }
+        float sum = 0.0;
+        for (uint s = 0u; s < n_states; s++) {
+            logits[s] = exp(logits[s] - mx);
+            sum += logits[s];
+        }
+        const float inv_sum = 1.0 / sum;
+        for (uint s = 0u; s < n_states; s++) mx_w[q][s] = logits[s] * inv_sum * inv_s[s];
+    }
+    barrier();
 
-    // Pass 2: weighted sum of normalized states (+ optional copy of last state + optional RMSNorm for n_q==1).
-    const uint64_t stride = uint64_t(gl_NumWorkGroups.x) * uint64_t(H) * 4u;
     float out_sq = 0.0;
-    for (uint i = gl_LocalInvocationIndex; i < H; i += 256u) {
+    for (uint i = tid; i < H; i += 256u) {
         float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
         float last_v = 0.0;
         for (uint s = 0u; s < n_states; s++) {
@@ -253,16 +606,12 @@ void main() {
     }
     if (has_norm != 0u) {
         out_sq = subgroupAdd(out_sq);
-        if (gl_SubgroupInvocationID == 0u) mx_sg[0][gl_SubgroupID] = out_sq;
+        if (lane == 0u) mx_nsg[sg] = out_sq;
         barrier();
-        if (gl_LocalInvocationIndex == 0u) {
-            float tot = 0.0;
-            for (uint g = 0u; g < 8u; g++) tot += mx_sg[0][g];
-            mx_sg[0][0] = inversesqrt(tot / float(H) + norm_eps);
-        }
-        barrier();
-        const float inv = mx_sg[0][0];
-        for (uint i = gl_LocalInvocationIndex; i < H; i += 256u) {
+        float tot = 0.0;
+        for (uint g = 0u; g < n_sg; g++) tot += mx_nsg[g];
+        const float inv = inversesqrt(tot / float(H) + norm_eps);
+        for (uint i = tid; i < H; i += 256u) {
             F32(out_base + row_off).v[i] *= inv * F32(norm_w).v[i];
         }
     }
@@ -553,9 +902,6 @@ void main() {
 // Params: 4 E (<= 256), 5 K (<= 16), 6 has_bias, 7 route_scale.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_inkling2_router
-shared float rt_prob[256];
-shared float rt_score[256];
-
 void main() {
     const uint r = gl_WorkGroupID.x;
     const uint lane = gl_SubgroupInvocationID;
@@ -566,37 +912,53 @@ void main() {
     const uint64_t lrow = arg(0) + uint64_t(r) * uint64_t(E) * 4u;
     const uint64_t bias = arg(1);
 
-    for (uint e = lane; e < E; e += 32u) {
-        const float p = 1.0 / (1.0 + exp(-F32(lrow).v[e]));
-        rt_prob[e] = p;
-        rt_score[e] = p + (has_bias != 0u ? F32(bias).v[e] : 0.0);
+    float p[8];
+    float s[8];
+    [[unroll]] for (uint j = 0u; j < 8u; j++) {
+        const uint e = lane + 32u * j;
+        if (e < E) {
+            const float pr = 1.0 / (1.0 + exp(-F32(lrow).v[e]));
+            p[j] = pr;
+            s[j] = pr + (has_bias != 0u ? F32(bias).v[e] : 0.0);
+        } else {
+            p[j] = 0.0;
+            s[j] = -1e30;
+        }
     }
-    barrier();
 
-    if (lane == 0u) {
-        uint ids[16];
-        float ws[16];
-        float wsum = 0.0;
-        for (uint k = 0u; k < K; k++) {
-            float best_s = -1e30;
-            uint best_e = 0u;
-            for (uint e = 0u; e < E; e++) {
-                const float s = rt_score[e];
-                if (s > best_s) {
-                    best_s = s;
-                    best_e = e;
-                }
+    uint my_e = 0u;
+    float my_w = 0.0;
+    float wsum = 0.0;
+    for (uint k = 0u; k < K; k++) {
+        float best_s = -1e30;
+        uint best_e = 0xffffffffu;
+        [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            if (s[j] > best_s) {
+                best_s = s[j];
+                best_e = lane + 32u * j;
             }
-            rt_score[best_e] = -1e30;
-            ids[k] = best_e;
-            ws[k] = rt_prob[best_e];
-            wsum += ws[k];
         }
+        const float top = subgroupMax(best_s);
+        const uint e = subgroupMin(best_s == top ? best_e : 0xffffffffu);
+        float ep = 0.0;
+        [[unroll]] for (uint j = 0u; j < 8u; j++) {
+            if (lane + 32u * j == e) {
+                ep = p[j];
+                s[j] = -1e30;
+            }
+        }
+        const float prob_e = subgroupAdd(ep);
+        wsum += prob_e;
+        if (lane == k) {
+            my_e = e;
+            my_w = prob_e;
+        }
+    }
+
+    if (lane < K) {
         const float inv = route_scale / max(wsum, 1e-20);
-        for (uint k = 0u; k < K; k++) {
-            U32(arg(2)).v[r * K + k] = ids[k];
-            F32(arg(3)).v[r * K + k] = ws[k] * inv;
-        }
+        U32(arg(2)).v[r * K + lane] = my_e;
+        F32(arg(3)).v[r * K + lane] = my_w * inv;
     }
 }
 #endif
@@ -803,35 +1165,71 @@ void main() {
 // ---------------------------------------------------------------------------
 // 15. Relative-position bias projection:
 //     out[r, e] = sum_{d=0..D} x[r, d] * bias[e, d]
-// When n_rows <= 32 and D <= 16 (decode: n_rows = 24, D = 16), loads all
-// x[0..n_rows, 0..D] into 1.5 KB shared memory and reads each bias[e, 0..D]
-// ONCE instead of 24x (24x less memory traffic!).
+// Tiles n_rows in blocks of 32 (when D <= 16) with 32 threads (1 subgroup) per
+// WG: for ext=1024 launches 32 WGs/tile (8x more parallelism on decode, 32x
+// less bias bandwidth on prefill) and fuses R L2 clip + tau for ALL row counts.
 // x: [n_rows, D] f32, bias: [ext, D] (ty: 0=F32, 1=F16, 2=BF16), out: [n_rows, ext] f32.
-// Grid: (ceil(ext / 256), n_rows <= 32 && D <= 16 ? 1 : n_rows, 1), 256 threads.
+// Grid: (ceil(ext / 32), D <= 16 ? ceil(n_rows / 32) : n_rows, 1), 32 threads.
 // Buffers: 0 x, 1 bias, 2 out, 3 r_clip (optional).
-// Params: 4 D, 5 ext, 6 ty, 7 n_rows, 8 has_r_clip, 9 rel_clip, 10 pos0, 11 log_floor, 12 log_alpha.
+// Params: 4 D, 5 ext, 6 ty, 7 n_rows, 8 has_r_clip, 9 rel_clip, 10 pos0,
+//         11 log_floor, 12 log_alpha, 13 nh.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_inkling2_rel_bias
 shared float rb_x[512]; // up to 32 * 16 floats = 2 KB
+shared float rb_b[512]; // up to 32 * 16 floats = 2 KB (coalesced bias tile)
 
 void main() {
-    const uint e = gl_WorkGroupID.x * 256u + gl_LocalInvocationIndex;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
     const uint D = arg_u32(4);
     const uint ext = arg_u32(5);
     const uint ty = arg_u32(6);
     const uint n_rows = arg_u32(7);
     const uint has_r_clip = arg_u32(8);
 
-    if (n_rows <= 32u && D <= 16u) {
-        const uint total = n_rows * D;
-        for (uint i = gl_LocalInvocationIndex; i < total; i += 256u) {
-            rb_x[i] = F32(arg(0)).v[i];
+    if (D <= 16u) {
+        const uint tile_r0 = gl_WorkGroupID.y * 32u;
+        const uint tile_cnt = min(32u, n_rows - tile_r0);
+        const uint e0 = gl_WorkGroupID.x * 32u;
+        const uint e_cnt = min(32u, ext - e0);
+        const uint total_x = tile_cnt * D;
+        const uint total_b = e_cnt * D;
+        const uint64_t x_base = arg(0) + uint64_t(tile_r0) * uint64_t(D) * 4u;
+        for (uint i = tid; i < total_x; i += 128u) {
+            rb_x[i] = F32(x_base).v[i];
+        }
+        // Coalesced bias tile load into shared memory (zero 64B-stride waste!).
+        if (ty == 0u && D == 16u) {
+            const uint be = tid >> 2u;
+            const uint bd = (tid & 3u) << 2u;
+            if (be < e_cnt) {
+                const vec4 v = F32x4(arg(1) + (uint64_t(e0 + be) * 16u + uint64_t(bd)) * 4u).v[0];
+                rb_b[be * 16u + bd] = v.x;
+                rb_b[be * 16u + bd + 1u] = v.y;
+                rb_b[be * 16u + bd + 2u] = v.z;
+                rb_b[be * 16u + bd + 3u] = v.w;
+            }
+        } else if (ty == 0u) {
+            const uint64_t b_base = arg(1) + uint64_t(e0) * uint64_t(D) * 4u;
+            for (uint i = tid; i < total_b; i += 128u) rb_b[i] = F32(b_base).v[i];
+        } else if (ty == 1u) {
+            const uint64_t b_base = arg(1) + uint64_t(e0) * uint64_t(D) * 2u;
+            for (uint i = tid; i < total_b; i += 128u) rb_b[i] = float(F16(b_base).v[i]);
+        } else {
+            const uint64_t b_base = arg(1) + uint64_t(e0) * uint64_t(D) * 2u;
+            for (uint i = tid; i < total_b; i += 128u) rb_b[i] = uintBitsToFloat(uint(U16(b_base).v[i]) << 16u);
         }
         barrier();
-        if (has_r_clip != 0u && gl_LocalInvocationIndex < n_rows) {
-            const uint r = gl_LocalInvocationIndex;
-            const uint base = r * D;
-            const uint64_t sc_ptr = arg(3) + uint64_t(r) * uint64_t(D) * 4u;
+
+        if (has_r_clip != 0u && tid < tile_cnt) {
+            const uint lr = tid;
+            const uint r_global = tile_r0 + lr;
+            const uint nh = arg_u32(13);
+            const uint head_h = r_global % nh;
+            const uint tok_r = r_global / nh;
+            const uint base = lr * D;
+            const uint64_t sc_ptr = arg(3) + uint64_t(head_h) * uint64_t(D) * 4u;
             float sq = 0.0;
             for (uint d = 0u; d < D; d++) {
                 const float v = rb_x[base + d] * F32(sc_ptr).v[d];
@@ -843,35 +1241,46 @@ void main() {
             const uint log_floor = arg_u32(11);
             const float log_alpha = arg_f32(12);
             if (log_alpha > 0.0 && log_floor > 0u) {
-                const float ratio = float(arg_u32(10) + 1u) / float(log_floor);
+                const float ratio = float(arg_u32(10) + tok_r + 1u) / float(log_floor);
                 if (ratio > 1.0) factor *= (1.0 + log_alpha * log(ratio));
             }
             for (uint d = 0u; d < D; d++) rb_x[base + d] *= factor;
         }
         barrier();
-        if (e >= ext) return;
 
-        float bv[16];
-        if (ty == 0u) {
-            const uint64_t b_row = arg(1) + uint64_t(e) * uint64_t(D) * 4u;
-            for (uint d = 0u; d < D; d++) bv[d] = F32(b_row).v[d];
-        } else if (ty == 1u) {
-            const uint64_t b_row = arg(1) + uint64_t(e) * uint64_t(D) * 2u;
-            for (uint d = 0u; d < D; d++) bv[d] = float(F16(b_row).v[d]);
-        } else {
-            const uint64_t b_row = arg(1) + uint64_t(e) * uint64_t(D) * 2u;
-            for (uint d = 0u; d < D; d++) bv[d] = uintBitsToFloat(uint(U16(b_row).v[d]) << 16u);
+        if (lane >= e_cnt) return;
+        const uint e = e0 + lane;
+        if (D == 16u) {
+            const uint bb = lane * 16u;
+            const vec4 b0 = vec4(rb_b[bb], rb_b[bb + 1u], rb_b[bb + 2u], rb_b[bb + 3u]);
+            const vec4 b1 = vec4(rb_b[bb + 4u], rb_b[bb + 5u], rb_b[bb + 6u], rb_b[bb + 7u]);
+            const vec4 b2 = vec4(rb_b[bb + 8u], rb_b[bb + 9u], rb_b[bb + 10u], rb_b[bb + 11u]);
+            const vec4 b3 = vec4(rb_b[bb + 12u], rb_b[bb + 13u], rb_b[bb + 14u], rb_b[bb + 15u]);
+            for (uint lr = sg; lr < tile_cnt; lr += 4u) {
+                const uint base = lr * 16u;
+                const float acc =
+                    dot(vec4(rb_x[base], rb_x[base + 1u], rb_x[base + 2u], rb_x[base + 3u]), b0)
+                  + dot(vec4(rb_x[base + 4u], rb_x[base + 5u], rb_x[base + 6u], rb_x[base + 7u]), b1)
+                  + dot(vec4(rb_x[base + 8u], rb_x[base + 9u], rb_x[base + 10u], rb_x[base + 11u]), b2)
+                  + dot(vec4(rb_x[base + 12u], rb_x[base + 13u], rb_x[base + 14u], rb_x[base + 15u]), b3);
+                F32(arg(2)).v[(tile_r0 + lr) * ext + e] = acc;
+            }
+            return;
         }
-        for (uint r = 0u; r < n_rows; r++) {
+        float bv[16];
+        const uint bb = lane * D;
+        for (uint d = 0u; d < D; d++) bv[d] = rb_b[bb + d];
+        for (uint lr = sg; lr < tile_cnt; lr += 4u) {
             float acc = 0.0;
-            const uint base = r * D;
+            const uint base = lr * D;
             for (uint d = 0u; d < D; d++) acc += rb_x[base + d] * bv[d];
-            F32(arg(2)).v[r * ext + e] = acc;
+            F32(arg(2)).v[(tile_r0 + lr) * ext + e] = acc;
         }
         return;
     }
 
     const uint r = gl_WorkGroupID.y;
+    const uint e = gl_WorkGroupID.x * 128u + tid;
     if (e >= ext) return;
     const uint64_t x_row = arg(0) + uint64_t(r) * uint64_t(D) * 4u;
     float acc = 0.0;
@@ -964,7 +1373,11 @@ float gu_group_sum8(float v) {
 }
 
 float gu_dot_task(uint64_t row, uint t, in vec4 xv[8]) {
-#if defined(KERNEL_inkling2_moe_gu_situ_iq2_xxs)
+#if defined(KERNEL_inkling2_moe_gu_situ_q8_0)
+    return i2_q8_dot_xv(row, t, xv);
+#elif defined(KERNEL_inkling2_moe_gu_situ_nvfp4)
+    return i2_nvfp4_dot_xv(row, t, xv);
+#elif defined(KERNEL_inkling2_moe_gu_situ_iq2_xxs)
     return glm53_dot_iq2_xxs(row, t, xv);
 #elif defined(KERNEL_inkling2_moe_gu_situ_iq2_xs)
     const uint64_t b = row + uint64_t(t >> 3u) * 74u;
@@ -1177,7 +1590,9 @@ void main() {
 
 #ifdef DS_TYPE
 float ds_dot_task(uint64_t row, uint t, uint64_t x) {
-#if defined(KERNEL_inkling2_moe_down_sum_q2_0)
+#if defined(KERNEL_inkling2_moe_down_sum_q8_0)
+    return i2_q8_dot_ptr(row, t, x);
+#elif defined(KERNEL_inkling2_moe_down_sum_q2_0)
     const uint64_t b = row + uint64_t(t >> 1u) * 18u;
     const uint half_idx = t & 1u;
     const float d = glm53_h2f(uint(U16(b).v[0]));
@@ -1255,6 +1670,89 @@ float ds_dot_task(uint64_t row, uint t, uint64_t x) {
 
 shared uint ds_exp[16];
 shared float ds_w[16];
+#if defined(KERNEL_inkling2_moe_down_sum_q8_0) || defined(KERNEL_inkling2_moe_down_sum_nvfp4)
+void main() {
+    // 4 subgroups (128 threads) x 2 adjacent output rows/subgroup = 8 rows/WG
+    // (288 WGs for H=2304). With K_exp=8, 4 lanes per expert run all 8 experts in
+    // parallel (36 / 4 = 9 exact iterations, 100% lane utilization) while reusing
+    // xv[8] across both output rows (n0, n1).
+    const uint n0 = gl_WorkGroupID.x * 8u + gl_SubgroupID * 2u;
+    const uint n1 = n0 + 1u;
+    const uint r = gl_WorkGroupID.y;
+    const uint H = arg_u32(6);
+    const uint KK = arg_u32(7);
+    const uint row_bytes = arg_u32(8);
+    const uint K_exp = arg_u32(9);
+    const uint has_scale = arg_u32(10);
+
+    if (gl_LocalInvocationIndex < K_exp) {
+        const uint k = gl_LocalInvocationIndex;
+        const uint e = U32(arg(2)).v[r * K_exp + k];
+        float w = F32(arg(3)).v[r * K_exp + k];
+        if (has_scale != 0u) w *= F32(arg(4)).v[e];
+        ds_exp[k] = e;
+        ds_w[k] = w;
+    }
+    barrier();
+    if (n0 >= H) return;
+    const bool has1 = n1 < H;
+    const uint tasks = KK >> 5u;
+    float acc0 = 0.0, acc1 = 0.0;
+    if (K_exp == 8u) {
+        const uint k = gl_SubgroupInvocationID >> 2u;
+        const uint lane_t = gl_SubgroupInvocationID & 3u;
+        const uint e = ds_exp[k];
+        const float wk = ds_w[k];
+        const uint64_t w0 = arg(1) + (uint64_t(e) * uint64_t(H) + uint64_t(n0)) * uint64_t(row_bytes);
+        const uint64_t w1 = w0 + uint64_t(row_bytes);
+        const uint64_t x_row = arg(0) + uint64_t(r * 8u + k) * uint64_t(KK) * 4u;
+        float k0 = 0.0, k1 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 4u) {
+            const uint64_t xt = x_row + uint64_t(t) * 128u;
+            vec4 xv[8];
+            [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(xt + 16u * q).v[0];
+#if defined(KERNEL_inkling2_moe_down_sum_nvfp4)
+            k0 += i2_nvfp4_dot_xv(w0, t, xv);
+            if (has1) k1 += i2_nvfp4_dot_xv(w1, t, xv);
+#else
+            k0 += i2_q8_dot_xv(w0, t, xv);
+            if (has1) k1 += i2_q8_dot_xv(w1, t, xv);
+#endif
+        }
+        acc0 = wk * k0;
+        if (has1) acc1 = wk * k1;
+    } else {
+        for (uint k = 0u; k < K_exp; k++) {
+            const uint e = ds_exp[k];
+            const float wk = ds_w[k];
+            const uint64_t w0 = arg(1) + (uint64_t(e) * uint64_t(H) + uint64_t(n0)) * uint64_t(row_bytes);
+            const uint64_t w1 = w0 + uint64_t(row_bytes);
+            const uint64_t x_row = arg(0) + uint64_t(r * K_exp + k) * uint64_t(KK) * 4u;
+            float k0 = 0.0, k1 = 0.0;
+            for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
+                const uint64_t xt = x_row + uint64_t(t) * 128u;
+                vec4 xv[8];
+                [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(xt + 16u * q).v[0];
+#if defined(KERNEL_inkling2_moe_down_sum_nvfp4)
+                k0 += i2_nvfp4_dot_xv(w0, t, xv);
+                if (has1) k1 += i2_nvfp4_dot_xv(w1, t, xv);
+#else
+                k0 += i2_q8_dot_xv(w0, t, xv);
+                if (has1) k1 += i2_q8_dot_xv(w1, t, xv);
+#endif
+            }
+            acc0 += wk * k0;
+            if (has1) acc1 += wk * k1;
+        }
+    }
+    acc0 = subgroupAdd(acc0);
+    if (has1) acc1 = subgroupAdd(acc1);
+    if (gl_SubgroupInvocationID == 0u) {
+        F32(arg(5)).v[r * H + n0] = acc0;
+        if (has1) F32(arg(5)).v[r * H + n1] = acc1;
+    }
+}
+#else
 void main() {
     const uint n = gl_WorkGroupID.x * 8u + gl_SubgroupID;
     const uint r = gl_WorkGroupID.y;
@@ -1305,6 +1803,7 @@ void main() {
         F32(arg(5)).v[r * H + n] = acc;
     }
 }
+#endif
 #endif
 
 // ---------------------------------------------------------------------------
@@ -1425,6 +1924,29 @@ float gum4_sum8(float v) {
     return v;
 }
 
+#if defined(KERNEL_inkling2_moe_gu_m4_q8_0)
+void gum4_q8_dot_m(uint64_t row, uint t, uint cnt, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, inout float a0, inout float a1, inout float a2, inout float a3) {
+    float d;
+    vec4 w[8];
+    i2_q8_decode_raw(row, t, d, w);
+    const uint64_t toff = uint64_t(t) * 128u;
+    float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    [[unroll]] for (uint q = 0u; q < 8u; q++) s0 += dot(w[q], F32x4(x0 + toff + 16u * q).v[0]);
+    a0 += d * s0;
+    if (cnt > 1u) {
+        [[unroll]] for (uint q = 0u; q < 8u; q++) s1 += dot(w[q], F32x4(x1 + toff + 16u * q).v[0]);
+        a1 += d * s1;
+    }
+    if (cnt > 2u) {
+        [[unroll]] for (uint q = 0u; q < 8u; q++) s2 += dot(w[q], F32x4(x2 + toff + 16u * q).v[0]);
+        a2 += d * s2;
+    }
+    if (cnt > 3u) {
+        [[unroll]] for (uint q = 0u; q < 8u; q++) s3 += dot(w[q], F32x4(x3 + toff + 16u * q).v[0]);
+        a3 += d * s3;
+    }
+}
+#else
 void gum4_dot_task(uint64_t row, uint t, uint cnt, uint64_t x_rows[4], inout float acc[4]) {
     const uint64_t toff = uint64_t(t) * 128u;
 #if defined(KERNEL_inkling2_moe_gu_m4_iq2_xxs)
@@ -1557,9 +2079,14 @@ void gum4_dot_task(uint64_t row, uint t, uint cnt, uint64_t x_rows[4], inout flo
     for (uint m = 0u; m < cnt; m++) acc[m] += glm53_task_dot(w, x_rows[m] + toff);
 #endif
 }
+#endif
 
 float gum4_dot_single(uint64_t row, uint t, in vec4 xv[8]) {
-#if defined(KERNEL_inkling2_moe_gu_m4_iq2_xxs)
+#if defined(KERNEL_inkling2_moe_gu_m4_q8_0)
+    return i2_q8_dot_xv(row, t, xv);
+#elif defined(KERNEL_inkling2_moe_gu_m4_nvfp4)
+    return i2_nvfp4_dot_xv(row, t, xv);
+#elif defined(KERNEL_inkling2_moe_gu_m4_iq2_xxs)
     return glm53_dot_iq2_xxs(row, t, xv);
 #elif defined(KERNEL_inkling2_moe_gu_m4_iq2_xs)
     const uint64_t b = row + uint64_t(t >> 3u) * 74u;
@@ -1705,11 +2232,218 @@ void main() {
         }
         ag[0] = g0;
         au[0] = u0;
+#if defined(KERNEL_inkling2_moe_gu_m4_nvfp4)
+    } else if (cnt == 2u) {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1];
+        float g0 = 0.0, g1 = 0.0, u0 = 0.0, u1 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 8u) {
+            const uint64_t bo = uint64_t(t >> 1u) * 36u;
+            const uint half_idx = t & 1u;
+            const uint swg = U32(w_gate + bo).v[0];
+            const uint swu = U32(w_up + bo).v[0];
+            const uint64_t toff = uint64_t(t) * 128u;
+            [[unroll]] for (uint sb = 0u; sb < 2u; sb++) {
+                const uint s = 2u * half_idx + sb;
+                const uint64_t xo = toff + 64u * sb;
+                const vec4 x0a = F32x4(xr0 + xo).v[0], x0b = F32x4(xr0 + xo + 16u).v[0];
+                const vec4 x0c = F32x4(xr0 + xo + 32u).v[0], x0d = F32x4(xr0 + xo + 48u).v[0];
+                const vec4 x1a = F32x4(xr1 + xo).v[0], x1b = F32x4(xr1 + xo + 16u).v[0];
+                const vec4 x1c = F32x4(xr1 + xo + 32u).v[0], x1d = F32x4(xr1 + xo + 48u).v[0];
+                {
+                    const float dg = i2_ue4m3_lut[(swg >> (8u * s)) & 0xffu];
+                    vec4 w0, w1, w2, w3;
+                    i2_nvfp4_decode_sb(w_gate + bo + 4u + 8u * s, w0, w1, w2, w3);
+                    g0 += dg * (dot(w0, x0a) + dot(w1, x0b) + dot(w2, x0c) + dot(w3, x0d));
+                    g1 += dg * (dot(w0, x1a) + dot(w1, x1b) + dot(w2, x1c) + dot(w3, x1d));
+                }
+                {
+                    const float du = i2_ue4m3_lut[(swu >> (8u * s)) & 0xffu];
+                    vec4 w0, w1, w2, w3;
+                    i2_nvfp4_decode_sb(w_up + bo + 4u + 8u * s, w0, w1, w2, w3);
+                    u0 += du * (dot(w0, x0a) + dot(w1, x0b) + dot(w2, x0c) + dot(w3, x0d));
+                    u1 += du * (dot(w0, x1a) + dot(w1, x1b) + dot(w2, x1c) + dot(w3, x1d));
+                }
+            }
+        }
+        ag[0] = g0; ag[1] = g1;
+        au[0] = u0; au[1] = u1;
+    } else if (cnt == 3u) {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1], xr2 = x_rows[2];
+        float g0 = 0.0, g1 = 0.0, g2 = 0.0;
+        float u0 = 0.0, u1 = 0.0, u2 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 8u) {
+            const uint64_t bo = uint64_t(t >> 1u) * 36u;
+            const uint half_idx = t & 1u;
+            const uint swg = U32(w_gate + bo).v[0];
+            const uint swu = U32(w_up + bo).v[0];
+            const uint64_t toff = uint64_t(t) * 128u;
+            [[unroll]] for (uint sb = 0u; sb < 2u; sb++) {
+                const uint s = 2u * half_idx + sb;
+                const float dg = i2_ue4m3_lut[(swg >> (8u * s)) & 0xffu];
+                const float du = i2_ue4m3_lut[(swu >> (8u * s)) & 0xffu];
+                vec4 wg0, wg1, wg2, wg3, wu0, wu1, wu2, wu3;
+                i2_nvfp4_decode_sb(w_gate + bo + 4u + 8u * s, wg0, wg1, wg2, wg3);
+                i2_nvfp4_decode_sb(w_up + bo + 4u + 8u * s, wu0, wu1, wu2, wu3);
+                const uint64_t xo = toff + 64u * sb;
+                {
+                    const vec4 xa = F32x4(xr0 + xo).v[0], xb = F32x4(xr0 + xo + 16u).v[0];
+                    const vec4 xc = F32x4(xr0 + xo + 32u).v[0], xd = F32x4(xr0 + xo + 48u).v[0];
+                    g0 += dg * (dot(wg0, xa) + dot(wg1, xb) + dot(wg2, xc) + dot(wg3, xd));
+                    u0 += du * (dot(wu0, xa) + dot(wu1, xb) + dot(wu2, xc) + dot(wu3, xd));
+                }
+                {
+                    const vec4 xa = F32x4(xr1 + xo).v[0], xb = F32x4(xr1 + xo + 16u).v[0];
+                    const vec4 xc = F32x4(xr1 + xo + 32u).v[0], xd = F32x4(xr1 + xo + 48u).v[0];
+                    g1 += dg * (dot(wg0, xa) + dot(wg1, xb) + dot(wg2, xc) + dot(wg3, xd));
+                    u1 += du * (dot(wu0, xa) + dot(wu1, xb) + dot(wu2, xc) + dot(wu3, xd));
+                }
+                {
+                    const vec4 xa = F32x4(xr2 + xo).v[0], xb = F32x4(xr2 + xo + 16u).v[0];
+                    const vec4 xc = F32x4(xr2 + xo + 32u).v[0], xd = F32x4(xr2 + xo + 48u).v[0];
+                    g2 += dg * (dot(wg0, xa) + dot(wg1, xb) + dot(wg2, xc) + dot(wg3, xd));
+                    u2 += du * (dot(wu0, xa) + dot(wu1, xb) + dot(wu2, xc) + dot(wu3, xd));
+                }
+            }
+        }
+        ag[0] = g0; ag[1] = g1; ag[2] = g2;
+        au[0] = u0; au[1] = u1; au[2] = u2;
+    } else {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1], xr2 = x_rows[2], xr3 = x_rows[3];
+        float g0 = 0.0, g1 = 0.0, g2 = 0.0, g3 = 0.0;
+        float u0 = 0.0, u1 = 0.0, u2 = 0.0, u3 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 8u) {
+            const uint64_t bo = uint64_t(t >> 1u) * 36u;
+            const uint half_idx = t & 1u;
+            const uint swg = U32(w_gate + bo).v[0];
+            const uint swu = U32(w_up + bo).v[0];
+            const uint64_t toff = uint64_t(t) * 128u;
+            [[unroll]] for (uint sb = 0u; sb < 2u; sb++) {
+                const uint s = 2u * half_idx + sb;
+                const float dg = i2_ue4m3_lut[(swg >> (8u * s)) & 0xffu];
+                const float du = i2_ue4m3_lut[(swu >> (8u * s)) & 0xffu];
+                vec4 wg0, wg1, wg2, wg3, wu0, wu1, wu2, wu3;
+                i2_nvfp4_decode_sb(w_gate + bo + 4u + 8u * s, wg0, wg1, wg2, wg3);
+                i2_nvfp4_decode_sb(w_up + bo + 4u + 8u * s, wu0, wu1, wu2, wu3);
+                const uint64_t xo = toff + 64u * sb;
+                {
+                    const vec4 xa = F32x4(xr0 + xo).v[0], xb = F32x4(xr0 + xo + 16u).v[0];
+                    const vec4 xc = F32x4(xr0 + xo + 32u).v[0], xd = F32x4(xr0 + xo + 48u).v[0];
+                    g0 += dg * (dot(wg0, xa) + dot(wg1, xb) + dot(wg2, xc) + dot(wg3, xd));
+                    u0 += du * (dot(wu0, xa) + dot(wu1, xb) + dot(wu2, xc) + dot(wu3, xd));
+                }
+                {
+                    const vec4 xa = F32x4(xr1 + xo).v[0], xb = F32x4(xr1 + xo + 16u).v[0];
+                    const vec4 xc = F32x4(xr1 + xo + 32u).v[0], xd = F32x4(xr1 + xo + 48u).v[0];
+                    g1 += dg * (dot(wg0, xa) + dot(wg1, xb) + dot(wg2, xc) + dot(wg3, xd));
+                    u1 += du * (dot(wu0, xa) + dot(wu1, xb) + dot(wu2, xc) + dot(wu3, xd));
+                }
+                {
+                    const vec4 xa = F32x4(xr2 + xo).v[0], xb = F32x4(xr2 + xo + 16u).v[0];
+                    const vec4 xc = F32x4(xr2 + xo + 32u).v[0], xd = F32x4(xr2 + xo + 48u).v[0];
+                    g2 += dg * (dot(wg0, xa) + dot(wg1, xb) + dot(wg2, xc) + dot(wg3, xd));
+                    u2 += du * (dot(wu0, xa) + dot(wu1, xb) + dot(wu2, xc) + dot(wu3, xd));
+                }
+                {
+                    const vec4 xa = F32x4(xr3 + xo).v[0], xb = F32x4(xr3 + xo + 16u).v[0];
+                    const vec4 xc = F32x4(xr3 + xo + 32u).v[0], xd = F32x4(xr3 + xo + 48u).v[0];
+                    g3 += dg * (dot(wg0, xa) + dot(wg1, xb) + dot(wg2, xc) + dot(wg3, xd));
+                    u3 += du * (dot(wu0, xa) + dot(wu1, xb) + dot(wu2, xc) + dot(wu3, xd));
+                }
+            }
+        }
+        ag[0] = g0; ag[1] = g1; ag[2] = g2; ag[3] = g3;
+        au[0] = u0; au[1] = u1; au[2] = u2; au[3] = u3;
+#elif defined(KERNEL_inkling2_moe_gu_m4_q8_0)
+    } else if (cnt == 2u) {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1];
+        float g0 = 0.0, g1 = 0.0, u0 = 0.0, u1 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 8u) {
+            const uint64_t toff = uint64_t(t) * 128u;
+            vec4 x0[8], x1[8];
+            [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                x0[q] = F32x4(xr0 + toff + 16u * q).v[0];
+                x1[q] = F32x4(xr1 + toff + 16u * q).v[0];
+            }
+            {
+                float d; vec4 w[8];
+                i2_q8_decode_raw(w_gate, t, d, w);
+                float s0 = 0.0, s1 = 0.0;
+                [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                    s0 += dot(w[q], x0[q]);
+                    s1 += dot(w[q], x1[q]);
+                }
+                g0 += d * s0; g1 += d * s1;
+            }
+            {
+                float d; vec4 w[8];
+                i2_q8_decode_raw(w_up, t, d, w);
+                float s0 = 0.0, s1 = 0.0;
+                [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                    s0 += dot(w[q], x0[q]);
+                    s1 += dot(w[q], x1[q]);
+                }
+                u0 += d * s0; u1 += d * s1;
+            }
+        }
+        ag[0] = g0; ag[1] = g1;
+        au[0] = u0; au[1] = u1;
+    } else if (cnt == 3u) {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1], xr2 = x_rows[2];
+        float g0 = 0.0, g1 = 0.0, g2 = 0.0;
+        float u0 = 0.0, u1 = 0.0, u2 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 8u) {
+            const uint64_t toff = uint64_t(t) * 128u;
+            float dg, du; vec4 wg[8], wu[8];
+            i2_q8_decode_raw(w_gate, t, dg, wg);
+            i2_q8_decode_raw(w_up, t, du, wu);
+            float gs0 = 0.0, gs1 = 0.0, gs2 = 0.0;
+            float us0 = 0.0, us1 = 0.0, us2 = 0.0;
+            [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                const vec4 v0 = F32x4(xr0 + toff + 16u * q).v[0];
+                gs0 += dot(wg[q], v0); us0 += dot(wu[q], v0);
+                const vec4 v1 = F32x4(xr1 + toff + 16u * q).v[0];
+                gs1 += dot(wg[q], v1); us1 += dot(wu[q], v1);
+                const vec4 v2 = F32x4(xr2 + toff + 16u * q).v[0];
+                gs2 += dot(wg[q], v2); us2 += dot(wu[q], v2);
+            }
+            g0 += dg * gs0; g1 += dg * gs1; g2 += dg * gs2;
+            u0 += du * us0; u1 += du * us1; u2 += du * us2;
+        }
+        ag[0] = g0; ag[1] = g1; ag[2] = g2;
+        au[0] = u0; au[1] = u1; au[2] = u2;
+    } else {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1], xr2 = x_rows[2], xr3 = x_rows[3];
+        float g0 = 0.0, g1 = 0.0, g2 = 0.0, g3 = 0.0;
+        float u0 = 0.0, u1 = 0.0, u2 = 0.0, u3 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 8u) {
+            const uint64_t toff = uint64_t(t) * 128u;
+            float dg, du; vec4 wg[8], wu[8];
+            i2_q8_decode_raw(w_gate, t, dg, wg);
+            i2_q8_decode_raw(w_up, t, du, wu);
+            float gs0 = 0.0, gs1 = 0.0, gs2 = 0.0, gs3 = 0.0;
+            float us0 = 0.0, us1 = 0.0, us2 = 0.0, us3 = 0.0;
+            [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                const vec4 v0 = F32x4(xr0 + toff + 16u * q).v[0];
+                gs0 += dot(wg[q], v0); us0 += dot(wu[q], v0);
+                const vec4 v1 = F32x4(xr1 + toff + 16u * q).v[0];
+                gs1 += dot(wg[q], v1); us1 += dot(wu[q], v1);
+                const vec4 v2 = F32x4(xr2 + toff + 16u * q).v[0];
+                gs2 += dot(wg[q], v2); us2 += dot(wu[q], v2);
+                const vec4 v3 = F32x4(xr3 + toff + 16u * q).v[0];
+                gs3 += dot(wg[q], v3); us3 += dot(wu[q], v3);
+            }
+            g0 += dg * gs0; g1 += dg * gs1; g2 += dg * gs2; g3 += dg * gs3;
+            u0 += du * us0; u1 += du * us1; u2 += du * us2; u3 += du * us3;
+        }
+        ag[0] = g0; ag[1] = g1; ag[2] = g2; ag[3] = g3;
+        au[0] = u0; au[1] = u1; au[2] = u2; au[3] = u3;
+#else
     } else {
         for (uint t = lane_t; t < tasks; t += 8u) {
             gum4_dot_task(w_gate, t, cnt, x_rows, ag);
             gum4_dot_task(w_up, t, cnt, x_rows, au);
         }
+#endif
     }
 
     for (uint m = 0u; m < cnt; m++) {
@@ -1815,6 +2549,154 @@ void main() {
     const uint tasks = KK >> 5u;
 
     float a[4] = float[4](0.0, 0.0, 0.0, 0.0);
+#if defined(KERNEL_inkling2_moe_down_m4_q8_0)
+    if (cnt == 1u) {
+        const uint64_t xr0 = x_rows[0];
+        float a0 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 4u) {
+            a0 += i2_q8_dot_ptr(w_row, t, xr0 + uint64_t(t) * 128u);
+        }
+        a[0] = a0;
+    } else if (cnt == 2u) {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1];
+        float a0 = 0.0, a1 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 4u) {
+            float d;
+            vec4 w[8];
+            i2_q8_decode_raw(w_row, t, d, w);
+            float s0 = 0.0, s1 = 0.0;
+            const uint64_t toff = uint64_t(t) * 128u;
+            [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                s0 += dot(w[q], F32x4(xr0 + toff + 16u * q).v[0]);
+                s1 += dot(w[q], F32x4(xr1 + toff + 16u * q).v[0]);
+            }
+            a0 += d * s0;
+            a1 += d * s1;
+        }
+        a[0] = a0; a[1] = a1;
+    } else if (cnt == 3u) {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1], xr2 = x_rows[2];
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 4u) {
+            float d;
+            vec4 w[8];
+            i2_q8_decode_raw(w_row, t, d, w);
+            float s0 = 0.0, s1 = 0.0, s2 = 0.0;
+            const uint64_t toff = uint64_t(t) * 128u;
+            [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                s0 += dot(w[q], F32x4(xr0 + toff + 16u * q).v[0]);
+                s1 += dot(w[q], F32x4(xr1 + toff + 16u * q).v[0]);
+                s2 += dot(w[q], F32x4(xr2 + toff + 16u * q).v[0]);
+            }
+            a0 += d * s0;
+            a1 += d * s1;
+            a2 += d * s2;
+        }
+        a[0] = a0; a[1] = a1; a[2] = a2;
+    } else {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1], xr2 = x_rows[2], xr3 = x_rows[3];
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 4u) {
+            float d;
+            vec4 w[8];
+            i2_q8_decode_raw(w_row, t, d, w);
+            float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+            const uint64_t toff = uint64_t(t) * 128u;
+            [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                s0 += dot(w[q], F32x4(xr0 + toff + 16u * q).v[0]);
+                s1 += dot(w[q], F32x4(xr1 + toff + 16u * q).v[0]);
+                s2 += dot(w[q], F32x4(xr2 + toff + 16u * q).v[0]);
+                s3 += dot(w[q], F32x4(xr3 + toff + 16u * q).v[0]);
+            }
+            a0 += d * s0;
+            a1 += d * s1;
+            a2 += d * s2;
+            a3 += d * s3;
+        }
+        a[0] = a0; a[1] = a1; a[2] = a2; a[3] = a3;
+    }
+#elif defined(KERNEL_inkling2_moe_down_m4_nvfp4)
+    if (cnt == 1u) {
+        const uint64_t xr0 = x_rows[0];
+        float a0 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 4u) {
+            const uint64_t xt = xr0 + uint64_t(t) * 128u;
+            vec4 xv[8];
+            [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(xt + 16u * q).v[0];
+            a0 += i2_nvfp4_dot_xv(w_row, t, xv);
+        }
+        a[0] = a0;
+    } else if (cnt == 2u) {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1];
+        float a0 = 0.0, a1 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 4u) {
+            const uint64_t b = w_row + uint64_t(t >> 1u) * 36u;
+            const uint half_idx = t & 1u;
+            const uint sw = U32(b).v[0];
+            const uint64_t toff = uint64_t(t) * 128u;
+            [[unroll]] for (uint sb = 0u; sb < 2u; sb++) {
+                const uint s = 2u * half_idx + sb;
+                const float d = i2_ue4m3_lut[(sw >> (8u * s)) & 0xffu];
+                vec4 w0, w1, w2, w3;
+                i2_nvfp4_decode_sb(b + 4u + 8u * s, w0, w1, w2, w3);
+                const uint64_t xo = toff + 64u * sb;
+                a0 += d * (dot(w0, F32x4(xr0 + xo).v[0]) + dot(w1, F32x4(xr0 + xo + 16u).v[0])
+                         + dot(w2, F32x4(xr0 + xo + 32u).v[0]) + dot(w3, F32x4(xr0 + xo + 48u).v[0]));
+                a1 += d * (dot(w0, F32x4(xr1 + xo).v[0]) + dot(w1, F32x4(xr1 + xo + 16u).v[0])
+                         + dot(w2, F32x4(xr1 + xo + 32u).v[0]) + dot(w3, F32x4(xr1 + xo + 48u).v[0]));
+            }
+        }
+        a[0] = a0; a[1] = a1;
+    } else if (cnt == 3u) {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1], xr2 = x_rows[2];
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 4u) {
+            const uint64_t b = w_row + uint64_t(t >> 1u) * 36u;
+            const uint half_idx = t & 1u;
+            const uint sw = U32(b).v[0];
+            const uint64_t toff = uint64_t(t) * 128u;
+            [[unroll]] for (uint sb = 0u; sb < 2u; sb++) {
+                const uint s = 2u * half_idx + sb;
+                const float d = i2_ue4m3_lut[(sw >> (8u * s)) & 0xffu];
+                vec4 w0, w1, w2, w3;
+                i2_nvfp4_decode_sb(b + 4u + 8u * s, w0, w1, w2, w3);
+                const uint64_t xo = toff + 64u * sb;
+                a0 += d * (dot(w0, F32x4(xr0 + xo).v[0]) + dot(w1, F32x4(xr0 + xo + 16u).v[0])
+                         + dot(w2, F32x4(xr0 + xo + 32u).v[0]) + dot(w3, F32x4(xr0 + xo + 48u).v[0]));
+                a1 += d * (dot(w0, F32x4(xr1 + xo).v[0]) + dot(w1, F32x4(xr1 + xo + 16u).v[0])
+                         + dot(w2, F32x4(xr1 + xo + 32u).v[0]) + dot(w3, F32x4(xr1 + xo + 48u).v[0]));
+                a2 += d * (dot(w0, F32x4(xr2 + xo).v[0]) + dot(w1, F32x4(xr2 + xo + 16u).v[0])
+                         + dot(w2, F32x4(xr2 + xo + 32u).v[0]) + dot(w3, F32x4(xr2 + xo + 48u).v[0]));
+            }
+        }
+        a[0] = a0; a[1] = a1; a[2] = a2;
+    } else {
+        const uint64_t xr0 = x_rows[0], xr1 = x_rows[1], xr2 = x_rows[2], xr3 = x_rows[3];
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+        for (uint t = lane_t; t < tasks; t += 4u) {
+            const uint64_t b = w_row + uint64_t(t >> 1u) * 36u;
+            const uint half_idx = t & 1u;
+            const uint sw = U32(b).v[0];
+            const uint64_t toff = uint64_t(t) * 128u;
+            [[unroll]] for (uint sb = 0u; sb < 2u; sb++) {
+                const uint s = 2u * half_idx + sb;
+                const float d = i2_ue4m3_lut[(sw >> (8u * s)) & 0xffu];
+                vec4 w0, w1, w2, w3;
+                i2_nvfp4_decode_sb(b + 4u + 8u * s, w0, w1, w2, w3);
+                const uint64_t xo = toff + 64u * sb;
+                a0 += d * (dot(w0, F32x4(xr0 + xo).v[0]) + dot(w1, F32x4(xr0 + xo + 16u).v[0])
+                         + dot(w2, F32x4(xr0 + xo + 32u).v[0]) + dot(w3, F32x4(xr0 + xo + 48u).v[0]));
+                a1 += d * (dot(w0, F32x4(xr1 + xo).v[0]) + dot(w1, F32x4(xr1 + xo + 16u).v[0])
+                         + dot(w2, F32x4(xr1 + xo + 32u).v[0]) + dot(w3, F32x4(xr1 + xo + 48u).v[0]));
+                a2 += d * (dot(w0, F32x4(xr2 + xo).v[0]) + dot(w1, F32x4(xr2 + xo + 16u).v[0])
+                         + dot(w2, F32x4(xr2 + xo + 32u).v[0]) + dot(w3, F32x4(xr2 + xo + 48u).v[0]));
+                a3 += d * (dot(w0, F32x4(xr3 + xo).v[0]) + dot(w1, F32x4(xr3 + xo + 16u).v[0])
+                         + dot(w2, F32x4(xr3 + xo + 32u).v[0]) + dot(w3, F32x4(xr3 + xo + 48u).v[0]));
+            }
+        }
+        a[0] = a0; a[1] = a1; a[2] = a2; a[3] = a3;
+    }
+#else
     for (uint t = lane_t; t < tasks; t += 4u) {
         const uint64_t toff = uint64_t(t) * 128u;
 #if defined(KERNEL_inkling2_moe_down_m4_q2_0)
@@ -1894,6 +2776,7 @@ void main() {
         for (uint m = 0u; m < cnt; m++) a[m] += glm53_task_dot(w, x_rows[m] + toff);
 #endif
     }
+#endif
 
     for (uint m = 0u; m < cnt; m++) a[m] = dm4_sum4(a[m]);
 
@@ -1953,9 +2836,23 @@ void main() {
 // Buffers: 0 cur, 1 msg, 2 W_down (F32 [rank, 2*H]), 3 mid ([rows, rank]).
 // Params: 4 H, 5 rank, 6 eps.
 // ---------------------------------------------------------------------------
-#ifdef KERNEL_inkling2_ctrl_down_f32
+#if defined(KERNEL_inkling2_ctrl_down_f32) || defined(KERNEL_inkling2_ctrl_down_bf16)
 shared float cd_sg0[8];
 shared float cd_sg1[8];
+
+vec4 cd_load_w4(uint64_t addr, uint i) {
+#ifdef KERNEL_inkling2_ctrl_down_bf16
+    const uvec2 u = U32x2(addr).v[i];
+    return vec4(
+        uintBitsToFloat(u.x << 16u),
+        uintBitsToFloat(u.x & 0xffff0000u),
+        uintBitsToFloat(u.y << 16u),
+        uintBitsToFloat(u.y & 0xffff0000u)
+    );
+#else
+    return F32x4(addr).v[i];
+#endif
+}
 
 void main() {
     const uint o = gl_WorkGroupID.x * 8u + gl_SubgroupID;
@@ -1968,11 +2865,12 @@ void main() {
 
     float sq0 = 0.0;
     float sq1 = 0.0;
-    for (uint i = gl_LocalInvocationIndex; i < H; i += 256u) {
-        const float v0 = F32(cur_row).v[i];
-        const float v1 = F32(msg_row).v[i];
-        sq0 += v0 * v0;
-        sq1 += v1 * v1;
+    const uint H4 = H >> 2u;
+    for (uint i = gl_LocalInvocationIndex; i < H4; i += 256u) {
+        const vec4 v0 = F32x4(cur_row).v[i];
+        const vec4 v1 = F32x4(msg_row).v[i];
+        sq0 += dot(v0, v0);
+        sq1 += dot(v1, v1);
     }
     sq0 = subgroupAdd(sq0);
     sq1 = subgroupAdd(sq1);
@@ -1992,14 +2890,18 @@ void main() {
 
     const float inv0 = cd_sg0[0];
     const float inv1 = cd_sg1[0];
-    const uint64_t w0 = arg(2) + uint64_t(o) * uint64_t(2u * H) * 4u;
-    const uint64_t w1 = w0 + uint64_t(H) * 4u;
+#ifdef KERNEL_inkling2_ctrl_down_bf16
+    const uint64_t elem_b = 2u;
+#else
+    const uint64_t elem_b = 4u;
+#endif
+    const uint64_t w0 = arg(2) + uint64_t(o) * uint64_t(2u * H) * elem_b;
+    const uint64_t w1 = w0 + uint64_t(H) * elem_b;
     float acc0 = 0.0;
     float acc1 = 0.0;
-    const uint H4 = H >> 2u;
     for (uint i = gl_SubgroupInvocationID; i < H4; i += 32u) {
-        acc0 += dot(F32x4(w0).v[i], F32x4(cur_row).v[i]);
-        acc1 += dot(F32x4(w1).v[i], F32x4(msg_row).v[i]);
+        acc0 += dot(cd_load_w4(w0, i), F32x4(cur_row).v[i]);
+        acc1 += dot(cd_load_w4(w1, i), F32x4(msg_row).v[i]);
     }
     const float tot = subgroupAdd(acc0) * inv0 + subgroupAdd(acc1) * inv1;
     if (gl_SubgroupInvocationID == 0u) {
@@ -2009,19 +2911,33 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
-// 24. Fused loop controller gain+forget+blend (F32):
+// 24. Fused loop controller gain+forget+blend (F32 / BF16):
 //     out[r, i] = (1 - tanh(W_forget[i] . mid[r])) * cur[r, i] + tanh(W_gain[i] . mid[r]) * msg[r, i]
 // Eliminates ctrl_gain/ctrl_forget buffers + 2 dispatches + 2 barriers per controller!
-// Grid: (ceil(H / 256), rows, 1), 256 threads.
-// Buffers: 0 cur, 1 msg, 2 mid, 3 W_gain (F32 [H, rank]), 4 W_forget (F32 [H, rank]), 5 out.
+// Grid: (ceil(H / 64), rows, 1), 256 threads.
+// Buffers: 0 cur, 1 msg, 2 mid, 3 W_gain ([H, rank]), 4 W_forget ([H, rank]), 5 out.
 // Params: 6 H, 7 rank (<= 128).
 // ---------------------------------------------------------------------------
-#ifdef KERNEL_inkling2_ctrl_blend_f32
+#if defined(KERNEL_inkling2_ctrl_blend_f32) || defined(KERNEL_inkling2_ctrl_blend_bf16)
 shared float cb_mid[128];
+
+vec4 cb_load_w4(uint64_t addr, uint k) {
+#ifdef KERNEL_inkling2_ctrl_blend_bf16
+    const uvec2 u = U32x2(addr).v[k];
+    return vec4(
+        uintBitsToFloat(u.x << 16u),
+        uintBitsToFloat(u.x & 0xffff0000u),
+        uintBitsToFloat(u.y << 16u),
+        uintBitsToFloat(u.y & 0xffff0000u)
+    );
+#else
+    return F32x4(addr).v[k];
+#endif
+}
 
 void main() {
     // 4 lanes per output row i (64 rows per workgroup): adjacent lanes read
-    // contiguous vec4s of W_gain[i] and W_forget[i] -> 100% coalesced 64B bursts!
+    // contiguous vec4s of W_gain[i] and W_forget[i] -> 100% coalesced bursts!
     const uint row_in_sg = gl_SubgroupInvocationID >> 2u;
     const uint lane = gl_SubgroupInvocationID & 3u;
     const uint i = gl_WorkGroupID.x * 64u + gl_SubgroupID * 8u + row_in_sg;
@@ -2034,15 +2950,20 @@ void main() {
     barrier();
     if (i >= H) return;
 
-    const uint64_t wg = arg(3) + uint64_t(i) * uint64_t(rank) * 4u;
-    const uint64_t wf = arg(4) + uint64_t(i) * uint64_t(rank) * 4u;
+#ifdef KERNEL_inkling2_ctrl_blend_bf16
+    const uint64_t elem_b = 2u;
+#else
+    const uint64_t elem_b = 4u;
+#endif
+    const uint64_t wg = arg(3) + uint64_t(i) * uint64_t(rank) * elem_b;
+    const uint64_t wf = arg(4) + uint64_t(i) * uint64_t(rank) * elem_b;
     float g = 0.0;
     float f = 0.0;
     const uint r4 = rank >> 2u;
     for (uint k = lane; k < r4; k += 4u) {
         const vec4 m = vec4(cb_mid[4u * k], cb_mid[4u * k + 1u], cb_mid[4u * k + 2u], cb_mid[4u * k + 3u]);
-        g += dot(F32x4(wg).v[k], m);
-        f += dot(F32x4(wf).v[k], m);
+        g += dot(cb_load_w4(wg, k), m);
+        f += dot(cb_load_w4(wf, k), m);
     }
     g += subgroupShuffleXor(g, 2u);
     g += subgroupShuffleXor(g, 1u);
@@ -2362,9 +3283,23 @@ void main() {
 // Grid: (ceil(rank / 8), rows, 3), 256 threads (8 subgroups).
 // Buffers: 0 cur0, 1 cur1, 2 cur2, 3 msg_out, 4 w0, 5 w1, 6 w2, 7 mid_out.
 // Params: 8 H, 9 rank, 10 eps, 11 rows.
-#ifdef KERNEL_inkling2_ctrl_down3_f32
+#if defined(KERNEL_inkling2_ctrl_down3_f32) || defined(KERNEL_inkling2_ctrl_down3_bf16)
 shared float cd3_sg0[8];
 shared float cd3_sg1[8];
+
+vec4 cd3_load_w4(uint64_t addr, uint i) {
+#ifdef KERNEL_inkling2_ctrl_down3_bf16
+    const uvec2 u = U32x2(addr).v[i];
+    return vec4(
+        uintBitsToFloat(u.x << 16u),
+        uintBitsToFloat(u.x & 0xffff0000u),
+        uintBitsToFloat(u.y << 16u),
+        uintBitsToFloat(u.y & 0xffff0000u)
+    );
+#else
+    return F32x4(addr).v[i];
+#endif
+}
 
 void main() {
     const uint o = gl_WorkGroupID.x * 8u + gl_SubgroupID;
@@ -2381,11 +3316,12 @@ void main() {
 
     float sq0 = 0.0;
     float sq1 = 0.0;
-    for (uint i = gl_LocalInvocationIndex; i < H; i += 256u) {
-        const float v0 = F32(cur_row).v[i];
-        const float v1 = F32(msg_row).v[i];
-        sq0 += v0 * v0;
-        sq1 += v1 * v1;
+    const uint H4 = H >> 2u;
+    for (uint i = gl_LocalInvocationIndex; i < H4; i += 256u) {
+        const vec4 v0 = F32x4(cur_row).v[i];
+        const vec4 v1 = F32x4(msg_row).v[i];
+        sq0 += dot(v0, v0);
+        sq1 += dot(v1, v1);
     }
     sq0 = subgroupAdd(sq0);
     sq1 = subgroupAdd(sq1);
@@ -2405,14 +3341,18 @@ void main() {
 
     const float inv0 = cd3_sg0[0];
     const float inv1 = cd3_sg1[0];
-    const uint64_t w0 = w_base + uint64_t(o) * uint64_t(2u * H) * 4u;
-    const uint64_t w1 = w0 + uint64_t(H) * 4u;
+#ifdef KERNEL_inkling2_ctrl_down3_bf16
+    const uint64_t elem_b = 2u;
+#else
+    const uint64_t elem_b = 4u;
+#endif
+    const uint64_t w0 = w_base + uint64_t(o) * uint64_t(2u * H) * elem_b;
+    const uint64_t w1 = w0 + uint64_t(H) * elem_b;
     float acc0 = 0.0;
     float acc1 = 0.0;
-    const uint H4 = H >> 2u;
     for (uint i = gl_SubgroupInvocationID; i < H4; i += 32u) {
-        acc0 += dot(F32x4(w0).v[i], F32x4(cur_row).v[i]);
-        acc1 += dot(F32x4(w1).v[i], F32x4(msg_row).v[i]);
+        acc0 += dot(cd3_load_w4(w0, i), F32x4(cur_row).v[i]);
+        acc1 += dot(cd3_load_w4(w1, i), F32x4(msg_row).v[i]);
     }
     const float tot = subgroupAdd(acc0) * inv0 + subgroupAdd(acc1) * inv1;
     if (gl_SubgroupInvocationID == 0u) {
@@ -2421,13 +3361,27 @@ void main() {
 }
 #endif
 
-// Batched 3-way coalesced ctrl_blend_f32 (j = gl_WorkGroupID.z in 0..3).
+// Batched 3-way coalesced ctrl_blend (F32 / BF16, j = gl_WorkGroupID.z in 0..3).
 // Grid: (ceil(H / 64), rows, 3), 256 threads (4 lanes/row).
 // Buffers: 0 cur0, 1 cur1, 2 cur2, 3 msg_out, 4 mid_out,
 //          5 wg0, 6 wg1, 7 wg2, 8 wf0, 9 wf1, 10 wf2, 11 out0, 12 out1, 13 out2.
 // Params: 14 H, 15 rank, 16 rows.
-#ifdef KERNEL_inkling2_ctrl_blend3_f32
+#if defined(KERNEL_inkling2_ctrl_blend3_f32) || defined(KERNEL_inkling2_ctrl_blend3_bf16)
 shared float cb3_mid[128];
+
+vec4 cb3_load_w4(uint64_t addr, uint k) {
+#ifdef KERNEL_inkling2_ctrl_blend3_bf16
+    const uvec2 u = U32x2(addr).v[k];
+    return vec4(
+        uintBitsToFloat(u.x << 16u),
+        uintBitsToFloat(u.x & 0xffff0000u),
+        uintBitsToFloat(u.y << 16u),
+        uintBitsToFloat(u.y & 0xffff0000u)
+    );
+#else
+    return F32x4(addr).v[k];
+#endif
+}
 
 void main() {
     const uint row_in_sg = gl_SubgroupInvocationID >> 2u;
@@ -2444,17 +3398,22 @@ void main() {
     barrier();
     if (i >= H) return;
 
+#ifdef KERNEL_inkling2_ctrl_blend3_bf16
+    const uint64_t elem_b = 2u;
+#else
+    const uint64_t elem_b = 4u;
+#endif
     const uint64_t wg_base = j == 0u ? arg(5) : (j == 1u ? arg(6) : arg(7));
     const uint64_t wf_base = j == 0u ? arg(8) : (j == 1u ? arg(9) : arg(10));
-    const uint64_t wg = wg_base + uint64_t(i) * uint64_t(rank) * 4u;
-    const uint64_t wf = wf_base + uint64_t(i) * uint64_t(rank) * 4u;
+    const uint64_t wg = wg_base + uint64_t(i) * uint64_t(rank) * elem_b;
+    const uint64_t wf = wf_base + uint64_t(i) * uint64_t(rank) * elem_b;
     float g = 0.0;
     float f = 0.0;
     const uint r4 = rank >> 2u;
     for (uint k = lane; k < r4; k += 4u) {
         const vec4 m = vec4(cb3_mid[4u * k], cb3_mid[4u * k + 1u], cb3_mid[4u * k + 2u], cb3_mid[4u * k + 3u]);
-        g += dot(F32x4(wg).v[k], m);
-        f += dot(F32x4(wf).v[k], m);
+        g += dot(cb3_load_w4(wg, k), m);
+        f += dot(cb3_load_w4(wf, k), m);
     }
     g += subgroupShuffleXor(g, 2u);
     g += subgroupShuffleXor(g, 1u);
@@ -2505,5 +3464,563 @@ void main() {
     for (uint i = tid; i < H; i += 256u) {
         F32(y_row).v[i] = F32(x_row).v[i] * inv * F32(w_ptr).v[i];
     }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// 28. Split-K + GQA-shared + 4-key-unrolled decode/verify attention
+//     (`inkling2_attn_split` + `inkling2_attn_combine`), head_dim = 128.
+//
+// Each workgroup processes `chunk_keys` keys (4 subgroups x `chunk_keys/4` keys,
+// unrolled 4 keys/step) for `g_step` (1..=4) query heads sharing ONE KV head
+// (`g_step` divides `nh / nkv`, so for Inkling 2 Mini G=3 -> 3x less KV reads).
+// `inkling2_attn_combine` merges chunks with the implicit zero attention sink
+// (`M = max(0, max_c m_c)`, `L = exp(-M) + sum_c l_c * exp(m_c - M)`) and
+// applies the optional sigmoid output gate.
+//
+// Split grid: (chunks, nh / g_step, rows), 128 threads (4 subgroups).
+// Split buffers: 0 q, 1 k_cache (F16), 2 v_cache (F16), 3 rel_table, 4 sinks,
+//                5 partial ([rows, nh, chunks, 130]), 6 q_clip (optional).
+// Split params: 7 nh, 8 nkv, 9 g_step, 10 pos0, 11 slots, 12 is_swa, 13 window,
+//               14 extent, 15 has_q_clip, 16 qk_clip, 17 log_floor, 18 log_alpha,
+//               19 chunks, 20 chunk_keys.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_inkling2_attn_split
+shared float asp_m[4];
+shared float asp_l[4];
+shared vec4 asp_acc[4][32];
+
+void main() {
+    const uint c = gl_WorkGroupID.x;
+    const uint y = gl_WorkGroupID.y;
+    const uint r = gl_WorkGroupID.z;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+
+    const uint nh = arg_u32(7);
+    const uint nkv = arg_u32(8);
+    const uint g_step = arg_u32(9);
+    const uint pos_q = arg_u32(10) + r;
+    const uint slots = arg_u32(11);
+    const uint is_swa = arg_u32(12);
+    const uint window = arg_u32(13);
+    const uint extent = arg_u32(14);
+    const uint has_q_clip = arg_u32(15);
+    const uint chunks = arg_u32(19);
+    const uint chunk_keys = arg_u32(20);
+
+    const uint h0 = y * g_step;
+    const uint kv_h = h0 / (nh / nkv);
+
+    vec4 q[4];
+    float sink[4];
+    uint64_t rel_row[4];
+    float mx[4] = float[4](-1.0 / 0.0, -1.0 / 0.0, -1.0 / 0.0, -1.0 / 0.0);
+    float sum[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    vec4 acc[4] = vec4[4](vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0));
+
+    float tau = 1.0;
+    if (has_q_clip != 0u) {
+        const uint log_floor = arg_u32(17);
+        const float log_alpha = arg_f32(18);
+        if (log_alpha > 0.0 && log_floor > 0u) {
+            const float ratio = float(pos_q + 1u) / float(log_floor);
+            if (ratio > 1.0) tau = 1.0 + log_alpha * log(ratio);
+        }
+    }
+    const float qk_clip = arg_f32(16);
+
+    [[unroll]] for (uint g = 0u; g < 4u; g++) {
+        if (g >= g_step) break;
+        const uint h = h0 + g;
+        const uint64_t q_off = (uint64_t(r) * uint64_t(nh) + uint64_t(h)) * 128u * 4u;
+        vec4 qv = F32x4(arg(0) + q_off).v[lane];
+        if (has_q_clip != 0u) {
+            qv *= F32x4(arg(6) + uint64_t(h) * 128u * 4u).v[lane];
+            const float norm = sqrt(subgroupAdd(dot(qv, qv))) + 1e-6;
+            const float factor = clamp(qk_clip / norm, 0.0, 1.0) * tau;
+            qv *= factor * inversesqrt(128.0);
+        } else {
+            qv *= inversesqrt(128.0);
+        }
+        q[g] = qv;
+        sink[g] = F32(arg(4)).v[r * nh + h];
+        rel_row[g] = arg(3) + (uint64_t(r) * uint64_t(nh) + uint64_t(h)) * uint64_t(extent) * 4u;
+    }
+
+    const uint k_start = (is_swa != 0u && pos_q + 1u > window) ? (pos_q + 1u - window) : 0u;
+    const uint k_end = pos_q + 1u;
+    const uint keys_per_sg = chunk_keys >> 2u;
+    const uint first = k_start + c * chunk_keys + sg * keys_per_sg;
+    const uint last = min(first + keys_per_sg, k_end);
+
+    if (first < last) {
+        U32x2 kbuf = U32x2(arg(1) + uint64_t(kv_h) * 256u);
+        U32x2 vbuf = U32x2(arg(2) + uint64_t(kv_h) * 256u);
+        const uint kv_row = nkv * 32u;
+        uint slot = is_swa != 0u ? (first % slots) : first;
+
+        [[dont_unroll]] for (uint key = first; key < last; key += 4u) {
+            vec4 kr[4], vr[4];
+            const uint rem = last - 1u - key;
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint su = slot + min(u, rem);
+                if (is_swa != 0u && su >= slots) su -= slots;
+                const uvec2 kp = kbuf.v[su * kv_row + lane];
+                const uvec2 vp = vbuf.v[su * kv_row + lane];
+                kr[u] = vec4(unpackHalf2x16(kp.x), unpackHalf2x16(kp.y));
+                vr[u] = vec4(unpackHalf2x16(vp.x), unpackHalf2x16(vp.y));
+            }
+            [[unroll]] for (uint g = 0u; g < 4u; g++) {
+                if (g >= g_step) break;
+                float sc[4];
+                float mn = mx[g];
+                [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                    const float d = subgroupAdd(dot(q[g], kr[u]));
+                    if (u <= rem) {
+                        const uint dist = pos_q - (key + u);
+                        const float rb = dist < extent ? F32(rel_row[g]).v[dist] : 0.0;
+                        sc[u] = d + rb - sink[g];
+                        mn = max(mn, sc[u]);
+                    } else {
+                        sc[u] = -1.0 / 0.0;
+                    }
+                }
+                const float a = mx[g] == -1.0 / 0.0 ? 0.0 : exp(mx[g] - mn);
+                sum[g] *= a;
+                float e[4];
+                [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                    e[u] = u <= rem ? exp(sc[u] - mn) : 0.0;
+                    sum[g] += e[u];
+                }
+                acc[g] = acc[g] * a + vr[0] * e[0] + vr[1] * e[1] + vr[2] * e[2] + vr[3] * e[3];
+                mx[g] = mn;
+            }
+            slot += 4u;
+            if (is_swa != 0u && slot >= slots) slot -= slots;
+        }
+    }
+
+    [[unroll]] for (uint g = 0u; g < 4u; g++) {
+        if (g >= g_step) break;
+        if (lane == 0u) {
+            asp_m[sg] = mx[g];
+            asp_l[sg] = sum[g];
+        }
+        asp_acc[sg][lane] = acc[g];
+        barrier();
+        if (sg == 0u) {
+            const float M = max(max(asp_m[0], asp_m[1]), max(asp_m[2], asp_m[3]));
+            const uint64_t P = arg(5) + 4u * (((uint64_t(r) * uint64_t(nh) + uint64_t(h0 + g)) * uint64_t(chunks) + uint64_t(c)) * 130u);
+            if (M == -1.0 / 0.0) {
+                if (lane == 0u) {
+                    F32(P).v[0] = -1.0 / 0.0;
+                    F32(P).v[1] = 0.0;
+                }
+            } else {
+                const float f0 = asp_m[0] == -1.0 / 0.0 ? 0.0 : exp(asp_m[0] - M);
+                const float f1 = asp_m[1] == -1.0 / 0.0 ? 0.0 : exp(asp_m[1] - M);
+                const float f2 = asp_m[2] == -1.0 / 0.0 ? 0.0 : exp(asp_m[2] - M);
+                const float f3 = asp_m[3] == -1.0 / 0.0 ? 0.0 : exp(asp_m[3] - M);
+                const vec4 a = asp_acc[0][lane] * f0 + asp_acc[1][lane] * f1
+                             + asp_acc[2][lane] * f2 + asp_acc[3][lane] * f3;
+                F32x4(P + 8u).v[lane] = a;
+                if (lane == 0u) {
+                    F32(P).v[0] = M;
+                    F32(P).v[1] = asp_l[0] * f0 + asp_l[1] * f1 + asp_l[2] * f2 + asp_l[3] * f3;
+                }
+            }
+        }
+        barrier();
+    }
+}
+#endif
+
+// Combine grid: (nh, rows, 1), 128 threads (1 thread per head_dim element 0..127).
+// Buffers: 0 partial, 1 out, 2 gate (optional).
+// Params: 3 nh, 4 chunks (<= 128), 5 has_gate.
+#ifdef KERNEL_inkling2_attn_combine
+shared float acb_m[128];
+shared float acb_w[128];
+shared float acb_red_m[4];
+shared float acb_red_l[4];
+
+void main() {
+    const uint h = gl_WorkGroupID.x;
+    const uint r = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint nh = arg_u32(3);
+    const uint chunks = arg_u32(4);
+    const uint has_gate = arg_u32(5);
+    const uint64_t P = arg(0) + 4u * ((uint64_t(r) * uint64_t(nh) + uint64_t(h)) * uint64_t(chunks) * 130u);
+
+    // Implicit zero attention sink at score 0.0 -> M >= 0.0.
+    float mx = 0.0;
+    if (tid < chunks) {
+        const float m = F32(P).v[tid * 130u];
+        acb_m[tid] = m;
+        mx = max(mx, m);
+    }
+    mx = subgroupMax(mx);
+    if (gl_SubgroupInvocationID == 0u) acb_red_m[gl_SubgroupID] = mx;
+    barrier();
+    const float M = max(max(acb_red_m[0], acb_red_m[1]), max(acb_red_m[2], acb_red_m[3]));
+
+    float l_part = 0.0;
+    if (tid < chunks) {
+        const float m = acb_m[tid];
+        const float w = m == -1.0 / 0.0 ? 0.0 : exp(m - M);
+        acb_w[tid] = w;
+        if (w != 0.0) l_part = F32(P).v[tid * 130u + 1u] * w;
+    }
+    l_part = subgroupAdd(l_part);
+    if (gl_SubgroupInvocationID == 0u) acb_red_l[gl_SubgroupID] = l_part;
+    barrier();
+    const float L = exp(-M) + acb_red_l[0] + acb_red_l[1] + acb_red_l[2] + acb_red_l[3];
+
+    float a = 0.0;
+    for (uint c = 0u; c < chunks; c++) {
+        const float w = acb_w[c];
+        if (w != 0.0) a += F32(P).v[c * 130u + 2u + tid] * w;
+    }
+    float res = a / L;
+    const uint64_t q_off = (uint64_t(r) * uint64_t(nh) + uint64_t(h)) * 128u * 4u;
+    if (has_gate != 0u) {
+        const float gv = F32(arg(2) + q_off).v[tid];
+        res = res / (1.0 + exp(-gv));
+    }
+    F32(arg(1) + q_off).v[tid] = res;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// 29. Split-K + GQA-shared DSpark non-causal attention (hd = 128).
+//     Chunks 0..ctx_chunks cover ctx_kv[ctx_start..ctx_pos] (F16);
+//     final chunk c == ctx_chunks covers block_kv[0..block] (F32).
+//
+// Split grid: (ctx_chunks + 1, nh / g_step, block), 128 threads (4 subgroups).
+// Split buffers: 0 q, 1 k_ctx (F16), 2 v_ctx (F16), 3 k_blk (F32), 4 v_blk (F32),
+//                5 partial ([block, nh, ctx_chunks + 1, 130]).
+// Split params: 6 nh, 7 nkv, 8 g_step, 9 ctx_start, 10 ctx_pos, 11 block,
+//               12 ctx_chunks, 13 chunk_keys.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_inkling2_dspark_attn_split
+shared float dsp_m[4];
+shared float dsp_l[4];
+shared vec4 dsp_acc[4][32];
+
+void main() {
+    const uint c = gl_WorkGroupID.x;
+    const uint y = gl_WorkGroupID.y;
+    const uint r = gl_WorkGroupID.z;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+
+    const uint nh = arg_u32(6);
+    const uint nkv = arg_u32(7);
+    const uint g_step = arg_u32(8);
+    const uint ctx_start = arg_u32(9);
+    const uint ctx_pos = arg_u32(10);
+    const uint block = arg_u32(11);
+    const uint ctx_chunks = arg_u32(12);
+    const uint chunk_keys = arg_u32(13);
+    const uint total_chunks = ctx_chunks + 1u;
+
+    const uint h0 = y * g_step;
+    const uint kv_h = h0 / (nh / nkv);
+    const float scale = inversesqrt(128.0);
+
+    vec4 q[4];
+    float mx[4] = float[4](-1.0 / 0.0, -1.0 / 0.0, -1.0 / 0.0, -1.0 / 0.0);
+    float sum[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    vec4 acc[4] = vec4[4](vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0));
+
+    [[unroll]] for (uint g = 0u; g < 4u; g++) {
+        if (g >= g_step) break;
+        const uint64_t q_off = (uint64_t(r) * uint64_t(nh) + uint64_t(h0 + g)) * 128u * 4u;
+        q[g] = F32x4(arg(0) + q_off).v[lane] * scale;
+    }
+
+    if (c < ctx_chunks) {
+        const uint keys_per_sg = chunk_keys >> 2u;
+        const uint first = ctx_start + c * chunk_keys + sg * keys_per_sg;
+        const uint last = min(first + keys_per_sg, ctx_pos);
+        if (first < last) {
+            U32x2 kbuf = U32x2(arg(1) + uint64_t(kv_h) * 256u);
+            U32x2 vbuf = U32x2(arg(2) + uint64_t(kv_h) * 256u);
+            const uint kv_row = nkv * 32u;
+            [[dont_unroll]] for (uint key = first; key < last; key += 4u) {
+                vec4 kr[4], vr[4];
+                const uint rem = last - 1u - key;
+                [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                    const uint su = key + min(u, rem);
+                    const uvec2 kp = kbuf.v[su * kv_row + lane];
+                    const uvec2 vp = vbuf.v[su * kv_row + lane];
+                    kr[u] = vec4(unpackHalf2x16(kp.x), unpackHalf2x16(kp.y));
+                    vr[u] = vec4(unpackHalf2x16(vp.x), unpackHalf2x16(vp.y));
+                }
+                [[unroll]] for (uint g = 0u; g < 4u; g++) {
+                    if (g >= g_step) break;
+                    float sc[4];
+                    float mn = mx[g];
+                    [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                        const float d = subgroupAdd(dot(q[g], kr[u]));
+                        sc[u] = u <= rem ? d : -1.0 / 0.0;
+                        mn = max(mn, sc[u]);
+                    }
+                    const float a = mx[g] == -1.0 / 0.0 ? 0.0 : exp(mx[g] - mn);
+                    sum[g] *= a;
+                    float e[4];
+                    [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                        e[u] = u <= rem ? exp(sc[u] - mn) : 0.0;
+                        sum[g] += e[u];
+                    }
+                    acc[g] = acc[g] * a + vr[0] * e[0] + vr[1] * e[1] + vr[2] * e[2] + vr[3] * e[3];
+                    mx[g] = mn;
+                }
+            }
+        }
+    } else {
+        // Final chunk: F32 block_kv[0..block] distributed across the 4 subgroups.
+        const uint kv_row = nkv * 32u;
+        F32x4 kblk = F32x4(arg(3) + uint64_t(kv_h) * 512u);
+        F32x4 vblk = F32x4(arg(4) + uint64_t(kv_h) * 512u);
+        for (uint b = sg; b < block; b += 4u) {
+            const vec4 kv = kblk.v[b * kv_row + lane];
+            const vec4 vv = vblk.v[b * kv_row + lane];
+            [[unroll]] for (uint g = 0u; g < 4u; g++) {
+                if (g >= g_step) break;
+                const float s = subgroupAdd(dot(q[g], kv));
+                const float mn = max(mx[g], s);
+                const float a = mx[g] == -1.0 / 0.0 ? 0.0 : exp(mx[g] - mn);
+                const float e = exp(s - mn);
+                sum[g] = sum[g] * a + e;
+                acc[g] = acc[g] * a + vv * e;
+                mx[g] = mn;
+            }
+        }
+    }
+
+    [[unroll]] for (uint g = 0u; g < 4u; g++) {
+        if (g >= g_step) break;
+        if (lane == 0u) {
+            dsp_m[sg] = mx[g];
+            dsp_l[sg] = sum[g];
+        }
+        dsp_acc[sg][lane] = acc[g];
+        barrier();
+        if (sg == 0u) {
+            const float M = max(max(dsp_m[0], dsp_m[1]), max(dsp_m[2], dsp_m[3]));
+            const uint64_t P = arg(5) + 4u * (((uint64_t(r) * uint64_t(nh) + uint64_t(h0 + g)) * uint64_t(total_chunks) + uint64_t(c)) * 130u);
+            if (M == -1.0 / 0.0) {
+                if (lane == 0u) {
+                    F32(P).v[0] = -1.0 / 0.0;
+                    F32(P).v[1] = 0.0;
+                }
+            } else {
+                const float f0 = dsp_m[0] == -1.0 / 0.0 ? 0.0 : exp(dsp_m[0] - M);
+                const float f1 = dsp_m[1] == -1.0 / 0.0 ? 0.0 : exp(dsp_m[1] - M);
+                const float f2 = dsp_m[2] == -1.0 / 0.0 ? 0.0 : exp(dsp_m[2] - M);
+                const float f3 = dsp_m[3] == -1.0 / 0.0 ? 0.0 : exp(dsp_m[3] - M);
+                const vec4 a = dsp_acc[0][lane] * f0 + dsp_acc[1][lane] * f1
+                             + dsp_acc[2][lane] * f2 + dsp_acc[3][lane] * f3;
+                F32x4(P + 8u).v[lane] = a;
+                if (lane == 0u) {
+                    F32(P).v[0] = M;
+                    F32(P).v[1] = dsp_l[0] * f0 + dsp_l[1] * f1 + dsp_l[2] * f2 + dsp_l[3] * f3;
+                }
+            }
+        }
+        barrier();
+    }
+}
+#endif
+
+// DSpark combine grid: (nh, block, 1), 128 threads.
+// Buffers: 0 partial, 1 out. Params: 2 nh, 3 total_chunks (<= 128).
+#ifdef KERNEL_inkling2_dspark_attn_combine
+shared float dcb_m[128];
+shared float dcb_w[128];
+shared float dcb_red_m[4];
+shared float dcb_red_l[4];
+
+void main() {
+    const uint h = gl_WorkGroupID.x;
+    const uint r = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint nh = arg_u32(2);
+    const uint chunks = arg_u32(3);
+    const uint64_t P = arg(0) + 4u * ((uint64_t(r) * uint64_t(nh) + uint64_t(h)) * uint64_t(chunks) * 130u);
+
+    float mx = -1.0 / 0.0;
+    if (tid < chunks) {
+        const float m = F32(P).v[tid * 130u];
+        dcb_m[tid] = m;
+        mx = m;
+    }
+    mx = subgroupMax(mx);
+    if (gl_SubgroupInvocationID == 0u) dcb_red_m[gl_SubgroupID] = mx;
+    barrier();
+    const float M = max(max(dcb_red_m[0], dcb_red_m[1]), max(dcb_red_m[2], dcb_red_m[3]));
+
+    float l_part = 0.0;
+    if (tid < chunks) {
+        const float m = dcb_m[tid];
+        const float w = m == -1.0 / 0.0 ? 0.0 : exp(m - M);
+        dcb_w[tid] = w;
+        if (w != 0.0) l_part = F32(P).v[tid * 130u + 1u] * w;
+    }
+    l_part = subgroupAdd(l_part);
+    if (gl_SubgroupInvocationID == 0u) dcb_red_l[gl_SubgroupID] = l_part;
+    barrier();
+    const float L = dcb_red_l[0] + dcb_red_l[1] + dcb_red_l[2] + dcb_red_l[3];
+
+    float a = 0.0;
+    for (uint c = 0u; c < chunks; c++) {
+        const float w = dcb_w[c];
+        if (w != 0.0) a += F32(P).v[c * 130u + 2u + tid] * w;
+    }
+    const uint64_t out_off = (uint64_t(r) * uint64_t(nh) + uint64_t(h)) * 128u * 4u;
+    F32(arg(1) + out_off).v[tid] = a / L;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// 30. Parallel-across-rows prefill short_conv, history update, and kv_prep.
+//     Eliminates sequential `for (r = 0..rows)` loops during prompt prefill!
+//     History is read-only during prefill and updated after the barrier by
+//     `inkling2_sconv_hist_update` (requires `rows >= n_conv - 1`).
+// ---------------------------------------------------------------------------
+
+// Grid: (ceil(C / 256), rows, 1), 256 threads.
+// Buffers: 0 x, 1 weight, 2 dyn, 3 history (RO), 4 y, 5 res.
+// Params: 6 rows, 7 C, 8 n_conv, 9 n_heads, 10 has_res.
+#ifdef KERNEL_inkling2_sconv_prefill
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint r = gl_WorkGroupID.y;
+    const uint C = arg_u32(7);
+    if (c >= C) return;
+    const uint n_conv = arg_u32(8);
+    const uint n_heads = arg_u32(9);
+    const uint has_res = arg_u32(10);
+    const uint hist_len = n_conv - 1u;
+
+    const uint64_t x_buf = arg(0);
+    const uint64_t w_buf = arg(1) + uint64_t(c) * uint64_t(n_conv) * 4u;
+    const uint64_t d_buf = arg(2);
+    const uint64_t h_buf = arg(3) + uint64_t(c) * uint64_t(hist_len) * 4u;
+
+    float ring[8];
+    for (uint k = 0u; k < n_conv; k++) {
+        const int src_r = int(r) + int(k) - int(hist_len);
+        if (src_r < 0) {
+            ring[k] = F32(h_buf).v[k + r];
+        } else {
+            ring[k] = F32(x_buf).v[uint(src_r) * C + c];
+        }
+    }
+    const float xr = ring[hist_len];
+    float acc = 0.0;
+    for (uint k = 0u; k < n_conv; k++) {
+        acc += ring[k] * F32(w_buf).v[k];
+    }
+    if (n_heads > 0u) {
+        const uint head = c / (C / n_heads);
+        const uint64_t d_off = (uint64_t(r) * uint64_t(n_heads) + uint64_t(head)) * uint64_t(n_conv) * 4u;
+        for (uint lag = 0u; lag < n_conv; lag++) {
+            acc += ring[n_conv - 1u - lag] * F32(d_buf + d_off).v[lag];
+        }
+    }
+    const float scale = inversesqrt(float(((n_heads > 0u ? 2u : 1u) * n_conv) + 1u));
+    float out_v = (xr + acc) * scale;
+    if (has_res != 0u) out_v += F32(arg(5)).v[r * C + c];
+    F32(arg(4)).v[r * C + c] = out_v;
+}
+#endif
+
+// Grid: (ceil(C / 256), 1, 1), 256 threads.
+// Buffers: 0 x, 1 history. Params: 2 rows (>= hist_len), 3 C, 4 hist_len.
+#ifdef KERNEL_inkling2_sconv_hist_update
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint C = arg_u32(3);
+    if (c >= C) return;
+    const uint rows = arg_u32(2);
+    const uint hist_len = arg_u32(4);
+    const uint64_t x_buf = arg(0);
+    const uint64_t h_buf = arg(1) + uint64_t(c) * uint64_t(hist_len) * 4u;
+    const uint base_r = rows - hist_len;
+    for (uint k = 0u; k < hist_len; k++) {
+        F32(h_buf).v[k] = F32(x_buf).v[(base_r + k) * C + c];
+    }
+}
+#endif
+
+// Grid: (n_head_kv, 2, rows), 128 threads (4 subgroups = 1 head of dim 128).
+// Buffers: 0 k_raw, 1 v_raw, 2 k_conv_w, 3 v_conv_w, 4 k_dyn, 5 v_dyn,
+//          6 k_hist (RO), 7 v_hist (RO), 8 k_cache, 9 v_cache.
+// Params: 10 rows, 11 n_head_kv, 12 n_conv, 13 is_swa, 14 pos0, 15 slots,
+//         16 qk_clip, 17 rms_eps.
+#ifdef KERNEL_inkling2_kv_prep_prefill
+shared float kvpp_sg[4];
+
+void main() {
+    const uint kh = gl_WorkGroupID.x;
+    const uint is_v = gl_WorkGroupID.y;
+    const uint r = gl_WorkGroupID.z;
+    const uint d = gl_LocalInvocationIndex; // 0..128
+    const uint nkv = arg_u32(11);
+    const uint n_conv = arg_u32(12);
+    const uint is_swa = arg_u32(13);
+    const uint pos0 = arg_u32(14);
+    const uint slots = arg_u32(15);
+    const float qk_clip = arg_f32(16);
+    const float rms_eps = arg_f32(17);
+    const uint hist_len = n_conv - 1u;
+    const uint C = nkv * 128u;
+    const uint c = kh * 128u + d;
+
+    const uint64_t x_buf = is_v == 0u ? arg(0) : arg(1);
+    const uint64_t w_buf = (is_v == 0u ? arg(2) : arg(3)) + uint64_t(c) * uint64_t(n_conv) * 4u;
+    const uint64_t d_buf = is_v == 0u ? arg(4) : arg(5);
+    const uint64_t h_buf = (is_v == 0u ? arg(6) : arg(7)) + uint64_t(c) * uint64_t(hist_len) * 4u;
+    const uint64_t c_buf = is_v == 0u ? arg(8) : arg(9);
+
+    float ring[8];
+    for (uint k = 0u; k < n_conv; k++) {
+        const int src_r = int(r) + int(k) - int(hist_len);
+        if (src_r < 0) {
+            ring[k] = F32(h_buf).v[k + r];
+        } else {
+            ring[k] = F32(x_buf).v[uint(src_r) * C + c];
+        }
+    }
+    const float xr = ring[hist_len];
+    float acc = 0.0;
+    for (uint k = 0u; k < n_conv; k++) acc += ring[k] * F32(w_buf).v[k];
+    const uint has_dyn = is_swa == 0u ? 1u : 0u;
+    if (has_dyn != 0u) {
+        const uint64_t d_off = (uint64_t(r) * uint64_t(nkv) + uint64_t(kh)) * uint64_t(n_conv) * 4u;
+        for (uint lag = 0u; lag < n_conv; lag++) {
+            acc += ring[n_conv - 1u - lag] * F32(d_buf + d_off).v[lag];
+        }
+    }
+    const float scale = inversesqrt(float(((has_dyn != 0u ? 2u : 1u) * n_conv) + 1u));
+    float val = (xr + acc) * scale;
+
+    float sq = subgroupAdd(val * val);
+    if (gl_SubgroupInvocationID == 0u) kvpp_sg[gl_SubgroupID] = sq;
+    barrier();
+    const float tot = kvpp_sg[0] + kvpp_sg[1] + kvpp_sg[2] + kvpp_sg[3];
+    if (is_v == 0u) {
+        val *= clamp(qk_clip / (sqrt(tot) + 1e-6), 0.0, 1.0);
+    } else {
+        val *= inversesqrt(tot / 128.0 + rms_eps);
+    }
+
+    const uint pos = pos0 + r;
+    const uint slot = is_swa != 0u ? (pos % slots) : pos;
+    F16(c_buf + (uint64_t(slot) * uint64_t(C) + uint64_t(c)) * 2u).v[0] = float16_t(val);
 }
 #endif

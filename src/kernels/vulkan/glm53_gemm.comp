@@ -28,6 +28,7 @@
     defined(KERNEL_glm53_gemm_iq4_xs)
 #define GLM53_INKLING_TYPES
 #endif
+#define GLM53_NO_IQ2_XXS_DOT
 #include "common.glsl"
 #include "glm53_quant.glsl"
 #include "matmul.glsl"
@@ -63,6 +64,14 @@ uint glm53_bf16_bits(float f) {
 #endif
 #ifdef KERNEL_glm53_gemm_q6_k_bx
 #define KERNEL_glm53_gemm_q6_k
+#define GEMM_BX
+#endif
+#ifdef KERNEL_glm53_gemm_f32_bx
+#define KERNEL_glm53_gemm_f32
+#define GEMM_BX
+#endif
+#ifdef KERNEL_glm53_gemm_bf16_bx
+#define KERNEL_glm53_gemm_bf16
 #define GEMM_BX
 #endif
 // The _bx4 forms: four subgroups a threadgroup (128 rows of X, a thread

@@ -247,6 +247,37 @@ fn gemv_matches_cpu_for_every_type_and_row_count() {
 }
 
 #[test]
+fn gemv_bf16_r2_and_q4_0_r4_match_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(5304);
+    // BF16 r2 (m=1..8, rows>=1024), including odd tail rows.
+    let (cols, rows) = (1024usize, 1029usize);
+    let raw = random_blocks(&mut rng, GgmlType::Bf16, rows * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Bf16, cols, rows).unwrap();
+    let cpu = mat(GgmlType::Bf16, &raw, rows, cols);
+    for m in [1usize, 2, 3, 4, 5, 6, 7, 8] {
+        let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+        let tx = tensor(&ctx, &x);
+        let out = zeros(&ctx, m * rows);
+        run(&ctx, |p| gemv(&ctx, p, &w, &tx, &out, m).unwrap());
+        let expected: Vec<f32> =
+            (0..m).flat_map(|i| cpu.mv(&x[i * cols..(i + 1) * cols])).collect();
+        assert_close(&out.to_f32().unwrap(), &expected, 1e-4, 1e-4);
+    }
+    // Q4_0 m=1 r4 (rows >= 32768, odd tail).
+    let (qcols, qrows) = (1024usize, 32771usize);
+    let qraw = random_blocks(&mut rng, GgmlType::Q4_0, qrows * qcols);
+    let qw = QWeight::from_bytes(&ctx, &qraw, GgmlType::Q4_0, qcols, qrows).unwrap();
+    let qcpu = mat(GgmlType::Q4_0, &qraw, qrows, qcols);
+    let qx = f32s(&mut rng, qcols, -1.0, 1.0);
+    let tqx = tensor(&ctx, &qx);
+    let qout = zeros(&ctx, qrows);
+    run(&ctx, |p| gemv(&ctx, p, &qw, &tqx, &qout, 1).unwrap());
+    let qexp = qcpu.mv(&qx);
+    assert_close(&qout.to_f32().unwrap(), &qexp, 1e-4, 1e-4);
+}
+
+#[test]
 fn gemv_grouped_matches_cpu() {
     // attn_k_b's shape: 64 heads x 512 rows of 256, input per head; Q5_K
     // at all 64 heads is past the two-rows-a-subgroup threshold (32768
@@ -2669,6 +2700,11 @@ fn gemm_bx_matches_gemm() {
         (GgmlType::Q4K, 512, 136, 1024),
         (GgmlType::F16, 256, 72, 255),
         (GgmlType::F16, 512, 100, 513),
+        (GgmlType::F32, 256, 72, 255),
+        (GgmlType::F32, 512, 128, 513),
+        (GgmlType::F32, 256, 128, 24),
+        (GgmlType::Bf16, 256, 72, 255),
+        (GgmlType::Bf16, 512, 128, 513),
         // Short runs over 8 192 weight rows (four-subgroup tiles), and
         // their edge at 128 and 129 rows.
         (GgmlType::Q8_0, 256, 8192, 24),

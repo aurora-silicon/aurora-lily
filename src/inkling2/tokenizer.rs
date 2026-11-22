@@ -45,7 +45,7 @@ pub fn chat_template(g: &Gguf) -> Result<String> {
     patch_chat_template(g.str("tokenizer.chat_template")?)
 }
 
-fn patch_chat_template(raw: &str) -> Result<String> {
+pub fn patch_chat_template(raw: &str) -> Result<String> {
     let mut t = raw.to_string();
     for tag in ["generation", "endgeneration"] {
         for (open, close) in

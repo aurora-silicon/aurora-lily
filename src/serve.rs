@@ -1843,7 +1843,9 @@ fn checkpoint_max_position_embeddings(model_dir: &Path) -> Result<usize> {
     Ok(config
         .get("max_position_embeddings")
         .or_else(|| {
-            config.get("text_config").and_then(|t| t.get("max_position_embeddings"))
+            config.get("text_config").and_then(|t| {
+                t.get("max_position_embeddings").or_else(|| t.get("model_max_length"))
+            })
         })
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize)

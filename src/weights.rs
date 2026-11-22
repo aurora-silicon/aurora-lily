@@ -202,6 +202,9 @@ fn to_dtype(dtype: &SafetensorsDType) -> Result<DType> {
         SafetensorsDType::BF16 => Ok(DType::BF16),
         SafetensorsDType::F32 => Ok(DType::F32),
         SafetensorsDType::U32 => Ok(DType::U32),
+        SafetensorsDType::U8 | SafetensorsDType::F8E4M3 => {
+            anyhow::bail!("unsupported checkpoint dtype {dtype:?}")
+        }
         SafetensorsDType::Other(s) => anyhow::bail!("unsupported checkpoint dtype {s}"),
     }
 }

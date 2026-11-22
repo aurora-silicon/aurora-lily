@@ -21,6 +21,10 @@ pub enum SafetensorsDType {
     F32,
     /// Packed quantized weight codes in mlx checkpoints.
     U32,
+    /// Raw unsigned bytes (packed NVFP4 nibbles, UE8M0 scales).
+    U8,
+    /// OCP FP8 E4M3FN bytes (NVFP4 block scales, MXFP8 weights).
+    F8E4M3,
     Other(String),
 }
 
@@ -30,12 +34,15 @@ impl SafetensorsDType {
             "BF16" => Self::BF16,
             "F32" => Self::F32,
             "U32" => Self::U32,
+            "U8" => Self::U8,
+            "F8_E4M3" => Self::F8E4M3,
             other => Self::Other(other.to_string()),
         }
     }
 
     pub fn size(&self) -> Option<usize> {
         match self {
+            Self::U8 | Self::F8E4M3 => Some(1),
             Self::BF16 => Some(2),
             Self::F32 | Self::U32 => Some(4),
             Self::Other(_) => None,
@@ -121,6 +128,12 @@ impl Checkpoint {
                 }
             }
         }
+        Ok(Self { tensors })
+    }
+
+    /// Opens a single `.safetensors` file directly (e.g. `mtp.safetensors`).
+    pub fn open_file(path: impl AsRef<Path>) -> Result<Self> {
+        let tensors = parse_shard_header(path.as_ref())?;
         Ok(Self { tensors })
     }
 

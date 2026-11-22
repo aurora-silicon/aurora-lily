@@ -23,7 +23,7 @@ pub const GEMV_MAX_ROWS_WIDE: usize = 8;
 
 /// Rows a GEMV over weights of `ty` takes at once.
 pub fn gemv_max_rows(ty: GgmlType) -> usize {
-    if matches!(ty, GgmlType::Q8_0 | GgmlType::F16) {
+    if matches!(ty, GgmlType::Q8_0 | GgmlType::F16 | GgmlType::Bf16 | GgmlType::F32) {
         GEMV_MAX_ROWS_WIDE
     } else {
         GEMV_MAX_ROWS
@@ -67,6 +67,21 @@ impl QWeight {
             rows,
         )
     }
+}
+
+/// The two-weight-rows BF16 GEMV of `m` (2 to 8) activation rows.
+fn gemv_bf16_r2_name(m: usize) -> Result<&'static str> {
+    const NAMES: [&str; 7] = [
+        "glm53_gemv_bf16_r2_m2",
+        "glm53_gemv_bf16_r2_m3",
+        "glm53_gemv_bf16_r2_m4",
+        "glm53_gemv_bf16_r2_m5",
+        "glm53_gemv_bf16_r2_m6",
+        "glm53_gemv_bf16_r2_m7",
+        "glm53_gemv_bf16_r2_m8",
+    ];
+    ensure!((2..=8).contains(&m), "two-row BF16 GEMV of {m} rows");
+    Ok(NAMES[m - 2])
 }
 
 /// The two-weight-rows Q8_0 GEMV of `m` (1 to 8) activation rows.
@@ -120,7 +135,7 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
         rows!("iq4_xs"),
     ];
     if m > GEMV_MAX_ROWS {
-        const WIDE: [[&str; 4]; 2] = [
+        const WIDE: [[&str; 4]; 4] = [
             [
                 "glm53_gemv_q8_0_m5",
                 "glm53_gemv_q8_0_m6",
@@ -133,9 +148,27 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
                 "glm53_gemv_f16_m7",
                 "glm53_gemv_f16_m8",
             ],
+            [
+                "glm53_gemv_bf16_m5",
+                "glm53_gemv_bf16_m6",
+                "glm53_gemv_bf16_m7",
+                "glm53_gemv_bf16_m8",
+            ],
+            [
+                "glm53_gemv_f32_m5",
+                "glm53_gemv_f32_m6",
+                "glm53_gemv_f32_m7",
+                "glm53_gemv_f32_m8",
+            ],
         ];
         ensure!(m <= gemv_max_rows(ty), "GEMV of {m} rows over {ty:?}");
-        let t = usize::from(ty == GgmlType::F16);
+        let t = match ty {
+            GgmlType::Q8_0 => 0,
+            GgmlType::F16 => 1,
+            GgmlType::Bf16 => 2,
+            GgmlType::F32 => 3,
+            _ => unreachable!(),
+        };
         return Ok(WIDE[t][m - GEMV_MAX_ROWS - 1]);
     }
     ensure!((1..=GEMV_MAX_ROWS).contains(&m), "GEMV of {m} rows");
@@ -339,6 +372,7 @@ fn gemv_dispatch(
         w0.cols
     );
     let max_rows = sets.iter().map(|(w, _)| w.rows).max().unwrap_or(0);
+    let total_rows: usize = sets.iter().map(|(w, _)| w.rows).sum();
     let g16 = g16_gemv_name(ctx, w0.ty, w0.cols, m, l.x_group, l.x_row_stride);
     // DeepSeek V4's two-weight-rows Q8_0 kernel (`r2`: gemv_sets_r2,
     // gemv_with_r2), for any activation row count so that a row computes
@@ -353,10 +387,28 @@ fn gemv_dispatch(
         && w0.ty == GgmlType::Q8_0
         && tasks == 32
         && l.x_group.is_multiple_of(2);
+    // Two-row BF16 streaming GEMV for m >= 2 (cuts X load issue traffic 2x while
+    // keeping 16 rows/TG for full GPU occupancy on N >= 1024).
+    let bf16_r2 = !r2
+        && g16.is_none()
+        && w0.ty == GgmlType::Bf16
+        && m >= 2
+        && tasks >= 32
+        && l.x_group >= max_rows
+        && total_rows >= 1024;
+    // Four-row Q4_0 m=1 GEMV for wide LM heads (shares X loads and -8*sum(x) across 4 rows).
+    let q4_0_r4 = !r2
+        && !bf16_r2
+        && g16.is_none()
+        && w0.ty == GgmlType::Q4_0
+        && m == 1
+        && tasks >= 32
+        && l.x_group >= max_rows
+        && max_rows >= GEMV_R2_MIN_ROWS;
     // Two rows a subgroup share one input row, so grouped inputs (GLM's
     // per-head attn_k_b) take one; the G16 kernels set their own rows.
-    let r = if !r2 && g16.is_none() && l.x_group >= max_rows {
-        gemv_rows_per_subgroup(w0.ty, m, max_rows)
+    let r = if !r2 && !bf16_r2 && !q4_0_r4 && g16.is_none() && l.x_group >= max_rows {
+        gemv_rows_per_subgroup(w0.ty, m, total_rows)
     } else {
         1
     };
@@ -364,7 +416,13 @@ fn gemv_dispatch(
         Some((_, rows)) => rows,
         None => 32 / tasks.min(32),
     };
-    let rows_per_tg = if r2 { 16 } else { 8 * per_sg * r };
+    let rows_per_tg = if r2 || bf16_r2 {
+        16
+    } else if q4_0_r4 {
+        32
+    } else {
+        8 * per_sg * r
+    };
     let mut groups = 0;
     for &(w, y) in sets {
         ensure!(
@@ -393,8 +451,11 @@ fn gemv_dispatch(
     let name = match g16 {
         Some((name, _)) => name,
         None if r2 => gemv_r2_name(m)?,
+        None if bf16_r2 => gemv_bf16_r2_name(m)?,
+        None if q4_0_r4 => "glm53_gemv_q4_0_m1_r4",
         None if r == 2 => match w0.ty {
             GgmlType::Q4K => "glm53_gemv_q4_k_m1_r2",
+            GgmlType::Bf16 => "glm53_gemv_bf16_m1_r2",
             _ => "glm53_gemv_q5_k_m1_r2",
         },
         None => gemv_name(w0.ty, m)?,
@@ -427,7 +488,10 @@ const GEMV_R2_MIN_ROWS: usize = 32768;
 /// groups at `m` rows over weights of up to `rows` rows: two for a wide
 /// Q5_K at one row (they share the x loads), else one.
 fn gemv_rows_per_subgroup(ty: GgmlType, m: usize, rows: usize) -> usize {
-    if ty == GgmlType::Q5K && m == 1 && rows >= GEMV_R2_MIN_ROWS {
+    if m == 1
+        && ((ty == GgmlType::Q5K && rows >= GEMV_R2_MIN_ROWS)
+            || (ty == GgmlType::Bf16 && rows >= 1024))
+    {
         2
     } else {
         1
@@ -591,6 +655,8 @@ pub fn gemm_bx_with(
         (GgmlType::Q8_0, true) => ("glm53_gemm_q8_0_bx4", 128, 128),
         (GgmlType::Q4K, true) => ("glm53_gemm_q4_k_bx4", 128, 128),
         (GgmlType::F16, _) => ("glm53_gemm_f16_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::F32, _) => ("glm53_gemm_f32_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
+        (GgmlType::Bf16, _) => ("glm53_gemm_bf16_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
         (GgmlType::Q5K, _) => ("glm53_gemm_q5_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
         (GgmlType::Q6K, _) => ("glm53_gemm_q6_k_bx", GEMM_BX_ROWS, GEMM_BX_THREADS),
         (other, _) => anyhow::bail!("no bfloat-input GLM GEMM over {other:?}"),
@@ -606,15 +672,28 @@ const GEMM_BX_THREADS: usize = 256;
 
 /// Whether [`gemm_bx`] takes weights of this type.
 pub fn gemm_bx_takes(w: &QWeight) -> bool {
-    matches!(w.ty, GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
-        && w.cols.is_multiple_of(8)
+    matches!(
+        w.ty,
+        GgmlType::Q8_0
+            | GgmlType::Q4K
+            | GgmlType::Q5K
+            | GgmlType::Q6K
+            | GgmlType::F32
+            | GgmlType::Bf16
+    ) && w.cols.is_multiple_of(8)
 }
 
 /// Whether [`gemm_bx_with`] takes weights of this type (F16 too).
 pub fn gemm_bx_with_takes(w: &QWeight) -> bool {
     matches!(
         w.ty,
-        GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::F16
+        GgmlType::Q8_0
+            | GgmlType::Q4K
+            | GgmlType::Q5K
+            | GgmlType::Q6K
+            | GgmlType::F16
+            | GgmlType::F32
+            | GgmlType::Bf16
     ) && w.cols.is_multiple_of(8)
 }
 

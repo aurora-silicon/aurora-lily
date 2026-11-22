@@ -100,6 +100,165 @@ impl Config {
         Self::from_metadata(&gguf.metadata)
     }
 
+    /// Reads and validates a native HuggingFace `thinkingmachines/Inkling-2-Mini`
+    /// checkpoint directory (`config.json` with `model_type == "inkling2_loop"`).
+    pub fn from_hf_dir(dir: &std::path::Path) -> Result<Self> {
+        let path = dir.join("config.json");
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let root: serde_json::Value =
+            serde_json::from_slice(&bytes).context("parsing config.json")?;
+        let arch = root
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .context("config.json missing model_type")?;
+        ensure!(
+            arch == ARCH_LOOP || arch == ARCH_PLAIN,
+            "expected model_type = {ARCH_LOOP:?} or {ARCH_PLAIN:?}, got {arch:?}"
+        );
+        let tc = root.get("text_config").unwrap_or(&root);
+        let u = |k: &str, max: usize| -> Result<usize> {
+            let v = tc
+                .get(k)
+                .and_then(|v| v.as_u64())
+                .with_context(|| format!("config.json missing {k}"))?;
+            ensure!(v <= max as u64, "{k} is {v}, max {max}");
+            Ok(v as usize)
+        };
+        let u_or = |k: &str, max: usize, default: usize| -> Result<usize> {
+            match tc.get(k).and_then(|v| v.as_u64()) {
+                Some(v) => {
+                    ensure!(v <= max as u64, "{k} is {v}, max {max}");
+                    Ok(v as usize)
+                }
+                None => Ok(default),
+            }
+        };
+        let f_or = |k: &str, default: f32| -> f32 {
+            tc.get(k).and_then(|v| v.as_f64()).map_or(default, |v| v as f32)
+        };
+
+        let n_phys = u("num_hidden_layers", MAX_LAYERS)?;
+        let hidden = u("hidden_size", MAX_HIDDEN)?;
+        let vocab_padded = u("vocab_size", MAX_VOCAB)?;
+        let vocab_unpadded = u_or("unpadded_vocab_size", vocab_padded, vocab_padded)?;
+        let n_head_v = u("num_attention_heads", 256)?;
+        let n_head_kv_v = u("num_key_value_heads", n_head_v)?;
+        let head_dim = u("head_dim", 512)?;
+        let head_dim_swa = u_or("swa_head_dim", 512, head_dim)?;
+        ensure!(
+            head_dim == head_dim_swa,
+            "head_dim {head_dim} != swa_head_dim {head_dim_swa}"
+        );
+        let window = u_or("sliding_window_size", 1 << 20, 1024)?;
+        let rel_len = u_or("d_rel", 256, 16)?;
+        let rel_extent = u_or("rel_extent", 1 << 16, 1024)?;
+        let qk_clip = f_or("qk_l2_clip_threshold", 22.627_417);
+        let rel_clip = f_or("rel_l2_clip_threshold", 8.0);
+        let log_scale_floor = u_or("log_scaling_n_floor", 1 << 24, 8192)?;
+        let log_scale_alpha = f_or("log_scaling_alpha", 0.1);
+        let sconv_l_cache = u_or("sconv_kernel_size", 16, 4)?;
+        let attn_res_block_size = u_or("n_layers_per_attn_res_block", MAX_LAYERS, 6)?;
+        let n_expert = u("n_routed_experts", 1024)?;
+        let n_expert_used = u("num_experts_per_tok", n_expert)?;
+        let ff_expert = u("intermediate_size", 1 << 18)?;
+        let route_scale = f_or("route_scale", 8.0);
+        let situ_beta = f_or("mlp_gate_softcap", 4.0);
+        let situ_linear_beta = f_or("mlp_up_softcap", 25.0);
+        let final_logit_softcapping = f_or("final_logit_softcapping", 30.0);
+        let rms_eps = f_or("rms_norm_eps", 1e-6);
+        let context_length = u_or("model_max_length", 1 << 24, 1_048_576)?;
+
+        let mut swa = vec![false; n_phys];
+        if let Some(arr) = tc.get("local_layer_ids").and_then(|v| v.as_array()) {
+            for id in arr {
+                let idx = id.as_u64().context("local_layer_ids entry not u64")? as usize;
+                ensure!(idx < n_phys, "local_layer_ids {idx} >= {n_phys}");
+                swa[idx] = true;
+            }
+        } else {
+            for (i, s) in swa.iter_mut().enumerate() {
+                *s = i % 6 != 5;
+            }
+        }
+
+        let (loop_layout, loop_start, loop_end, loop_count, loop_gate_rank, n_visits) =
+            if let Some(lc) = tc.get("loop_config").and_then(|v| v.as_object()) {
+                let is_varloop =
+                    lc.get("is_varloop").and_then(|v| v.as_bool()).unwrap_or(false);
+                ensure!(!is_varloop, "varying loop_count is not supported");
+                let ls = lc
+                    .get("core_start")
+                    .and_then(|v| v.as_u64())
+                    .context("loop_config missing core_start")? as usize;
+                let le = lc
+                    .get("core_end")
+                    .and_then(|v| v.as_u64())
+                    .context("loop_config missing core_end")? as usize;
+                let lp = lc
+                    .get("num_passes")
+                    .and_then(|v| v.as_u64())
+                    .context("loop_config missing num_passes")? as usize;
+                let lr = lc.get("gate_rank").and_then(|v| v.as_u64()).unwrap_or(64)
+                    as usize;
+                ensure!(ls < le && le <= n_phys && lp >= 1, "invalid loop_config");
+                let visits = n_phys + (lp - 1) * (le - ls);
+                (LoopLayout::Unsloth, ls, le, lp, lr, visits)
+            } else {
+                (LoopLayout::None, 0, 0, 1, 0, n_phys)
+            };
+
+        let eos = root
+            .get("eos_token_id")
+            .or_else(|| tc.get("eos_token_id"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(200_006) as u32;
+        let pad = root
+            .get("pad_token_id")
+            .or_else(|| tc.get("pad_token_id"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(199_999) as u32;
+
+        Ok(Self {
+            arch: arch.to_string(),
+            loop_layout,
+            n_phys,
+            n_visits,
+            loop_start,
+            loop_end,
+            loop_count,
+            loop_gate_rank,
+            hidden,
+            vocab_padded,
+            vocab_unpadded,
+            n_head: vec![n_head_v; n_phys],
+            n_head_kv: vec![n_head_kv_v; n_phys],
+            head_dim,
+            head_dim_swa,
+            swa,
+            window,
+            rel_len,
+            rel_extent,
+            qk_clip,
+            rel_clip,
+            log_scale_floor,
+            log_scale_alpha,
+            sconv_l_cache,
+            attn_res_block_size,
+            n_expert,
+            n_expert_used,
+            ff_expert,
+            route_scale,
+            situ_beta,
+            situ_linear_beta,
+            final_logit_softcapping,
+            rms_eps,
+            context_length,
+            eos,
+            pad,
+        })
+    }
+
     pub fn from_metadata(meta: &BTreeMap<String, Value>) -> Result<Self> {
         let arch = meta
             .get("general.architecture")

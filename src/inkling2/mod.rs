@@ -15,6 +15,7 @@ pub mod config;
 pub mod dspark;
 pub mod engine;
 pub mod model;
+pub mod native;
 pub mod reference;
 pub mod schema;
 pub mod tokenizer;

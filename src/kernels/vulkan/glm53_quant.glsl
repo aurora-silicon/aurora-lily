@@ -561,6 +561,7 @@ uvec4 glm53_iq2xxs_signs_h[128] = uvec4[128](
 #include "glm53_iq2xxs_signs_h.glsl"
 );
 
+#ifndef GLM53_NO_IQ2_XXS_DOT
 // The block scale of an IQ2_XXS task, 0.125 d (2 s + 1), pinned.
 #ifdef LILY_PRECISE_LEGACY
 #define GLM53_IQ2_XXS_SCALE(name, d, aux1) \
@@ -641,3 +642,4 @@ vec2 glm53_dot2_iq2_xxs(uint64_t row, uint t, in vec4 xa[8], in vec4 xb[8]) {
     GLM53_PRECISE_MUL(v1, k, s1);
     return vec2(v0, v1);
 }
+#endif
