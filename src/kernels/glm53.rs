@@ -352,6 +352,204 @@ pub fn gemv_with_r2(
     gemv_dispatch(ctx, pass, &[(w, y)], x, m, l, true)
 }
 
+/// Direct-load FP16 cooperative-matrix `Q4_0` GEMM for small-batch `m` in `1..=16`
+/// (up to 4 `Q4_0` weight matrices sharing F32 `x`, `K % 32 == 0`).
+/// Uses native FP16 `coopMatMulAdd` with F32 accumulators (for speculative drafters
+/// such as Inkling 2 DSpark where slight FP16 input rounding does not affect target
+/// verification parity). Requires `ctx.matrix_units()` and `256 <= ctx.max_workgroup_invocations()`.
+pub fn gemv_cmat_q4_0_sets(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    sets: &[(&QWeight, &Tensor)],
+    x: &Tensor,
+    m: usize,
+) -> Result<()> {
+    ensure!(ctx.matrix_units(), "gemv_cmat_q4_0_sets requires matrix units");
+    ensure!(
+        256 <= ctx.max_workgroup_invocations(),
+        "gemv_cmat_q4_0_sets requires max_workgroup_invocations >= 256"
+    );
+    ensure!((1..=4).contains(&sets.len()), "cmat_q4_0 of {} sets", sets.len());
+    ensure!((1..=16).contains(&m), "cmat_q4_0 of {m} rows");
+    check_f32(&[x])?;
+    let w0 = sets[0].0;
+    ensure!(w0.ty == GgmlType::Q4_0, "cmat_q4_0 requires Q4_0 weights, got {:?}", w0.ty);
+    ensure!(
+        w0.cols.is_multiple_of(32),
+        "cmat_q4_0 row of {} values (requires multiple of 32)",
+        w0.cols
+    );
+    ensure!(x.numel() >= m * w0.cols, "cmat_q4_0 input of {} values", x.numel());
+    let mut groups = 0usize;
+    let mut max_rows = 0usize;
+    for &(w, y) in sets {
+        ensure!(
+            w.ty == GgmlType::Q4_0 && w.cols == w0.cols && w.row_bytes == w0.row_bytes,
+            "cmat_q4_0 sets of different types or widths"
+        );
+        check_f32(&[y])?;
+        ensure!(y.numel() >= m * w.rows, "cmat_q4_0 output of {}", y.numel());
+        max_rows = max_rows.max(w.rows);
+        groups += w.rows.div_ceil(16);
+    }
+    ensure!(
+        max_rows.saturating_mul(w0.row_bytes / 2) < (1usize << 31),
+        "cmat_q4_0 weight offset exceeds u32 halfword range"
+    );
+    let xb = x.binding();
+    let mut bindings = [xb; 9];
+    for (s, &(w, y)) in sets.iter().enumerate() {
+        bindings[1 + s] = w.t.binding();
+        bindings[5 + s] = y.binding();
+    }
+    let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
+    let pipeline = ctx.pipeline("glm53_cmat_q4_0_n16_sk8_f16", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &bindings,
+        &[
+            &u32_bytes(w0.cols),
+            &u32_bytes(m),
+            &u32_bytes(w0.row_bytes),
+            &rows(0),
+            &rows(1),
+            &rows(2),
+            &rows(3),
+            &u32_bytes(max_rows.max(1)),
+            &u32_bytes(w0.cols),
+            &u32_bytes(0),
+        ],
+        Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
+/// Direct-load `MAT_K64` cooperative-matrix BF16 GEMV/small-batch GEMM for
+/// `m` in `1..=16`, `K % 64 == 0`, and `1..=8` BF16 weight matrices sharing F32 `x`.
+/// Requires `ctx.matrix_units()`. Bit-exact across `m` in `1..=16`.
+pub fn gemv_cmat_bf16_sets(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    sets: &[(&QWeight, &Tensor)],
+    x: &Tensor,
+    m: usize,
+) -> Result<()> {
+    let mut xsets: Vec<(&QWeight, &Tensor, u8)> = Vec::with_capacity(sets.len());
+    for &(w, y) in sets {
+        xsets.push((w, y, 0));
+    }
+    gemv_cmat_bf16_sets_x3(ctx, pass, [x, x, x], &xsets, m)
+}
+
+/// Multi-input variant of [`gemv_cmat_bf16_sets`]: up to 8 BF16 weight sets
+/// across up to 3 F32 input tensors `xs[0..3]` (each set picks `x_idx in 0..3`),
+/// all in ONE single GPU dispatch.
+pub fn gemv_cmat_bf16_sets_x3(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    xs: [&Tensor; 3],
+    sets: &[(&QWeight, &Tensor, u8)],
+    m: usize,
+) -> Result<()> {
+    ensure!(ctx.matrix_units(), "gemv_cmat_bf16_sets_x3 requires matrix units");
+    ensure!((1..=8).contains(&sets.len()), "cmat_bf16 of {} sets", sets.len());
+    ensure!((1..=16).contains(&m), "cmat_bf16 of {m} rows");
+    let is_bf16 = xs[0].dtype() == DType::BF16;
+    if is_bf16 {
+        for x in xs {
+            ensure!(x.dtype() == DType::BF16, "cmat_bf16_bx requires BF16 inputs, got {:?}", x.dtype());
+        }
+    } else {
+        check_f32(&xs)?;
+    }
+    let w0 = sets[0].0;
+    ensure!(w0.ty == GgmlType::Bf16, "cmat_bf16 requires Bf16 weights, got {:?}", w0.ty);
+    ensure!(
+        w0.cols.is_multiple_of(64),
+        "cmat_bf16 row of {} values (requires multiple of 64)",
+        w0.cols
+    );
+    for x in xs {
+        ensure!(x.numel() >= m * w0.cols, "cmat_bf16 input of {} values", x.numel());
+    }
+    let total_rows: usize = sets.iter().map(|(w, _, _)| w.rows).sum();
+    if !is_bf16 && sets.len() == 1 && total_rows <= 256 && m <= 8 {
+        let (w, y, xi) = sets[0];
+        ensure!(xi < 3, "cmat_bf16 x_idx {xi} >= 3");
+        check_f32(&[y])?;
+        ensure!(y.numel() >= m * w.rows, "cmat_bf16 narrow output of {}", y.numel());
+        let pipeline = ctx.pipeline("glm53_gemv_bf16_narrow", SOURCE, MslVersion::V3_1)?;
+        return pass.dispatch_at(
+            &pipeline,
+            &[xs[usize::from(xi)].binding(), w.t.binding(), y.binding()],
+            &[&u32_bytes(w.cols), &u32_bytes(m), &u32_bytes(w.rows)],
+            Grid::Threadgroups {
+                groups: (w.rows, m, 1),
+                threadgroup: (96, 1, 1),
+            },
+        );
+    }
+    let (name, rows_per_wg, tg) = if is_bf16 {
+        if total_rows >= 32768 {
+            ("glm53_cmat_bf16_bx_n32_sg4", 128usize, 128usize)
+        } else if total_rows >= 4096 {
+            ("glm53_cmat_bf16_bx_n64_sk2", 64usize, 64usize)
+        } else if total_rows >= 1024 {
+            ("glm53_cmat_bf16_bx_n16_sk4", 16usize, 128usize)
+        } else {
+            ("glm53_cmat_bf16_bx_n16_sk8", 16usize, 256usize)
+        }
+    } else if total_rows >= 32768 {
+        ("glm53_cmat_bf16_n32_sg4", 128usize, 128usize)
+    } else if total_rows >= 4096 {
+        ("glm53_cmat_bf16_n64_sk2", 64usize, 64usize)
+    } else if total_rows >= 1024 {
+        ("glm53_cmat_bf16_n16_sk4", 16usize, 128usize)
+    } else {
+        ("glm53_cmat_bf16_n16_sk8", 16usize, 256usize)
+    };
+    let mut groups = 0usize;
+    let mut x_mask = 0u32;
+    for (s, &(w, y, xi)) in sets.iter().enumerate() {
+        ensure!(xi < 3, "cmat_bf16 x_idx {xi} >= 3");
+        ensure!(
+            w.ty == GgmlType::Bf16 && w.cols == w0.cols && w.row_bytes == w0.row_bytes,
+            "cmat_bf16 sets of different types or widths"
+        );
+        check_f32(&[y])?;
+        ensure!(y.numel() >= m * w.rows, "cmat_bf16 output of {}", y.numel());
+        groups += w.rows.div_ceil(rows_per_wg);
+        x_mask |= u32::from(xi) << (2 * s);
+    }
+    let x0b = xs[0].binding();
+    let mut bindings = [x0b; 19];
+    bindings[1] = xs[1].binding();
+    bindings[2] = xs[2].binding();
+    for (s, &(w, y, _)) in sets.iter().enumerate() {
+        bindings[3 + s] = w.t.binding();
+        bindings[11 + s] = y.binding();
+    }
+    let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _, _)| w.rows));
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &bindings,
+        &[
+            &u32_bytes(w0.cols),
+            &u32_bytes(m),
+            &x_mask.to_le_bytes(),
+            &rows(0),
+            &rows(1),
+            &rows(2),
+            &rows(3),
+            &rows(4),
+            &rows(5),
+            &rows(6),
+            &rows(7),
+        ],
+        Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (tg, 1, 1) },
+    )
+}
+
 fn gemv_dispatch(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,

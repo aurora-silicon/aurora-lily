@@ -15,52 +15,112 @@
 //   starts at 1.0 (equivalent to a virtual key with score 0 and value 0).
 // - Optional fused `sigmoid(gate)` epilogue before storing output.
 //
-// Grid: (ceil(m * G / 16), kvh, 1), 128 threads (4 subgroups).
+// Grid (non-split): (ceil(m * G / 16), kvh, 1), 128 threads (4 subgroups).
+// Grid (split):     (ceil(m * G / 16), kvh, chunks), 128 threads (4 subgroups).
 // Requires `slots >= 128` when `is_swa != 0`.
-// Buffers: 0 q [m, H, 128] f32, 1 k_cache [slots, kvh, 128] f16,
-//          2 v_cache [slots, kvh, 128] f16, 3 rel_table [m, H, ext] f32,
-//          4 sinks [m, H] f32, 5 out [m, H, 128] f32,
-//          6 gate [m, H, 128] f32 (optional), 7 q_clip [H, 128] f32 (optional).
-// Params: 8 H, 9 kvh, 10 pos0, 11 slots, 12 is_swa, 13 window, 14 ext, 15 m,
-//         16 has_gate, 17 has_q_clip, 18 qk_clip, 19 log_floor, 20 log_alpha.
+// Buffers (non-split): 0 q [m, H, 128] f32, 1 k_cache [slots, kvh, 128] f16,
+//                      2 v_cache [slots, kvh, 128] f16, 3 rel_table [m, H, ext] f32,
+//                      4 sinks [m, H] f32, 5 out [m, H, 128] f32,
+//                      6 gate [m, H, 128] f32 (optional), 7 q_clip [H, 128] f32 (optional).
+// Params  (non-split): 8 H, 9 kvh, 10 pos0, 11 slots, 12 is_swa, 13 window, 14 ext, 15 m,
+//                      16 has_gate, 17 has_q_clip, 18 qk_clip, 19 log_floor, 20 log_alpha.
+// Buffers (split):     0 q, 1 k_cache, 2 v_cache, 3 rel_table, 4 sinks,
+//                      5 partial [m, H, chunks, 130] f32, 6 q_clip (optional).
+// Params  (split):     7 H, 8 kvh, 9 pos0, 10 slots, 11 is_swa, 12 window, 13 ext, 14 m,
+//                      15 has_q_clip, 16 qk_clip, 17 log_floor, 18 log_alpha,
+//                      19 chunks, 20 chunk_keys (multiple of 128).
 #include "common.glsl"
 #include "matmul.glsl"
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
-#ifdef KERNEL_inkling2_attn_mu
+#if defined(KERNEL_inkling2_attn_mu) || defined(KERNEL_inkling2_attn_mu_split) || \
+    defined(KERNEL_inkling2_attn_mu_rel_f32) || defined(KERNEL_inkling2_attn_mu_split_rel_f32) || \
+    defined(KERNEL_inkling2_attn_mu_split_bk64_1_rel_f32)
+#if defined(KERNEL_inkling2_attn_mu_split) || defined(KERNEL_inkling2_attn_mu_split_rel_f32) || \
+    defined(KERNEL_inkling2_attn_mu_split_bk64_1_rel_f32)
+#define ATTN_MU_SPLIT
+#endif
+#if defined(KERNEL_inkling2_attn_mu_rel_f32) || defined(KERNEL_inkling2_attn_mu_split_rel_f32) || \
+    defined(KERNEL_inkling2_attn_mu_split_bk64_1_rel_f32)
+#define ATTN_MU_REL_F32
+#endif
+#ifdef KERNEL_inkling2_attn_mu_split_bk64_1_rel_f32
+#define ATTN_MU_BK64_1
+#endif
 #define AD 128u
 #define MatAh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
 #define MatBh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
 #define MatCf coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define BQ 16u
+#ifdef ATTN_MU_BK64_1
+#define BK 64u
+#else
 #define BK 128u
+#endif
 #define NB (AD / 64u) // 2 blocks of 16 head dims per subgroup
 #define H_LO(w) uint16BitsToHalf(uint16_t(w))
 #define H_HI(w) uint16BitsToHalf(uint16_t((w) >> 16))
 
-// Query tile in MAT_K64 order: 256 uvec4s (4 KB).
+// Query tile: row-major [16][16 uvec4] for BK64_1, MAT_K64 [256 uvec4] otherwise (4 KB).
 shared uvec4 q_tile[AD / 16u * 32u];
-// Scores, row-major, 4 keys per vec4 (8 KB).
+// Scores, row-major, 4 keys per vec4 (8 KB for BK=128, 4 KB for BK=64).
 shared vec4 s_tile[BQ * BK / 4u];
-// Probabilities in MAT_K64 P-operand layout (4 KB).
+// Probabilities in MAT_K64 P-operand layout (4 KB for BK=128, 2 KB for BK=64).
 shared f16vec4 p_tile[BQ * BK / 4u];
+#ifdef ATTN_MU_REL_F32
+// Fused rel_bias (D == 16, F32) clipped R vectors per tile row (1 KB).
+shared vec4 r_tile[BQ * 4u];
+#endif
+#ifdef ATTN_MU_BK64_1
+// Shared tile of rel_bias entries covering [d_base, d_max] (<= 80 entries * 16 floats = 5 KB).
+shared vec4 rb_tile[80u * 4u];
+#endif
 shared float row_max[BQ], row_sum[BQ], row_alpha[BQ];
 shared float q_factor[BQ], row_sink[BQ];
 
 void main() {
-    const uint H = arg_u32(8);
-    const uint kvh = arg_u32(9);
-    const uint pos0 = arg_u32(10);
-    const uint slots_n = arg_u32(11);
-    const uint is_swa = arg_u32(12);
-    const uint window = arg_u32(13);
-    const uint ext = arg_u32(14);
-    const uint m = arg_u32(15);
-    const uint has_gate = arg_u32(16);
-    const uint has_q_clip = arg_u32(17);
-    const float qk_clip = arg_f32(18);
-    const uint log_floor = arg_u32(19);
-    const float log_alpha = arg_f32(20);
+#ifdef ATTN_MU_SPLIT
+    const uint H = arg_u32(10);
+    const uint kvh = arg_u32(11);
+    const uint pos0 = arg_u32(12);
+    const uint slots_n = arg_u32(13);
+    const uint is_swa = arg_u32(14);
+    const uint window = arg_u32(15);
+    const uint ext = arg_u32(16);
+    const uint m = arg_u32(17);
+    const uint has_q_clip = arg_u32(18);
+    const float qk_clip = arg_f32(19);
+    const uint log_floor = arg_u32(20);
+    const float log_alpha = arg_f32(21);
+    const uint chunks = arg_u32(22);
+    const uint chunk_keys = arg_u32(23);
+    const float rel_clip_thr = arg_f32(25);
+    const uint64_t q_clip_addr = arg(6);
+    const uint64_t r_proj_addr = arg(7);
+    const uint64_t rel_bias_addr = arg(8);
+    const uint64_t rel_clip_addr = arg(9);
+    const uint chunk_id = gl_WorkGroupID.z;
+#else
+    const uint H = arg_u32(11);
+    const uint kvh = arg_u32(12);
+    const uint pos0 = arg_u32(13);
+    const uint slots_n = arg_u32(14);
+    const uint is_swa = arg_u32(15);
+    const uint window = arg_u32(16);
+    const uint ext = arg_u32(17);
+    const uint m = arg_u32(18);
+    const uint has_gate = arg_u32(19);
+    const uint has_q_clip = arg_u32(20);
+    const float qk_clip = arg_f32(21);
+    const uint log_floor = arg_u32(22);
+    const float log_alpha = arg_f32(23);
+    const float rel_clip_thr = arg_f32(25);
+    const uint out_bf16 = arg_u32(26);
+    const uint64_t q_clip_addr = arg(7);
+    const uint64_t r_proj_addr = arg(8);
+    const uint64_t rel_bias_addr = arg(9);
+    const uint64_t rel_clip_addr = arg(10);
+#endif
 
     const uint G = H / kvh;
     const uint kv = gl_WorkGroupID.y;
@@ -71,6 +131,80 @@ void main() {
 
     // Step 1: per-tile-row Q scaling factor (clip + tau + 1/sqrt(128)) and sink.
     // 8 threads per tile row (16 rows * 8 = 128 threads), each reads 16 floats.
+#ifdef ATTN_MU_BK64_1
+    // Fused Step 1 + Step 2: load Q & q_clip ONCE with coalesced F32x4 loads, apply
+    // clip/tau/scale in registers, and pack directly into row-major q_tile[16][16 uvec4]
+    // (eliminates 32 scalar global loads/thread + 1 full workgroup barrier!).
+    {
+        const uint qr = tid >> 3u;
+        const uint ql = tid & 7u;
+        const uint P = min(P0 + qr, rows - 1u);
+        const uint row = P / G, head = kv * G + P % G;
+        const uint64_t Q = arg(0) + 4u * ((uint64_t(row) * H + head) * AD + 16u * ql);
+        vec4 v0 = F32x4(Q).v[0];
+        vec4 v1 = F32x4(Q).v[1];
+        vec4 v2 = F32x4(Q).v[2];
+        vec4 v3 = F32x4(Q).v[3];
+        float factor = inversesqrt(128.0);
+        if (has_q_clip != 0u) {
+            const uint64_t QC = q_clip_addr + 4u * (uint64_t(head) * AD + 16u * ql);
+            v0 *= F32x4(QC).v[0];
+            v1 *= F32x4(QC).v[1];
+            v2 *= F32x4(QC).v[2];
+            v3 *= F32x4(QC).v[3];
+            float sq = (dot(v0, v0) + dot(v1, v1)) + (dot(v2, v2) + dot(v3, v3));
+            sq += subgroupShuffleXor(sq, 1u);
+            sq += subgroupShuffleXor(sq, 2u);
+            sq += subgroupShuffleXor(sq, 4u);
+            float cf = clamp(qk_clip / (sqrt(sq) + 1e-6), 0.0, 1.0);
+            if (log_alpha > 0.0 && log_floor > 0u) {
+                const float ratio = float(pos0 + row + 1u) / float(log_floor);
+                if (ratio > 1.0) cf *= (1.0 + log_alpha * log(ratio));
+            }
+            factor *= cf;
+        }
+        v0 *= factor;
+        v1 *= factor;
+        v2 *= factor;
+        v3 *= factor;
+        q_tile[qr * 16u + 2u * ql + 0u] = uvec4(
+            packHalf2x16(v0.xy), packHalf2x16(v0.zw),
+            packHalf2x16(v1.xy), packHalf2x16(v1.zw));
+        q_tile[qr * 16u + 2u * ql + 1u] = uvec4(
+            packHalf2x16(v2.xy), packHalf2x16(v2.zw),
+            packHalf2x16(v3.xy), packHalf2x16(v3.zw));
+        if (ql == 0u) {
+            row_sink[qr] = F32(arg(4)).v[row * H + head];
+        }
+        if (ql < 4u) {
+            const uint64_t R = r_proj_addr + 4u * ((uint64_t(row) * H + head) * 16u + 4u * ql);
+            vec4 rv = F32x4(R).v[0];
+            if (rel_clip_thr > 0.0) {
+                const uint64_t RC = rel_clip_addr + 4u * (uint64_t(head) * 16u + 4u * ql);
+                rv *= F32x4(RC).v[0];
+                float rsq = dot(rv, rv);
+                rsq += subgroupShuffleXor(rsq, 1u);
+                rsq += subgroupShuffleXor(rsq, 2u);
+                float rf = clamp(rel_clip_thr / (sqrt(rsq) + 1e-6), 0.0, 1.0);
+                if (log_alpha > 0.0 && log_floor > 0u) {
+                    const float ratio = float(pos0 + row + 1u) / float(log_floor);
+                    if (ratio > 1.0) rf *= (1.0 + log_alpha * log(ratio));
+                }
+                rv *= rf;
+            }
+            r_tile[qr * 4u + ql] = rv;
+        }
+    }
+    const uint first_pos = pos0 + P0 / G;
+    const uint last_pos = pos0 + (min(P0 + BQ, rows) - 1u) / G;
+    const uint k_lo_tile = (is_swa != 0u && first_pos + 1u > window) ? first_pos + 1u - window : 0u;
+    const uint k_end_tile = last_pos + 1u;
+    const uint base_k_raw = (is_swa != 0u && pos0 + 1u > window) ? pos0 + 1u - window : 0u;
+    const uint base_k = base_k_raw & ~(chunk_keys - 1u);
+    const uint k_lo = base_k + chunk_id * chunk_keys;
+    const uint k_end = min(k_lo + chunk_keys, k_end_tile);
+    barrier();
+#else
     {
         const uint qr = tid >> 3u;
         const uint ql = tid & 7u;
@@ -78,7 +212,7 @@ void main() {
         const uint row = P / G, head = kv * G + P % G;
         if (has_q_clip != 0u) {
             const uint64_t Q = arg(0) + 4u * ((uint64_t(row) * H + head) * AD + 16u * ql);
-            const uint64_t QC = arg(7) + 4u * (uint64_t(head) * AD + 16u * ql);
+            const uint64_t QC = q_clip_addr + 4u * (uint64_t(head) * AD + 16u * ql);
             float sq = 0.0;
             [[unroll]] for (uint j = 0u; j < 4u; j++) {
                 const vec4 v = F32x4(Q).v[j] * F32x4(QC).v[j];
@@ -100,11 +234,38 @@ void main() {
             q_factor[qr] = inversesqrt(128.0);
             row_sink[qr] = F32(arg(4)).v[row * H + head];
         }
+#ifdef ATTN_MU_REL_F32
+        // Fused R L2 clip + log-scale tau for D == 16 F32 rel_bias (zero extra barrier!).
+        if (ql < 4u) {
+            const uint64_t R = r_proj_addr + 4u * ((uint64_t(row) * H + head) * 16u + 4u * ql);
+            vec4 rv = F32x4(R).v[0];
+            if (rel_clip_thr > 0.0) {
+                const uint64_t RC = rel_clip_addr + 4u * (uint64_t(head) * 16u + 4u * ql);
+                rv *= F32x4(RC).v[0];
+                float rsq = dot(rv, rv);
+                rsq += subgroupShuffleXor(rsq, 1u);
+                rsq += subgroupShuffleXor(rsq, 2u);
+                float rf = clamp(rel_clip_thr / (sqrt(rsq) + 1e-6), 0.0, 1.0);
+                if (log_alpha > 0.0 && log_floor > 0u) {
+                    const float ratio = float(pos0 + row + 1u) / float(log_floor);
+                    if (ratio > 1.0) rf *= (1.0 + log_alpha * log(ratio));
+                }
+                rv *= rf;
+            }
+            r_tile[qr * 4u + ql] = rv;
+        }
+#endif
     }
     if (tid < BQ) {
+#ifdef ATTN_MU_SPLIT
+        // Combine kernel adds the implicit zero attention sink once across all chunks.
+        row_max[tid] = -1.0 / 0.0;
+        row_sum[tid] = 0.0;
+#else
         // Implicit zero attention sink at score 0.0!
         row_max[tid] = 0.0;
         row_sum[tid] = 1.0;
+#endif
     }
     barrier();
 
@@ -123,7 +284,7 @@ void main() {
             F32 q = F32(Q);
             vec4 v = vec4(q.v[d0], q.v[d0 + 8u], q.v[d0 + 16u], q.v[d0 + 24u]);
             if (has_q_clip != 0u) {
-                F32 qc = F32(arg(7) + 4u * uint64_t(head) * AD);
+                F32 qc = F32(q_clip_addr + 4u * uint64_t(head) * AD);
                 v *= vec4(qc.v[d0], qc.v[d0 + 8u], qc.v[d0 + 16u], qc.v[d0 + 24u]);
             }
             v *= q_factor[r0 + h];
@@ -134,9 +295,18 @@ void main() {
     }
     const uint first_pos = pos0 + P0 / G;
     const uint last_pos = pos0 + (min(P0 + BQ, rows) - 1u) / G;
-    const uint k_lo = (is_swa != 0u && first_pos + 1u > window) ? first_pos + 1u - window : 0u;
-    const uint k_end = last_pos + 1u;
+    const uint k_lo_tile = (is_swa != 0u && first_pos + 1u > window) ? first_pos + 1u - window : 0u;
+    const uint k_end_tile = last_pos + 1u;
+#ifdef ATTN_MU_SPLIT
+    const uint base_k = (is_swa != 0u && pos0 + 1u > window) ? pos0 + 1u - window : 0u;
+    const uint k_lo = max(base_k + chunk_id * chunk_keys, k_lo_tile);
+    const uint k_end = min(base_k + (chunk_id + 1u) * chunk_keys, k_end_tile);
+#else
+    const uint k_lo = k_lo_tile;
+    const uint k_end = k_end_tile;
+#endif
     barrier();
+#endif
 
     const uint lane_row = mat_lane_row(), lane_col = mat_lane_col();
     const uint p_at = lane_row * 4u + 2u * mat_a_half() + mat_a_odd();
@@ -144,10 +314,12 @@ void main() {
     U32x2 vc = U32x2(arg(2) + 2u * uint64_t(kv) * AD);
     const uint row8 = rstride / 8u;
 
+#ifndef ATTN_MU_BK64_1
     MatCf acc[NB];
     [[unroll]] for (uint i = 0u; i < NB; i++) acc[i] = MatCf(0.0);
+#endif
 
-    // Softmax thread assignment: 8 threads per tile row, 16 keys each.
+    // Softmax thread assignment: 8 threads per tile row, 16 keys each (8 keys for BK=64).
     const uint srow = tid >> 3u, sblk = tid & 7u;
     int s_pos, s_lo;
     uint64_t s_rel_row = arg(3);
@@ -164,79 +336,304 @@ void main() {
             s_lo = 0;
         }
     }
+    const int s_k_end = int(k_end);
 
-    for (uint k0 = k_lo; k0 < k_end; k0 += BK) {
+#ifdef ATTN_MU_BK64_1
+    // Single-tile Split-K (chunk_keys == BK == 64): no outer k0 loop, no alpha rescaling,
+    // globally 64-key aligned k0 for bit-exact decode(1) == verify(m) parity,
+    // and acc[NB] is declared AFTER softmax (-16 live GPRs across Q*K^T & softmax!).
+    if (k_lo < k_end && k_lo + BK > k_lo_tile) {
+        const uint k0 = k_lo;
         const uint slot0 = is_swa != 0u ? (k0 % slots_n) : k0;
-        // S = Q K^T for key blocks 2 sg, 2 sg + 1.
-        const uint kb = k0 + 32u * sg;
+        // BK = 64: each of the 4 subgroups computes ONE 16x16 key block (no sb loop),
+        // and all 128 threads cooperatively preload rel_bias[d_base..=d_max] into rb_tile
+        // before the existing barrier (13x fewer global rel_bias loads, 100% coalesced).
+        const int d_base = max(0, int(first_pos) - int(k0 + BK - 1u));
+        const int d_max = min(int(ext) - 1, int(last_pos) - int(k0));
+        const uint n_rb = d_max >= d_base ? uint(d_max - d_base + 1) : 0u;
+        for (uint idx = tid; idx < n_rb * 4u; idx += 128u) {
+            const uint dd = uint(d_base) + (idx >> 2u);
+            rb_tile[idx] = F32x4(rel_bias_addr + uint64_t(dd) * 64u).v[idx & 3u];
+        }
+        const uint kb = k0 + 16u * sg;
         if (kb < k_end) {
-            uint k_slots[8];
-            [[unroll]] for (uint j = 0u; j < 8u; j++) {
-                const uint off = 32u * sg + 16u * (j >> 2u) + lane_col + (j & 3u);
+            uint k_slots[4];
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {
+                const uint off = 16u * sg + lane_col + j;
                 uint slot = slot0 + min(off, k_end - 1u - k0);
                 if (is_swa != 0u && slot >= slots_n) slot -= slots_n;
                 k_slots[j] = slot;
             }
-            MatCf s0 = MatCf(0.0), s1 = MatCf(0.0);
+            MatCf s = MatCf(0.0);
             [[unroll]] for (uint g = 0u; g < AD / 64u; g++) {
                 const uint at = (64u * g) / 8u + (lane_row >> 1u);
-                uvec4 kw[8];
-                [[unroll]] for (uint j = 0u; j < 8u; j++) kw[j] = kc.v[k_slots[j] * row8 + at];
-                uvec4 qw[4];
-                [[unroll]] for (uint t = 0u; t < 4u; t++) qw[t] = q_tile[32u * (4u * g + t) + lane];
+                uvec4 kw[4];
+                [[unroll]] for (uint j = 0u; j < 4u; j++) kw[j] = kc.v[k_slots[j] * row8 + at];
+                const uint qa_base0 = lane_row * 16u + 8u * g + 4u * mat_a_half();
+                const uint qa_base1 = (lane_row + 1u) * 16u + 8u * g + 4u * mat_a_half();
+                const uint odd16 = 16u * mat_a_odd();
                 [[unroll]] for (uint t = 0u; t < 4u; t++) {
                     MatAh a;
                     MatBh b;
-                    a[0] = H_LO(qw[t][0]); a[1] = H_HI(qw[t][0]); a[2] = H_LO(qw[t][1]); a[3] = H_HI(qw[t][1]);
-                    a[4] = H_LO(qw[t][2]); a[5] = H_HI(qw[t][2]); a[6] = H_LO(qw[t][3]); a[7] = H_HI(qw[t][3]);
+                    a[0] = uint16BitsToHalf(uint16_t(q_tile[qa_base0 + 0u][t] >> odd16));
+                    a[1] = uint16BitsToHalf(uint16_t(q_tile[qa_base0 + 1u][t] >> odd16));
+                    a[2] = uint16BitsToHalf(uint16_t(q_tile[qa_base0 + 2u][t] >> odd16));
+                    a[3] = uint16BitsToHalf(uint16_t(q_tile[qa_base0 + 3u][t] >> odd16));
+                    a[4] = uint16BitsToHalf(uint16_t(q_tile[qa_base1 + 0u][t] >> odd16));
+                    a[5] = uint16BitsToHalf(uint16_t(q_tile[qa_base1 + 1u][t] >> odd16));
+                    a[6] = uint16BitsToHalf(uint16_t(q_tile[qa_base1 + 2u][t] >> odd16));
+                    a[7] = uint16BitsToHalf(uint16_t(q_tile[qa_base1 + 3u][t] >> odd16));
                     b[0] = H_LO(kw[0][t]); b[1] = H_LO(kw[1][t]); b[2] = H_LO(kw[2][t]); b[3] = H_LO(kw[3][t]);
                     b[4] = H_HI(kw[0][t]); b[5] = H_HI(kw[1][t]); b[6] = H_HI(kw[2][t]); b[7] = H_HI(kw[3][t]);
-                    s0 = coopMatMulAdd(a, b, s0);
-                    b[0] = H_LO(kw[4][t]); b[1] = H_LO(kw[5][t]); b[2] = H_LO(kw[6][t]); b[3] = H_LO(kw[7][t]);
-                    b[4] = H_HI(kw[4][t]); b[5] = H_HI(kw[5][t]); b[6] = H_HI(kw[6][t]); b[7] = H_HI(kw[7][t]);
-                    s1 = coopMatMulAdd(a, b, s1);
+                    s = coopMatMulAdd(a, b, s);
                 }
             }
-            coopMatStore(s0, s_tile, 8u * sg, BK / 4u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatStore(s1, s_tile, 8u * sg + 4u, BK / 4u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatStore(s, s_tile, 4u * sg, BK / 4u, gl_CooperativeMatrixLayoutRowMajor);
         }
         barrier();
 
-        // Online softmax with relative-position bias, learned sink, and implicit zero sink.
+        // In-register online softmax (8 keys = 2 vec4s per thread, zero s_tile writeback!).
         {
-            const float prev = row_max[srow];
-            const int kfirst = int(k0 + 16u * sblk);
-            vec4 sv[4];
-            [[unroll]] for (uint j = 0u; j < 4u; j++) sv[j] = s_tile[srow * (BK / 4u) + 4u * sblk + j];
-            float adj[16];
-            float mx = prev;
-            [[unroll]] for (uint j = 0u; j < 16u; j++) {
-                const int kp = kfirst + int(j);
-                if (kp >= s_lo && kp <= s_pos) {
+            float mx = -1.0 / 0.0;
+            const int kfirst = int(k0 + 8u * sblk);
+            const uint s_base = srow * (BK / 4u) + 2u * sblk;
+            const vec4 rr0 = r_tile[srow * 4u + 0u];
+            const vec4 rr1 = r_tile[srow * 4u + 1u];
+            const vec4 rr2 = r_tile[srow * 4u + 2u];
+            const vec4 rr3 = r_tile[srow * 4u + 3u];
+            const vec4 sv0 = s_tile[s_base + 0u];
+            const vec4 sv1 = s_tile[s_base + 1u];
+            vec4 e0 = vec4(-1.0 / 0.0);
+            vec4 e1 = vec4(-1.0 / 0.0);
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                const int kp = kfirst + int(c);
+                if (kp >= s_lo && kp <= s_pos && kp < s_k_end) {
                     const uint dist = uint(s_pos - kp);
-                    const float rb = dist < ext ? F32(s_rel_row).v[dist] : 0.0;
-                    const float sc = sv[j / 4u][j % 4u] + rb - s_sink;
-                    adj[j] = sc;
+                    float rb = 0.0;
+                    if (dist < ext) {
+                        const uint rbi = (dist - uint(d_base)) * 4u;
+                        rb = (dot(rr0, rb_tile[rbi + 0u]) + dot(rr1, rb_tile[rbi + 1u]))
+                           + (dot(rr2, rb_tile[rbi + 2u]) + dot(rr3, rb_tile[rbi + 3u]));
+                    }
+                    const float sc = sv0[c] + rb - s_sink;
+                    e0[c] = sc;
                     mx = max(mx, sc);
-                } else {
-                    adj[j] = 0.0;
+                }
+            }
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                const int kp = kfirst + 4 + int(c);
+                if (kp >= s_lo && kp <= s_pos && kp < s_k_end) {
+                    const uint dist = uint(s_pos - kp);
+                    float rb = 0.0;
+                    if (dist < ext) {
+                        const uint rbi = (dist - uint(d_base)) * 4u;
+                        rb = (dot(rr0, rb_tile[rbi + 0u]) + dot(rr1, rb_tile[rbi + 1u]))
+                           + (dot(rr2, rb_tile[rbi + 2u]) + dot(rr3, rb_tile[rbi + 3u]));
+                    }
+                    const float sc = sv1[c] + rb - s_sink;
+                    e1[c] = sc;
+                    mx = max(mx, sc);
                 }
             }
             [[unroll]] for (uint off = 1u; off < 8u; off <<= 1u) mx = max(mx, subgroupShuffleXor(mx, off));
-            float p[16];
-            float psum = 0.0;
-            [[unroll]] for (uint j = 0u; j < 16u; j++) {
-                const int kp = kfirst + int(j);
-                p[j] = (kp >= s_lo && kp <= s_pos) ? exp(adj[j] - mx) : 0.0;
-                psum += p[j];
-            }
-            [[unroll]] for (uint j = 0u; j < 4u; j++) {
-                const uint c = 8u * (j / 2u) + (j % 2u);
-                p_tile[(16u * sblk + srow) * 4u + j] = f16vec4(vec4(p[c], p[c + 2u], p[c + 4u], p[c + 6u]));
-            }
+            const vec4 p0 = vec4(
+                e0.x != -1.0 / 0.0 ? exp(e0.x - mx) : 0.0,
+                e0.y != -1.0 / 0.0 ? exp(e0.y - mx) : 0.0,
+                e0.z != -1.0 / 0.0 ? exp(e0.z - mx) : 0.0,
+                e0.w != -1.0 / 0.0 ? exp(e0.w - mx) : 0.0
+            );
+            const vec4 p1 = vec4(
+                e1.x != -1.0 / 0.0 ? exp(e1.x - mx) : 0.0,
+                e1.y != -1.0 / 0.0 ? exp(e1.y - mx) : 0.0,
+                e1.z != -1.0 / 0.0 ? exp(e1.z - mx) : 0.0,
+                e1.w != -1.0 / 0.0 ? exp(e1.w - mx) : 0.0
+            );
+            const vec4 ps4 = p0 + p1;
+            float psum = (ps4.x + ps4.y) + (ps4.z + ps4.w);
+            const uint pb = sblk >> 1u;
+            const uint ph = sblk & 1u;
+            p_tile[(16u * pb + srow) * 4u + 2u * ph + 0u] = f16vec4(vec4(p0.x, p0.z, p1.x, p1.z));
+            p_tile[(16u * pb + srow) * 4u + 2u * ph + 1u] = f16vec4(vec4(p0.y, p0.w, p1.y, p1.w));
             [[unroll]] for (uint off = 1u; off < 8u; off <<= 1u) psum += subgroupShuffleXor(psum, off);
             if (sblk == 0u) {
-                const float alpha = exp(prev - mx);
+                row_sum[srow] = psum;
+                row_max[srow] = mx;
+            }
+        }
+        barrier();
+
+        // acc = P V over the single 64-key tile.
+        MatCf acc[NB];
+        [[unroll]] for (uint i = 0u; i < NB; i++) acc[i] = MatCf(0.0);
+        const uint dcol = (AD / 4u) * sg + lane_col;
+        for (uint b = 0u; b < BK / 16u; b++) {
+            const uint key0 = 16u * b;
+            if (k0 + key0 >= k_end) break;
+            uint va[2];
+            [[unroll]] for (uint h = 0u; h < 2u; h++) {
+                uint slot = slot0 + min(key0 + lane_row + h, k_end - 1u - k0);
+                if (is_swa != 0u && slot >= slots_n) slot -= slots_n;
+                va[h] = (slot * rstride + dcol) / 4u;
+            }
+            uvec2 vw[NB][2];
+            [[unroll]] for (uint i = 0u; i < NB; i++) {
+                vw[i][0] = vc.v[va[0] + 4u * i];
+                vw[i][1] = vc.v[va[1] + 4u * i];
+            }
+            const f16vec4 pe0 = p_tile[p_at + 64u * b], pe1 = p_tile[p_at + 64u * b + 4u];
+            MatAh pa;
+            pa[0] = pe0[0]; pa[1] = pe0[1]; pa[2] = pe0[2]; pa[3] = pe0[3];
+            pa[4] = pe1[0]; pa[5] = pe1[1]; pa[6] = pe1[2]; pa[7] = pe1[3];
+            [[unroll]] for (uint i = 0u; i < NB; i++) {
+                MatBh vb;
+                vb[0] = H_LO(vw[i][0].x); vb[1] = H_HI(vw[i][0].x); vb[2] = H_LO(vw[i][0].y); vb[3] = H_HI(vw[i][0].y);
+                vb[4] = H_LO(vw[i][1].x); vb[5] = H_HI(vw[i][1].x); vb[6] = H_LO(vw[i][1].y); vb[7] = H_HI(vw[i][1].y);
+                acc[i] = coopMatMulAdd(pa, vb, acc[i]);
+            }
+        }
+        // Store partial [m, H, chunks, 130] directly while acc[NB] is in scope.
+        [[unroll]] for (uint h = 0u; h < 2u; h++) {
+            const uint r = lane_row + h, P = P0 + r;
+            if (P >= rows) continue;
+            const uint row = P / G, head = kv * G + P % G;
+            const uint64_t Pptr = arg(5) + 4u * (((uint64_t(row) * uint64_t(H) + uint64_t(head)) * uint64_t(chunks) + uint64_t(chunk_id)) * 130u);
+            const float rm = row_max[r];
+            if (rm == -1.0 / 0.0) {
+                if (sg == 0u && lane_col == 0u) {
+                    F32(Pptr).v[0] = -1.0 / 0.0;
+                    F32(Pptr).v[1] = 0.0;
+                }
+            } else {
+                if (sg == 0u && lane_col == 0u) {
+                    F32(Pptr).v[0] = rm;
+                    F32(Pptr).v[1] = row_sum[r];
+                }
+                F32x4 Pacc = F32x4(Pptr + 8u);
+                [[unroll]] for (uint i = 0u; i < NB; i++) {
+                    const uint d = (AD / 4u) * sg + 16u * i + lane_col;
+                    Pacc.v[d / 4u] = vec4(acc[i][4u * h], acc[i][4u * h + 1u], acc[i][4u * h + 2u], acc[i][4u * h + 3u]);
+                }
+            }
+        }
+    } else if (sg == 0u && lane_col == 0u) {
+        [[unroll]] for (uint h = 0u; h < 2u; h++) {
+            const uint r = lane_row + h, P = P0 + r;
+            if (P >= rows) continue;
+            const uint row = P / G, head = kv * G + P % G;
+            const uint64_t Pptr = arg(5) + 4u * (((uint64_t(row) * uint64_t(H) + uint64_t(head)) * uint64_t(chunks) + uint64_t(chunk_id)) * 130u);
+            F32(Pptr).v[0] = -1.0 / 0.0;
+            F32(Pptr).v[1] = 0.0;
+        }
+    }
+#else
+    for (uint k0 = k_lo; k0 < k_end; k0 += BK) {
+        const uint slot0 = is_swa != 0u ? (k0 % slots_n) : k0;
+        // S = Q K^T for key blocks 2 sg, 2 sg + 1 (sequential s0 then s1 to cut GPRs!).
+        const uint kb = k0 + 32u * sg;
+        if (kb < k_end) {
+            [[dont_unroll]] for (uint sb = 0u; sb < 2u; sb++) {
+                uint k_slots[4];
+                [[unroll]] for (uint j = 0u; j < 4u; j++) {
+                    const uint off = 32u * sg + 16u * sb + lane_col + j;
+                    uint slot = slot0 + min(off, k_end - 1u - k0);
+                    if (is_swa != 0u && slot >= slots_n) slot -= slots_n;
+                    k_slots[j] = slot;
+                }
+                MatCf s = MatCf(0.0);
+                [[unroll]] for (uint g = 0u; g < AD / 64u; g++) {
+                    const uint at = (64u * g) / 8u + (lane_row >> 1u);
+                    uvec4 kw[4];
+                    [[unroll]] for (uint j = 0u; j < 4u; j++) kw[j] = kc.v[k_slots[j] * row8 + at];
+                    [[unroll]] for (uint t = 0u; t < 4u; t++) {
+                        const uvec4 q = q_tile[32u * (4u * g + t) + lane];
+                        MatAh a;
+                        MatBh b;
+                        a[0] = H_LO(q[0]); a[1] = H_HI(q[0]); a[2] = H_LO(q[1]); a[3] = H_HI(q[1]);
+                        a[4] = H_LO(q[2]); a[5] = H_HI(q[2]); a[6] = H_LO(q[3]); a[7] = H_HI(q[3]);
+                        b[0] = H_LO(kw[0][t]); b[1] = H_LO(kw[1][t]); b[2] = H_LO(kw[2][t]); b[3] = H_LO(kw[3][t]);
+                        b[4] = H_HI(kw[0][t]); b[5] = H_HI(kw[1][t]); b[6] = H_HI(kw[2][t]); b[7] = H_HI(kw[3][t]);
+                        s = coopMatMulAdd(a, b, s);
+                    }
+                }
+                coopMatStore(s, s_tile, 8u * sg + 4u * sb, BK / 4u, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        barrier();
+
+        // Online softmax with in-place s_tile staging (eliminates float adj[16] & rr0..rr3
+        // live registers while acc[NB] is live, lifting AGX3 occupancy from 384 -> 640+ threads!).
+        {
+            const float prev = row_max[srow];
+            float mx = prev;
+            const int kfirst = int(k0 + 16u * sblk);
+            const uint s_base = srow * (BK / 4u) + 4u * sblk;
+            [[unroll]] for (uint j4 = 0u; j4 < 4u; j4++) {
+                const vec4 sv = s_tile[s_base + j4];
+                vec4 out_sc = vec4(-1.0 / 0.0);
+                [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                    const uint j = 4u * j4 + c;
+                    const int kp = kfirst + int(j);
+                    if (kp >= s_lo && kp <= s_pos && kp < s_k_end) {
+                        const uint dist = uint(s_pos - kp);
+                        float rb = 0.0;
+                        if (dist < ext) {
+#ifdef ATTN_MU_REL_F32
+                            const uint64_t ba = rel_bias_addr + uint64_t(dist) * 64u;
+                            rb = dot(r_tile[srow * 4u + 0u], F32x4(ba).v[0])
+                               + dot(r_tile[srow * 4u + 1u], F32x4(ba + 16u).v[0])
+                               + dot(r_tile[srow * 4u + 2u], F32x4(ba + 32u).v[0])
+                               + dot(r_tile[srow * 4u + 3u], F32x4(ba + 48u).v[0]);
+#else
+                            rb = F32(s_rel_row).v[dist];
+#endif
+                        }
+                        const float sc = sv[c] + rb - s_sink;
+                        out_sc[c] = sc;
+                        mx = max(mx, sc);
+                    }
+                }
+                s_tile[s_base + j4] = out_sc;
+            }
+            [[unroll]] for (uint off = 1u; off < 8u; off <<= 1u) mx = max(mx, subgroupShuffleXor(mx, off));
+            const vec4 e0 = s_tile[s_base + 0u];
+            const vec4 e1 = s_tile[s_base + 1u];
+            const vec4 e2 = s_tile[s_base + 2u];
+            const vec4 e3 = s_tile[s_base + 3u];
+            const vec4 p0 = vec4(
+                e0.x != -1.0 / 0.0 ? exp(e0.x - mx) : 0.0,
+                e0.y != -1.0 / 0.0 ? exp(e0.y - mx) : 0.0,
+                e0.z != -1.0 / 0.0 ? exp(e0.z - mx) : 0.0,
+                e0.w != -1.0 / 0.0 ? exp(e0.w - mx) : 0.0
+            );
+            const vec4 p1 = vec4(
+                e1.x != -1.0 / 0.0 ? exp(e1.x - mx) : 0.0,
+                e1.y != -1.0 / 0.0 ? exp(e1.y - mx) : 0.0,
+                e1.z != -1.0 / 0.0 ? exp(e1.z - mx) : 0.0,
+                e1.w != -1.0 / 0.0 ? exp(e1.w - mx) : 0.0
+            );
+            const vec4 p2 = vec4(
+                e2.x != -1.0 / 0.0 ? exp(e2.x - mx) : 0.0,
+                e2.y != -1.0 / 0.0 ? exp(e2.y - mx) : 0.0,
+                e2.z != -1.0 / 0.0 ? exp(e2.z - mx) : 0.0,
+                e2.w != -1.0 / 0.0 ? exp(e2.w - mx) : 0.0
+            );
+            const vec4 p3 = vec4(
+                e3.x != -1.0 / 0.0 ? exp(e3.x - mx) : 0.0,
+                e3.y != -1.0 / 0.0 ? exp(e3.y - mx) : 0.0,
+                e3.z != -1.0 / 0.0 ? exp(e3.z - mx) : 0.0,
+                e3.w != -1.0 / 0.0 ? exp(e3.w - mx) : 0.0
+            );
+            const vec4 ps4 = (p0 + p1) + (p2 + p3);
+            float psum = (ps4.x + ps4.y) + (ps4.z + ps4.w);
+            p_tile[(16u * sblk + srow) * 4u + 0u] = f16vec4(vec4(p0.x, p0.z, p1.x, p1.z));
+            p_tile[(16u * sblk + srow) * 4u + 1u] = f16vec4(vec4(p0.y, p0.w, p1.y, p1.w));
+            p_tile[(16u * sblk + srow) * 4u + 2u] = f16vec4(vec4(p2.x, p2.z, p3.x, p3.z));
+            p_tile[(16u * sblk + srow) * 4u + 3u] = f16vec4(vec4(p2.y, p2.w, p3.y, p3.w));
+            [[unroll]] for (uint off = 1u; off < 8u; off <<= 1u) psum += subgroupShuffleXor(psum, off);
+            if (sblk == 0u) {
+                const float alpha = (prev == -1.0 / 0.0 || mx == -1.0 / 0.0)
+                    ? 0.0
+                    : (mx == prev ? 1.0 : exp(prev - mx));
                 row_sum[srow] = row_sum[srow] * alpha + psum;
                 row_max[srow] = mx;
                 row_alpha[srow] = alpha;
@@ -279,8 +676,34 @@ void main() {
             }
         }
     }
-    barrier();
+#endif
 
+#if defined(ATTN_MU_SPLIT) && !defined(ATTN_MU_BK64_1)
+    // Store partial [m, H, chunks, 130] for `inkling2_attn_combine`.
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {
+        const uint r = lane_row + h, P = P0 + r;
+        if (P >= rows) continue;
+        const uint row = P / G, head = kv * G + P % G;
+        const uint64_t Pptr = arg(5) + 4u * (((uint64_t(row) * uint64_t(H) + uint64_t(head)) * uint64_t(chunks) + uint64_t(chunk_id)) * 130u);
+        const float rm = row_max[r];
+        if (rm == -1.0 / 0.0) {
+            if (sg == 0u && lane_col == 0u) {
+                F32(Pptr).v[0] = -1.0 / 0.0;
+                F32(Pptr).v[1] = 0.0;
+            }
+        } else {
+            if (sg == 0u && lane_col == 0u) {
+                F32(Pptr).v[0] = rm;
+                F32(Pptr).v[1] = row_sum[r];
+            }
+            F32x4 Pacc = F32x4(Pptr + 8u);
+            [[unroll]] for (uint i = 0u; i < NB; i++) {
+                const uint d = (AD / 4u) * sg + 16u * i + lane_col;
+                Pacc.v[d / 4u] = vec4(acc[i][4u * h], acc[i][4u * h + 1u], acc[i][4u * h + 2u], acc[i][4u * h + 3u]);
+            }
+        }
+    }
+#elif !defined(ATTN_MU_SPLIT)
     // Store output with optional fused sigmoid(gate).
     [[unroll]] for (uint h = 0u; h < 2u; h++) {
         const uint r = lane_row + h, P = P0 + r;
@@ -289,6 +712,7 @@ void main() {
         const uint row = P / G, head = kv * G + P % G;
         const uint64_t off = 4u * ((uint64_t(row) * H + head) * AD);
         F32x4 O = F32x4(arg(5) + off);
+        U32x2 Ob = U32x2(arg(5) + (off >> 1u));
         [[unroll]] for (uint i = 0u; i < NB; i++) {
             const uint d = (AD / 4u) * sg + 16u * i + lane_col;
             vec4 res = vec4(acc[i][4u * h], acc[i][4u * h + 1u], acc[i][4u * h + 2u], acc[i][4u * h + 3u]) * inv;
@@ -296,8 +720,10 @@ void main() {
                 const vec4 gv = F32x4(arg(6) + off).v[d / 4u];
                 res = res / (vec4(1.0) + exp(-gv));
             }
-            O.v[d / 4u] = res;
+            if (out_bf16 != 0u) Ob.v[d / 4u] = mat_bf16_words(res);
+            else O.v[d / 4u] = res;
         }
     }
+#endif
 }
 #endif

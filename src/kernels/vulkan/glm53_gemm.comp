@@ -28,6 +28,9 @@
     defined(KERNEL_glm53_gemm_iq4_xs)
 #define GLM53_INKLING_TYPES
 #endif
+#if defined(KERNEL_glm53_cmat_q4_0_n16_sk8_f16)
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 #define GLM53_NO_IQ2_XXS_DOT
 #include "common.glsl"
 #include "glm53_quant.glsl"
@@ -904,5 +907,542 @@ void main() {
     for (uint s = 0u; s < used; s++) acc += F32(arg(0) + 4u * (uint64_t(i * used + s) * H)).v[r];
     const uint64_t at = uint64_t(i) * H + r;
     F32(arg(2) + 4u * at).v[0] = acc + F32(arg(1) + 4u * at).v[0];
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Direct-load MAT_K64 cooperative-matrix BF16 GEMV/small-batch GEMM (M <= 16,
+// K % 64 == 0, 1..=8 weight sets across up to 3 F32 X inputs) with optional
+// workgroup Split-K (`CMAT_SK = 1, 2, 4, 8`) for full GPU occupancy.
+// Bit-exact across M in 1..=16.
+// Grid: (sum_s ceil(N_s / (16 * CMAT_NB)), 1, 1), 32 * CMAT_SK threads.
+// Buffers: 0..2 X0..X2 (F32 [M, K]), 3..10 W0..W7 (BF16 [N_s, K]),
+//          11..18 Y0..Y7 (F32 [M, N_s]).
+// Params: 19 K, 20 M, 21 x_mask (2 bits/set), 22..29 N0..N7.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_glm53_cmat_bf16_n16_sk8)
+#define CMAT_NB 1
+#define CMAT_SK 8
+#define CMAT_SG_N 1
+#elif defined(KERNEL_glm53_cmat_bf16_n16_sk4)
+#define CMAT_NB 1
+#define CMAT_SK 4
+#define CMAT_SG_N 1
+#elif defined(KERNEL_glm53_cmat_bf16_n32_sg4)
+#define CMAT_NB 2
+#define CMAT_SK 1
+#define CMAT_SG_N 4
+#elif defined(KERNEL_glm53_cmat_bf16_n64_sk2)
+#define CMAT_NB 4
+#define CMAT_SK 2
+#define CMAT_SG_N 1
+#elif defined(KERNEL_glm53_cmat_bf16_bx_n16_sk8)
+#define CMAT_NB 1
+#define CMAT_SK 8
+#define CMAT_SG_N 1
+#define CMAT_BX
+#elif defined(KERNEL_glm53_cmat_bf16_bx_n16_sk4)
+#define CMAT_NB 1
+#define CMAT_SK 4
+#define CMAT_SG_N 1
+#define CMAT_BX
+#elif defined(KERNEL_glm53_cmat_bf16_bx_n64_sk2)
+#define CMAT_NB 4
+#define CMAT_SK 2
+#define CMAT_SG_N 1
+#define CMAT_BX
+#elif defined(KERNEL_glm53_cmat_bf16_bx_n32_sg4)
+#define CMAT_NB 2
+#define CMAT_SK 1
+#define CMAT_SG_N 4
+#define CMAT_BX
+#endif
+
+#ifdef CMAT_NB
+#define CMAT_ROWS (16u * uint(CMAT_NB))
+#define CMAT_WG_ROWS (CMAT_ROWS * uint(CMAT_SG_N))
+
+#if CMAT_SK > 1
+shared float cmat_red[CMAT_SK][16][CMAT_ROWS];
+#endif
+
+// Branchless F32->BF16 (round-to-nearest-even, finite inputs — avoids common.glsl's NaN branch).
+bfloat16_t cmat_f2bf(float f) {
+    return uintBitsToBFloat16EXT(uint16_t(glm53_bf16_bits(f)));
+}
+
+#define CMAT_B_LOAD(bb, at)                                                                   \
+    uvec4 w##bb##0 = bw.v[at(bb, 0u)], w##bb##1 = bw.v[at(bb, 1u)],                           \
+          w##bb##2 = bw.v[at(bb, 2u)], w##bb##3 = bw.v[at(bb, 3u)];
+
+#define CMAT_B_STEP(bb, t)                                                                    \
+    MAT_K64_B(mb, t, w##bb##0, w##bb##1, w##bb##2, w##bb##3)                                  \
+    acc##bb = coopMatMulAdd(ma##t, mb, acc##bb);
+
+#define CMAT_B_BLOCK(bb)                                                                      \
+    CMAT_B_STEP(bb, 0) CMAT_B_STEP(bb, 1) CMAT_B_STEP(bb, 2) CMAT_B_STEP(bb, 3)
+
+#define CMAT_B_INSIDE(bb, j) (b_at + g + (16u * (bb) + (j)) * K8)
+#define CMAT_B_CLAMPED(bb, j) (min(b_col + (16u * (bb) + (j)), N - 1u) * K8 + b_vec + g)
+
+#ifdef CMAT_BX
+// Pre-converted BF16 activation input: zero `cmat_f2bf` ALU, half the X loads,
+// and `r0 == r1` skip halves X loads for M <= 6 (75% of lanes clamp to M - 1)!
+#define CMAT_LOAD_A(g)                                                                        \
+    MatA ma0, ma1, ma2, ma3;                                                                  \
+    {                                                                                         \
+        const uvec4 v00 = xa_b.v[a0_base + (g) + 0u], v01 = xa_b.v[a0_base + (g) + 1u];       \
+        const uvec4 v02 = xa_b.v[a0_base + (g) + 2u], v03 = xa_b.v[a0_base + (g) + 3u];       \
+        if (r0 == r1) {                                                                       \
+            MAT_K64_A(ma0, ma1, ma2, ma3, v00, v01, v02, v03, v00, v01, v02, v03, odd16)      \
+        } else {                                                                              \
+            const uvec4 v10 = xa_b.v[a1_base + (g) + 0u], v11 = xa_b.v[a1_base + (g) + 1u];   \
+            const uvec4 v12 = xa_b.v[a1_base + (g) + 2u], v13 = xa_b.v[a1_base + (g) + 3u];   \
+            MAT_K64_A(ma0, ma1, ma2, ma3, v00, v01, v02, v03, v10, v11, v12, v13, odd16)      \
+        }                                                                                     \
+    }
+
+#if CMAT_NB == 1
+#define CMAT_GROUP(at)                                                                        \
+    {                                                                                         \
+        CMAT_B_LOAD(0, at)                                                                    \
+        CMAT_LOAD_A(g)                                                                        \
+        MatB mb;                                                                              \
+        CMAT_B_BLOCK(0)                                                                       \
+    }
+#elif CMAT_NB == 2
+#define CMAT_GROUP(at)                                                                        \
+    {                                                                                         \
+        CMAT_B_LOAD(0, at)                                                                    \
+        CMAT_LOAD_A(g)                                                                        \
+        MatB mb;                                                                              \
+        CMAT_B_LOAD(1, at) CMAT_B_BLOCK(0)                                                    \
+        CMAT_B_BLOCK(1)                                                                       \
+    }
+#else
+#define CMAT_GROUP(at)                                                                        \
+    {                                                                                         \
+        CMAT_B_LOAD(0, at)                                                                    \
+        CMAT_LOAD_A(g)                                                                        \
+        MatB mb;                                                                              \
+        CMAT_B_LOAD(1, at) CMAT_B_BLOCK(0)                                                    \
+        CMAT_B_LOAD(2, at) CMAT_B_BLOCK(1)                                                    \
+        CMAT_B_LOAD(3, at) CMAT_B_BLOCK(2)                                                    \
+        CMAT_B_BLOCK(3)                                                                       \
+    }
+#endif
+#else
+#define CMAT_LOAD_A(g4)                                                                       \
+    MatA ma0, ma1, ma2, ma3;                                                                  \
+    {                                                                                         \
+        const vec4 f00 = xa.v[a0_base + (g4) + 0u], f01 = xa.v[a0_base + (g4) + 1u];          \
+        const vec4 f02 = xa.v[a0_base + (g4) + 2u], f03 = xa.v[a0_base + (g4) + 3u];          \
+        const vec4 f04 = xa.v[a0_base + (g4) + 4u], f05 = xa.v[a0_base + (g4) + 5u];          \
+        const vec4 f06 = xa.v[a0_base + (g4) + 6u], f07 = xa.v[a0_base + (g4) + 7u];          \
+        const vec2 p00 = a_odd != 0u ? f00.yw : f00.xz;                                       \
+        const vec2 p01 = a_odd != 0u ? f01.yw : f01.xz;                                       \
+        const vec2 p02 = a_odd != 0u ? f02.yw : f02.xz;                                       \
+        const vec2 p03 = a_odd != 0u ? f03.yw : f03.xz;                                       \
+        const vec2 p04 = a_odd != 0u ? f04.yw : f04.xz;                                       \
+        const vec2 p05 = a_odd != 0u ? f05.yw : f05.xz;                                       \
+        const vec2 p06 = a_odd != 0u ? f06.yw : f06.xz;                                       \
+        const vec2 p07 = a_odd != 0u ? f07.yw : f07.xz;                                       \
+        ma0[0] = cmat_f2bf(p00.x); ma1[0] = cmat_f2bf(p00.y);                                 \
+        ma2[0] = cmat_f2bf(p01.x); ma3[0] = cmat_f2bf(p01.y);                                 \
+        ma0[1] = cmat_f2bf(p02.x); ma1[1] = cmat_f2bf(p02.y);                                 \
+        ma2[1] = cmat_f2bf(p03.x); ma3[1] = cmat_f2bf(p03.y);                                 \
+        ma0[2] = cmat_f2bf(p04.x); ma1[2] = cmat_f2bf(p04.y);                                 \
+        ma2[2] = cmat_f2bf(p05.x); ma3[2] = cmat_f2bf(p05.y);                                 \
+        ma0[3] = cmat_f2bf(p06.x); ma1[3] = cmat_f2bf(p06.y);                                 \
+        ma2[3] = cmat_f2bf(p07.x); ma3[3] = cmat_f2bf(p07.y);                                 \
+        if (r0 == r1) {                                                                       \
+            ma0[4] = ma0[0]; ma1[4] = ma1[0]; ma2[4] = ma2[0]; ma3[4] = ma3[0];               \
+            ma0[5] = ma0[1]; ma1[5] = ma1[1]; ma2[5] = ma2[1]; ma3[5] = ma3[1];               \
+            ma0[6] = ma0[2]; ma1[6] = ma1[2]; ma2[6] = ma2[2]; ma3[6] = ma3[2];               \
+            ma0[7] = ma0[3]; ma1[7] = ma1[3]; ma2[7] = ma2[3]; ma3[7] = ma3[3];               \
+        } else {                                                                              \
+            const vec4 f10 = xa.v[a1_base + (g4) + 0u], f11 = xa.v[a1_base + (g4) + 1u];      \
+            const vec4 f12 = xa.v[a1_base + (g4) + 2u], f13 = xa.v[a1_base + (g4) + 3u];      \
+            const vec4 f14 = xa.v[a1_base + (g4) + 4u], f15 = xa.v[a1_base + (g4) + 5u];      \
+            const vec4 f16 = xa.v[a1_base + (g4) + 6u], f17 = xa.v[a1_base + (g4) + 7u];      \
+            const vec2 p10 = a_odd != 0u ? f10.yw : f10.xz;                                   \
+            const vec2 p11 = a_odd != 0u ? f11.yw : f11.xz;                                   \
+            const vec2 p12 = a_odd != 0u ? f12.yw : f12.xz;                                   \
+            const vec2 p13 = a_odd != 0u ? f13.yw : f13.xz;                                   \
+            const vec2 p14 = a_odd != 0u ? f14.yw : f14.xz;                                   \
+            const vec2 p15 = a_odd != 0u ? f15.yw : f15.xz;                                   \
+            const vec2 p16 = a_odd != 0u ? f16.yw : f16.xz;                                   \
+            const vec2 p17 = a_odd != 0u ? f17.yw : f17.xz;                                   \
+            ma0[4] = cmat_f2bf(p10.x); ma1[4] = cmat_f2bf(p10.y);                             \
+            ma2[4] = cmat_f2bf(p11.x); ma3[4] = cmat_f2bf(p11.y);                             \
+            ma0[5] = cmat_f2bf(p12.x); ma1[5] = cmat_f2bf(p12.y);                             \
+            ma2[5] = cmat_f2bf(p13.x); ma3[5] = cmat_f2bf(p13.y);                             \
+            ma0[6] = cmat_f2bf(p14.x); ma1[6] = cmat_f2bf(p14.y);                             \
+            ma2[6] = cmat_f2bf(p15.x); ma3[6] = cmat_f2bf(p15.y);                             \
+            ma0[7] = cmat_f2bf(p16.x); ma1[7] = cmat_f2bf(p16.y);                             \
+            ma2[7] = cmat_f2bf(p17.x); ma3[7] = cmat_f2bf(p17.y);                             \
+        }                                                                                     \
+    }
+
+#if CMAT_NB == 1
+#define CMAT_GROUP(at)                                                                        \
+    {                                                                                         \
+        CMAT_LOAD_A(g * 2u)                                                                   \
+        CMAT_B_LOAD(0, at)                                                                    \
+        MatB mb;                                                                              \
+        CMAT_B_BLOCK(0)                                                                       \
+    }
+#elif CMAT_NB == 2
+#define CMAT_GROUP(at)                                                                        \
+    {                                                                                         \
+        CMAT_LOAD_A(g * 2u)                                                                   \
+        CMAT_B_LOAD(0, at)                                                                    \
+        MatB mb;                                                                              \
+        CMAT_B_LOAD(1, at) CMAT_B_BLOCK(0)                                                    \
+        CMAT_B_BLOCK(1)                                                                       \
+    }
+#else
+#define CMAT_GROUP(at)                                                                        \
+    {                                                                                         \
+        CMAT_LOAD_A(g * 2u)                                                                   \
+        CMAT_B_LOAD(0, at)                                                                    \
+        MatB mb;                                                                              \
+        CMAT_B_LOAD(1, at) CMAT_B_BLOCK(0)                                                    \
+        CMAT_B_LOAD(2, at) CMAT_B_BLOCK(1)                                                    \
+        CMAT_B_LOAD(3, at) CMAT_B_BLOCK(2)                                                    \
+        CMAT_B_BLOCK(3)                                                                       \
+    }
+#endif
+#endif
+
+#if CMAT_SK == 1
+#define CMAT_STORE(acc, bb)                                                                   \
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {                                               \
+        const uint row = lane_row + h;                                                        \
+        const uint col = col0 + 16u * (bb) + lane_col;                                        \
+        if (row < M && col < N) {                                                             \
+            const uint64_t y_row = Y_addr + 4u * uint64_t(row) * uint64_t(N);                 \
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {                                       \
+                if (col + j < N) F32(y_row).v[col + j] = acc[4u * h + j];                     \
+            }                                                                                 \
+        }                                                                                     \
+    }
+#else
+#define CMAT_STASH(acc, bb)                                                                   \
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {                                               \
+        const uint row = lane_row + h;                                                        \
+        if (row < M) {                                                                        \
+            const uint lc = 16u * (bb) + lane_col;                                            \
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {                                       \
+                cmat_red[sg][row][lc + j] = acc[4u * h + j];                                  \
+            }                                                                                 \
+        }                                                                                     \
+    }
+#endif
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint set = 0u;
+    uint N = arg_u32(22);
+    [[unroll]] for (uint s = 0u; s < 7u; s++) {
+        const uint g = (N + CMAT_WG_ROWS - 1u) / CMAT_WG_ROWS;
+        if (set == s && wg >= g) {
+            wg -= g;
+            set = s + 1u;
+            N = arg_u32(23u + s);
+        }
+    }
+    const uint sg = gl_SubgroupID;
+#if CMAT_SG_N > 1
+    const uint col0 = wg * CMAT_WG_ROWS + sg * CMAT_ROWS;
+#else
+    const uint col0 = wg * CMAT_ROWS;
+#endif
+    if (col0 >= N) return;
+
+    const uint64_t W_addr = arg(3u + set);
+    const uint64_t Y_addr = arg(11u + set);
+    const uint x_idx = (arg_u32(21) >> (2u * set)) & 3u;
+    const uint64_t X_addr = arg(x_idx);
+
+    const uint K = arg_u32(19);
+    const uint M = arg_u32(20);
+    const uint K8 = K >> 3u;
+    const uint K4 = K >> 2u;
+    const uint lane_row = mat_lane_row();
+    const uint lane_col = mat_lane_col();
+    const uint a_half = mat_a_half();
+    const uint a_odd = mat_a_odd();
+
+    const uint r0 = min(lane_row, M - 1u);
+    const uint r1 = min(lane_row + 1u, M - 1u);
+#ifdef CMAT_BX
+    const uint a0_base = r0 * K8 + 4u * a_half;
+    const uint a1_base = r1 * K8 + 4u * a_half;
+    const uint odd16 = 16u * a_odd;
+    U32x4 xa_b = U32x4(X_addr);
+#else
+    const uint a0_base = r0 * K4 + 8u * a_half;
+    const uint a1_base = r1 * K4 + 8u * a_half;
+    F32x4 xa = F32x4(X_addr);
+#endif
+    const uint b_col = col0 + lane_col;
+    const uint b_vec = lane_row >> 1u;
+    const uint b_at = b_col * K8 + b_vec;
+
+    U32x4 bw = U32x4(W_addr);
+
+    MatC acc0 = MatC(0.0);
+#if CMAT_NB >= 2
+    MatC acc1 = MatC(0.0);
+#endif
+#if CMAT_NB >= 4
+    MatC acc2 = MatC(0.0);
+    MatC acc3 = MatC(0.0);
+#endif
+
+#if CMAT_SK > 1
+    const uint g_start = sg * 8u;
+    const uint g_step = uint(CMAT_SK) * 8u;
+#else
+    const uint g_start = 0u;
+    const uint g_step = 8u;
+#endif
+    if (col0 + CMAT_ROWS <= N) {
+        for (uint g = g_start; g < K8; g += g_step) CMAT_GROUP(CMAT_B_INSIDE)
+    } else {
+        for (uint g = g_start; g < K8; g += g_step) CMAT_GROUP(CMAT_B_CLAMPED)
+    }
+
+#if CMAT_SK == 1
+    CMAT_STORE(acc0, 0u)
+#if CMAT_NB >= 2
+    CMAT_STORE(acc1, 1u)
+#endif
+#if CMAT_NB >= 4
+    CMAT_STORE(acc2, 2u)
+    CMAT_STORE(acc3, 3u)
+#endif
+#else
+    CMAT_STASH(acc0, 0u)
+#if CMAT_NB >= 2
+    CMAT_STASH(acc1, 1u)
+#endif
+#if CMAT_NB >= 4
+    CMAT_STASH(acc2, 2u)
+    CMAT_STASH(acc3, 3u)
+#endif
+    barrier();
+    const uint total_out = M * CMAT_ROWS;
+    for (uint idx = gl_LocalInvocationIndex; idx < total_out; idx += uint(CMAT_SK) * 32u) {
+        const uint row = idx / CMAT_ROWS;
+        const uint lc = idx % CMAT_ROWS;
+        const uint col = col0 + lc;
+        if (col < N) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0u; s < uint(CMAT_SK); s++) sum += cmat_red[s][row][lc];
+            F32(Y_addr + 4u * uint64_t(row) * uint64_t(N)).v[col] = sum;
+        }
+    }
+#endif
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// High-occupancy Split-K BF16 GEMV for narrow N (e.g. router N=128, M <= 8):
+// 2 output rows per WG, 4 subgroups (128 threads) splitting K per row ->
+// 64 WGs x 8 subgroups = 512 subgroups across all GPU cores, [[unroll]] SSA
+// accumulators (zero scratch spills!) + M==1 fast path.
+// Grid: (ceil(N / 2), 1, 1), 256 threads (8 subgroups).
+// Buffers: 0 X (F32 [M, K]), 1 W (BF16 [N, K]), 2 Y (F32 [M, N]).
+// Params: 3 K, 4 M, 5 N.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_gemv_bf16_narrow
+// Per-row SK=3 (96 threads = 3 subgroups/WG, grid = (N, M, 1)):
+// For L2-resident narrow BF16 matrices (e.g. MoE router 128x2304 = 590 KB),
+// dispatching M rows in parallel across gl_WorkGroupID.y gives 128*M WGs
+// (384*M subgroups) at ~25 GPRs with full L2 broadcast and zero multi-row pressure!
+shared float bfn_red[3];
+
+void main() {
+    const uint sk = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint n = gl_WorkGroupID.x;
+    const uint r = gl_WorkGroupID.y;
+    const uint K = arg_u32(3);
+    const uint N = arg_u32(5);
+    const uint K8 = K >> 3u;
+    const uint K4 = K >> 2u;
+    if (n >= N) return;
+
+    U32x4 wbuf = U32x4(arg(1) + uint64_t(n) * uint64_t(K) * 2u);
+    F32x4 xbuf = F32x4(arg(0) + uint64_t(r) * uint64_t(K) * 4u);
+
+    float a0 = 0.0;
+    for (uint q = sk * 32u + lane; q < K8; q += 96u) {
+        const uvec4 v = wbuf.v[q];
+        const vec4 w0 = vec4(
+            uintBitsToFloat(v.x << 16u), uintBitsToFloat(v.x & 0xffff0000u),
+            uintBitsToFloat(v.y << 16u), uintBitsToFloat(v.y & 0xffff0000u)
+        );
+        const vec4 w1 = vec4(
+            uintBitsToFloat(v.z << 16u), uintBitsToFloat(v.z & 0xffff0000u),
+            uintBitsToFloat(v.w << 16u), uintBitsToFloat(v.w & 0xffff0000u)
+        );
+        const uint xq = 2u * q;
+        a0 += dot(w0, xbuf.v[xq]) + dot(w1, xbuf.v[xq + 1u]);
+    }
+    const float s0 = subgroupAdd(a0);
+    if (lane == 0u) bfn_red[sk] = s0;
+    barrier();
+    if (sk == 0u && lane == 0u) {
+        F32(arg(2) + 4u * uint64_t(r) * uint64_t(N)).v[n] = bfn_red[0] + bfn_red[1] + bfn_red[2];
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Direct-load zero-shared-mem cooperative-matrix Q4_0 GEMV/small-batch GEMM
+// (M <= 16, K % 32 == 0, 1..=4 weight sets sharing F32 X) with workgroup Split-K.
+// Every lane loads ONE 16-bit word per weight row (bytes 2 + lane_row..+1):
+// low nibbles supply K-block t=0 (0..15) and high nibbles supply t=1 (16..31),
+// 100% coalesced across the 8 lane_rows, reusing X across 16 or 32 weight rows!
+// Same binding/param layout as glm53_gemv_q4_0_r2_m*.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_glm53_cmat_q4_0_n16_sk8_f16)
+#define CQ4_NB 1
+#define CQ4_SK 8
+#endif
+#ifdef CQ4_NB
+#define CQ4_ROWS (16u * uint(CQ4_NB))
+#define CQ4_MAT_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define CQ4_MAT_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+shared float cq4_red[CQ4_SK][16][CQ4_ROWS];
+
+void main() {
+    const uint64_t X_addr = arg(0);
+    const uint K = arg_u32(9);
+    const uint M = arg_u32(10);
+    const uint row_bytes = arg_u32(11);
+    const uint x_row_stride = arg_u32(17);
+    const uint y_stride_param = arg_u32(18);
+    uint wg = gl_WorkGroupID.x;
+    uint set = 0u;
+    uint N = arg_u32(12);
+    [[unroll]] for (uint s = 0u; s < 3u; s++) {
+        const uint g = (N + CQ4_ROWS - 1u) / CQ4_ROWS;
+        if (set == s && wg >= g) {
+            wg -= g;
+            set = s + 1u;
+            N = arg_u32(13u + s);
+        }
+    }
+    const uint col0 = wg * CQ4_ROWS;
+    if (col0 >= N) return;
+
+    const uint64_t W_addr = arg(1u + set);
+    const uint64_t Y_addr = arg(5u + set);
+    const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint lane_row = mat_lane_row();
+    const uint lane_col = mat_lane_col();
+    const uint a_half = mat_a_half();
+    const uint a_odd = mat_a_odd();
+    const uint r0 = min(lane_row, M - 1u);
+    const uint r1 = min(lane_row + 1u, M - 1u);
+    const uint x4_stride = x_row_stride >> 2u;
+    const uint a0_base = r0 * x4_stride + 2u * a_half;
+    const uint a1_base = r1 * x4_stride + 2u * a_half;
+    F32x4 xa = F32x4(X_addr);
+    U16 w16 = U16(W_addr);
+
+    // 32-bit U16 row offsets (saves 4 live GPRs & 12 64-bit address ops/block).
+    const uint row_u16 = row_bytes >> 1u;
+    const uint q_lane_u16 = 1u + (lane_row >> 1u);
+    uint wrow0[4];
+    [[unroll]] for (uint j = 0u; j < 4u; j++) {
+        wrow0[j] = min(col0 + lane_col + j, N - 1u) * row_u16;
+    }
+
+    MatC acc0 = MatC(0.0);
+    const uint n_blocks = K >> 5u;
+    // Strided K across subgroups so all 8 subgroups of a WG share cache lines in L1!
+    for (uint blk = sg; blk < n_blocks; blk += uint(CQ4_SK)) {
+        const uint boff = blk * 9u;
+        const uint qoff = boff + q_lane_u16;
+        uint dh0[4], pq0[4];
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            dh0[j] = uint(w16.v[wrow0[j] + boff]);
+            pq0[j] = uint(w16.v[wrow0[j] + qoff]);
+        }
+
+        const uint k4 = blk * 8u;
+        CQ4_MAT_A ma0, ma1;
+        {
+            const vec4 f00 = xa.v[a0_base + k4 + 0u];
+            const vec4 f01 = xa.v[a0_base + k4 + 1u];
+            const vec4 f02 = xa.v[a0_base + k4 + 4u];
+            const vec4 f03 = xa.v[a0_base + k4 + 5u];
+            const vec2 p00 = a_odd != 0u ? f00.yw : f00.xz;
+            const vec2 p01 = a_odd != 0u ? f01.yw : f01.xz;
+            const vec2 p02 = a_odd != 0u ? f02.yw : f02.xz;
+            const vec2 p03 = a_odd != 0u ? f03.yw : f03.xz;
+            ma0[0] = float16_t(p00.x); ma0[1] = float16_t(p00.y);
+            ma0[2] = float16_t(p01.x); ma0[3] = float16_t(p01.y);
+            ma1[0] = float16_t(p02.x); ma1[1] = float16_t(p02.y);
+            ma1[2] = float16_t(p03.x); ma1[3] = float16_t(p03.y);
+            if (r0 == r1) {
+                ma0[4] = ma0[0]; ma0[5] = ma0[1]; ma0[6] = ma0[2]; ma0[7] = ma0[3];
+                ma1[4] = ma1[0]; ma1[5] = ma1[1]; ma1[6] = ma1[2]; ma1[7] = ma1[3];
+            } else {
+                const vec4 f10 = xa.v[a1_base + k4 + 0u];
+                const vec4 f11 = xa.v[a1_base + k4 + 1u];
+                const vec4 f12 = xa.v[a1_base + k4 + 4u];
+                const vec4 f13 = xa.v[a1_base + k4 + 5u];
+                const vec2 p10 = a_odd != 0u ? f10.yw : f10.xz;
+                const vec2 p11 = a_odd != 0u ? f11.yw : f11.xz;
+                const vec2 p12 = a_odd != 0u ? f12.yw : f12.xz;
+                const vec2 p13 = a_odd != 0u ? f13.yw : f13.xz;
+                ma0[4] = float16_t(p10.x); ma0[5] = float16_t(p10.y);
+                ma0[6] = float16_t(p11.x); ma0[7] = float16_t(p11.y);
+                ma1[4] = float16_t(p12.x); ma1[5] = float16_t(p12.y);
+                ma1[6] = float16_t(p13.x); ma1[7] = float16_t(p13.y);
+            }
+        }
+
+        CQ4_MAT_B mb0, mb1;
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            const uint p = pq0[j];
+            const float16_t d = uint16BitsToHalf(uint16_t(dh0[j]));
+            mb0[j]      = d * float16_t(int(p & 15u) - 8);
+            mb0[4u + j] = d * float16_t(int((p >> 8u) & 15u) - 8);
+            mb1[j]      = d * float16_t(int((p >> 4u) & 15u) - 8);
+            mb1[4u + j] = d * float16_t(int(p >> 12u) - 8);
+        }
+        acc0 = coopMatMulAdd(ma0, mb0, acc0);
+        acc0 = coopMatMulAdd(ma1, mb1, acc0);
+    }
+
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {
+        const uint row = lane_row + h;
+        if (row < M) {
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {
+                cq4_red[sg][row][lane_col + j] = acc0[4u * h + j];
+            }
+        }
+    }
+    barrier();
+    const uint total_out = M * CQ4_ROWS;
+    for (uint idx = gl_LocalInvocationIndex; idx < total_out; idx += uint(CQ4_SK) * 32u) {
+        const uint row = idx / CQ4_ROWS;
+        const uint lc = idx % CQ4_ROWS;
+        const uint col = col0 + lc;
+        if (col < N) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0u; s < uint(CQ4_SK); s++) sum += cq4_red[s][row][lc];
+            F32(Y_addr).v[row * y_row_stride + col] = sum;
+        }
+    }
 }
 #endif

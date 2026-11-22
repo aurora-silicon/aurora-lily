@@ -126,14 +126,14 @@ pub fn short_conv(
     let mut padded = vec![0.0f32; n_channels * (hist_len + n_tokens)];
     for c in 0..n_channels {
         for j in 0..hist_len {
-            padded[c * (hist_len + n_tokens) + j] = history[c * hist_len + j];
+            padded[c * (hist_len + n_tokens) + j] = history[j * n_channels + c];
         }
         for t in 0..n_tokens {
             padded[c * (hist_len + n_tokens) + hist_len + t] = x[t * n_channels + c];
         }
-        // Update history with the last `hist_len` values.
+        // Update history `[hist_len, n_channels]` with the last `hist_len` values.
         for j in 0..hist_len {
-            history[c * hist_len + j] =
+            history[j * n_channels + c] =
                 padded[c * (hist_len + n_tokens) + n_tokens + j];
         }
     }

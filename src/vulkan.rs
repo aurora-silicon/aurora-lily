@@ -450,6 +450,8 @@ struct Dev {
     subgroup32: bool,
     /// VK_KHR_calibrated_timestamps, enabled for the trace ([`trace`]).
     calibrated: Option<ash::khr::calibrated_timestamps::Device>,
+    /// `limits.maxComputeWorkGroupInvocations` (capped by `maxComputeWorkGroupSize[0]`).
+    max_workgroup_invocations: usize,
 }
 
 /// How the device imports host memory.
@@ -619,28 +621,26 @@ impl Dev {
                 && priority.memory_priority == vk::TRUE
                 && pageable.pageable_device_local_memory == vk::TRUE;
             let mut found = false;
-            unsafe {
-                let mut next = features.p_next.cast::<vk::BaseOutStructure>();
-                while !next.is_null() {
-                    if (*next).s_type == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES {
-                        let v12 = next.cast::<vk::PhysicalDeviceVulkan12Features>();
-                        (*v12).buffer_device_address_capture_replay = vk::FALSE;
-                        (*v12).buffer_device_address_multi_device = vk::FALSE;
-                        found = true;
-                    }
-                    // Without matrix units the memory priorities end the
-                    // chain after v11: unlinked here when not enabled.
-                    let after = (*next).p_next;
-                    if !matrix_units
-                        && !prioritize
-                        && !after.is_null()
-                        && (*after).s_type
-                            == vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT
-                    {
-                        (*next).p_next = std::ptr::null_mut();
-                    }
-                    next = (*next).p_next;
+            let mut next = features.p_next.cast::<vk::BaseOutStructure>();
+            while !next.is_null() {
+                if (*next).s_type == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES {
+                    let v12 = next.cast::<vk::PhysicalDeviceVulkan12Features>();
+                    (*v12).buffer_device_address_capture_replay = vk::FALSE;
+                    (*v12).buffer_device_address_multi_device = vk::FALSE;
+                    found = true;
                 }
+                // Without matrix units the memory priorities end the
+                // chain after v11: unlinked here when not enabled.
+                let after = (*next).p_next;
+                if !matrix_units
+                    && !prioritize
+                    && !after.is_null()
+                    && (*after).s_type
+                        == vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT
+                {
+                    (*next).p_next = std::ptr::null_mut();
+                }
+                next = (*next).p_next;
             }
             ensure!(found, "the Vulkan 1.2 features are not in the device feature chain");
             let enable_cooperative2 = has_cooperative2
@@ -664,6 +664,7 @@ impl Dev {
                     bfloat.p_next = std::ptr::null_mut();
                 }
             }
+            let _ = bfloat.p_next;
             let cooperative_matrix_register_ops = enable_cooperative2
                 && cooperative2.conversions == vk::TRUE
                 && cooperative2.reductions == vk::TRUE
@@ -758,6 +759,12 @@ impl Dev {
                 .push_next(&mut v11_props)
                 .push_next(&mut v13_props);
             instance.get_physical_device_properties2(physical, &mut props);
+            let max_workgroup_invocations = props
+                .properties
+                .limits
+                .max_compute_work_group_invocations
+                .min(props.properties.limits.max_compute_work_group_size[0])
+                as usize;
             let default_width = v11_props.subgroup_size;
             let subgroup32 = default_width != 32;
             ensure!(
@@ -794,6 +801,7 @@ impl Dev {
                 g16,
                 subgroup32,
                 calibrated,
+                max_workgroup_invocations,
             }))
         }
     }
@@ -846,17 +854,23 @@ impl Dev {
         Ok(module)
     }
 
-    /// The pipeline of kernel `name` at threadgroup size `local`.
-    fn pipeline(&self, name: &'static str, local: [u32; 3]) -> Result<vk::Pipeline> {
+    /// The pipeline of kernel `name` at threadgroup size `local`, plus the
+    /// compilation duration in nanoseconds when newly compiled on this call.
+    fn pipeline_cached(
+        &self,
+        name: &'static str,
+        local: [u32; 3],
+    ) -> Result<(vk::Pipeline, Option<u64>)> {
         {
             let pipelines = self
                 .pipelines
                 .lock()
                 .map_err(|e| anyhow!("pipeline cache poisoned: {e}"))?;
             if let Some(&pipeline) = pipelines.get(&(name, local)) {
-                return Ok(pipeline);
+                return Ok((pipeline, None));
             }
         }
+        let started = Instant::now();
         let module = self.module(name)?;
         let entries = [0u32, 1, 2].map(|i| {
             vk::SpecializationMapEntry::default().constant_id(i).offset(4 * i).size(4)
@@ -882,11 +896,12 @@ impl Dev {
             self.device.create_compute_pipelines(vk::PipelineCache::null(), &info, None)
         }
         .map_err(|(_, e)| anyhow!("creating the pipeline of {name} at {local:?}: {e}"))?[0];
+        let elapsed_ns = started.elapsed().as_nanos() as u64;
         self.pipelines
             .lock()
             .map_err(|e| anyhow!("pipeline cache poisoned: {e}"))?
             .insert((name, local), pipeline);
-        Ok(pipeline)
+        Ok((pipeline, Some(elapsed_ns)))
     }
 
     fn new_buffer(self: &Arc<Self>, len: usize, zero: bool) -> Result<Buffer> {
@@ -900,6 +915,7 @@ impl Dev {
                         vk::BufferUsageFlags::STORAGE_BUFFER
                             | vk::BufferUsageFlags::TRANSFER_SRC
                             | vk::BufferUsageFlags::TRANSFER_DST
+                            | vk::BufferUsageFlags::INDIRECT_BUFFER
                             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                     )
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
@@ -1011,6 +1027,7 @@ impl Dev {
                         vk::BufferUsageFlags::STORAGE_BUFFER
                             | vk::BufferUsageFlags::TRANSFER_SRC
                             | vk::BufferUsageFlags::TRANSFER_DST
+                            | vk::BufferUsageFlags::INDIRECT_BUFFER
                             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                     )
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -2056,6 +2073,11 @@ impl MetalContext {
         self.dev.matrix_units
     }
 
+    /// Maximum 1D compute workgroup size supported by the device.
+    pub fn max_workgroup_invocations(&self) -> usize {
+        self.dev.max_workgroup_invocations
+    }
+
     /// Whether the device offers, and the context enabled, the cooperative
     /// matrix operations on a matrix in registers of VK_NV_cooperative_matrix2
     /// (conversions between uses, reductions, per-element operations): the
@@ -2538,6 +2560,32 @@ fn barrier(device: &ash::Device, cmd: vk::CommandBuffer) {
     };
 }
 
+fn barrier_indirect(device: &ash::Device, cmd: vk::CommandBuffer) {
+    let src_stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
+    let dst_stages = src_stages | vk::PipelineStageFlags::DRAW_INDIRECT;
+    let barriers = [vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(
+            vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::TRANSFER_READ
+                | vk::AccessFlags::TRANSFER_WRITE
+                | vk::AccessFlags::INDIRECT_COMMAND_READ,
+        )];
+    // SAFETY: the command buffer is recording.
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            src_stages,
+            dst_stages,
+            vk::DependencyFlags::empty(),
+            &barriers,
+            &[],
+            &[],
+        )
+    };
+}
+
 impl<'a> ComputePass<'a> {
     /// Runs `f` on the open command buffer, opening one first if none is.
     fn with_cmd<R>(
@@ -2730,14 +2778,11 @@ impl<'a> ComputePass<'a> {
         };
         let local = [local.0 as u32, local.1 as u32, local.2 as u32];
         let tracing = trace::on();
-        let started = Instant::now();
-        let known = self.ctx.dev.pipelines.lock().is_ok_and(|p| p.contains_key(&(kernel.name, local)));
-        let pipeline = self.ctx.dev.pipeline(kernel.name, local)?;
-        if !known {
+        let started = tracing.then(Instant::now);
+        let (pipeline, built_ns) = self.ctx.dev.pipeline_cached(kernel.name, local)?;
+        if let Some(ns) = built_ns {
             self.ctx.built.fetch_add(1, Ordering::Relaxed);
-            self.ctx
-                .build_nanos
-                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.ctx.build_nanos.fetch_add(ns, Ordering::Relaxed);
         }
         let serial = !self.concurrent;
         let dev = &self.ctx.dev;
@@ -2810,9 +2855,100 @@ impl<'a> ComputePass<'a> {
             seg.kernel = kernel.name;
             Ok(())
         })?;
-        if tracing {
+        if let Some(s) = started {
             let (driver, whole) = self.trace_ns.get();
-            self.trace_ns.set((driver, whole + started.elapsed().as_nanos() as u64));
+            self.trace_ns.set((driver, whole + s.elapsed().as_nanos() as u64));
+        }
+        self.close_full_segment()
+    }
+
+    /// Encodes an indirect compute dispatch (`vkCmdDispatchIndirect`) whose
+    /// workgroup counts `(x, y, z)` live as three `u32`s at `indirect.1` bytes
+    /// in `indirect.0`. `fallback_groups` is unused on Vulkan.
+    pub fn dispatch_indirect_at(
+        &self,
+        kernel: &Kernel,
+        buffers: &[(&GpuBuffer, usize)],
+        params: &[&[u8]],
+        indirect: (&GpuBuffer, usize),
+        _fallback_groups: (usize, usize, usize),
+        threadgroup: (usize, usize, usize),
+    ) -> Result<()> {
+        ensure!(
+            params.len() <= MAX_KERNEL_PARAMS,
+            "{} kernel params exceeds MAX_KERNEL_PARAMS ({MAX_KERNEL_PARAMS})",
+            params.len()
+        );
+        ensure!(
+            buffers.len() + params.len() <= MAX_BUFFER_BINDINGS,
+            "{} buffer bindings exceeds the limit of {MAX_BUFFER_BINDINGS}",
+            buffers.len() + params.len()
+        );
+        ensure!(
+            indirect.1.is_multiple_of(4) && indirect.1 + 12 <= indirect.0.length(),
+            "indirect dispatch args at byte {} out of bounds (len {})",
+            indirect.1,
+            indirect.0.length()
+        );
+        let local = [threadgroup.0 as u32, threadgroup.1 as u32, threadgroup.2 as u32];
+        let tracing = trace::on();
+        let started = tracing.then(Instant::now);
+        let (pipeline, built_ns) = self.ctx.dev.pipeline_cached(kernel.name, local)?;
+        if let Some(ns) = built_ns {
+            self.ctx.built.fetch_add(1, Ordering::Relaxed);
+            self.ctx.build_nanos.fetch_add(ns, Ordering::Relaxed);
+        }
+        let serial = !self.concurrent;
+        let dev = &self.ctx.dev;
+        self.with_cmd(|device, seg, inner| {
+            let mut table = [0u64; MAX_BUFFER_BINDINGS];
+            for (slot, (buf, offset)) in table.iter_mut().zip(buffers) {
+                *slot = buf.address() + *offset as u64;
+            }
+            for (i, bytes) in params.iter().enumerate() {
+                ensure!(!bytes.is_empty(), "empty kernel param");
+                table[buffers.len() + i] = inner.arena.push(dev, bytes)?;
+            }
+            let bound = buffers.len() + params.len();
+            let mut push = [0u8; PUSH_BYTES as usize];
+            push[PUSH_HEADER..PUSH_HEADER + 8 * bound]
+                .copy_from_slice(bytemuck::cast_slice(&table[..bound]));
+            let push = &push[..PUSH_HEADER + 8 * bound];
+            let recording = tracing.then(Instant::now);
+            // SAFETY: the command buffer is recording; the pipeline, layout,
+            // and indirect buffer (allocated with INDIRECT_BUFFER) are valid.
+            unsafe {
+                if seg.bound != pipeline {
+                    device.cmd_bind_pipeline(
+                        seg.cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pipeline,
+                    );
+                    seg.bound = pipeline;
+                }
+                device.cmd_push_constants(
+                    seg.cmd,
+                    dev.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    push,
+                );
+                device.cmd_dispatch_indirect(seg.cmd, indirect.0.buffer, indirect.1 as u64);
+            }
+            if serial {
+                barrier(device, seg.cmd);
+            }
+            if let Some(recording) = recording {
+                let (driver, whole) = self.trace_ns.get();
+                self.trace_ns.set((driver + recording.elapsed().as_nanos() as u64, whole));
+            }
+            seg.dispatches += 1;
+            seg.kernel = kernel.name;
+            Ok(())
+        })?;
+        if let Some(s) = started {
+            let (driver, whole) = self.trace_ns.get();
+            self.trace_ns.set((driver, whole + s.elapsed().as_nanos() as u64));
         }
         self.close_full_segment()
     }
@@ -2867,6 +3003,23 @@ impl<'a> ComputePass<'a> {
     pub fn signal_event(&self, event: &SharedEvent, value: u64) -> Result<()> {
         self.close_segment(true)?;
         self.program.borrow_mut().push(Item::Signal(event.clone(), value));
+        Ok(())
+    }
+
+    /// Orders all prior dispatches' buffer writes before both subsequent
+    /// compute reads and indirect dispatch command reads (`vkCmdDispatchIndirect`).
+    pub fn memory_barrier_indirect(&self) -> Result<()> {
+        if self.concurrent && !self.ctx.profile {
+            let open = self.open.borrow();
+            if let Some(seg) = open.as_ref() {
+                let recording = trace::on().then(Instant::now);
+                barrier_indirect(&self.ctx.dev.device, seg.cmd);
+                if let Some(recording) = recording {
+                    let (driver, whole) = self.trace_ns.get();
+                    self.trace_ns.set((driver + recording.elapsed().as_nanos() as u64, whole));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3067,14 +3220,33 @@ impl CompletedPass {
     }
 }
 
-impl PendingPass<'_> {
+impl<'a> PendingPass<'a> {
+    /// Returns a no-op completed pass with zero GPU submission or fence wait.
+    pub fn already_done(ctx: &'a MetalContext) -> Self {
+        Self {
+            ctx,
+            fence_value: 0,
+            done: None,
+            milestone: None,
+            feedback: Arc::new(Feedback::default()),
+            slot: None,
+            trace: 0,
+        }
+    }
+
     /// Blocks until the GPU finishes this pass.
     pub fn wait(self) -> Result<()> {
+        if self.fence_value == 0 {
+            return Ok(());
+        }
         self.wait_retain().map(|_| ())
     }
 
     /// Blocks until completion while retaining the pass's feedback.
     pub fn wait_retain(mut self) -> Result<CompletedPass> {
+        if self.fence_value == 0 {
+            return self.finished();
+        }
         let waited = self.ctx.wait_fence(self.fence_value);
         self.release(waited.is_ok());
         waited?;

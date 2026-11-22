@@ -145,7 +145,7 @@ fn short_conv_static_and_dynamic_match_cpu() {
     let tx = Tensor::from_f32(&ctx, &x, &[rows, c]).unwrap();
     let tw = Tensor::from_f32(&ctx, &w, &[c, n_conv]).unwrap();
     let td = Tensor::from_f32(&ctx, &dyn_w, &[rows, n_heads, n_conv]).unwrap();
-    let th = Tensor::from_f32(&ctx, &hist_cpu, &[c, n_conv - 1]).unwrap();
+    let th = Tensor::from_f32(&ctx, &hist_cpu, &[n_conv - 1, c]).unwrap();
     let ty = Tensor::zeros(&ctx, &[rows, c], DType::F32).unwrap();
 
     run(&ctx, |p| {
@@ -657,7 +657,7 @@ fn short_conv_prefill_and_kv_prep_prefill_match_sequential() {
     let tres = Tensor::from_f32(&ctx, &res, &[rows, c]).unwrap();
     let tw = Tensor::from_f32(&ctx, &w, &[c, n_conv]).unwrap();
     let td = Tensor::from_f32(&ctx, &dyn_w, &[rows, nkv, n_conv]).unwrap();
-    let th = Tensor::from_f32(&ctx, &hist0, &[c, n_conv - 1]).unwrap();
+    let th = Tensor::from_f32(&ctx, &hist0, &[n_conv - 1, c]).unwrap();
     let ty = Tensor::zeros(&ctx, &[rows, c], DType::F32).unwrap();
 
     let pass = ctx.begin_concurrent().unwrap();
@@ -684,13 +684,13 @@ fn short_conv_prefill_and_kv_prep_prefill_match_sequential() {
     let tvw = Tensor::from_f32(&ctx, &vw, &[c, n_conv]).unwrap();
     let tvd = Tensor::from_f32(&ctx, &vdyn, &[rows, nkv, n_conv]).unwrap();
 
-    let kh_seq = Tensor::from_f32(&ctx, &hist0, &[c, n_conv - 1]).unwrap();
-    let vh_seq = Tensor::from_f32(&ctx, &vhist0, &[c, n_conv - 1]).unwrap();
+    let kh_seq = Tensor::from_f32(&ctx, &hist0, &[n_conv - 1, c]).unwrap();
+    let vh_seq = Tensor::from_f32(&ctx, &vhist0, &[n_conv - 1, c]).unwrap();
     let kc_seq = Tensor::zeros(&ctx, &[32, c], DType::F16).unwrap();
     let vc_seq = Tensor::zeros(&ctx, &[32, c], DType::F16).unwrap();
 
-    let kh_pre = Tensor::from_f32(&ctx, &hist0, &[c, n_conv - 1]).unwrap();
-    let vh_pre = Tensor::from_f32(&ctx, &vhist0, &[c, n_conv - 1]).unwrap();
+    let kh_pre = Tensor::from_f32(&ctx, &hist0, &[n_conv - 1, c]).unwrap();
+    let vh_pre = Tensor::from_f32(&ctx, &vhist0, &[n_conv - 1, c]).unwrap();
     let kc_pre = Tensor::zeros(&ctx, &[32, c], DType::F16).unwrap();
     let vc_pre = Tensor::zeros(&ctx, &[32, c], DType::F16).unwrap();
 
@@ -963,6 +963,102 @@ fn attention_mu_matches_cpu_swa_and_global() {
         }
         // f16 Q/P operands in matrix-unit FlashAttention match f32 CPU reference within ~3e-3.
         assert_close(&tout.to_f32().unwrap(), &exp, 5e-3, 5e-3);
+    }
+}
+
+#[test]
+fn attention_mu_split_matches_cpu_swa_and_global() {
+    let ctx = ctx();
+    if !ctx.matrix_units() {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(309);
+    let (nh, nkv, hd, ext, window, slots) = (6, 2, 128, 64, 300, 384);
+    for (is_swa, n_prefill, n_step) in [(true, 360, 6), (false, 310, 6)] {
+        let total = n_prefill + n_step;
+        let cap = if is_swa { slots } else { total.max(384) };
+        let k_all = f32s(&mut rng, total * nkv * hd, -1.0, 1.0);
+        let v_all = f32s(&mut rng, total * nkv * hd, -1.0, 1.0);
+        let q_step = f32s(&mut rng, n_step * nh * hd, -2.0, 2.0);
+        let q_clip = f32s(&mut rng, nh * hd, 0.5, 1.5);
+        let gate = f32s(&mut rng, n_step * nh * hd, -2.0, 2.0);
+        let rel_tab = f32s(&mut rng, n_step * nh * ext, -0.5, 0.5);
+        let sinks = f32s(&mut rng, n_step * nh, -0.5, 0.5);
+
+        let tk_cache = Tensor::zeros(&ctx, &[cap, nkv * hd], DType::F16).unwrap();
+        let tv_cache = Tensor::zeros(&ctx, &[cap, nkv * hd], DType::F16).unwrap();
+        let tk_in = Tensor::from_f32(&ctx, &k_all, &[total, nkv * hd]).unwrap();
+        let tv_in = Tensor::from_f32(&ctx, &v_all, &[total, nkv * hd]).unwrap();
+        let tq = Tensor::from_f32(&ctx, &q_step, &[n_step, nh * hd]).unwrap();
+        let tqc = Tensor::from_f32(&ctx, &q_clip, &[nh, hd]).unwrap();
+        let tgate = Tensor::from_f32(&ctx, &gate, &[n_step, nh * hd]).unwrap();
+        let trel = Tensor::from_f32(&ctx, &rel_tab, &[n_step, nh * ext]).unwrap();
+        let tsink = Tensor::from_f32(&ctx, &sinks, &[n_step, nh]).unwrap();
+        let tpart = Tensor::zeros(&ctx, &[n_step, nh, ATTN_SPLIT_MAX_CHUNKS, 130], DType::F32).unwrap();
+        let tout_split = Tensor::zeros(&ctx, &[n_step, nh * hd], DType::F32).unwrap();
+        let tout_mu = Tensor::zeros(&ctx, &[n_step, nh * hd], DType::F32).unwrap();
+
+        let (qk_clip, lf, la) = (
+            22.627_417f32,
+            if is_swa { 0 } else { 128 },
+            if is_swa { 0.0 } else { 0.1 },
+        );
+        let pass = ctx.begin_concurrent().unwrap();
+        kv_store(&ctx, &pass, &tk_in, &tv_in, &tk_cache, &tv_cache, total, nkv * hd, 0, cap, is_swa)
+            .unwrap();
+        pass.memory_barrier().unwrap();
+        attention_mu_split(
+            &ctx,
+            &pass,
+            &tq,
+            &tk_cache,
+            &tv_cache,
+            &trel,
+            &tsink,
+            &tpart,
+            &tout_split,
+            Some(&tgate),
+            Some(&tqc),
+            n_step,
+            nh,
+            nkv,
+            n_prefill,
+            cap,
+            is_swa,
+            window,
+            ext,
+            qk_clip,
+            lf,
+            la,
+        )
+        .unwrap();
+        attention_mu(
+            &ctx,
+            &pass,
+            &tq,
+            &tk_cache,
+            &tv_cache,
+            &trel,
+            &tsink,
+            &tout_mu,
+            Some(&tgate),
+            Some(&tqc),
+            n_step,
+            nh,
+            nkv,
+            n_prefill,
+            cap,
+            is_swa,
+            window,
+            ext,
+            qk_clip,
+            lf,
+            la,
+        )
+        .unwrap();
+        pass.commit_wait().unwrap();
+
+        assert_close(&tout_split.to_f32().unwrap(), &tout_mu.to_f32().unwrap(), 2e-4, 2e-4);
     }
 }
 
@@ -1267,4 +1363,410 @@ fn mix_many_states_matches_cpu() {
         }
     }
     assert_close(&got, &expected, 1e-4, 1e-4);
+}
+
+#[test]
+fn router_bucket_and_argmax_spec_accept_match_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(409);
+
+    // 1. router_bucket vs separate router + moe_bucket.
+    let (rows, n_exp, top_k) = (6usize, 128usize, 8usize);
+    let logits = f32s(&mut rng, rows * n_exp, -3.0, 3.0);
+    let bias = f32s(&mut rng, n_exp, -0.3, 0.3);
+    let tl = Tensor::from_f32(&ctx, &logits, &[rows, n_exp]).unwrap();
+    let tb = Tensor::from_f32(&ctx, &bias, &[n_exp]).unwrap();
+    let ids_ref = Tensor::zeros(&ctx, &[rows * top_k], DType::U32).unwrap();
+    let w_ref = Tensor::zeros(&ctx, &[rows * top_k], DType::F32).unwrap();
+    let rk_ref = Tensor::zeros(&ctx, &[rows * top_k], DType::U32).unwrap();
+    let tiles_ref = Tensor::zeros(&ctx, &[rows * top_k * 4], DType::U32).unwrap();
+    let nt_ref = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+
+    let ids_f = Tensor::zeros(&ctx, &[rows * top_k], DType::U32).unwrap();
+    let w_f = Tensor::zeros(&ctx, &[rows * top_k], DType::F32).unwrap();
+    let rk_f = Tensor::zeros(&ctx, &[rows * top_k], DType::U32).unwrap();
+    let tiles_f = Tensor::zeros(&ctx, &[rows * top_k * 4], DType::U32).unwrap();
+    let nt_f = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+
+    let pass = ctx.begin_concurrent().unwrap();
+    router(&ctx, &pass, &tl, Some(&tb), &ids_ref, &w_ref, rows, n_exp, top_k, 8.0).unwrap();
+    pass.memory_barrier().unwrap();
+    moe_bucket(&ctx, &pass, &ids_ref, &rk_ref, &tiles_ref, &nt_ref, rows * top_k, n_exp).unwrap();
+    router_bucket(
+        &ctx, &pass, &tl, Some(&tb), &ids_f, &w_f, &rk_f, &tiles_f, &nt_f, rows, n_exp, top_k, 8.0,
+    )
+    .unwrap();
+    pass.commit_wait().unwrap();
+
+    assert_eq!(ids_f.to_u32().unwrap(), ids_ref.to_u32().unwrap());
+    assert_close(&w_f.to_f32().unwrap(), &w_ref.to_f32().unwrap(), 1e-6, 1e-6);
+    assert_eq!(nt_f.to_u32().unwrap(), nt_ref.to_u32().unwrap());
+    let n_tiles = nt_f.to_u32().unwrap()[0] as usize;
+    assert_eq!(&tiles_f.to_u32().unwrap()[..n_tiles * 4], &tiles_ref.to_u32().unwrap()[..n_tiles * 4]);
+
+    // 2. argmax_rows + spec_accept (including tie breaking and partial acceptance).
+    let (arows, vocab) = (6usize, 4099usize);
+    let mut alogits = f32s(&mut rng, arows * vocab, -5.0, 5.0);
+    // Force exact tie on row 2 between indices 17 and 2049 -> must pick 17!
+    alogits[2 * vocab + 17] = 9.5;
+    alogits[2 * vocab + 2049] = 9.5;
+    let tal = Tensor::from_f32(&ctx, &alogits, &[arows, vocab]).unwrap();
+    let pv = Tensor::zeros(&ctx, &[arows, 64], DType::F32).unwrap();
+    let pi = Tensor::zeros(&ctx, &[arows, 64], DType::U32).unwrap();
+    let draws = Tensor::zeros(&ctx, &[arows], DType::U32).unwrap();
+    run(&ctx, |p| argmax_rows(&ctx, p, &tal, &pv, &pi, &draws, arows, vocab).unwrap());
+    let got_draws = draws.to_u32().unwrap();
+    for r in 0..arows {
+        let mut bi = 0usize;
+        let mut bv = f32::NEG_INFINITY;
+        for i in 0..vocab {
+            let v = alogits[r * vocab + i];
+            if v > bv {
+                bv = v;
+                bi = i;
+            }
+        }
+        assert_eq!(got_draws[r], bi as u32, "argmax_rows mismatch row {r}");
+    }
+
+    // spec_accept: match first 2 drafts, mismatch at 3rd.
+    let staged = [99u32, got_draws[0], got_draws[1], got_draws[2] ^ 1, got_draws[3], got_draws[4]];
+    let tstaged = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&staged), &[arows], DType::U32).unwrap();
+    let meta = Tensor::zeros(&ctx, &[6], DType::U32).unwrap();
+    let btoks = Tensor::zeros(&ctx, &[8], DType::U32).unwrap();
+    let rnn = Tensor::from_f32(&ctx, &vec![1.0f32; 128], &[128]).unwrap();
+    run(&ctx, |p| {
+        spec_accept(&ctx, p, &tstaged, &draws, &meta, &btoks, &rnn, arows, 1020, 128, 512).unwrap();
+    });
+    let m = meta.to_u32().unwrap();
+    assert_eq!(m, vec![2, 3, got_draws[2], 1023, 2, 511]);
+    assert_eq!(btoks.to_u32().unwrap()[0], got_draws[2]);
+    assert!(rnn.to_f32().unwrap().iter().all(|&v| v == 0.0));
+}
+
+#[test]
+fn router_bucket_indirect_matches_direct_dispatch() {
+    use crate::inkling2::native::repack_nvfp4_experts;
+
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(9001);
+    let (n_exp, ff, h, top_k, rows) = (6usize, 128usize, 128usize, 4usize, 6usize);
+    let rows_k = rows * top_k;
+
+    let gu_w_u8: Vec<u8> = (0..n_exp * (2 * ff) * (h / 2)).map(|_| rng.r#gen()).collect();
+    let gu_s_fp8: Vec<u8> =
+        (0..n_exp * (2 * ff) * (h / 16)).map(|_| rng.gen_range(1u8..0x7eu8)).collect();
+    let dn_w_u8: Vec<u8> = (0..n_exp * h * (ff / 2)).map(|_| rng.r#gen()).collect();
+    let dn_s_fp8: Vec<u8> =
+        (0..n_exp * h * (ff / 16)).map(|_| rng.gen_range(1u8..0x7eu8)).collect();
+
+    let gu_aos = repack_nvfp4_experts(&gu_w_u8, &gu_s_fp8, n_exp, 2 * ff, h, true).unwrap();
+    let dn_aos = repack_nvfp4_experts(&dn_w_u8, &dn_s_fp8, n_exp, h, ff, false).unwrap();
+
+    let q_gu_aos = QWeight::from_bytes(&ctx, &gu_aos, GgmlType::Nvfp4, h, n_exp * 2 * ff).unwrap();
+    let q_dn_aos = QWeight::from_bytes(&ctx, &dn_aos, GgmlType::Nvfp4, ff, n_exp * h).unwrap();
+
+    let x = f32s(&mut rng, rows * h, -0.5, 0.5);
+    let gu_sc = f32s(&mut rng, n_exp, 0.05, 0.2);
+
+    let tx = Tensor::from_f32(&ctx, &x, &[rows, h]).unwrap();
+    let tgu_sc = Tensor::from_f32(&ctx, &gu_sc, &[n_exp]).unwrap();
+
+    // Verify dispatch_indirect via router_bucket_ex matches direct dispatch bit-for-bit.
+    let sorted_rk = Tensor::zeros(&ctx, &[rows_k], DType::U32).unwrap();
+    let tiles = Tensor::zeros(&ctx, &[rows_k * 4], DType::U32).unwrap();
+    let n_tiles = Tensor::zeros(&ctx, &[12], DType::U32).unwrap();
+    let max_tiles = rows_k;
+    let logits_ind = Tensor::from_f32(&ctx, &f32s(&mut rng, rows * n_exp, -2.0, 2.0), &[rows, n_exp]).unwrap();
+    let r_ids = Tensor::zeros(&ctx, &[rows_k], DType::U32).unwrap();
+    let r_w = Tensor::zeros(&ctx, &[rows_k], DType::F32).unwrap();
+    let gm_s_dir = Tensor::zeros(&ctx, &[rows_k, ff], DType::F32).unwrap();
+    let gm_d_dir = Tensor::zeros(&ctx, &[rows_k, h], DType::F32).unwrap();
+    let gm_s_ind = Tensor::zeros(&ctx, &[rows_k, ff], DType::F32).unwrap();
+    let gm_d_ind = Tensor::zeros(&ctx, &[rows_k, h], DType::F32).unwrap();
+    run(&ctx, |p| {
+        router_bucket_ex(
+            &ctx, p, &logits_ind, None, &r_ids, &r_w, &sorted_rk, &tiles, &n_tiles,
+            rows, n_exp, top_k, 1.0, Some((ff.div_ceil(32), h.div_ceil(32))),
+        ).unwrap();
+        p.memory_barrier_indirect().unwrap();
+        moe_gu_m4_ex(&ctx, p, &tx, &q_gu_aos, &sorted_rk, &tiles, &n_tiles, None, Some(&tgu_sc), &gm_s_dir, max_tiles, ff, top_k, 4.0, 25.0).unwrap();
+        moe_gu_m4_ex(&ctx, p, &tx, &q_gu_aos, &sorted_rk, &tiles, &n_tiles, Some(16), Some(&tgu_sc), &gm_s_ind, max_tiles, ff, top_k, 4.0, 25.0).unwrap();
+        p.memory_barrier().unwrap();
+        moe_down_m4_ex(&ctx, p, &gm_s_dir, &q_dn_aos, &sorted_rk, &tiles, &n_tiles, None, &gm_d_dir, max_tiles, h).unwrap();
+        moe_down_m4_ex(&ctx, p, &gm_s_ind, &q_dn_aos, &sorted_rk, &tiles, &n_tiles, Some(32), &gm_d_ind, max_tiles, h).unwrap();
+    });
+    assert_close(&gm_s_ind.to_f32().unwrap(), &gm_s_dir.to_f32().unwrap(), 1e-6, 1e-6);
+    assert_close(&gm_d_ind.to_f32().unwrap(), &gm_d_dir.to_f32().unwrap(), 1e-6, 1e-6);
+}
+
+#[test]
+fn attention_mu_split_rel_decode_matches_verify_across_split_boundaries() {
+    use half::f16;
+
+    let ctx = ctx();
+    if !ctx.matrix_units() {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(5101);
+    let (nh, nkv, hd, rel_len, win, ext, slots) = (6usize, 2usize, 128usize, 16usize, 256usize, 2400usize, 16400usize);
+    let rows = 5usize;
+
+    let k_f16: Vec<u16> = f32s(&mut rng, slots * nkv * hd, -0.5, 0.5)
+        .into_iter()
+        .map(|v| f16::from_f32(v).to_bits())
+        .collect();
+    let v_f16: Vec<u16> = f32s(&mut rng, slots * nkv * hd, -0.5, 0.5)
+        .into_iter()
+        .map(|v| f16::from_f32(v).to_bits())
+        .collect();
+    let rel_bias_f = f32s(&mut rng, ext * rel_len, -0.2, 0.2);
+    let rel_clip = f32s(&mut rng, nh * rel_len, 0.5, 1.5);
+    let q_clip = f32s(&mut rng, nh * hd, 0.5, 1.5);
+
+    let tk = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&k_f16), &[slots, nkv, hd], DType::F16).unwrap();
+    let tv = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&v_f16), &[slots, nkv, hd], DType::F16).unwrap();
+    let tw_rb = QWeight::from_bytes(&ctx, bytemuck::cast_slice(&rel_bias_f), GgmlType::F32, rel_len, ext).unwrap();
+    let trc = Tensor::from_f32(&ctx, &rel_clip, &[nh, rel_len]).unwrap();
+    let tqc = Tensor::from_f32(&ctx, &q_clip, &[nh, hd]).unwrap();
+    let part = Tensor::zeros(&ctx, &[rows, nh, ATTN_SPLIT_MAX_CHUNKS, 130], DType::F32).unwrap();
+
+    // Test both Global and SWA across 64-key split boundaries (62..66, 254..258, 318..322),
+    // the 2,048-key BK64 -> BK128 cutoff (2046..2050), BK128 tile/chunk boundaries (2174, 2302),
+    // and the 16,384-key 32 -> 33 chunk combine-kernel switch (16382..16386).
+    for (is_swa, pos0) in [
+        (false, 62usize),
+        (false, 126usize),
+        (false, 2046usize),
+        (false, 2174usize),
+        (false, 2302usize),
+        (false, 16382usize),
+        (true, 62usize),
+        (true, 254usize),
+        (true, 318usize),
+    ] {
+        let q = f32s(&mut rng, rows * nh * hd, -0.5, 0.5);
+        let r = f32s(&mut rng, rows * nh * rel_len, -0.5, 0.5);
+        let sinks = f32s(&mut rng, rows * nh, -0.5, 0.5);
+        let gate = f32s(&mut rng, rows * nh * hd, -1.0, 1.0);
+
+        let tq = Tensor::from_f32(&ctx, &q, &[rows, nh, hd]).unwrap();
+        let tr = Tensor::from_f32(&ctx, &r, &[rows, nh, rel_len]).unwrap();
+        let tsinks = Tensor::from_f32(&ctx, &sinks, &[rows, nh]).unwrap();
+        let tgate = Tensor::from_f32(&ctx, &gate, &[rows, nh, hd]).unwrap();
+        let out_verify = Tensor::zeros(&ctx, &[rows, nh, hd], DType::F32).unwrap();
+        run(&ctx, |p| {
+            attention_mu_split_rel(
+                &ctx, p, &tq, &tk, &tv, &tr, &tw_rb, Some(&trc), &tsinks, &part, &out_verify,
+                Some(&tgate), Some(&tqc), rows, nh, nkv, pos0, slots, is_swa, win, ext,
+                100.0, 100.0, 128, 0.1,
+            ).unwrap();
+        });
+        let got_verify = out_verify.to_f32().unwrap();
+
+        for row in 0..rows {
+            let tq1 = tq.view(row * nh * hd, &[1, nh, hd]).unwrap();
+            let tr1 = tr.view(row * nh * rel_len, &[1, nh, rel_len]).unwrap();
+            let ts1 = tsinks.view(row * nh, &[1, nh]).unwrap();
+            let tg1 = tgate.view(row * nh * hd, &[1, nh, hd]).unwrap();
+            let out_dec = Tensor::zeros(&ctx, &[1, nh, hd], DType::F32).unwrap();
+            run(&ctx, |p| {
+                attention_mu_split_rel(
+                    &ctx, p, &tq1, &tk, &tv, &tr1, &tw_rb, Some(&trc), &ts1, &part, &out_dec,
+                    Some(&tg1), Some(&tqc), 1, nh, nkv, pos0 + row, slots, is_swa, win, ext,
+                    100.0, 100.0, 128, 0.1,
+                ).unwrap();
+            });
+            let got_dec = out_dec.to_f32().unwrap();
+            let row_slice = &got_verify[row * nh * hd..(row + 1) * nh * hd];
+            assert_eq!(
+                got_dec.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                row_slice.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "decode(1) != verify({rows}) bit-for-bit at is_swa={is_swa} pos0={pos0} row={row}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dspark_fused_markov_q4_head_and_attn_mu_split_q32_match_reference() {
+    use crate::kernels::glm53 as gk;
+    use half::{bf16, f16};
+
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(10101);
+
+    let to_bf16_bytes = |vals: &[f32]| -> Vec<u8> {
+        let mut b = Vec::with_capacity(vals.len() * 2);
+        for &v in vals {
+            b.extend_from_slice(&bf16::from_f32(v).to_le_bytes());
+        }
+        b
+    };
+
+    // 1. dspark_markov_gru_bf16 + dspark_hidden_out_add_bf16 vs unfused path.
+    let (rank, dh, vocab) = (256usize, 256usize, 32usize);
+    let mk_w1_f = f32s(&mut rng, vocab * rank, -0.4, 0.4);
+    let jp_f = f32s(&mut rng, (3 * rank) * (2 * rank + 2 * dh), -0.2, 0.2);
+    let jp_b = f32s(&mut rng, 3 * rank, -0.1, 0.1);
+    let ho_f = f32s(&mut rng, dh * rank, -0.3, 0.3);
+    let ho_b = f32s(&mut rng, dh, -0.1, 0.1);
+    let w_mk = QWeight::from_bytes(&ctx, &to_bf16_bytes(&mk_w1_f), GgmlType::Bf16, rank, vocab).unwrap();
+    let w_jp = QWeight::from_bytes(&ctx, &to_bf16_bytes(&jp_f), GgmlType::Bf16, 2 * rank + 2 * dh, 3 * rank).unwrap();
+    let w_ho = QWeight::from_bytes(&ctx, &to_bf16_bytes(&ho_f), GgmlType::Bf16, rank, dh).unwrap();
+
+    let prev_tok = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&[7u32]), &[1], DType::U32).unwrap();
+    let rnn_init = f32s(&mut rng, rank, -0.5, 0.5);
+    let h_slot = f32s(&mut rng, dh, -0.5, 0.5);
+    let f_rnn = f32s(&mut rng, dh, -0.5, 0.5);
+    let t_rnn_ref = Tensor::from_f32(&ctx, &rnn_init, &[rank]).unwrap();
+    let t_rnn_in = Tensor::from_f32(&ctx, &rnn_init, &[rank]).unwrap();
+    let t_rnn_out = Tensor::zeros(&ctx, &[rank], DType::F32).unwrap();
+    let t_h_slot = Tensor::from_f32(&ctx, &h_slot, &[dh]).unwrap();
+    let t_f_rnn = Tensor::from_f32(&ctx, &f_rnn, &[dh]).unwrap();
+    let t_jp_b = Tensor::from_f32(&ctx, &jp_b, &[3 * rank]).unwrap();
+    let t_ho_b = Tensor::from_f32(&ctx, &ho_b, &[dh]).unwrap();
+
+    let ji = Tensor::zeros(&ctx, &[1, 2 * rank + 2 * dh], DType::F32).unwrap();
+    let jo = Tensor::zeros(&ctx, &[1, 3 * rank], DType::F32).unwrap();
+    let lat_ref = Tensor::zeros(&ctx, &[1, rank], DType::F32).unwrap();
+    let corr_ref = Tensor::zeros(&ctx, &[1, dh], DType::F32).unwrap();
+    let comb_ref = Tensor::zeros(&ctx, &[1, dh], DType::F32).unwrap();
+    let lat_got = Tensor::zeros(&ctx, &[1, rank], DType::F32).unwrap();
+    let comb_got = Tensor::zeros(&ctx, &[1, dh], DType::F32).unwrap();
+
+    run(&ctx, |p| {
+        copy_f32(&ctx, p, &t_rnn_ref, &ji.view(0, &[rank]).unwrap(), rank).unwrap();
+        embed(&ctx, p, &prev_tok, &w_mk, &ji.view(rank, &[rank]).unwrap(), 1).unwrap();
+        copy_f32(&ctx, p, &t_h_slot, &ji.view(2 * rank, &[dh]).unwrap(), dh).unwrap();
+        copy_f32(&ctx, p, &t_f_rnn, &ji.view(2 * rank + dh, &[dh]).unwrap(), dh).unwrap();
+        p.memory_barrier().unwrap();
+        gk::gemv(&ctx, p, &w_jp, &ji, &jo, 1).unwrap();
+        p.memory_barrier().unwrap();
+        dspark_gru(&ctx, p, &jo, &t_jp_b, &t_rnn_ref, &lat_ref, rank).unwrap();
+        p.memory_barrier().unwrap();
+        gk::gemv(&ctx, p, &w_ho, &lat_ref, &corr_ref, 1).unwrap();
+        p.memory_barrier().unwrap();
+        add3(&ctx, p, &t_h_slot, &corr_ref, &t_ho_b, &comb_ref, dh).unwrap();
+
+        dspark_markov_gru_bf16(&ctx, p, &prev_tok, &t_rnn_in, &w_mk, &t_h_slot, &t_f_rnn, &w_jp, &t_jp_b, &t_rnn_out, &lat_got, rank, dh).unwrap();
+        p.memory_barrier().unwrap();
+        dspark_hidden_out_add_bf16(&ctx, p, &lat_got, &w_ho, &t_h_slot, &t_ho_b, &comb_got, dh, rank).unwrap();
+    });
+    assert_close(&t_rnn_out.to_f32().unwrap(), &t_rnn_ref.to_f32().unwrap(), 1e-4, 1e-4);
+    assert_close(&lat_got.to_f32().unwrap(), &lat_ref.to_f32().unwrap(), 1e-4, 1e-4);
+    assert_close(&comb_got.to_f32().unwrap(), &comb_ref.to_f32().unwrap(), 1e-4, 1e-4);
+
+    // 2. draft_head_q4_0_argmax matches gk::gemv + CPU argmax.
+    let (q4_v, q4_k) = (6500usize, 1024usize);
+    let bpr = q4_k / 32;
+    let mut q4_bytes = vec![0u8; q4_v * bpr * 18];
+    for r in 0..q4_v {
+        for b in 0..bpr {
+            let off = (r * bpr + b) * 18;
+            let d = f16::from_f32(rng.gen_range(0.01..0.05));
+            q4_bytes[off..off + 2].copy_from_slice(&d.to_le_bytes());
+            for j in 0..16 {
+                q4_bytes[off + 2 + j] = rng.r#gen();
+            }
+        }
+    }
+    let w_q4 = QWeight::from_bytes(&ctx, &q4_bytes, GgmlType::Q4_0, q4_k, q4_v).unwrap();
+    let x_lm = f32s(&mut rng, q4_k, -1.0, 1.0);
+    let tx_lm = Tensor::from_f32(&ctx, &x_lm, &[1, q4_k]).unwrap();
+    let ref_logits = Tensor::zeros(&ctx, &[1, q4_v], DType::F32).unwrap();
+    let n_parts = q4_v.div_ceil(32).max(1);
+    let pval = Tensor::zeros(&ctx, &[n_parts], DType::F32).unwrap();
+    let pidx = Tensor::zeros(&ctx, &[n_parts], DType::U32).unwrap();
+    let out_tok = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+    run(&ctx, |p| {
+        gk::gemv(&ctx, p, &w_q4, &tx_lm, &ref_logits, 1).unwrap();
+        draft_head_q4_0_argmax(&ctx, p, &tx_lm, &w_q4, &pval, &pidx, &out_tok, q4_v).unwrap();
+    });
+    let logits_cpu = ref_logits.to_f32().unwrap();
+    let (best_i, _) = logits_cpu
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
+        .unwrap();
+    assert_eq!(out_tok.to_u32().unwrap()[0] as usize, best_i, "draft_head_q4_0_argmax mismatch");
+
+    // 2b. draft_head_q2_k_argmax matches gk::gemv + CPU argmax.
+    let q2_bpr = q4_k / 256;
+    let mut q2_bytes = vec![0u8; q4_v * q2_bpr * 84];
+    for r in 0..q4_v {
+        for b in 0..q2_bpr {
+            let off = (r * q2_bpr + b) * 84;
+            for j in 0..80 {
+                q2_bytes[off + j] = rng.r#gen();
+            }
+            let d = f16::from_f32(rng.gen_range(0.01..0.05));
+            let dm = f16::from_f32(rng.gen_range(0.01..0.05));
+            q2_bytes[off + 80..off + 82].copy_from_slice(&d.to_le_bytes());
+            q2_bytes[off + 82..off + 84].copy_from_slice(&dm.to_le_bytes());
+        }
+    }
+    let w_q2 = QWeight::from_bytes(&ctx, &q2_bytes, GgmlType::Q2K, q4_k, q4_v).unwrap();
+    let ref_logits_q2 = Tensor::zeros(&ctx, &[1, q4_v], DType::F32).unwrap();
+    let out_tok_q2 = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+    run(&ctx, |p| {
+        gk::gemv(&ctx, p, &w_q2, &tx_lm, &ref_logits_q2, 1).unwrap();
+        draft_head_q2_k_argmax(&ctx, p, &tx_lm, &w_q2, &pval, &pidx, &out_tok_q2, q4_v).unwrap();
+    });
+    let logits_q2 = ref_logits_q2.to_f32().unwrap();
+    let (best_q2, _) = logits_q2
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
+        .unwrap();
+    assert_eq!(out_tok_q2.to_u32().unwrap()[0] as usize, best_q2, "draft_head_q2_k_argmax mismatch");
+
+    // 3. attention_mu_split BQ=32 path (rows*G = 18 SWA and 24/32 Global) matches attention_split_fused!
+    if ctx.matrix_units() {
+        for (is_swa, nh, nkv, rows, pos0, slots, win, ext) in [
+            (true, 6usize, 2usize, 6usize, 260usize, 320usize, 256usize, 256usize),  // rows*G = 18
+            (false, 8usize, 2usize, 6usize, 260usize, 320usize, 256usize, 256usize), // rows*G = 24
+            (false, 8usize, 2usize, 8usize, 260usize, 320usize, 256usize, 256usize), // rows*G = 32
+        ] {
+            let hd = 128usize;
+            let q = f32s(&mut rng, rows * nh * hd, -0.5, 0.5);
+            let k_f16: Vec<u16> = f32s(&mut rng, slots * nkv * hd, -0.5, 0.5)
+                .into_iter()
+                .map(|v| f16::from_f32(v).to_bits())
+                .collect();
+            let v_f16: Vec<u16> = f32s(&mut rng, slots * nkv * hd, -0.5, 0.5)
+                .into_iter()
+                .map(|v| f16::from_f32(v).to_bits())
+                .collect();
+            let rel = f32s(&mut rng, rows * nh * ext, -0.2, 0.2);
+            let sinks = f32s(&mut rng, rows * nh, -0.5, 0.5);
+            let gate = f32s(&mut rng, rows * nh * hd, -1.0, 1.0);
+            let q_clip = f32s(&mut rng, nh * hd, 0.5, 1.5);
+
+            let tq = Tensor::from_f32(&ctx, &q, &[rows, nh, hd]).unwrap();
+            let tk = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&k_f16), &[slots, nkv, hd], DType::F16).unwrap();
+            let tv = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&v_f16), &[slots, nkv, hd], DType::F16).unwrap();
+            let trel = Tensor::from_f32(&ctx, &rel, &[rows, nh, ext]).unwrap();
+            let tsinks = Tensor::from_f32(&ctx, &sinks, &[rows, nh]).unwrap();
+            let tgate = Tensor::from_f32(&ctx, &gate, &[rows, nh, hd]).unwrap();
+            let tqclip = Tensor::from_f32(&ctx, &q_clip, &[nh, hd]).unwrap();
+            let part = Tensor::zeros(&ctx, &[rows, nh, ATTN_SPLIT_MAX_CHUNKS, 130], DType::F32).unwrap();
+            let out_ref = Tensor::zeros(&ctx, &[rows, nh, hd], DType::F32).unwrap();
+            let out_q32 = Tensor::zeros(&ctx, &[rows, nh, hd], DType::F32).unwrap();
+            run(&ctx, |p| {
+                attention_split_fused(
+                    &ctx, p, &tq, &tk, &tv, &trel, &tsinks, &part, &out_ref,
+                    Some(&tgate), Some(&tqclip), rows, nh, nkv, pos0, slots,
+                    is_swa, win, ext, 100.0, 128, 0.1,
+                ).unwrap();
+                p.memory_barrier().unwrap();
+                attention_mu_split(
+                    &ctx, p, &tq, &tk, &tv, &trel, &tsinks, &part, &out_q32,
+                    Some(&tgate), Some(&tqclip), rows, nh, nkv, pos0, slots,
+                    is_swa, win, ext, 100.0, 128, 0.1,
+                ).unwrap();
+            });
+            assert_close(&out_q32.to_f32().unwrap(), &out_ref.to_f32().unwrap(), 2e-3, 2e-3);
+        }
+    }
 }

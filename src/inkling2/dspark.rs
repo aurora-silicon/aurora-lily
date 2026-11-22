@@ -20,7 +20,7 @@ use crate::glm53::model::Mapped;
 use crate::kernels::glm53::{self as k, QWeight};
 use crate::kernels::inkling2 as ik;
 use crate::kernels::sample::{SamplerScratch, SamplingParams, sample_f32};
-use crate::metal::MetalContext;
+use crate::metal::{MetalContext, Param};
 use crate::tensor::{DType, Tensor};
 
 /// Maximum drafts per block (`block_size - 1` = 7).
@@ -206,8 +206,10 @@ pub(super) struct DsparkScratch {
     pub(super) latent: Tensor,       // F32 [1, rank]
     pub(super) corr: Tensor,         // F32 [1, hidden]
     pub(super) combined: Tensor,     // F32 [1, hidden]
-    pub(super) logits_raw: Tensor,   // F32 [vocab_padded]
-    pub(super) best_toks: Tensor,    // U32 [max_block] (slot 0 = anchor, 1..block = drafts)
+    pub(super) logits_raw: Tensor,     // F32 [vocab_padded]
+    pub(super) draft_part_val: Tensor, // F32 [160]
+    pub(super) draft_part_idx: Tensor, // U32 [160]
+    pub(super) best_toks: Tensor,      // U32 [max_block] (slot 0 = anchor, 1..block = drafts)
     pub(super) sampler: SamplerScratch,
 }
 
@@ -380,14 +382,15 @@ impl Inkling2Dspark {
         let qw = cfg.n_head * cfg.head_dim;
         let kw = cfg.n_head_kv * cfg.head_dim;
         let rank = cfg.markov_rank;
+        let nl = cfg.n_layer.max(1);
         let scratch = DsparkScratch {
             max_block,
             cur: Tensor::zeros(ctx, &[max_block, h], DType::F32)?,
-            x_h: Tensor::zeros(ctx, &[max_block, h], DType::F32)?,
+            x_h: Tensor::zeros(ctx, &[nl * max_block, h], DType::F32)?,
             post_attn: Tensor::zeros(ctx, &[max_block, h], DType::F32)?,
             q: Tensor::zeros(ctx, &[max_block, qw], DType::F32)?,
-            k: Tensor::zeros(ctx, &[max_block, kw], DType::F32)?,
-            v: Tensor::zeros(ctx, &[max_block, kw], DType::F32)?,
+            k: Tensor::zeros(ctx, &[nl * max_block, kw], DType::F32)?,
+            v: Tensor::zeros(ctx, &[nl * max_block, kw], DType::F32)?,
             attn_partial: Tensor::zeros(
                 ctx,
                 &[max_block, cfg.n_head, ik::DSPARK_SPLIT_MAX_CHUNKS + 1, 130],
@@ -407,6 +410,16 @@ impl Inkling2Dspark {
             corr: Tensor::zeros(ctx, &[1, h], DType::F32)?,
             combined: Tensor::zeros(ctx, &[1, h], DType::F32)?,
             logits_raw: Tensor::zeros(ctx, &[target.vocab_padded], DType::F32)?,
+            draft_part_val: Tensor::zeros(
+                ctx,
+                &[target.vocab_unpadded.div_ceil(32).max(1)],
+                DType::F32,
+            )?,
+            draft_part_idx: Tensor::zeros(
+                ctx,
+                &[target.vocab_unpadded.div_ceil(32).max(1)],
+                DType::U32,
+            )?,
             best_toks: Tensor::zeros(ctx, &[max_block], DType::U32)?,
             sampler: SamplerScratch::new(ctx, target.vocab_unpadded)?,
         };
@@ -429,6 +442,22 @@ impl Inkling2Dspark {
         })
     }
 
+    fn use_cmat_q4_0(ctx: &MetalContext, ws: &[&QWeight], rows: usize) -> bool {
+        let Some(&w0) = ws.first() else {
+            return false;
+        };
+        let total_rows: usize = ws.iter().map(|w| w.rows).sum();
+        let max_rows = ws.iter().map(|w| w.rows).max().unwrap_or(0);
+        ctx.matrix_units()
+            && 256 <= ctx.max_workgroup_invocations()
+            && (2..=16).contains(&rows)
+            && w0.ty == crate::gguf::GgmlType::Q4_0
+            && w0.cols.is_multiple_of(32)
+            && total_rows >= 512
+            && max_rows.saturating_mul(w0.row_bytes / 2) < (1usize << 31)
+            && ws.iter().all(|w| w.ty == crate::gguf::GgmlType::Q4_0 && w.cols == w0.cols)
+    }
+
     fn dispatch_linear(
         ctx: &MetalContext,
         pass: &crate::metal::ComputePass<'_>,
@@ -437,6 +466,16 @@ impl Inkling2Dspark {
         y: &Tensor,
         rows: usize,
     ) -> Result<()> {
+        if ctx.matrix_units()
+            && w.ty == crate::gguf::GgmlType::Bf16
+            && w.cols.is_multiple_of(64)
+            && rows <= 16
+        {
+            return k::gemv_cmat_bf16_sets(ctx, pass, &[(w, y)], x, rows);
+        }
+        if Self::use_cmat_q4_0(ctx, &[w], rows) {
+            return k::gemv_cmat_q4_0_sets(ctx, pass, &[(w, y)], x, rows);
+        }
         if rows <= k::gemv_max_rows(w.ty) {
             k::gemv(ctx, pass, w, x, y, rows)
         } else {
@@ -454,6 +493,18 @@ impl Inkling2Dspark {
         y1: &Tensor,
         rows: usize,
     ) -> Result<()> {
+        if ctx.matrix_units()
+            && w0.ty == crate::gguf::GgmlType::Bf16
+            && w1.ty == crate::gguf::GgmlType::Bf16
+            && w0.cols == w1.cols
+            && w0.cols.is_multiple_of(64)
+            && rows <= 16
+        {
+            return k::gemv_cmat_bf16_sets(ctx, pass, &[(w0, y0), (w1, y1)], x, rows);
+        }
+        if Self::use_cmat_q4_0(ctx, &[w0, w1], rows) {
+            return k::gemv_cmat_q4_0_sets(ctx, pass, &[(w0, y0), (w1, y1)], x, rows);
+        }
         if w0.ty == w1.ty && rows <= k::gemv_max_rows(w0.ty) {
             k::gemv_sets(ctx, pass, &[(w0, y0), (w1, y1)], x, rows)
         } else {
@@ -474,6 +525,26 @@ impl Inkling2Dspark {
         y2: &Tensor,
         rows: usize,
     ) -> Result<()> {
+        if ctx.matrix_units()
+            && w0.ty == crate::gguf::GgmlType::Bf16
+            && w1.ty == crate::gguf::GgmlType::Bf16
+            && w2.ty == crate::gguf::GgmlType::Bf16
+            && w0.cols == w1.cols
+            && w0.cols == w2.cols
+            && w0.cols.is_multiple_of(64)
+            && rows <= 16
+        {
+            return k::gemv_cmat_bf16_sets(
+                ctx,
+                pass,
+                &[(w0, y0), (w1, y1), (w2, y2)],
+                x,
+                rows,
+            );
+        }
+        if Self::use_cmat_q4_0(ctx, &[w0, w1, w2], rows) {
+            return k::gemv_cmat_q4_0_sets(ctx, pass, &[(w0, y0), (w1, y1), (w2, y2)], x, rows);
+        }
         if w0.ty == w1.ty && w0.ty == w2.ty && rows <= k::gemv_max_rows(w0.ty) {
             k::gemv_sets(ctx, pass, &[(w0, y0), (w1, y1), (w2, y2)], x, rows)
         } else {
@@ -506,63 +577,44 @@ impl Inkling2Dspark {
         let nkv = self.cfg.n_head_kv;
         let kv_w = nkv * hd;
         let nt = self.cfg.target_layers.len();
-        let xv = sc.x_h.view(0, &[rows, h])?;
-        let kv = sc.k.view(0, &[rows, kv_w])?;
-        let vv = sc.v.view(0, &[rows, kv_w])?;
-
-        for il in 0..self.cfg.n_layer {
+        let nl = self.cfg.n_layer;
+        let mut xvs = Vec::with_capacity(nl);
+        let mut kvs = Vec::with_capacity(nl);
+        let mut vvs = Vec::with_capacity(nl);
+        for il in 0..nl {
+            xvs.push(sc.x_h.view(il * sc.max_block * h, &[rows, h])?);
+            kvs.push(sc.k.view(il * sc.max_block * kv_w, &[rows, kv_w])?);
+            vvs.push(sc.v.view(il * sc.max_block * kv_w, &[rows, kv_w])?);
+        }
+        // Wave 1: all n_layer feature fusions + f_rnn_last in parallel!
+        for il in 0..nl {
             let l = &self.layers[il];
             let fw = self.fuse_weights.view(il * nt, &[nt])?;
             ik::dspark_fuse_norm(
-                ctx,
-                pass,
-                cap,
-                &fw,
-                &l.dflare_norm,
-                &xv,
-                rows,
-                h,
-                cap_stride,
-                nt,
-                self.cfg.rms_eps,
-                0,
+                ctx, pass, cap, &fw, &l.dflare_norm, &xvs[il], rows, h, cap_stride, nt,
+                self.cfg.rms_eps, 0,
             )?;
-            pass.memory_barrier()?;
-            Self::dispatch_linear2(ctx, pass, &l.wk_ctx, &l.wv_ctx, &xv, &kv, &vv, rows)?;
-            pass.memory_barrier()?;
-            ik::dspark_qk_rope(
-                ctx,
-                pass,
-                &kv,
-                &l.k_ctx_norm,
-                Some(&vv),
-                Some(&state.k_ctx[il]),
-                Some(&state.v_ctx[il]),
-                rows,
-                nkv,
-                hd,
-                pos0,
-                self.cfg.rms_eps,
-                self.cfg.rope_theta,
-            )?;
-            pass.memory_barrier()?;
         }
-
-        let fw_rnn = self.fuse_weights.view(self.cfg.n_layer * nt, &[nt])?;
+        let fw_rnn = self.fuse_weights.view(nl * nt, &[nt])?;
         ik::dspark_fuse_norm(
-            ctx,
-            pass,
-            cap,
-            &fw_rnn,
-            &self.dspark_norm,
-            &state.f_rnn_last,
-            1,
-            h,
-            cap_stride,
-            nt,
-            self.cfg.rms_eps,
-            rows - 1,
+            ctx, pass, cap, &fw_rnn, &self.dspark_norm, &state.f_rnn_last, 1, h, cap_stride,
+            nt, self.cfg.rms_eps, rows - 1,
         )?;
+        pass.memory_barrier()?;
+        // Wave 2: all n_layer wk_ctx/wv_ctx projections in parallel!
+        for il in 0..nl {
+            let l = &self.layers[il];
+            Self::dispatch_linear2(ctx, pass, &l.wk_ctx, &l.wv_ctx, &xvs[il], &kvs[il], &vvs[il], rows)?;
+        }
+        pass.memory_barrier()?;
+        // Wave 3: all n_layer QK-norm/RoPE + F16 ctx KV store in parallel!
+        for il in 0..nl {
+            let l = &self.layers[il];
+            ik::dspark_qk_rope(
+                ctx, pass, &kvs[il], &l.k_ctx_norm, Some(&vvs[il]), Some(&state.k_ctx[il]),
+                Some(&state.v_ctx[il]), rows, nkv, hd, pos0, self.cfg.rms_eps, self.cfg.rope_theta,
+            )?;
+        }
         state.pos = pos0 + rows;
         Ok(())
     }
@@ -654,6 +706,90 @@ impl Inkling2Dspark {
         Ok(())
     }
 
+    pub(super) fn best_toks_tensor(&self) -> &Tensor {
+        &self.scratch.best_toks
+    }
+
+    pub(super) fn rnn_state_tensor(&self) -> &Tensor {
+        &self.scratch.rnn_state
+    }
+
+    /// Dynamic variant of [`encode_inject`] reading `kept = spec_meta[1]` and
+    /// `row_off = spec_meta[4]` (`= kept - 1`) directly from GPU memory so
+    /// target verify + DSpark inject + propose run in ONE command buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_inject_dynamic(
+        &self,
+        ctx: &MetalContext,
+        pass: &crate::metal::ComputePass<'_>,
+        state: &DsparkState,
+        cap: &Tensor,
+        cap_stride: usize,
+        max_rows: usize,
+        pos0: Param<'_>,
+        spec_meta: &Tensor,
+    ) -> Result<()> {
+        let sc = &self.scratch;
+        ensure!(max_rows <= sc.max_block, "encode_inject_dynamic rows {max_rows} > {}", sc.max_block);
+        let h = self.cfg.hidden;
+        let hd = self.cfg.head_dim;
+        let nkv = self.cfg.n_head_kv;
+        let kv_w = nkv * hd;
+        let nt = self.cfg.target_layers.len();
+        let nl = self.cfg.n_layer;
+        let mut xvs = Vec::with_capacity(nl);
+        let mut kvs = Vec::with_capacity(nl);
+        let mut vvs = Vec::with_capacity(nl);
+        for il in 0..nl {
+            xvs.push(sc.x_h.view(il * sc.max_block * h, &[max_rows, h])?);
+            kvs.push(sc.k.view(il * sc.max_block * kv_w, &[max_rows, kv_w])?);
+            vvs.push(sc.v.view(il * sc.max_block * kv_w, &[max_rows, kv_w])?);
+        }
+        let (meta_buf, meta_off) = spec_meta.binding();
+        let kept_param = Param::Gpu(meta_buf, meta_off + 4);
+        let last_row_param = Param::Gpu(meta_buf, meta_off + 16);
+
+        // Wave 1: all n_layer feature fusions + f_rnn_last in parallel!
+        for il in 0..nl {
+            let l = &self.layers[il];
+            let fw = self.fuse_weights.view(il * nt, &[nt])?;
+            ik::dspark_fuse_norm(
+                ctx, pass, cap, &fw, &l.dflare_norm, &xvs[il], max_rows, h, cap_stride, nt,
+                self.cfg.rms_eps, 0,
+            )?;
+        }
+        let fw_rnn = self.fuse_weights.view(nl * nt, &[nt])?;
+        ik::dspark_fuse_norm_dyn(
+            ctx, pass, cap, &fw_rnn, &self.dspark_norm, &state.f_rnn_last, 1, h, cap_stride,
+            nt, self.cfg.rms_eps, last_row_param,
+        )?;
+        pass.memory_barrier()?;
+        // Wave 2: all n_layer wk_ctx/wv_ctx projections in parallel!
+        for il in 0..nl {
+            let l = &self.layers[il];
+            Self::dispatch_linear2(ctx, pass, &l.wk_ctx, &l.wv_ctx, &xvs[il], &kvs[il], &vvs[il], max_rows)?;
+        }
+        pass.memory_barrier()?;
+        // Wave 3: all n_layer QK-norm/RoPE + F16 ctx KV store in parallel!
+        for il in 0..nl {
+            let l = &self.layers[il];
+            ik::dspark_qk_rope_dyn(
+                ctx, pass, &kvs[il], &l.k_ctx_norm, Some(&vvs[il]), Some(&state.k_ctx[il]),
+                Some(&state.v_ctx[il]), max_rows, nkv, hd, pos0, kept_param,
+                self.cfg.rms_eps, self.cfg.rope_theta,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Split-K grids `((global_chunks, global_ck), (swa_chunks, swa_ck))` for `max_ctx_pos`.
+    pub fn split_grids(&self, max_ctx_pos: usize) -> ((usize, usize), (usize, usize)) {
+        (
+            ik::dspark_split_grid(max_ctx_pos),
+            ik::dspark_split_grid(max_ctx_pos.min(self.cfg.window)),
+        )
+    }
+
     /// Host-side staging before [`encode_propose`] (must be called while GPU is idle).
     pub fn prepare_propose(&self, anchor_token: u32) -> Result<()> {
         let sc = &self.scratch;
@@ -670,9 +806,8 @@ impl Inkling2Dspark {
         Ok(all_toks[1..block].to_vec())
     }
 
-    /// Encodes ALL 3 DFlare layers (attn_norm, Q/K/V, Q/K norm+RoPE, GPU non-causal GQA,
-    /// wo, residual, FFN) + `output_norm` + ALL `n_drafts` recurrent Markov head slots
-    /// into a single `ComputePass` with ZERO CPU round-trips!
+    /// Encodes ALL 3 DFlare layers + `output_norm` + ALL `n_drafts` recurrent Markov head
+    /// slots into a single `ComputePass` with ZERO CPU round-trips.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_propose(
         &self,
@@ -683,6 +818,65 @@ impl Inkling2Dspark {
         target_output: &QWeight,
         vocab_unpadded: usize,
         pos: usize,
+        n_drafts: usize,
+    ) -> Result<()> {
+        self.encode_propose_impl(
+            ctx,
+            pass,
+            state,
+            anchor_embd_normed,
+            target_output,
+            vocab_unpadded,
+            Param::U32(pos as u32),
+            None,
+            state.pos,
+            n_drafts,
+        )
+    }
+
+    /// Dynamic variant of [`encode_propose`] reading `new_pos = spec_meta[3]` and
+    /// `swa_ctx_start = spec_meta[5]` from GPU memory (`hd = 128`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_propose_dynamic(
+        &self,
+        ctx: &MetalContext,
+        pass: &crate::metal::ComputePass<'_>,
+        state: &DsparkState,
+        anchor_embd_normed: &Tensor,
+        target_output: &QWeight,
+        vocab_unpadded: usize,
+        max_ctx_pos: usize,
+        spec_meta: &Tensor,
+        n_drafts: usize,
+    ) -> Result<()> {
+        ensure!(self.cfg.head_dim == 128, "encode_propose_dynamic requires hd=128");
+        let (meta_buf, meta_off) = spec_meta.binding();
+        self.encode_propose_impl(
+            ctx,
+            pass,
+            state,
+            anchor_embd_normed,
+            target_output,
+            vocab_unpadded,
+            Param::Gpu(meta_buf, meta_off + 12),
+            Some((Param::Gpu(meta_buf, meta_off + 20), Param::Gpu(meta_buf, meta_off + 12))),
+            max_ctx_pos,
+            n_drafts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_propose_impl(
+        &self,
+        ctx: &MetalContext,
+        pass: &crate::metal::ComputePass<'_>,
+        state: &DsparkState,
+        anchor_embd_normed: &Tensor,
+        target_output: &QWeight,
+        vocab_unpadded: usize,
+        pos_param: Param<'_>,
+        dyn_ctx: Option<(Param<'_>, Param<'_>)>,
+        max_ctx_pos: usize,
         n_drafts: usize,
     ) -> Result<()> {
         let sc = &self.scratch;
@@ -708,29 +902,40 @@ impl Inkling2Dspark {
         let mid_v = sc.mid.view(0, &[block, self.cfg.ff])?;
         let down_v = sc.down.view(0, &[block, h])?;
 
+        let fused_markov = self.markov_w1.ty == crate::gguf::GgmlType::Bf16
+            && self.joint_proj.ty == crate::gguf::GgmlType::Bf16
+            && self.hidden_out.ty == crate::gguf::GgmlType::Bf16
+            && rank <= 512
+            && rank.is_multiple_of(8)
+            && h.is_multiple_of(8);
+
         ik::dspark_init_cur(ctx, pass, anchor_embd_normed, &self.mask_embd, &cur_v, block, h)?;
-        let ji_frnn = sc.joint_in.view(2 * rank + h, &[h])?;
-        ik::copy_f32(ctx, pass, &state.f_rnn_last, &ji_frnn, h)?;
+        if !fused_markov {
+            let ji_frnn = sc.joint_in.view(2 * rank + h, &[h])?;
+            ik::copy_f32(ctx, pass, &state.f_rnn_last, &ji_frnn, h)?;
+        }
+        pass.memory_barrier()?;
+
+        let hn_v = sc.hidden_norm.view(0, &[block, h])?;
+        ik::rms_norm(
+            ctx,
+            pass,
+            &cur_v,
+            Some(&self.layers[0].attn_norm),
+            &xh_v,
+            block,
+            h,
+            self.cfg.rms_eps,
+        )?;
         pass.memory_barrier()?;
 
         for il in 0..self.cfg.n_layer {
             let l = &self.layers[il];
-            ik::rms_norm(
-                ctx,
-                pass,
-                &cur_v,
-                Some(&l.attn_norm),
-                &xh_v,
-                block,
-                h,
-                self.cfg.rms_eps,
-            )?;
-            pass.memory_barrier()?;
             Self::dispatch_linear3(
                 ctx, pass, &l.wq, &l.wk, &l.wv, &xh_v, &q_v, &k_v, &v_v, block,
             )?;
             pass.memory_barrier()?;
-            ik::dspark_qk_rope(
+            ik::dspark_qk_rope_dyn(
                 ctx,
                 pass,
                 &q_v,
@@ -741,11 +946,12 @@ impl Inkling2Dspark {
                 block,
                 nh,
                 hd,
-                pos,
+                pos_param,
+                Param::U32(block as u32),
                 self.cfg.rms_eps,
                 self.cfg.rope_theta,
             )?;
-            ik::dspark_qk_rope(
+            ik::dspark_qk_rope_dyn(
                 ctx,
                 pass,
                 &k_v,
@@ -756,45 +962,72 @@ impl Inkling2Dspark {
                 block,
                 nkv,
                 hd,
-                pos,
+                pos_param,
+                Param::U32(block as u32),
                 self.cfg.rms_eps,
                 self.cfg.rope_theta,
             )?;
             pass.memory_barrier()?;
 
-            let ctx_start = if self.cfg.swa[il] && state.pos > self.cfg.window {
-                state.pos - self.cfg.window
+            if let Some((swa_start_p, ctx_pos_p)) = dyn_ctx {
+                let ctx_start_p = if self.cfg.swa[il] { swa_start_p } else { Param::U32(0) };
+                let max_ctx_len = if self.cfg.swa[il] {
+                    max_ctx_pos.min(self.cfg.window)
+                } else {
+                    max_ctx_pos
+                };
+                ik::dspark_attn_split_dyn(
+                    ctx,
+                    pass,
+                    &q_v,
+                    &state.k_ctx[il],
+                    &state.v_ctx[il],
+                    &k_v,
+                    &v_v,
+                    &sc.attn_partial,
+                    &ao_v,
+                    nh,
+                    nkv,
+                    ctx_start_p,
+                    ctx_pos_p,
+                    max_ctx_len,
+                    block,
+                )?;
             } else {
-                0
-            };
-            ik::dspark_attn_split(
-                ctx,
-                pass,
-                &q_v,
-                &state.k_ctx[il],
-                &state.v_ctx[il],
-                &k_v,
-                &v_v,
-                &sc.attn_partial,
-                &ao_v,
-                nh,
-                nkv,
-                hd,
-                ctx_start,
-                state.pos,
-                block,
-            )?;
+                let ctx_start = if self.cfg.swa[il] && state.pos > self.cfg.window {
+                    state.pos - self.cfg.window
+                } else {
+                    0
+                };
+                ik::dspark_attn_split(
+                    ctx,
+                    pass,
+                    &q_v,
+                    &state.k_ctx[il],
+                    &state.v_ctx[il],
+                    &k_v,
+                    &v_v,
+                    &sc.attn_partial,
+                    &ao_v,
+                    nh,
+                    nkv,
+                    hd,
+                    ctx_start,
+                    state.pos,
+                    block,
+                )?;
+            }
             pass.memory_barrier()?;
 
             Self::dispatch_linear(ctx, pass, &l.wo, &ao_v, &wo_v, block)?;
             pass.memory_barrier()?;
-            ik::add(ctx, pass, &cur_v, &wo_v, &post_v, block * h)?;
-            pass.memory_barrier()?;
-            ik::rms_norm(
+            ik::add_rms_norm(
                 ctx,
                 pass,
+                &cur_v,
+                &wo_v,
+                &l.ffn_norm,
                 &post_v,
-                Some(&l.ffn_norm),
                 &xh_v,
                 block,
                 h,
@@ -816,63 +1049,150 @@ impl Inkling2Dspark {
             pass.memory_barrier()?;
             Self::dispatch_linear(ctx, pass, &l.ffn_down, &mid_v, &down_v, block)?;
             pass.memory_barrier()?;
-            ik::add(ctx, pass, &post_v, &down_v, &cur_v, block * h)?;
+            if il + 1 < self.cfg.n_layer {
+                ik::add_rms_norm(
+                    ctx,
+                    pass,
+                    &post_v,
+                    &down_v,
+                    &self.layers[il + 1].attn_norm,
+                    &cur_v,
+                    &xh_v,
+                    block,
+                    h,
+                    self.cfg.rms_eps,
+                )?;
+            } else {
+                ik::add_rms_norm(
+                    ctx,
+                    pass,
+                    &post_v,
+                    &down_v,
+                    &self.output_norm,
+                    &cur_v,
+                    &hn_v,
+                    block,
+                    h,
+                    self.cfg.rms_eps,
+                )?;
+            }
             pass.memory_barrier()?;
         }
 
-        let hn_v = sc.hidden_norm.view(0, &[block, h])?;
         let ji_rnn = sc.joint_in.view(0, &[rank])?;
         let ji_mk = sc.joint_in.view(rank, &[rank])?;
         let ji_h = sc.joint_in.view(2 * rank, &[h])?;
         let logits_unpadded = sc.logits_raw.view(0, &[vocab_unpadded])?;
         let greedy = SamplingParams::greedy();
 
-        ik::rms_norm(
-            ctx,
-            pass,
-            &cur_v,
-            Some(&self.output_norm),
-            &hn_v,
-            block,
-            h,
-            self.cfg.rms_eps,
-        )?;
-        pass.memory_barrier()?;
-
+        let rnn_alt = sc.joint_out.view(0, &[rank])?;
         for slot in 1..block {
             let prev_tok_v = sc.best_toks.view(slot - 1, &[1])?;
             let out_tok_v = sc.best_toks.view(slot, &[1])?;
             let h_slot = sc.hidden_norm.view(slot * h, &[h])?;
 
-            ik::copy_f32(ctx, pass, &sc.rnn_state, &ji_rnn, rank)?;
-            ik::embed(ctx, pass, &prev_tok_v, &self.markov_w1, &ji_mk, 1)?;
-            ik::copy_f32(ctx, pass, &h_slot, &ji_h, h)?;
-            pass.memory_barrier()?;
+            if fused_markov {
+                // Ping-pong rnn_in / rnn_out across slots to avoid cross-workgroup races.
+                let (rnn_in, rnn_out) =
+                    if (slot & 1) == 1 { (&sc.rnn_state, &rnn_alt) } else { (&rnn_alt, &sc.rnn_state) };
+                ik::dspark_markov_gru_bf16(
+                    ctx,
+                    pass,
+                    &prev_tok_v,
+                    rnn_in,
+                    &self.markov_w1,
+                    &h_slot,
+                    &state.f_rnn_last,
+                    &self.joint_proj,
+                    &self.joint_proj_b,
+                    rnn_out,
+                    &sc.latent,
+                    rank,
+                    h,
+                )?;
+                pass.memory_barrier()?;
 
-            Self::dispatch_linear(ctx, pass, &self.joint_proj, &sc.joint_in, &sc.joint_out, 1)?;
-            pass.memory_barrier()?;
+                ik::dspark_hidden_out_add_bf16(
+                    ctx,
+                    pass,
+                    &sc.latent,
+                    &self.hidden_out,
+                    &h_slot,
+                    &self.hidden_out_b,
+                    &sc.combined,
+                    h,
+                    rank,
+                )?;
+                pass.memory_barrier()?;
+            } else {
+                ik::copy_f32(ctx, pass, &sc.rnn_state, &ji_rnn, rank)?;
+                ik::embed(ctx, pass, &prev_tok_v, &self.markov_w1, &ji_mk, 1)?;
+                ik::copy_f32(ctx, pass, &h_slot, &ji_h, h)?;
+                pass.memory_barrier()?;
 
-            ik::dspark_gru(
-                ctx,
-                pass,
-                &sc.joint_out,
-                &self.joint_proj_b,
-                &sc.rnn_state,
-                &sc.latent,
-                rank,
-            )?;
-            pass.memory_barrier()?;
+                Self::dispatch_linear(ctx, pass, &self.joint_proj, &sc.joint_in, &sc.joint_out, 1)?;
+                pass.memory_barrier()?;
 
-            Self::dispatch_linear(ctx, pass, &self.hidden_out, &sc.latent, &sc.corr, 1)?;
-            pass.memory_barrier()?;
+                ik::dspark_gru(
+                    ctx,
+                    pass,
+                    &sc.joint_out,
+                    &self.joint_proj_b,
+                    &sc.rnn_state,
+                    &sc.latent,
+                    rank,
+                )?;
+                pass.memory_barrier()?;
 
-            ik::add3(ctx, pass, &h_slot, &sc.corr, &self.hidden_out_b, &sc.combined, h)?;
-            pass.memory_barrier()?;
+                Self::dispatch_linear(ctx, pass, &self.hidden_out, &sc.latent, &sc.corr, 1)?;
+                pass.memory_barrier()?;
 
-            Self::dispatch_linear(ctx, pass, target_output, &sc.combined, &sc.logits_raw, 1)?;
-            pass.memory_barrier()?;
+                ik::add3(ctx, pass, &h_slot, &sc.corr, &self.hidden_out_b, &sc.combined, h)?;
+                pass.memory_barrier()?;
+            }
 
-            sample_f32(ctx, pass, &logits_unpadded, &sc.sampler, &greedy, 0, &out_tok_v)?;
+            if target_output.ty == crate::gguf::GgmlType::Q4_0
+                && target_output.cols == h
+                && target_output.rows >= vocab_unpadded
+                && h.is_multiple_of(32)
+            {
+                ik::draft_head_q4_0_argmax(
+                    ctx,
+                    pass,
+                    &sc.combined,
+                    target_output,
+                    &sc.draft_part_val,
+                    &sc.draft_part_idx,
+                    &out_tok_v,
+                    vocab_unpadded,
+                )?;
+            } else if target_output.ty == crate::gguf::GgmlType::Q2K
+                && target_output.cols == h
+                && target_output.rows >= vocab_unpadded
+                && h.is_multiple_of(256)
+            {
+                ik::draft_head_q2_k_argmax(
+                    ctx,
+                    pass,
+                    &sc.combined,
+                    target_output,
+                    &sc.draft_part_val,
+                    &sc.draft_part_idx,
+                    &out_tok_v,
+                    vocab_unpadded,
+                )?;
+            } else {
+                Self::dispatch_linear(
+                    ctx,
+                    pass,
+                    target_output,
+                    &sc.combined,
+                    &sc.logits_raw,
+                    1,
+                )?;
+                pass.memory_barrier()?;
+                sample_f32(ctx, pass, &logits_unpadded, &sc.sampler, &greedy, 0, &out_tok_v)?;
+            }
             if slot + 1 < block {
                 pass.memory_barrier()?;
             }

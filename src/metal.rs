@@ -463,6 +463,11 @@ impl MetalContext {
         true
     }
 
+    /// Maximum 1D compute workgroup size supported by the device.
+    pub fn max_workgroup_invocations(&self) -> usize {
+        1024
+    }
+
     /// Whether the GPU is an Apple G16 (an M4) whose decode GEMVs take the
     /// Vulkan G16 kernels (`gemv_g16.comp`): never on Metal, which keeps its
     /// own kernels.
@@ -1840,6 +1845,31 @@ impl<'a> ComputePass<'a> {
         self.label.set(label);
     }
 
+    /// Encodes an indirect threadgroup dispatch. On Metal, falls back to the
+    /// bounded `fallback_groups` dispatch (the kernel guards on its GPU count).
+    pub fn dispatch_indirect_at(
+        &self,
+        kernel: &Kernel,
+        buffers: &[(&GpuBuffer, usize)],
+        params: &[&[u8]],
+        _indirect: (&GpuBuffer, usize),
+        fallback_groups: (usize, usize, usize),
+        threadgroup: (usize, usize, usize),
+    ) -> Result<()> {
+        self.dispatch_at(
+            kernel,
+            buffers,
+            params,
+            Grid::Threadgroups { groups: fallback_groups, threadgroup },
+        )
+    }
+
+    /// Orders prior compute writes before both compute reads and indirect
+    /// dispatch command reads.
+    pub fn memory_barrier_indirect(&self) -> Result<()> {
+        self.memory_barrier()
+    }
+
     /// Encodes one kernel dispatch with a byte offset per buffer binding — used
     /// to bind slices of a larger buffer (e.g. the q/k/v thirds of the fused
     /// GDN projection). Offsets must be 4-byte aligned per Metal's rules.
@@ -2251,15 +2281,35 @@ impl CompletedPass {
     }
 }
 
-impl PendingPass<'_> {
+impl<'a> PendingPass<'a> {
+    /// Returns a no-op completed pass with zero GPU submission or fence wait.
+    pub fn already_done(ctx: &'a MetalContext) -> Self {
+        Self {
+            ctx,
+            program: Vec::new(),
+            fence_value: 0,
+            done: None,
+            milestone: None,
+            feedback: Feedback::new(0, None, Vec::new()),
+            feeder: None,
+            slot: None,
+        }
+    }
+
     /// Blocks until the GPU finishes this pass.
     pub fn wait(self) -> Result<()> {
+        if self.fence_value == 0 {
+            return Ok(());
+        }
         self.wait_retain().map(|_| ())
     }
 
     /// Blocks until completion while retaining the pass's feedback.
     /// Benchmarks query its GPU clock only after their cadence timer ends.
     pub fn wait_retain(mut self) -> Result<CompletedPass> {
+        if self.fence_value == 0 {
+            return self.finished();
+        }
         self.join_feeder()?;
         self.ctx.wait_fence(self.fence_value)?;
         self.finished()
