@@ -134,7 +134,16 @@ impl Tokenizer {
                 Err(e) => return Err(e).context("reading tokenizer_config.json"),
             };
 
-        let template = Self::load_template(dir, &config)?;
+        let mut template = Self::load_template(dir, &config)?;
+        // Native `thinkingmachines/Inkling-2-Mini` HF checkpoint directory.
+        if let Ok(cfg) = crate::inkling2::config::Config::from_hf_dir(dir) {
+            template = crate::inkling2::tokenizer::patch_chat_template(&template)?;
+            let mut t = Self::new(inner, &config, template)?;
+            t.add_stop_tokens(&[cfg.eos, cfg.pad]);
+            t.legacy_nothink_rewrite = false;
+            t.tool_grammar = crate::serve::tools::ToolGrammar::Inkling2;
+            return Ok(t);
+        }
         Self::new(inner, &config, template)
     }
 

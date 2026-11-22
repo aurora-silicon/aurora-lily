@@ -7,8 +7,7 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 
 use super::model::{
-    Inkling2Model, Inkling2State, MAX_SEQ, PREFILL_ROWS, Scratch, capacity_cap,
-    check_tokens,
+    Inkling2Model, Inkling2State, MAX_SEQ, Scratch, capacity_cap, check_tokens,
 };
 use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
@@ -287,17 +286,23 @@ impl LanguageModel for Inkling2Model {
         let mut model = Inkling2Model::load(ctx, path)?;
         model.memory_limit = options.memory_limit;
 
-        // Optional DSpark speculative drafter beside the GGUF.
-        if options.mtp_drafts > 0 {
-            if let Some(dp) = super::dspark::find_beside(path, &model.cfg)? {
-                let d = super::dspark::Inkling2Dspark::load(ctx, &dp, &model.cfg)?;
-                eprintln!(
-                    "inkling2 dspark: {} ({:.2} GB)",
-                    dp.display(),
-                    d.bytes as f64 / 1e9
-                );
-                model.drafts = options.mtp_drafts.min(super::dspark::MAX_DRAFTS);
-                model.dspark = Some(d);
+        // Optional DSpark speculative drafter beside the GGUF or inside the native dir.
+        if options.mtp_drafts > 0
+            && let Some(dp) = super::dspark::find_beside(path, &model.cfg)?
+        {
+            let d = super::dspark::Inkling2Dspark::load(ctx, &dp, &model.cfg)?;
+            eprintln!(
+                "inkling2 dspark: {} ({:.2} GB)",
+                dp.display(),
+                d.bytes as f64 / 1e9
+            );
+            model.drafts = options.mtp_drafts.min(super::dspark::MAX_DRAFTS);
+            model.dspark = Some(d);
+            // When the main LM head is BF16 (~926 MB), build a compact Q4_0 copy
+            // (~261 MB) for DSpark drafting only; verification still uses exact BF16.
+            if model.output.ty == crate::gguf::GgmlType::Bf16 {
+                let dq = super::native::quantize_bf16_to_q4_0(ctx, &model.output)?;
+                model.draft_output = Some(dq);
             }
         }
 
@@ -309,7 +314,11 @@ impl LanguageModel for Inkling2Model {
                     + crate::serve::DECODE_CHECKPOINTS_PER_SESSION,
             );
             let mut chosen = None;
-            for rows in [PREFILL_ROWS, PREFILL_ROWS / 2, PREFILL_ROWS / 4, 32] {
+            let start_rows = model.prefill_rows;
+            for rows in [1024, 512, 256, 128, 64, 32] {
+                if rows > start_rows {
+                    continue;
+                }
                 model.prefill_rows = rows;
                 let probe = model.new_scratch(ctx, rows)?;
                 let scratch_bytes = ctx.current_allocated().saturating_sub(before);
@@ -407,7 +416,7 @@ impl LanguageModel for Inkling2Model {
             scratch.stage_tokens(&tokens[off..off + chunk])?;
             let has_ds = self.dspark.is_some();
             {
-                let cp = ctx.begin()?;
+                let cp = ctx.begin_concurrent()?;
                 self.encode_forward_rows(
                     ctx,
                     &cp,
@@ -431,7 +440,7 @@ impl LanguageModel for Inkling2Model {
             off += chunk;
         }
         if let Some(d) = draw {
-            let cp = ctx.begin()?;
+            let cp = ctx.begin_concurrent()?;
             let out = scratch.next_token.view(0, &[1])?;
             sample_f32(
                 ctx,
@@ -466,7 +475,7 @@ impl LanguageModel for Inkling2Model {
         slot_out: usize,
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>> {
-        let cp = ctx.begin()?;
+        let cp = ctx.begin_concurrent()?;
         let tok_in = scratch.next_token.view(slot_in, &[1])?;
         self.encode_forward_rows(
             ctx,
@@ -515,7 +524,7 @@ impl LanguageModel for Inkling2Model {
         scratch.stage_tokens(&[first])?;
         ds.prepare_propose(first)?;
         let anchor_embd = scratch.logits_raw.view(0, &[self.cfg.hidden])?;
-        let cp = ctx.begin()?;
+        let cp = ctx.begin_concurrent()?;
         crate::kernels::inkling2::embed(
             ctx,
             &cp,
@@ -541,7 +550,7 @@ impl LanguageModel for Inkling2Model {
             &cp,
             ds_state,
             &anchor_embd,
-            &self.output,
+            self.draft_output_weight(),
             self.cfg.vocab_unpadded,
             state.pos,
             drafts,
@@ -575,7 +584,7 @@ impl LanguageModel for Inkling2Model {
         ensure!(rows <= vs.max_rows, "verify rows {rows} > {}", vs.max_rows);
 
         scratch.stage_tokens(&tokens)?;
-        let cp = ctx.begin()?;
+        let cp = ctx.begin_concurrent()?;
         self.encode_forward_rows(
             ctx,
             &cp,
@@ -669,7 +678,7 @@ impl LanguageModel for Inkling2Model {
                 scratch.stage_tokens(&[anchor])?;
                 ds.prepare_propose(anchor)?;
             }
-            let cp = ctx.begin()?;
+            let cp = ctx.begin_concurrent()?;
             ds.encode_inject(
                 ctx,
                 &cp,
@@ -707,7 +716,7 @@ impl LanguageModel for Inkling2Model {
                     &cp,
                     ds_state,
                     &anchor_embd,
-                    &self.output,
+                    self.draft_output_weight(),
                     self.cfg.vocab_unpadded,
                     state.pos,
                     pending.next_drafts,

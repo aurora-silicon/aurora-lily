@@ -1,0 +1,582 @@
+#version 460
+// Inkling 2 Mini routed MoE on the matrix units (`src/kernels/inkling2.rs`
+// `moe_grouped_mu`): grouped by expert via `glm53_moe_group` with BF16 input
+// (`glm53_to_bf16`), K stepped in 64-deep tiles (Inkling 2 Mini's ff = 1152
+// is 18 * 64, not a multiple of 256).
+//
+// Two kernel families, each in 64-row and 128-row (`_r128`) tile variants
+// across all 19 GGML weight types, with a register dot path (`inkling2_moe_dot.glsl`)
+// for small single-tile experts (`rows <= dot_rows`):
+// 1. `inkling2_gemm_moe_gu_situ_<type>[_r128]`: packed `[E, 2 * ff, H]` gate+up
+//    with optional per-expert `gate_up_scale[e]` and fused SITU activation,
+//    writing BF16 `mid[pair, ff]`.
+// 2. `inkling2_gemm_moe_down_<type>[_r128]`: `[E, H, ff]` reading BF16 `mid`,
+//    writing F32 `down_out[pair, H]` (reduced by `inkling2_moe_sum`).
+
+// Map _r128 aliases to base kernel macro + GM_SUB = 32.
+#ifdef KERNEL_inkling2_gemm_moe_gu_situ_q8_0_r128
+#define KERNEL_inkling2_gemm_moe_gu_situ_q8_0
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q4_k_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_q4_k
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q2_k_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_q2_k
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq2_xxs_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_iq2_xxs
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_bf16_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_bf16
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_f32_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_f32
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_f16_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_f16
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q4_0_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_q4_0
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q5_k_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_q5_k
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q6_k_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_q6_k
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq4_nl_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_iq4_nl
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq2_s_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_iq2_s
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_mxfp4_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_mxfp4
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_nvfp4_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_nvfp4
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q2_0_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_q2_0
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq2_xs_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_iq2_xs
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq3_xxs_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_iq3_xxs
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq1_s_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_iq1_s
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq4_xs_r128)
+#define KERNEL_inkling2_gemm_moe_gu_situ_iq4_xs
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_q8_0_r128)
+#define KERNEL_inkling2_gemm_moe_down_q8_0
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_q4_k_r128)
+#define KERNEL_inkling2_gemm_moe_down_q4_k
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_q2_k_r128)
+#define KERNEL_inkling2_gemm_moe_down_q2_k
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_iq2_xxs_r128)
+#define KERNEL_inkling2_gemm_moe_down_iq2_xxs
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_bf16_r128)
+#define KERNEL_inkling2_gemm_moe_down_bf16
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_f32_r128)
+#define KERNEL_inkling2_gemm_moe_down_f32
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_f16_r128)
+#define KERNEL_inkling2_gemm_moe_down_f16
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_q4_0_r128)
+#define KERNEL_inkling2_gemm_moe_down_q4_0
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_q5_k_r128)
+#define KERNEL_inkling2_gemm_moe_down_q5_k
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_q6_k_r128)
+#define KERNEL_inkling2_gemm_moe_down_q6_k
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_iq4_nl_r128)
+#define KERNEL_inkling2_gemm_moe_down_iq4_nl
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_iq2_s_r128)
+#define KERNEL_inkling2_gemm_moe_down_iq2_s
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_mxfp4_r128)
+#define KERNEL_inkling2_gemm_moe_down_mxfp4
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_nvfp4_r128)
+#define KERNEL_inkling2_gemm_moe_down_nvfp4
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_q2_0_r128)
+#define KERNEL_inkling2_gemm_moe_down_q2_0
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_iq2_xs_r128)
+#define KERNEL_inkling2_gemm_moe_down_iq2_xs
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_iq3_xxs_r128)
+#define KERNEL_inkling2_gemm_moe_down_iq3_xxs
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_iq1_s_r128)
+#define KERNEL_inkling2_gemm_moe_down_iq1_s
+#define GM_SUB 32u
+#elif defined(KERNEL_inkling2_gemm_moe_down_iq4_xs_r128)
+#define KERNEL_inkling2_gemm_moe_down_iq4_xs
+#define GM_SUB 32u
+#endif
+
+#ifndef GM_SUB
+#define GM_SUB 16u
+#endif
+
+// Identify gate_up vs down.
+#if defined(KERNEL_inkling2_gemm_moe_gu_situ_q8_0) || defined(KERNEL_inkling2_gemm_moe_gu_situ_q4_k) || \
+    defined(KERNEL_inkling2_gemm_moe_gu_situ_q2_k) || defined(KERNEL_inkling2_gemm_moe_gu_situ_iq2_xxs) || \
+    defined(KERNEL_inkling2_gemm_moe_gu_situ_bf16) || defined(KERNEL_inkling2_gemm_moe_gu_situ_f32) || \
+    defined(KERNEL_inkling2_gemm_moe_gu_situ_f16) || defined(KERNEL_inkling2_gemm_moe_gu_situ_q4_0) || \
+    defined(KERNEL_inkling2_gemm_moe_gu_situ_q5_k) || defined(KERNEL_inkling2_gemm_moe_gu_situ_q6_k) || \
+    defined(KERNEL_inkling2_gemm_moe_gu_situ_iq4_nl) || defined(KERNEL_inkling2_gemm_moe_gu_situ_iq2_s) || \
+    defined(KERNEL_inkling2_gemm_moe_gu_situ_mxfp4) || defined(KERNEL_inkling2_gemm_moe_gu_situ_nvfp4) || \
+    defined(KERNEL_inkling2_gemm_moe_gu_situ_q2_0) || defined(KERNEL_inkling2_gemm_moe_gu_situ_iq2_xs) || \
+    defined(KERNEL_inkling2_gemm_moe_gu_situ_iq3_xxs) || defined(KERNEL_inkling2_gemm_moe_gu_situ_iq1_s) || \
+    defined(KERNEL_inkling2_gemm_moe_gu_situ_iq4_xs)
+#define I2_GM_GATE_UP 1
+#define I2_GM_P 7u
+#define I2_GM_DOT_ARG 14u
+#else
+#define I2_GM_P 6u
+#define I2_GM_DOT_ARG 10u
+#endif
+
+// Identify weight type.
+#if defined(KERNEL_inkling2_gemm_moe_gu_situ_q8_0) || defined(KERNEL_inkling2_gemm_moe_down_q8_0)
+#define I2_TY_Q8_0
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q4_k) || defined(KERNEL_inkling2_gemm_moe_down_q4_k)
+#define I2_TY_Q4_K
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q2_k) || defined(KERNEL_inkling2_gemm_moe_down_q2_k)
+#define I2_TY_Q2_K
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq2_xxs) || defined(KERNEL_inkling2_gemm_moe_down_iq2_xxs)
+#define I2_TY_IQ2_XXS
+#define I2_GM_NEEDS_QUANT
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_bf16) || defined(KERNEL_inkling2_gemm_moe_down_bf16)
+#define I2_TY_BF16
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_f32) || defined(KERNEL_inkling2_gemm_moe_down_f32)
+#define I2_TY_F32
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_f16) || defined(KERNEL_inkling2_gemm_moe_down_f16)
+#define I2_TY_F16
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q4_0) || defined(KERNEL_inkling2_gemm_moe_down_q4_0)
+#define I2_TY_Q4_0
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q5_k) || defined(KERNEL_inkling2_gemm_moe_down_q5_k)
+#define I2_TY_Q5_K
+#define GLM53_EXT_TYPES
+#define I2_GM_NEEDS_QUANT
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q6_k) || defined(KERNEL_inkling2_gemm_moe_down_q6_k)
+#define I2_TY_Q6_K
+#define GLM53_EXT_TYPES
+#define I2_GM_NEEDS_QUANT
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq4_nl) || defined(KERNEL_inkling2_gemm_moe_down_iq4_nl)
+#define I2_TY_IQ4_NL
+#define GLM53_EXT_TYPES
+#define I2_GM_NEEDS_QUANT
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq2_s) || defined(KERNEL_inkling2_gemm_moe_down_iq2_s)
+#define I2_TY_IQ2_S
+#define GLM53_EXT_TYPES
+#define I2_GM_NEEDS_QUANT
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_mxfp4) || defined(KERNEL_inkling2_gemm_moe_down_mxfp4)
+#define I2_TY_MXFP4
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_nvfp4) || defined(KERNEL_inkling2_gemm_moe_down_nvfp4)
+#define I2_TY_NVFP4
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_q2_0) || defined(KERNEL_inkling2_gemm_moe_down_q2_0)
+#define I2_TY_Q2_0
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq2_xs) || defined(KERNEL_inkling2_gemm_moe_down_iq2_xs)
+#define I2_TY_GENERIC GLM53_IQ2_XS
+#define GLM53_INKLING_TYPES
+#define I2_GM_NEEDS_QUANT
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq3_xxs) || defined(KERNEL_inkling2_gemm_moe_down_iq3_xxs)
+#define I2_TY_GENERIC GLM53_IQ3_XXS
+#define GLM53_INKLING_TYPES
+#define I2_GM_NEEDS_QUANT
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq1_s) || defined(KERNEL_inkling2_gemm_moe_down_iq1_s)
+#define I2_TY_GENERIC GLM53_IQ1_S
+#define GLM53_INKLING_TYPES
+#define I2_GM_NEEDS_QUANT
+#elif defined(KERNEL_inkling2_gemm_moe_gu_situ_iq4_xs) || defined(KERNEL_inkling2_gemm_moe_down_iq4_xs)
+#define I2_TY_GENERIC GLM53_IQ4_XS
+#define GLM53_INKLING_TYPES
+#define I2_GM_NEEDS_QUANT
+#endif
+
+#include "common.glsl"
+#ifdef I2_GM_NEEDS_QUANT
+#include "glm53_quant.glsl"
+#endif
+#include "matmul.glsl"
+
+#define GM_STEP 64u
+shared uvec4 gm_tile[2u * GM_STEP * 8u];
+
+uint i2_bf16_bits(float f) {
+    const uint u = floatBitsToUint(f);
+    return (u + 0x7fffu + ((u >> 16u) & 1u)) >> 16u;
+}
+float i2_h2f(uint bits) { return unpackHalf2x16(bits).x; }
+uint gm_pair(uint lo, uint hi) { return (lo >> 16u) | (hi & 0xffff0000u); }
+uint gm_round_w(float f) { return floatBitsToUint(f) + 0x8000u; }
+float i2_tanh(float x) {
+    const float t = exp(-2.0 * abs(x));
+    const float r = (1.0 - t) / (1.0 + t);
+    return x < 0.0 ? -r : r;
+}
+
+#if defined(I2_TY_MXFP4) || defined(I2_TY_NVFP4)
+#include "inkling2_nvfp4_lut.glsl"
+#endif
+
+#define GM_STORE_TILE(at, w)                                                                  \
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {                                               \
+        gm_tile[(at) + 16u * i] = uvec4(                                                      \
+            gm_pair(gm_round_w(w[0][2u * i]), gm_round_w(w[1][2u * i])),                      \
+            gm_pair(gm_round_w(w[2][2u * i]), gm_round_w(w[3][2u * i])),                      \
+            gm_pair(gm_round_w(w[0][2u * i + 1u]), gm_round_w(w[1][2u * i + 1u])),            \
+            gm_pair(gm_round_w(w[2][2u * i + 1u]), gm_round_w(w[3][2u * i + 1u])));           \
+    }
+
+// Decode 8 weights at k..k+8 (k a multiple of 8) of `row`.
+void i2_gm_decode8(uint64_t row, uint k, out float w[8]) {
+#if defined(I2_TY_Q8_0)
+    // 34-byte Q8_0 blocks are 2-byte aligned; stay on naturally aligned U16 loads.
+    const uint64_t b = row + uint64_t(k >> 5u) * 34u;
+    const float d = i2_h2f(uint(U16(b).v[0]));
+    const uint64_t qs = b + 2u + (k & 31u);
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(U16(qs).v[i]);
+        w[2u * i] = d * float(int(pair << 24) >> 24);
+        w[2u * i + 1u] = d * float(int(pair << 16) >> 24);
+    }
+#elif defined(I2_TY_BF16)
+    const uvec4 v = U32x4(row + 2u * k).v[0];
+    [[unroll]] for (uint c = 0u; c < 4u; c++) {
+        w[2u * c] = uintBitsToFloat(v[c] << 16u);
+        w[2u * c + 1u] = uintBitsToFloat(v[c] & 0xffff0000u);
+    }
+#elif defined(I2_TY_F16)
+    const uvec4 v = U32x4(row + 2u * k).v[0];
+    [[unroll]] for (uint c = 0u; c < 4u; c++) {
+        const vec2 h = unpackHalf2x16(v[c]);
+        w[2u * c] = h.x;
+        w[2u * c + 1u] = h.y;
+    }
+#elif defined(I2_TY_F32)
+    const vec4 v0 = F32x4(row + 4u * k).v[0];
+    const vec4 v1 = F32x4(row + 4u * k + 16u).v[0];
+    [[unroll]] for (uint c = 0u; c < 4u; c++) {
+        w[c] = v0[c];
+        w[4u + c] = v1[c];
+    }
+#elif defined(I2_TY_Q4_0)
+    const uint64_t b = row + uint64_t(k >> 5u) * 18u;
+    const float d = i2_h2f(uint(U16(b).v[0]));
+    const uint j = k & 31u, at = j & 15u, shift = j < 16u ? 0u : 4u;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(U16(b + 2u + at).v[i]);
+        w[2u * i] = d * (float((pair >> shift) & 0xfu) - 8.0);
+        w[2u * i + 1u] = d * (float((pair >> (8u + shift)) & 0xfu) - 8.0);
+    }
+#elif defined(I2_TY_Q4_K)
+    const uint v = k & 255u, j = v >> 5u, l = v & 31u;
+    const uint64_t b = row + uint64_t(k >> 8u) * 144u;
+    const uint dd = U32(b).v[0];
+    const float d = i2_h2f(dd & 0xffffu);
+    const float dmin = i2_h2f(dd >> 16u);
+    const uvec3 sw = uvec3(U32(b + 4u).v[0], U32(b + 8u).v[0], U32(b + 12u).v[0]);
+    #define Q4K_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
+    uint sc, mn;
+    if (j < 4u) {
+        sc = Q4K_BYTE(j) & 63u;
+        mn = Q4K_BYTE(j + 4u) & 63u;
+    } else {
+        sc = (Q4K_BYTE(j + 4u) & 0xfu) | ((Q4K_BYTE(j - 4u) >> 6u) << 4u);
+        mn = (Q4K_BYTE(j + 4u) >> 4u) | ((Q4K_BYTE(j) >> 6u) << 4u);
+    }
+    #undef Q4K_BYTE
+    const float scale = d * float(sc);
+    const float minv = dmin * float(mn);
+    const uint shift = (j & 1u) * 4u;
+    const uvec2 q = U32x2(b + 16u + (j >> 1u) * 32u + l).v[0];
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        w[i] = scale * float((q[i >> 2u] >> (8u * (i & 3u) + shift)) & 0xfu) - minv;
+    }
+#elif defined(I2_TY_Q2_K)
+    const uint v = k & 255u, h = v >> 7u, j = (v >> 5u) & 3u, l = v & 31u;
+    const uint64_t b = row + uint64_t(k >> 8u) * 84u;
+    const uint dd = U32(b + 80u).v[0];
+    const float d = i2_h2f(dd & 0xffffu);
+    const float dmin = i2_h2f(dd >> 16u);
+    const uint sc = uint(U8(b).v[8u * h + 2u * j + (l >> 4u)]);
+    const float scale = d * float(sc & 0xfu);
+    const float minv = dmin * float(sc >> 4u);
+    const uvec2 q = U32x2(b + 16u + 32u * h + l).v[0];
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        w[i] = scale * float((q[i >> 2u] >> (8u * (i & 3u) + 2u * j)) & 3u) - minv;
+    }
+#elif defined(I2_TY_Q5_K)
+    const uint64_t b = row + uint64_t(k >> 8u) * 176u;
+    const uint j = (k >> 5u) & 7u, l = k & 31u;
+    uint sc, mn;
+    glm53_k4_scale_min(b, j, sc, mn);
+    const uint dd = U32(b).v[0];
+    const float scale = i2_h2f(dd & 0xffffu) * float(sc);
+    const float minv = i2_h2f(dd >> 16u) * float(mn);
+    const uvec2 q = U32x2(b + 48u + (j >> 1u) * 32u + l).v[0] >> ((j & 1u) * 4u);
+    const uvec2 h = U32x2(b + 16u + l).v[0] >> j;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        const uint c = ((q[i >> 2u] >> (8u * (i & 3u))) & 0xfu) | (((h[i >> 2u] >> (8u * (i & 3u))) & 1u) << 4u);
+        w[i] = scale * float(c) - minv;
+    }
+#elif defined(I2_TY_Q6_K)
+    const uint ts = k >> 5u, o = (k >> 3u) & 3u;
+    const uint64_t b = row + uint64_t(ts >> 3u) * 210u;
+    const uint n = (ts >> 2u) & 1u, q = ts & 3u;
+    const float d = i2_h2f(uint(U16(b).v[104]));
+    const uint sw = uint(U16(b + 192u).v[4u * n + q]);
+    const float s = d * float(int(sw << (o < 2u ? 24u : 16u)) >> 24);
+    const uint64_t ql = b + 64u * n + 32u * (q & 1u) + 8u * o;
+    const uint64_t qh = b + 128u + 32u * n + 8u * o;
+    const uint lshift = 4u * (q >> 1u), hshift = 2u * q;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint lo = uint(U16(ql).v[i]) >> lshift;
+        const uint hi = uint(U16(qh).v[i]) >> hshift;
+        [[unroll]] for (uint c2 = 0u; c2 < 2u; c2++) {
+            const uint c = ((lo >> (8u * c2)) & 0xfu) | (((hi >> (8u * c2)) & 3u) << 4u);
+            w[2u * i + c2] = s * float(int(c) - 32);
+        }
+    }
+#elif defined(I2_TY_IQ4_NL)
+    const uint64_t b = row + uint64_t(k >> 5u) * 18u;
+    const float d = i2_h2f(uint(U16(b).v[0]));
+    const uint j = k & 31u, at = j & 15u, shift = j < 16u ? 0u : 4u;
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(U16(b + 2u + at).v[i]);
+        w[2u * i] = d * glm53_iq4nl_value((pair >> shift) & 0xfu);
+        w[2u * i + 1u] = d * glm53_iq4nl_value((pair >> (8u + shift)) & 0xfu);
+    }
+#elif defined(I2_TY_IQ2_XXS)
+    const uint t = k >> 5u, l = (k >> 3u) & 3u;
+    const uint bw = (t >> 3u) * 33u;
+    const uint qw = bw + 1u + 4u * (t & 7u);
+    const float d = i2_h2f(uint(U16(row).v[bw]));
+    const uint aux0 = uint(U16(row).v[qw]) | (uint(U16(row).v[qw + 1u]) << 16u);
+    const uint aux1 = uint(U16(row).v[qw + 2u]) | (uint(U16(row).v[qw + 3u]) << 16u);
+    const float scale = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
+    const uvec4 g = glm53_iq2xxs_grid_h[(aux0 >> (8u * l)) & 0xffu]
+                  ^ glm53_iq2xxs_signs_h[(aux1 >> (7u * l)) & 127u];
+    [[unroll]] for (uint p = 0u; p < 4u; p++) {
+        const vec2 v = unpackHalf2x16(g[p]);
+        w[p] = scale * v.x;
+        w[p + 4u] = scale * v.y;
+    }
+#elif defined(I2_TY_IQ2_S)
+    const uint t = k >> 5u, l = (k >> 3u) & 3u;
+    const uint64_t b = row + uint64_t(t >> 3u) * 82u;
+    const uint ib = t & 7u;
+    const float d = i2_h2f(uint(U16(b).v[0]));
+    const uint qs = uint(U16(b + 2u + 4u * ib).v[l >> 1u]) >> (8u * (l & 1u));
+    const uint sg = uint(U16(b + 34u + 4u * ib).v[l >> 1u]) >> (8u * (l & 1u));
+    const uint hs = uint(U16(b + 66u).v[ib >> 1u]) >> (8u * (ib & 1u));
+    const uint scb = uint(U16(b + 74u).v[ib >> 1u]) >> (8u * (ib & 1u));
+    const float dl = d * (0.5 + float((scb >> (l < 2u ? 0u : 4u)) & 0xfu)) * 0.25;
+    const uint g = (qs & 0xffu) | (((hs & 0xffu) << (8u - 2u * l)) & 0x300u);
+    const uint lo = glm53_iq2s_grid[2u * g];
+    const uint hi = glm53_iq2s_grid[2u * g + 1u];
+    [[unroll]] for (uint c = 0u; c < 8u; c++) {
+        const float v = dl * float(((c < 4u ? lo : hi) >> (8u * (c & 3u))) & 0xffu);
+        w[c] = ((sg >> c) & 1u) != 0u ? -v : v;
+    }
+#elif defined(I2_TY_MXFP4)
+    const uint64_t b = row + uint64_t(k >> 5u) * 17u;
+    const uint ex = uint(U8(b).v[0]);
+    const float d = ex < 2u ? uintBitsToFloat(0x00200000u << ex) : uintBitsToFloat((ex - 1u) << 23u);
+    const uint j = k & 31u, at = j & 15u, shift = j < 16u ? 0u : 4u;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        const uint byte_v = uint(U8(b + 1u).v[at + i]);
+        w[i] = d * i2_fp4_lut[(byte_v >> shift) & 0xfu];
+    }
+#elif defined(I2_TY_NVFP4)
+    const uint64_t b = row + uint64_t(k >> 6u) * 36u;
+    const uint sb = (k >> 4u) & 3u;
+    const uint hi = (k >> 3u) & 1u;
+    const float d = i2_ue4m3_lut[(U32(b).v[0] >> (8u * sb)) & 0xffu];
+    const uvec2 q = U32x2(b + 4u + 8u * sb).v[0] >> (4u * hi);
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        w[i] = d * i2_fp4_lut[(q[i >> 2u] >> (8u * (i & 3u))) & 0xfu];
+    }
+#elif defined(I2_TY_Q2_0)
+    const uint64_t b = row + uint64_t(k >> 6u) * 18u;
+    const float d = i2_h2f(uint(U16(b).v[0]));
+    const uint q_off = (k & 63u) >> 3u; // 0..7 (each pair of bytes holds 8 2-bit codes)
+    const uint pair = uint(U16(b + 2u).v[q_off]);
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        w[i] = d * float(int((pair >> (2u * i)) & 3u) - 1);
+    }
+#else
+    float tmp[32];
+    glm53_decode(I2_TY_GENERIC, row, k >> 5u, tmp);
+    [[unroll]] for (uint i = 0u; i < 8u; i++) w[i] = tmp[(k & 24u) + i];
+#endif
+}
+
+void main() {
+    if (gl_WorkGroupID.y >= U32(arg(5)).v[0]) return;
+    const uint N = arg_u32(I2_GM_P);
+    const uint K = arg_u32(I2_GM_P + 1u);
+    const uint row_bytes = arg_u32(I2_GM_P + 2u);
+    const uint x_shift = arg_u32(I2_GM_P + 3u);
+    const uint expert = U32(arg(4)).v[3u * gl_WorkGroupID.y];
+    const uint first = U32(arg(4)).v[3u * gl_WorkGroupID.y + 1u];
+    const uint rows = U32(arg(4)).v[3u * gl_WorkGroupID.y + 2u];
+    const uint tid = gl_LocalInvocationIndex;
+    const uint sg = gl_SubgroupID;
+    const uint quad = tid & 15u, k8 = tid >> 4u;
+
+    uint64_t wr[4];
+#ifdef I2_GM_GATE_UP
+    // Packed [E, 2*N, K]: quads 0..7 decode gate (rows n0..n0+32), quads 8..15 decode up (rows N+n0..N+n0+32).
+    const uint n0 = gl_WorkGroupID.x * 32u;
+    const uint64_t W_exp = arg(1) + uint64_t(expert) * uint64_t(2u * N) * uint64_t(row_bytes);
+    const uint64_t W = W_exp + uint64_t((quad < 8u ? 0u : N) + n0) * uint64_t(row_bytes);
+    [[unroll]] for (uint r = 0u; r < 4u; r++) wr[r] = W + uint64_t(min(4u * (quad & 7u) + r, N - 1u - n0)) * uint64_t(row_bytes);
+#else
+    const uint n0 = gl_WorkGroupID.x * 64u;
+    const uint64_t W = arg(1) + (uint64_t(expert) * uint64_t(N) + uint64_t(n0)) * uint64_t(row_bytes);
+    [[unroll]] for (uint r = 0u; r < 4u; r++) wr[r] = W + uint64_t(min(4u * quad + r, N - 1u - n0)) * uint64_t(row_bytes);
+#endif
+
+    // Register dot path for small single-tile experts (rows <= dot_rows <= 4).
+    const bool alone =
+        gl_WorkGroupID.y == 0u || U32(arg(4)).v[3u * (gl_WorkGroupID.y - 1u)] != expert;
+    if (alone && rows <= arg_u32(I2_GM_DOT_ARG)) {
+        const uint dq = tid >> 3u, dk8 = tid & 7u;
+        uint64_t dwr[4];
+#ifdef I2_GM_GATE_UP
+        const uint64_t DW = W_exp + uint64_t((dq < 8u ? 0u : N) + n0) * uint64_t(row_bytes);
+        [[unroll]] for (uint r = 0u; r < 4u; r++) dwr[r] = DW + uint64_t(min(4u * (dq & 7u) + r, N - 1u - n0)) * uint64_t(row_bytes);
+#else
+        const uint64_t DW = arg(1) + (uint64_t(expert) * uint64_t(N) + uint64_t(n0)) * uint64_t(row_bytes);
+        [[unroll]] for (uint r = 0u; r < 4u; r++) dwr[r] = DW + uint64_t(min(4u * dq + r, N - 1u - n0)) * uint64_t(row_bytes);
+#endif
+        if (rows == 1u) {
+#define GM_DR 1u
+#include "inkling2_moe_dot.glsl"
+#undef GM_DR
+        } else if (rows == 2u) {
+#define GM_DR 2u
+#include "inkling2_moe_dot.glsl"
+#undef GM_DR
+        } else if (rows == 3u) {
+#define GM_DR 3u
+#include "inkling2_moe_dot.glsl"
+#undef GM_DR
+        } else {
+#define GM_DR 4u
+#include "inkling2_moe_dot.glsl"
+#undef GM_DR
+        }
+        return;
+    }
+
+    const uint row0 = GM_SUB * sg;
+    const bool working = row0 < rows;
+    const uint lane_row = mat_lane_row(), a_half = mat_a_half(), odd16 = 16u * mat_a_odd();
+    const uint words = K / 8u;
+    uint a_at[GM_SUB / 8u];
+    [[unroll]] for (uint h = 0u; h < GM_SUB / 8u; h++) {
+        const uint r = row0 + 16u * (h >> 1u) + lane_row + (h & 1u);
+        const uint pr = U32(arg(3)).v[first + min(r, rows - 1u)];
+        a_at[h] = (x_shift >= 0x80000000u ? pr / (x_shift & 0x7fffffffu) : pr >> x_shift) * words;
+    }
+    U32x4 xa = U32x4(arg(0));
+    const uint lane_at = lane_row * 8u + mat_lane_col() / 4u;
+    MatC acc[GM_SUB / 16u][4];
+    [[unroll]] for (uint i = 0u; i < GM_SUB / 16u; i++) {
+        [[unroll]] for (uint c = 0u; c < 4u; c++) acc[i][c] = MatC(0.0);
+    }
+    for (uint k0 = 0u; k0 < K; k0 += GM_STEP) {
+        const uint tile_at = ((k0 / GM_STEP) & 1u) * (GM_STEP * 8u);
+        {
+            float w[4][8];
+            [[unroll]] for (uint r = 0u; r < 4u; r++) i2_gm_decode8(wr[r], k0 + 8u * k8, w[r]);
+            GM_STORE_TILE(tile_at + 64u * k8 + quad, w)
+        }
+        barrier();
+        if (working) {
+            [[unroll]] for (uint kk = 0u; kk < GM_STEP; kk += 16u) {
+                const uint at = (k0 + kk) / 8u + a_half;
+                const uint b_at = tile_at + lane_at + kk * 8u;
+                uvec4 v[GM_SUB / 8u];
+                [[unroll]] for (uint h = 0u; h < GM_SUB / 8u; h++) v[h] = xa.v[a_at[h] + at];
+                const uvec4 b0 = gm_tile[b_at], b1 = gm_tile[b_at + 4u];
+                const uvec4 b2 = gm_tile[b_at + 8u], b3 = gm_tile[b_at + 12u];
+                [[unroll]] for (uint i = 0u; i < GM_SUB / 16u; i++) {
+                    MatA ma;
+                    MatB mb;
+                    MAT_A_OF_ROWS(ma, v[2u * i], v[2u * i + 1u], odd16)
+                    MAT_OF_WORDS(mb, b0)
+                    acc[i][0] = coopMatMulAdd(ma, mb, acc[i][0]);
+                    MAT_OF_WORDS(mb, b1)
+                    acc[i][1] = coopMatMulAdd(ma, mb, acc[i][1]);
+                    MAT_OF_WORDS(mb, b2)
+                    acc[i][2] = coopMatMulAdd(ma, mb, acc[i][2]);
+                    MAT_OF_WORDS(mb, b3)
+                    acc[i][3] = coopMatMulAdd(ma, mb, acc[i][3]);
+                }
+            }
+        }
+    }
+    if (!working) return;
+    const uint col = n0 + mat_lane_col();
+#ifdef I2_GM_GATE_UP
+    const float sc = arg_u32(11) != 0u ? F32(arg(6)).v[expert] : 1.0;
+    const float beta = arg_f32(12);
+    const float lb = arg_f32(13);
+    [[unroll]] for (uint i = 0u; i < GM_SUB / 16u; i++)
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {
+        const uint r = row0 + 16u * i + lane_row + h;
+        if (r < rows) {
+            const uint p = U32(arg(3)).v[first + r];
+            [[unroll]] for (uint half_ = 0u; half_ < 2u; half_++) {
+                uint b[4];
+                [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                    const float g = acc[i][half_][4u * h + c] * sc;
+                    const float u = acc[i][2u + half_][4u * h + c] * sc;
+                    const float act = beta * i2_tanh(g / beta) / (1.0 + exp(-g));
+                    const float lin = lb > 0.0 ? lb * i2_tanh(u / lb) : u;
+                    b[c] = i2_bf16_bits(act * lin);
+                }
+                if (col + 16u * half_ < N) {
+                    const uint64_t at = arg(2) + 2u * (uint64_t(p) * N + col + 16u * half_);
+                    U32x2(at).v[0] = uvec2(b[0] | (b[1] << 16u), b[2] | (b[3] << 16u));
+                }
+            }
+        }
+    }
+#else
+    [[unroll]] for (uint i = 0u; i < GM_SUB / 16u; i++)
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {
+        const uint r = row0 + 16u * i + lane_row + h;
+        if (r < rows) {
+            const uint64_t y = arg(2) + 4u * uint64_t(U32(arg(3)).v[first + r]) * N;
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                if (col + 16u * c < N) {
+                    F32x4(y).v[(col + 16u * c) / 4u] =
+                        vec4(acc[i][c][4u * h], acc[i][c][4u * h + 1u], acc[i][c][4u * h + 2u], acc[i][c][4u * h + 3u]);
+                }
+            }
+        }
+    }
+#endif
+}

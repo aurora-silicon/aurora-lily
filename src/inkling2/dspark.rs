@@ -127,9 +127,17 @@ impl DsparkConfig {
     }
 }
 
-/// Finds a DSpark GGUF (`dspark-Inkling-2-Mini-*.gguf` or any `dflash` GGUF with
-/// `dspark_hidden_out.weight`) next to `model_path` (preferring Q8_0 over BF16).
+/// Finds a DSpark drafter next to `model_path`:
+/// - For a native HF safetensors directory, looks for `mtp.safetensors` inside it.
+/// - For a GGUF file, looks for `dspark-Inkling-2-Mini-*.gguf` (preferring Q8_0 over BF16).
 pub fn find_beside(model_path: &Path, target: &Config) -> Result<Option<PathBuf>> {
+    if model_path.is_dir() {
+        let mtp = model_path.join("mtp.safetensors");
+        if mtp.exists() {
+            return Ok(Some(mtp));
+        }
+        return Ok(None);
+    }
     let Some(dir) = model_path.parent() else {
         return Ok(None);
     };
@@ -176,49 +184,50 @@ pub struct DsparkLayerW {
 }
 
 /// Pre-allocated GPU scratch for DSpark (zero per-step Vulkan allocations).
-struct DsparkScratch {
-    max_block: usize,
-    cur: Tensor,         // F32 [max_block, hidden]
-    x_h: Tensor,         // F32 [max_block, hidden]
-    post_attn: Tensor,   // F32 [max_block, hidden]
-    q: Tensor,           // F32 [max_block, q_w]
-    k: Tensor,           // F32 [max_block, kv_w]
-    v: Tensor,           // F32 [max_block, kv_w]
-    attn_out: Tensor,    // F32 [max_block, q_w]
-    wo_out: Tensor,      // F32 [max_block, hidden]
-    gate: Tensor,        // F32 [max_block, ff]
-    up: Tensor,          // F32 [max_block, ff]
-    mid: Tensor,         // F32 [max_block, ff]
-    down: Tensor,        // F32 [max_block, hidden]
-    hidden_norm: Tensor, // F32 [max_block, hidden]
-    rnn_state: Tensor,   // F32 [rank]
-    joint_in: Tensor,    // F32 [1, 2*rank + 2*hidden]
-    joint_out: Tensor,   // F32 [1, 3*rank]
-    latent: Tensor,      // F32 [1, rank]
-    corr: Tensor,        // F32 [1, hidden]
-    combined: Tensor,    // F32 [1, hidden]
-    logits_raw: Tensor,  // F32 [vocab_padded]
-    best_toks: Tensor,   // U32 [max_block] (slot 0 = anchor, 1..block = drafts)
-    sampler: SamplerScratch,
+pub(super) struct DsparkScratch {
+    pub(super) max_block: usize,
+    pub(super) cur: Tensor,          // F32 [max_block, hidden]
+    pub(super) x_h: Tensor,          // F32 [max_block, hidden]
+    pub(super) post_attn: Tensor,    // F32 [max_block, hidden]
+    pub(super) q: Tensor,            // F32 [max_block, q_w]
+    pub(super) k: Tensor,            // F32 [max_block, kv_w]
+    pub(super) v: Tensor,            // F32 [max_block, kv_w]
+    pub(super) attn_partial: Tensor, // F32 [max_block, n_head, DSPARK_SPLIT_MAX_CHUNKS + 1, 130]
+    pub(super) attn_out: Tensor,     // F32 [max_block, q_w]
+    pub(super) wo_out: Tensor,       // F32 [max_block, hidden]
+    pub(super) gate: Tensor,         // F32 [max_block, ff]
+    pub(super) up: Tensor,           // F32 [max_block, ff]
+    pub(super) mid: Tensor,          // F32 [max_block, ff]
+    pub(super) down: Tensor,         // F32 [max_block, hidden]
+    pub(super) hidden_norm: Tensor,  // F32 [max_block, hidden]
+    pub(super) rnn_state: Tensor,    // F32 [rank]
+    pub(super) joint_in: Tensor,     // F32 [1, 2*rank + 2*hidden]
+    pub(super) joint_out: Tensor,    // F32 [1, 3*rank]
+    pub(super) latent: Tensor,       // F32 [1, rank]
+    pub(super) corr: Tensor,         // F32 [1, hidden]
+    pub(super) combined: Tensor,     // F32 [1, hidden]
+    pub(super) logits_raw: Tensor,   // F32 [vocab_padded]
+    pub(super) best_toks: Tensor,    // U32 [max_block] (slot 0 = anchor, 1..block = drafts)
+    pub(super) sampler: SamplerScratch,
 }
 
 /// Loaded Inkling 2 Mini DSpark drafter (100% GPU).
 pub struct Inkling2Dspark {
     pub cfg: DsparkConfig,
     pub bytes: usize,
-    _mapped: Mapped,
-    output_norm: Tensor,
+    pub(super) _mapped: Mapped,
+    pub(super) output_norm: Tensor,
     pub mask_embd: Tensor,
     /// Softmax-normalized fusion weights on GPU: `[n_layer + 1, n_target]` F32.
     pub fuse_weights: Tensor,
     pub dspark_norm: Tensor,
-    markov_w1: QWeight,
-    joint_proj: QWeight,
-    joint_proj_b: Tensor,
-    hidden_out: QWeight,
-    hidden_out_b: Tensor,
+    pub(super) markov_w1: QWeight,
+    pub(super) joint_proj: QWeight,
+    pub(super) joint_proj_b: Tensor,
+    pub(super) hidden_out: QWeight,
+    pub(super) hidden_out_b: Tensor,
     pub layers: Vec<DsparkLayerW>,
-    scratch: DsparkScratch,
+    pub(super) scratch: DsparkScratch,
 }
 
 /// Per-session DSpark GPU KV cache (stores context KV from target features in F16).
@@ -313,6 +322,9 @@ fn load_f32_gpu(ctx: &MetalContext, g: &Gguf, name: &str) -> Result<Tensor> {
 
 impl Inkling2Dspark {
     pub fn load(ctx: &MetalContext, path: &Path, target: &Config) -> Result<Self> {
+        if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+            return super::native::load_dspark(ctx, path, target);
+        }
         let g = Gguf::open(path)?;
         let cfg = DsparkConfig::from_gguf(&g, target)?;
         let mapped = Mapped::map(ctx, &g)?;
@@ -376,6 +388,11 @@ impl Inkling2Dspark {
             q: Tensor::zeros(ctx, &[max_block, qw], DType::F32)?,
             k: Tensor::zeros(ctx, &[max_block, kw], DType::F32)?,
             v: Tensor::zeros(ctx, &[max_block, kw], DType::F32)?,
+            attn_partial: Tensor::zeros(
+                ctx,
+                &[max_block, cfg.n_head, ik::DSPARK_SPLIT_MAX_CHUNKS + 1, 130],
+                DType::F32,
+            )?,
             attn_out: Tensor::zeros(ctx, &[max_block, qw], DType::F32)?,
             wo_out: Tensor::zeros(ctx, &[max_block, h], DType::F32)?,
             gate: Tensor::zeros(ctx, &[max_block, cfg.ff], DType::F32)?,
@@ -565,7 +582,7 @@ impl Inkling2Dspark {
         }
         state.ensure_capacity(ctx, pos0 + rows)?;
         if rows <= self.scratch.max_block {
-            let pass = ctx.begin()?;
+            let pass = ctx.begin_concurrent()?;
             self.encode_inject(ctx, &pass, state, cap, cap_stride, rows, pos0)?;
             pass.commit_wait()?;
             return Ok(());
@@ -578,7 +595,7 @@ impl Inkling2Dspark {
         let tx = Tensor::zeros(ctx, &[rows, h], DType::F32)?;
         let tk = Tensor::zeros(ctx, &[rows, kv_w], DType::F32)?;
         let tv = Tensor::zeros(ctx, &[rows, kv_w], DType::F32)?;
-        let pass = ctx.begin()?;
+        let pass = ctx.begin_concurrent()?;
         for il in 0..self.cfg.n_layer {
             let l = &self.layers[il];
             let fw = self.fuse_weights.view(il * nt, &[nt])?;
@@ -750,7 +767,7 @@ impl Inkling2Dspark {
             } else {
                 0
             };
-            ik::dspark_attn(
+            ik::dspark_attn_split(
                 ctx,
                 pass,
                 &q_v,
@@ -758,6 +775,7 @@ impl Inkling2Dspark {
                 &state.v_ctx[il],
                 &k_v,
                 &v_v,
+                &sc.attn_partial,
                 &ao_v,
                 nh,
                 nkv,
@@ -831,7 +849,7 @@ impl Inkling2Dspark {
             ik::copy_f32(ctx, pass, &h_slot, &ji_h, h)?;
             pass.memory_barrier()?;
 
-            k::gemv(ctx, pass, &self.joint_proj, &sc.joint_in, &sc.joint_out, 1)?;
+            Self::dispatch_linear(ctx, pass, &self.joint_proj, &sc.joint_in, &sc.joint_out, 1)?;
             pass.memory_barrier()?;
 
             ik::dspark_gru(
@@ -845,13 +863,13 @@ impl Inkling2Dspark {
             )?;
             pass.memory_barrier()?;
 
-            k::gemv(ctx, pass, &self.hidden_out, &sc.latent, &sc.corr, 1)?;
+            Self::dispatch_linear(ctx, pass, &self.hidden_out, &sc.latent, &sc.corr, 1)?;
             pass.memory_barrier()?;
 
             ik::add3(ctx, pass, &h_slot, &sc.corr, &self.hidden_out_b, &sc.combined, h)?;
             pass.memory_barrier()?;
 
-            k::gemv(ctx, pass, target_output, &sc.combined, &sc.logits_raw, 1)?;
+            Self::dispatch_linear(ctx, pass, target_output, &sc.combined, &sc.logits_raw, 1)?;
             pass.memory_barrier()?;
 
             sample_f32(ctx, pass, &logits_unpadded, &sc.sampler, &greedy, 0, &out_tok_v)?;

@@ -78,6 +78,10 @@ impl Mapped {
         Ok(Self { tensors, buffers })
     }
 
+    pub(crate) fn from_buffers(buffers: Vec<Buffer>) -> Self {
+        Self { tensors: std::collections::HashMap::new(), buffers }
+    }
+
     pub(crate) fn buffers(&self) -> Vec<Buffer> {
         self.buffers.clone()
     }

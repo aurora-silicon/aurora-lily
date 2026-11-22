@@ -45,6 +45,13 @@
     defined(KERNEL_glm53_gemv_iq4_xs_m3) || defined(KERNEL_glm53_gemv_iq4_xs_m4)
 #define GLM53_INKLING_TYPES
 #endif
+#if !defined(KERNEL_glm53_moe_gate_up_iq2_xxs) && \
+    !defined(KERNEL_glm53_moe_gate_up_iq2_xxs_xh) && \
+    !defined(KERNEL_glm53_moe_gate_up_iq2_xxs_m2)
+// Keep the `precise` IQ2_XXS dot helpers out of unrelated kernels so glslang
+// does not disable hardware FMA across GEMV and other paths.
+#define GLM53_NO_IQ2_XXS_DOT
+#endif
 #include "common.glsl"
 #include "glm53_quant.glsl"
 
@@ -102,13 +109,21 @@ float glm53_group_sum(float v, uint width) {
     defined(KERNEL_glm53_gemv_iq2_xxs_m3) || \
     defined(KERNEL_glm53_gemv_iq2_xxs_m4)
 #define GEMV_TYPE GLM53_IQ2_XXS
-#elif defined(KERNEL_glm53_gemv_bf16_m1) || \
+#elif defined(KERNEL_glm53_gemv_bf16_m1) || defined(KERNEL_glm53_gemv_bf16_m1_r2) || \
     defined(KERNEL_glm53_gemv_bf16_m2) || \
-    defined(KERNEL_glm53_gemv_bf16_m3) || defined(KERNEL_glm53_gemv_bf16_m4)
+    defined(KERNEL_glm53_gemv_bf16_m3) || defined(KERNEL_glm53_gemv_bf16_m4) || \
+    defined(KERNEL_glm53_gemv_bf16_m5) || defined(KERNEL_glm53_gemv_bf16_m6) || \
+    defined(KERNEL_glm53_gemv_bf16_m7) || defined(KERNEL_glm53_gemv_bf16_m8)
 #define GEMV_TYPE GLM53_BF16
+#define GEMV_BF16 1
+#ifdef KERNEL_glm53_gemv_bf16_m1_r2
+#define GEMV_R2 1
+#endif
 #elif defined(KERNEL_glm53_gemv_f32_m1) || \
     defined(KERNEL_glm53_gemv_f32_m2) || defined(KERNEL_glm53_gemv_f32_m3) || \
-    defined(KERNEL_glm53_gemv_f32_m4)
+    defined(KERNEL_glm53_gemv_f32_m4) || defined(KERNEL_glm53_gemv_f32_m5) || \
+    defined(KERNEL_glm53_gemv_f32_m6) || defined(KERNEL_glm53_gemv_f32_m7) || \
+    defined(KERNEL_glm53_gemv_f32_m8)
 #define GEMV_TYPE GLM53_F32
 #elif defined(KERNEL_glm53_gemv_f16_m1) || \
     defined(KERNEL_glm53_gemv_f16_m2) || defined(KERNEL_glm53_gemv_f16_m3) || \
@@ -170,7 +185,8 @@ float glm53_group_sum(float v, uint width) {
     defined(KERNEL_glm53_gemv_q4_k_m1) || defined(KERNEL_glm53_gemv_q4_k_m1_r2) || \
     defined(KERNEL_glm53_gemv_q2_k_m1) || \
     defined(KERNEL_glm53_gemv_iq2_xxs_m1) || \
-    defined(KERNEL_glm53_gemv_bf16_m1) || defined(KERNEL_glm53_gemv_f32_m1) || \
+    defined(KERNEL_glm53_gemv_bf16_m1) || defined(KERNEL_glm53_gemv_bf16_m1_r2) || \
+    defined(KERNEL_glm53_gemv_f32_m1) || \
     defined(KERNEL_glm53_gemv_f16_m1) || \
     defined(KERNEL_glm53_gemv_q4_0_m1) || \
     defined(KERNEL_glm53_gemv_q5_k_m1) || defined(KERNEL_glm53_gemv_q5_k_m1_r2) || \
@@ -230,18 +246,22 @@ float glm53_group_sum(float v, uint width) {
     defined(KERNEL_glm53_gemv_iq3_xxs_m4) || defined(KERNEL_glm53_gemv_iq1_s_m4) || \
     defined(KERNEL_glm53_gemv_iq4_xs_m4)
 #define GEMV_M 4u
-// Five to eight rows (DeepSeek V4's verify passes and draft blocks): Q8_0
-// and F16 only; the rows past four take accumulators acc4 .. acc7.
-#elif defined(KERNEL_glm53_gemv_q8_0_m5) || defined(KERNEL_glm53_gemv_f16_m5)
+// Five to eight rows (verify passes and draft blocks): Q8_0, F16, BF16, F32;
+// the rows past four take accumulators acc4 .. acc7.
+#elif defined(KERNEL_glm53_gemv_q8_0_m5) || defined(KERNEL_glm53_gemv_f16_m5) || \
+    defined(KERNEL_glm53_gemv_bf16_m5) || defined(KERNEL_glm53_gemv_f32_m5)
 #define GEMV_M 5u
 #define GEMV_WIDE 1
-#elif defined(KERNEL_glm53_gemv_q8_0_m6) || defined(KERNEL_glm53_gemv_f16_m6)
+#elif defined(KERNEL_glm53_gemv_q8_0_m6) || defined(KERNEL_glm53_gemv_f16_m6) || \
+    defined(KERNEL_glm53_gemv_bf16_m6) || defined(KERNEL_glm53_gemv_f32_m6)
 #define GEMV_M 6u
 #define GEMV_WIDE 1
-#elif defined(KERNEL_glm53_gemv_q8_0_m7) || defined(KERNEL_glm53_gemv_f16_m7)
+#elif defined(KERNEL_glm53_gemv_q8_0_m7) || defined(KERNEL_glm53_gemv_f16_m7) || \
+    defined(KERNEL_glm53_gemv_bf16_m7) || defined(KERNEL_glm53_gemv_f32_m7)
 #define GEMV_M 7u
 #define GEMV_WIDE 1
-#elif defined(KERNEL_glm53_gemv_q8_0_m8) || defined(KERNEL_glm53_gemv_f16_m8)
+#elif defined(KERNEL_glm53_gemv_q8_0_m8) || defined(KERNEL_glm53_gemv_f16_m8) || \
+    defined(KERNEL_glm53_gemv_bf16_m8) || defined(KERNEL_glm53_gemv_f32_m8)
 #define GEMV_M 8u
 #define GEMV_WIDE 1
 #endif
@@ -417,6 +437,73 @@ void main() {
         }
 #endif
     }
+#elif defined(GEMV_BF16)
+    // Streaming BF16 GEMV (8 weights = 16B U32x4 load at a time, zero w[32] spill).
+#ifdef GEMV_R2
+    for (uint t = sub; t < tasks; t += width) {
+        const uint64_t b0 = row + uint64_t(t) * 64u;
+        const uint64_t b1 = row_b + uint64_t(t) * 64u;
+        const uint64_t xt = X + 4u * (uint64_t(g) * K + t * GLM53_TASK);
+        [[unroll]] for (uint q = 0u; q < 4u; q++) {
+            const uvec4 u0 = U32x4(b0 + 16u * q).v[0];
+            const uvec4 u1 = U32x4(b1 + 16u * q).v[0];
+            const vec4 xa = F32x4(xt + 32u * q).v[0];
+            const vec4 xb = F32x4(xt + 32u * q + 16u).v[0];
+            acc0 += dot(vec4(uintBitsToFloat(u0.x << 16u), uintBitsToFloat(u0.x & 0xffff0000u),
+                             uintBitsToFloat(u0.y << 16u), uintBitsToFloat(u0.y & 0xffff0000u)), xa)
+                  + dot(vec4(uintBitsToFloat(u0.z << 16u), uintBitsToFloat(u0.z & 0xffff0000u),
+                             uintBitsToFloat(u0.w << 16u), uintBitsToFloat(u0.w & 0xffff0000u)), xb);
+            acc_b += dot(vec4(uintBitsToFloat(u1.x << 16u), uintBitsToFloat(u1.x & 0xffff0000u),
+                              uintBitsToFloat(u1.y << 16u), uintBitsToFloat(u1.y & 0xffff0000u)), xa)
+                   + dot(vec4(uintBitsToFloat(u1.z << 16u), uintBitsToFloat(u1.z & 0xffff0000u),
+                              uintBitsToFloat(u1.w << 16u), uintBitsToFloat(u1.w & 0xffff0000u)), xb);
+        }
+    }
+#else
+    for (uint t = sub; t < tasks; t += width) {
+        const uint64_t b = row + uint64_t(t) * 64u;
+        const uint64_t xt = X + 4u * (uint64_t(g) * K + t * GLM53_TASK);
+        [[unroll]] for (uint q = 0u; q < 4u; q++) {
+            const uvec4 u = U32x4(b + 16u * q).v[0];
+            const vec4 wa = vec4(uintBitsToFloat(u.x << 16u), uintBitsToFloat(u.x & 0xffff0000u),
+                                 uintBitsToFloat(u.y << 16u), uintBitsToFloat(u.y & 0xffff0000u));
+            const vec4 wb = vec4(uintBitsToFloat(u.z << 16u), uintBitsToFloat(u.z & 0xffff0000u),
+                                 uintBitsToFloat(u.w << 16u), uintBitsToFloat(u.w & 0xffff0000u));
+            const uint64_t xq = xt + 32u * q;
+            acc0 += dot(wa, F32x4(xq).v[0]) + dot(wb, F32x4(xq + 16u).v[0]);
+            if (m > 1u) {
+                const uint64_t x1 = xq + 4u * uint64_t(x_row_stride);
+                acc1 += dot(wa, F32x4(x1).v[0]) + dot(wb, F32x4(x1 + 16u).v[0]);
+            }
+            if (m > 2u) {
+                const uint64_t x2 = xq + 8u * uint64_t(x_row_stride);
+                acc2 += dot(wa, F32x4(x2).v[0]) + dot(wb, F32x4(x2 + 16u).v[0]);
+            }
+            if (m > 3u) {
+                const uint64_t x3 = xq + 12u * uint64_t(x_row_stride);
+                acc3 += dot(wa, F32x4(x3).v[0]) + dot(wb, F32x4(x3 + 16u).v[0]);
+            }
+#ifdef GEMV_WIDE
+            if (m > 4u) {
+                const uint64_t x4 = xq + 16u * uint64_t(x_row_stride);
+                acc4 += dot(wa, F32x4(x4).v[0]) + dot(wb, F32x4(x4 + 16u).v[0]);
+            }
+            if (m > 5u) {
+                const uint64_t x5 = xq + 20u * uint64_t(x_row_stride);
+                acc5 += dot(wa, F32x4(x5).v[0]) + dot(wb, F32x4(x5 + 16u).v[0]);
+            }
+            if (m > 6u) {
+                const uint64_t x6 = xq + 24u * uint64_t(x_row_stride);
+                acc6 += dot(wa, F32x4(x6).v[0]) + dot(wb, F32x4(x6 + 16u).v[0]);
+            }
+            if (m > 7u) {
+                const uint64_t x7 = xq + 28u * uint64_t(x_row_stride);
+                acc7 += dot(wa, F32x4(x7).v[0]) + dot(wb, F32x4(x7 + 16u).v[0]);
+            }
+#endif
+        }
+    }
+#endif
 #elif defined(GEMV_R2)
     // Two weight rows per subgroup sharing the 8 vec4 activation loads.
     for (uint t = sub; t < tasks; t += width) {
@@ -576,6 +663,196 @@ void main() {
             F32(Y).v[r * y_row_stride + n0] = a0[r];
             if (live1) F32(Y).v[r * y_row_stride + n0 + 1u] = a1[r];
         }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// 2-weight-rows-per-subgroup streaming BF16 GEMV for 2..8 activation rows.
+// Cuts X load issue traffic 2x while keeping 16 output rows per threadgroup
+// (high GPU occupancy on N = 1024..2304) and only 8 weight floats live at
+// once (zero w[32] register spill). Requires tasks >= 32 and x_group >= max_rows.
+// ---------------------------------------------------------------------------
+#if defined(KERNEL_glm53_gemv_bf16_r2_m2)
+#define BF16_R2_M 2u
+#elif defined(KERNEL_glm53_gemv_bf16_r2_m3)
+#define BF16_R2_M 3u
+#elif defined(KERNEL_glm53_gemv_bf16_r2_m4)
+#define BF16_R2_M 4u
+#elif defined(KERNEL_glm53_gemv_bf16_r2_m5)
+#define BF16_R2_M 5u
+#elif defined(KERNEL_glm53_gemv_bf16_r2_m6)
+#define BF16_R2_M 6u
+#elif defined(KERNEL_glm53_gemv_bf16_r2_m7)
+#define BF16_R2_M 7u
+#elif defined(KERNEL_glm53_gemv_bf16_r2_m8)
+#define BF16_R2_M 8u
+#endif
+#ifdef BF16_R2_M
+void main() {
+    const uint64_t X = arg(0);
+    const uint K = arg_u32(9);
+    const uint row_bytes = arg_u32(11);
+    const uint x_row_stride = arg_u32(17);
+    const uint y_stride_param = arg_u32(18);
+    const uint tasks = K / GLM53_TASK;
+    uint tg = gl_WorkGroupID.x;
+    uint set = 0u;
+    uint N = arg_u32(12);
+    [[unroll]] for (uint s = 0u; s < 3u; s++) {
+        const uint tgs = (N + 15u) / 16u;
+        if (set == s && tg >= tgs) {
+            tg -= tgs;
+            set = s + 1u;
+            N = arg_u32(13u + s);
+        }
+    }
+    const uint64_t W = arg(1u + set);
+    const uint64_t Y = arg(5u + set);
+    const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint n0 = (tg * 8u + gl_SubgroupID) * 2u;
+    if (n0 >= N) return;
+    const bool live1 = n0 + 1u < N;
+    const uint64_t row0 = W + uint64_t(n0) * row_bytes;
+    const uint64_t row1 = W + uint64_t(live1 ? n0 + 1u : n0) * row_bytes;
+    float a0[BF16_R2_M], a1[BF16_R2_M];
+    [[unroll]] for (uint r = 0u; r < BF16_R2_M; r++) {
+        a0[r] = 0.0; a1[r] = 0.0;
+    }
+    const uint64_t x_stride_b = 4u * uint64_t(x_row_stride);
+    for (uint t = lane; t < tasks; t += 32u) {
+        const uint64_t toff_w = uint64_t(t) * 64u;
+        const uint64_t b0 = row0 + toff_w;
+        const uint64_t b1 = row1 + toff_w;
+        const uint64_t xt = X + 4u * uint64_t(t * GLM53_TASK);
+        [[unroll]] for (uint q = 0u; q < 4u; q++) {
+            const uvec4 u0 = U32x4(b0 + 16u * q).v[0];
+            const uvec4 u1 = U32x4(b1 + 16u * q).v[0];
+            const vec4 w0a = vec4(uintBitsToFloat(u0.x << 16u), uintBitsToFloat(u0.x & 0xffff0000u),
+                                  uintBitsToFloat(u0.y << 16u), uintBitsToFloat(u0.y & 0xffff0000u));
+            const vec4 w0b = vec4(uintBitsToFloat(u0.z << 16u), uintBitsToFloat(u0.z & 0xffff0000u),
+                                  uintBitsToFloat(u0.w << 16u), uintBitsToFloat(u0.w & 0xffff0000u));
+            const vec4 w1a = vec4(uintBitsToFloat(u1.x << 16u), uintBitsToFloat(u1.x & 0xffff0000u),
+                                  uintBitsToFloat(u1.y << 16u), uintBitsToFloat(u1.y & 0xffff0000u));
+            const vec4 w1b = vec4(uintBitsToFloat(u1.z << 16u), uintBitsToFloat(u1.z & 0xffff0000u),
+                                  uintBitsToFloat(u1.w << 16u), uintBitsToFloat(u1.w & 0xffff0000u));
+            const uint64_t xq = xt + 32u * q;
+            [[unroll]] for (uint r = 0u; r < BF16_R2_M; r++) {
+                const uint64_t xr = xq + uint64_t(r) * x_stride_b;
+                const vec4 xa = F32x4(xr).v[0];
+                const vec4 xb = F32x4(xr + 16u).v[0];
+                a0[r] += dot(w0a, xa) + dot(w0b, xb);
+                a1[r] += dot(w1a, xa) + dot(w1b, xb);
+            }
+        }
+    }
+    [[unroll]] for (uint r = 0u; r < BF16_R2_M; r++) {
+        a0[r] = subgroupAdd(a0[r]);
+        a1[r] = subgroupAdd(a1[r]);
+    }
+    if (lane == 0u) {
+        [[unroll]] for (uint r = 0u; r < BF16_R2_M; r++) {
+            const uint base = r * y_row_stride + n0;
+            F32(Y).v[base] = a0[r];
+            if (live1) F32(Y).v[base + 1u] = a1[r];
+        }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// 4-weight-rows-per-subgroup Q4_0 m=1 GEMV (wide LM head, e.g. 201k rows).
+// Shares all 8 vec4 X loads and the `-8 * sum(x)` offset across 4 rows.
+// 32 output rows per threadgroup (8 subgroups x 4 rows). Requires tasks >= 32.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_gemv_q4_0_m1_r4
+layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer Q4Pairs { u16vec4 v[]; };
+
+float glm53_q4_0_dot_xv(uint64_t b, in vec4 xv[8], float xsum8) {
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const u16vec4 p0 = Q4Pairs(b + 2u).v[0];
+    const u16vec4 p1 = Q4Pairs(b + 2u).v[1];
+    float s = 0.0;
+    {
+        const uint w0 = uint(p0.x), w1 = uint(p0.y), w2 = uint(p0.z), w3 = uint(p0.w);
+        s += dot(vec4(float(w0 & 15u), float((w0 >> 8u) & 15u),
+                      float(w1 & 15u), float((w1 >> 8u) & 15u)), xv[0]);
+        s += dot(vec4(float(w2 & 15u), float((w2 >> 8u) & 15u),
+                      float(w3 & 15u), float((w3 >> 8u) & 15u)), xv[1]);
+        s += dot(vec4(float((w0 >> 4u) & 15u), float(w0 >> 12u),
+                      float((w1 >> 4u) & 15u), float(w1 >> 12u)), xv[4]);
+        s += dot(vec4(float((w2 >> 4u) & 15u), float(w2 >> 12u),
+                      float((w3 >> 4u) & 15u), float(w3 >> 12u)), xv[5]);
+    }
+    {
+        const uint w0 = uint(p1.x), w1 = uint(p1.y), w2 = uint(p1.z), w3 = uint(p1.w);
+        s += dot(vec4(float(w0 & 15u), float((w0 >> 8u) & 15u),
+                      float(w1 & 15u), float((w1 >> 8u) & 15u)), xv[2]);
+        s += dot(vec4(float(w2 & 15u), float((w2 >> 8u) & 15u),
+                      float(w3 & 15u), float((w3 >> 8u) & 15u)), xv[3]);
+        s += dot(vec4(float((w0 >> 4u) & 15u), float(w0 >> 12u),
+                      float((w1 >> 4u) & 15u), float(w1 >> 12u)), xv[6]);
+        s += dot(vec4(float((w2 >> 4u) & 15u), float(w2 >> 12u),
+                      float((w3 >> 4u) & 15u), float(w3 >> 12u)), xv[7]);
+    }
+    return d * (s - xsum8);
+}
+
+void main() {
+    const uint64_t X = arg(0);
+    const uint K = arg_u32(9);
+    const uint row_bytes = arg_u32(11);
+    const uint tasks = K / GLM53_TASK;
+    uint tg = gl_WorkGroupID.x;
+    uint set = 0u;
+    uint N = arg_u32(12);
+    [[unroll]] for (uint s = 0u; s < 3u; s++) {
+        const uint tgs = (N + 31u) / 32u;
+        if (set == s && tg >= tgs) {
+            tg -= tgs;
+            set = s + 1u;
+            N = arg_u32(13u + s);
+        }
+    }
+    const uint64_t W = arg(1u + set);
+    const uint64_t Y = arg(5u + set);
+    const uint lane = gl_SubgroupInvocationID;
+    const uint n0 = (tg * 8u + gl_SubgroupID) * 4u;
+    if (n0 >= N) return;
+    const bool live1 = n0 + 1u < N;
+    const bool live2 = n0 + 2u < N;
+    const bool live3 = n0 + 3u < N;
+    const uint64_t row0 = W + uint64_t(n0) * row_bytes;
+    const uint64_t row1 = W + uint64_t(live1 ? n0 + 1u : n0) * row_bytes;
+    const uint64_t row2 = W + uint64_t(live2 ? n0 + 2u : n0) * row_bytes;
+    const uint64_t row3 = W + uint64_t(live3 ? n0 + 3u : n0) * row_bytes;
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    for (uint t = lane; t < tasks; t += 32u) {
+        const uint64_t xt = X + 4u * uint64_t(t * GLM53_TASK);
+        vec4 xv[8];
+        vec4 xsv = vec4(0.0);
+        [[unroll]] for (uint q = 0u; q < 8u; q++) {
+            const vec4 v = F32x4(xt + 16u * q).v[0];
+            xv[q] = v;
+            xsv += v;
+        }
+        const float xsum8 = 8.0 * ((xsv.x + xsv.y) + (xsv.z + xsv.w));
+        const uint64_t bo = uint64_t(t) * 18u;
+        a0 += glm53_q4_0_dot_xv(row0 + bo, xv, xsum8);
+        a1 += glm53_q4_0_dot_xv(row1 + bo, xv, xsum8);
+        a2 += glm53_q4_0_dot_xv(row2 + bo, xv, xsum8);
+        a3 += glm53_q4_0_dot_xv(row3 + bo, xv, xsum8);
+    }
+    a0 = subgroupAdd(a0);
+    a1 = subgroupAdd(a1);
+    a2 = subgroupAdd(a2);
+    a3 = subgroupAdd(a3);
+    if (lane == 0u) {
+        F32(Y).v[n0] = a0;
+        if (live1) F32(Y).v[n0 + 1u] = a1;
+        if (live2) F32(Y).v[n0 + 2u] = a2;
+        if (live3) F32(Y).v[n0 + 3u] = a3;
     }
 }
 #endif
