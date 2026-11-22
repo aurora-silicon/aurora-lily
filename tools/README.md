@@ -338,6 +338,26 @@ outside the repository.
     --sessions t04,t05,t12 [--ids] [--cold 8] [--epochs 2] [--only t04]
 ```
 
+## bench/agent_bench.py
+
+Runs SWE-bench Verified and Terminal-Bench 2.0 presets against a running lily
+(or OpenAI-compatible) server via Harbor (`harbor` or `uvx --from harbor harbor`),
+forwarding requests through a local passthrough proxy so lily's per-request
+`timings` (decode/prefill tok/s, KV cache hit rate, speculative draft acceptance)
+are logged alongside Harbor's pass/fail results. Defaults to `--env podman`
+(daemonless) when available and supports cloud sandboxes (`--env modal`,
+`--env daytona`) so no Docker daemon is required. Presets: `swe-mini` (35 SWE-bench
+Verified tasks), `tb2-mini` (25 TB 2.0 tasks), `tb2-full` (all 89 TB 2.0 tasks),
+`fast` (25 SWE + 15 TB 2.0, ~1.5–2.5 h), and `full` (50 SWE + 89 TB 2.0, overnight).
+Unit tests need only stdlib Python:
+`python3 -m unittest discover -s tools/bench -p 'test_agent_bench.py'`.
+
+```sh
+python3 tools/bench/agent_bench.py fetch-swe-mini
+python3 tools/bench/agent_bench.py run --preset fast --env podman --url http://127.0.0.1:8000 --label qwen38-q4xl
+python3 tools/bench/agent_bench.py report docs/bench/2026-*-qwen38-q4xl-*
+```
+
 ## service/lily-service.sh
 
 Not Python: a bash script and a launchd plist template that run the server as
