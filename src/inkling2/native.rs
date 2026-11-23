@@ -10,8 +10,11 @@
 //!   GGML `block_nvfp4` (`[gate; up]` half-split nibbles) + per-expert outer
 //!   scale `amax[e] / outer_scale_denominator`.
 //! - Layers 20..24 routed experts (native MXFP8 `F8_E4M3` + `UE8M0` per 32
-//!   weights): parallel repack into `Q8_0` blocks (34B vs 33B per 32 weights,
-//!   7-bit mantissa vs FP8's 3-bit) so they hit all existing `Q8_0` kernels.
+//!   weights): lossy linear requantization into `Q8_0` blocks (34B vs 33B per
+//!   32 weights, one uniform `amax / 127` scale per block; weights below
+//!   `amax / 254` round to zero and small weights under `~amax / 16` are
+//!   coarser than the source `F8_E4M3` step) so they hit all existing `Q8_0`
+//!   kernels.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -240,41 +243,83 @@ pub(crate) fn repack_nvfp4_experts(
     let mut out = vec![0u8; n_expert * n_rows * out_row_bytes];
     let half_rows = n_rows / 2;
 
-    out.par_chunks_exact_mut(out_row_bytes).enumerate().for_each(|(global_row, dst_row)| {
-        let e = global_row / n_rows;
-        let out_r = global_row % n_rows;
-        let src_r = if deinterleave_gu {
-            if out_r < half_rows { 2 * out_r } else { 2 * (out_r - half_rows) + 1 }
-        } else {
-            out_r
-        };
-        let src_idx = e * n_rows + src_r;
-        let w_row = &w_u8[src_idx * w_row_bytes..(src_idx + 1) * w_row_bytes];
-        let s_row = &scale_fp8[src_idx * s_row_bytes..(src_idx + 1) * s_row_bytes];
+    out.par_chunks_exact_mut(out_row_bytes)
+        .enumerate()
+        .try_for_each(|(global_row, dst_row)| -> Result<()> {
+            let e = global_row / n_rows;
+            let out_r = global_row % n_rows;
+            let src_r = if deinterleave_gu {
+                if out_r < half_rows { 2 * out_r } else { 2 * (out_r - half_rows) + 1 }
+            } else {
+                out_r
+            };
+            let src_idx = e * n_rows + src_r;
+            let w_row = &w_u8[src_idx * w_row_bytes..(src_idx + 1) * w_row_bytes];
+            let s_row = &scale_fp8[src_idx * s_row_bytes..(src_idx + 1) * s_row_bytes];
 
-        for b in 0..blocks_per_row {
-            let dst = &mut dst_row[b * 36..(b + 1) * 36];
-            for s in 0..4 {
-                let sb = s_row[4 * b + s];
-                // Normalize negative zero (0x80) to 0x00; block scales are non-negative.
-                dst[s] = if sb == 0x80 { 0 } else { sb & 0x7f };
-                let inp = &w_row[(4 * b + s) * 8..(4 * b + s + 1) * 8];
-                let qout = &mut dst[4 + s * 8..4 + (s + 1) * 8];
-                // HF sequential [even=lo, odd=hi] -> GGML half-split [0..7=lo, 8..15=hi].
-                for j in 0..8 {
-                    let lo = if (j & 1) == 0 { inp[j >> 1] & 0x0f } else { inp[j >> 1] >> 4 };
-                    let hi = if (j & 1) == 0 {
-                        inp[(j + 8) >> 1] & 0x0f
-                    } else {
-                        inp[(j + 8) >> 1] >> 4
-                    };
-                    qout[j] = lo | (hi << 4);
+            for b in 0..blocks_per_row {
+                let dst = &mut dst_row[b * 36..(b + 1) * 36];
+                for s in 0..4 {
+                    let sb = s_row[4 * b + s];
+                    // Normalize -0.0 (0x80) to +0.0; reject NaN (0x7f / 0xff)
+                    // and negative non-zero scales instead of masking them.
+                    ensure!(
+                        (sb & 0x7f) != 0x7f,
+                        "NVFP4 NaN block scale 0x{sb:02x} at expert {e} row {src_r} sub-block {}",
+                        4 * b + s
+                    );
+                    ensure!(
+                        sb == 0x80 || (sb & 0x80) == 0,
+                        "NVFP4 negative block scale 0x{sb:02x} at expert {e} row {src_r} sub-block {}",
+                        4 * b + s
+                    );
+                    dst[s] = if sb == 0x80 { 0 } else { sb };
+                    let inp = &w_row[(4 * b + s) * 8..(4 * b + s + 1) * 8];
+                    let qout = &mut dst[4 + s * 8..4 + (s + 1) * 8];
+                    // HF sequential [even=lo, odd=hi] -> GGML half-split [0..7=lo, 8..15=hi].
+                    for j in 0..8 {
+                        let lo = if (j & 1) == 0 {
+                            inp[j >> 1] & 0x0f
+                        } else {
+                            inp[j >> 1] >> 4
+                        };
+                        let hi = if (j & 1) == 0 {
+                            inp[(j + 8) >> 1] & 0x0f
+                        } else {
+                            inp[(j + 8) >> 1] >> 4
+                        };
+                        qout[j] = lo | (hi << 4);
+                    }
                 }
             }
-        }
-    });
+            Ok(())
+        })?;
 
     Ok(out)
+}
+
+/// Validates and computes per-expert NVFP4 outer scales (`amax[e] / denom[0]`).
+pub(crate) fn compute_nvfp4_outer_scales(
+    amax: &[f32],
+    denom: &[f32],
+    n_expert: usize,
+    amax_name: &str,
+    denom_name: &str,
+) -> Result<Vec<f32>> {
+    ensure!(amax.len() == n_expert, "{amax_name} len {} != {n_expert}", amax.len());
+    ensure!(
+        denom.len() == 1 && denom[0].is_finite() && denom[0] > 0.0,
+        "invalid {denom_name}: {denom:?}"
+    );
+    let inv_d = 1.0 / denom[0];
+    let mut scales = Vec::with_capacity(n_expert);
+    for (e, &a) in amax.iter().enumerate() {
+        ensure!(a.is_finite() && a >= 0.0, "invalid {amax_name}[{e}] = {a}");
+        let s = a * inv_d;
+        ensure!(s.is_finite(), "non-finite outer scale {s} for {amax_name}[{e}]");
+        scales.push(s);
+    }
+    Ok(scales)
 }
 
 /// Quantizes raw row-major BF16 bytes `[rows, cols]` into a compact
@@ -463,10 +508,13 @@ fn load_expert_pair(
             let denom_name = format!("{prefix}_weight_outer_scale_denominator");
             let amax = read_f32_vec(ckpt, &amax_name)?;
             let denom = read_f32_vec(ckpt, &denom_name)?;
-            ensure!(amax.len() == n_expert, "{amax_name} len {} != {n_expert}", amax.len());
-            ensure!(denom.len() == 1 && denom[0] != 0.0, "invalid {denom_name}");
-            let inv_d = 1.0 / denom[0];
-            let scales: Vec<f32> = amax.into_iter().map(|a| a * inv_d).collect();
+            let scales = compute_nvfp4_outer_scales(
+                &amax,
+                &denom,
+                n_expert,
+                &amax_name,
+                &denom_name,
+            )?;
             let scale_t = Tensor::from_f32(ctx, &scales, &[n_expert])?;
             Ok((qw, Some(scale_t), buf))
         }
@@ -776,58 +824,8 @@ pub(super) fn load_dspark(
     let root: serde_json::Value =
         serde_json::from_slice(&cfg_bytes).context("parsing config.json for mtp_config")?;
     let mc = root.get("mtp_config").context("config.json missing mtp_config")?;
-
-    let u = |k: &str, default: usize| -> usize {
-        mc.get(k).and_then(|v| v.as_u64()).map_or(default, |v| v as usize)
-    };
-    let f = |k: &str, default: f32| -> f32 {
-        mc.get(k).and_then(|v| v.as_f64()).map_or(default, |v| v as f32)
-    };
-
-    let n_layer = u("num_hidden_layers", 3);
-    let hidden = u("hidden_size", target.hidden);
-    let ff = u("intermediate_size", 9216);
-    let n_head = u("num_attention_heads", 24);
-    let n_head_kv = u("num_key_value_heads", 8);
-    let head_dim = u("head_dim", 128);
-    let rope_theta = f("rope_theta", 1_000_000.0);
-    let rms_eps = f("rms_norm_eps", 1e-6);
-    let block_size = u("block_size", 8);
-    let markov_rank = u("markov_rank", 256);
-    let window = u("sliding_window_size", 1024);
-
-    let mut swa = vec![false; n_layer];
-    if let Some(arr) = mc.get("local_layer_ids").and_then(|v| v.as_array()) {
-        for id in arr {
-            let idx = id.as_u64().context("mtp_config.local_layer_ids entry not u64")? as usize;
-            ensure!(idx < n_layer, "mtp local_layer_ids {idx} >= {n_layer}");
-            swa[idx] = true;
-        }
-    }
-    let target_layers: Vec<usize> = match mc.get("target_layer_ids").and_then(|v| v.as_array()) {
-        Some(arr) => arr
-            .iter()
-            .map(|v| v.as_u64().map(|x| x as usize).context("target_layer_ids not u64"))
-            .collect::<Result<Vec<_>>>()?,
-        None => vec![5, 23, 41, 48],
-    };
-
-    let cfg = DsparkConfig {
-        n_layer,
-        hidden,
-        ff,
-        n_head,
-        n_head_kv,
-        head_dim,
-        rope_theta,
-        rms_eps,
-        block_size,
-        markov_rank,
-        window,
-        swa,
-        target_layers,
-        final_logit_softcapping: target.final_logit_softcapping,
-    };
+    let cfg = DsparkConfig::from_mtp_json(mc, target)?;
+    let head_dim = cfg.head_dim;
 
     let ckpt = Checkpoint::open_file(mtp_path)?;
     let map_names = vec![
@@ -1058,5 +1056,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn nvfp4_repack_rejects_negative_and_nan_block_scales_and_normalizes_neg_zero() {
+        let w = vec![0u8; 32]; // 1 expert, 1 row, 64 cols
+        // -0.0 (0x80) normalizes to +0.0 (0x00).
+        let packed =
+            repack_nvfp4_experts(&w, &[0x80, 0x38, 0x00, 0x38], 1, 1, 64, false)
+                .unwrap();
+        assert_eq!(packed[0], 0x00);
+        // Negative non-zero scale is rejected.
+        assert!(
+            repack_nvfp4_experts(&w, &[0x81, 0x38, 0x38, 0x38], 1, 1, 64, false)
+                .is_err()
+        );
+        // Positive and negative NaN encodings (0x7f, 0xff) are rejected.
+        assert!(
+            repack_nvfp4_experts(&w, &[0x38, 0x7f, 0x38, 0x38], 1, 1, 64, false)
+                .is_err()
+        );
+        assert!(
+            repack_nvfp4_experts(&w, &[0x38, 0x38, 0xff, 0x38], 1, 1, 64, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn nvfp4_outer_scales_reject_non_finite_and_invalid_values() {
+        let ok =
+            compute_nvfp4_outer_scales(&[0.0, 12.0], &[6.0], 2, "amax", "denom")
+                .unwrap();
+        assert_eq!(ok, vec![0.0, 2.0]);
+        assert!(
+            compute_nvfp4_outer_scales(&[f32::NAN, 1.0], &[6.0], 2, "a", "d").is_err()
+        );
+        assert!(
+            compute_nvfp4_outer_scales(&[f32::INFINITY, 1.0], &[6.0], 2, "a", "d")
+                .is_err()
+        );
+        assert!(compute_nvfp4_outer_scales(&[-1.0, 1.0], &[6.0], 2, "a", "d").is_err());
+        assert!(compute_nvfp4_outer_scales(&[1.0, 1.0], &[0.0], 2, "a", "d").is_err());
+        assert!(compute_nvfp4_outer_scales(&[1.0, 1.0], &[-1.0], 2, "a", "d").is_err());
+        assert!(
+            compute_nvfp4_outer_scales(&[1.0, 1.0], &[f32::NAN], 2, "a", "d").is_err()
+        );
+        assert!(
+            compute_nvfp4_outer_scales(&[1.0, 1.0], &[f32::INFINITY], 2, "a", "d")
+                .is_err()
+        );
+        assert!(
+            compute_nvfp4_outer_scales(&[f32::MAX, 1.0], &[1e-30], 2, "a", "d").is_err()
+        );
     }
 }

@@ -73,7 +73,7 @@ impl DsparkConfig {
             "DSpark hidden {hidden} != target {}",
             target.hidden
         );
-        ensure!(block_size >= 2 && block_size <= 16, "DSpark block_size={block_size}");
+        ensure!((2..=16).contains(&block_size), "DSpark block_size={block_size}");
 
         let markov_rank = g
             .tensor("markov_w1.weight")
@@ -108,7 +108,7 @@ impl DsparkConfig {
             target.n_visits
         );
 
-        Ok(Self {
+        let cfg = Self {
             n_layer,
             hidden,
             ff,
@@ -123,7 +123,128 @@ impl DsparkConfig {
             swa,
             target_layers,
             final_logit_softcapping,
-        })
+        };
+        cfg.validate(target)?;
+        Ok(cfg)
+    }
+
+    /// Parses and validates `mtp_config` from a native HF `config.json`.
+    pub fn from_mtp_json(mc: &serde_json::Value, target: &Config) -> Result<Self> {
+        let u = |k: &str, default: usize| -> usize {
+            mc.get(k).and_then(|v| v.as_u64()).map_or(default, |v| v as usize)
+        };
+        let f = |k: &str, default: f32| -> f32 {
+            mc.get(k).and_then(|v| v.as_f64()).map_or(default, |v| v as f32)
+        };
+
+        let n_layer = u("num_hidden_layers", 3);
+        let hidden = u("hidden_size", target.hidden);
+        let ff = u("intermediate_size", 9216);
+        let n_head = u("num_attention_heads", 24);
+        let n_head_kv = u("num_key_value_heads", 8);
+        let head_dim = u("head_dim", 128);
+        let rope_theta = f("rope_theta", 1_000_000.0);
+        let rms_eps = f("rms_norm_eps", 1e-6);
+        let block_size = u("block_size", 8);
+        let markov_rank = u("markov_rank", 256);
+        let window = u("sliding_window_size", 1024);
+
+        let mut swa = vec![false; n_layer];
+        if let Some(arr) = mc.get("local_layer_ids").and_then(|v| v.as_array()) {
+            for id in arr {
+                let idx = id
+                    .as_u64()
+                    .context("mtp_config.local_layer_ids entry not u64")?
+                    as usize;
+                ensure!(idx < n_layer, "mtp local_layer_ids {idx} >= {n_layer}");
+                swa[idx] = true;
+            }
+        }
+        let target_layers: Vec<usize> =
+            match mc.get("target_layer_ids").and_then(|v| v.as_array()) {
+                Some(arr) => arr
+                    .iter()
+                    .map(|v| {
+                        v.as_u64()
+                            .map(|x| x as usize)
+                            .context("target_layer_ids not u64")
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                None => vec![5, 23, 41, 48],
+            };
+
+        let cfg = Self {
+            n_layer,
+            hidden,
+            ff,
+            n_head,
+            n_head_kv,
+            head_dim,
+            rope_theta,
+            rms_eps,
+            block_size,
+            markov_rank,
+            window,
+            swa,
+            target_layers,
+            final_logit_softcapping: target.final_logit_softcapping,
+        };
+        cfg.validate(target)?;
+        Ok(cfg)
+    }
+
+    /// Validates all DSpark invariants shared between GGUF and native loaders.
+    pub fn validate(&self, target: &Config) -> Result<()> {
+        ensure!(
+            self.n_layer > 0 && self.n_layer <= super::config::MAX_LAYERS,
+            "DSpark n_layer {} out of range",
+            self.n_layer
+        );
+        ensure!(
+            self.hidden == target.hidden,
+            "DSpark hidden {} != target {}",
+            self.hidden,
+            target.hidden
+        );
+        ensure!(self.ff > 0, "DSpark ff must be positive");
+        ensure!(
+            self.n_head > 0
+                && self.n_head_kv > 0
+                && self.n_head.is_multiple_of(self.n_head_kv),
+            "DSpark invalid head counts {}/{}",
+            self.n_head,
+            self.n_head_kv
+        );
+        ensure!(
+            self.head_dim > 0 && self.head_dim.is_multiple_of(32),
+            "DSpark unsupported head_dim {}",
+            self.head_dim
+        );
+        ensure!(
+            (2..=16).contains(&self.block_size),
+            "DSpark block_size={} must be in 2..=16",
+            self.block_size
+        );
+        ensure!(self.markov_rank > 0, "DSpark markov_rank must be positive");
+        ensure!(self.window > 0, "DSpark window must be positive");
+        ensure!(
+            self.rope_theta.is_finite()
+                && self.rope_theta > 0.0
+                && self.rms_eps.is_finite()
+                && self.rms_eps > 0.0
+                && self.final_logit_softcapping.is_finite()
+                && self.final_logit_softcapping >= 0.0,
+            "invalid DSpark float parameters"
+        );
+        ensure!(self.swa.len() == self.n_layer, "DSpark swa pattern length mismatch");
+        ensure!(
+            !self.target_layers.is_empty()
+                && self.target_layers.iter().all(|&l| l <= target.n_visits),
+            "DSpark target_layers {:?} out of range for {} visits",
+            self.target_layers,
+            target.n_visits
+        );
+        Ok(())
     }
 }
 
@@ -280,19 +401,8 @@ impl DsparkState {
             let nk = Tensor::zeros(ctx, &[new_cap, self.kv_w], DType::F16)?;
             let nv = Tensor::zeros(ctx, &[new_cap, self.kv_w], DType::F16)?;
             if copy_bytes > 0 {
-                // SAFETY: both tensors are host-visible shared buffers, GPU idle.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        self.k_ctx[l].contents_ptr(),
-                        nk.contents_ptr(),
-                        copy_bytes,
-                    );
-                    core::ptr::copy_nonoverlapping(
-                        self.v_ctx[l].contents_ptr(),
-                        nv.contents_ptr(),
-                        copy_bytes,
-                    );
-                }
+                super::engine::host_copy(&self.k_ctx[l], &nk, copy_bytes);
+                super::engine::host_copy(&self.v_ctx[l], &nv, copy_bytes);
             }
             self.k_ctx[l] = nk;
             self.v_ctx[l] = nv;
@@ -342,6 +452,12 @@ impl Inkling2Dspark {
         let hidden_out_b = load_f32_gpu(ctx, &g, "dspark_hidden_out.bias")?;
 
         let nt = cfg.target_layers.len();
+        ensure!(
+            fuse_raw.len() == (cfg.n_layer + 1) * nt,
+            "dspark_fuse.weight len {} != {}*{nt}",
+            fuse_raw.len(),
+            cfg.n_layer + 1
+        );
         let mut fuse_flat = Vec::with_capacity((cfg.n_layer + 1) * nt);
         for row in 0..=cfg.n_layer {
             let slice = &fuse_raw[row * nt..(row + 1) * nt];

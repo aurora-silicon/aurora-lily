@@ -19,7 +19,7 @@ use crate::tensor::{DType, Tensor};
 /// Public alias for server wiring.
 pub type Inkling2Engine = Inkling2Model;
 
-fn host_copy(src: &Tensor, dst: &Tensor, bytes: usize) {
+pub(super) fn host_copy(src: &Tensor, dst: &Tensor, bytes: usize) {
     assert!(bytes <= src.byte_len() && bytes <= dst.byte_len());
     // SAFETY: both tensors are host-visible shared buffers, GPU idle.
     unsafe {

@@ -102,3 +102,160 @@ fn varying_loop_is_refused() {
     m.insert(format!("{ARCH_LOOP}.loop.varying"), Value::Bool(true));
     assert!(Config::from_metadata(&m).is_err());
 }
+
+fn hf_config_json() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "inkling2_loop",
+        "num_hidden_layers": 24,
+        "hidden_size": 2304,
+        "vocab_size": 201024,
+        "unpadded_vocab_size": 200058,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "n_routed_experts": 128,
+        "num_experts_per_tok": 8,
+        "intermediate_size": 1152,
+        "loop_config": {
+            "core_start": 6,
+            "core_end": 18,
+            "num_passes": 3,
+            "gate_rank": 64,
+            "is_varloop": false
+        }
+    })
+}
+
+fn load_hf(val: &serde_json::Value, tag: &str) -> Result<Config> {
+    let dir = std::env::temp_dir()
+        .join(format!("lily-inkling2-hf-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("config.json"), val.to_string()).expect("write");
+    let res = Config::from_hf_dir(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    res
+}
+
+#[test]
+fn hf_dir_enforces_shared_config_invariants() {
+    let base = hf_config_json();
+    let cfg = load_hf(&base, "valid").unwrap();
+    assert_eq!((cfg.n_phys, cfg.n_visits), (24, 48));
+
+    let bad_cases: [(&str, Box<dyn Fn(&mut serde_json::Value)>); 8] = [
+        (
+            "zero-kv-heads",
+            Box::new(|v| {
+                v["num_key_value_heads"] = 0.into();
+            }),
+        ),
+        (
+            "unaligned-hidden",
+            Box::new(|v| {
+                v["hidden_size"] = 2300.into();
+            }),
+        ),
+        (
+            "unaligned-head-dim",
+            Box::new(|v| {
+                v["head_dim"] = 100.into();
+                v["swa_head_dim"] = 100.into();
+            }),
+        ),
+        (
+            "zero-experts-used",
+            Box::new(|v| {
+                v["num_experts_per_tok"] = 0.into();
+            }),
+        ),
+        (
+            "zero-rms-eps",
+            Box::new(|v| {
+                v["rms_norm_eps"] = 0.0.into();
+            }),
+        ),
+        (
+            "huge-loop-passes",
+            Box::new(|v| {
+                v["loop_config"]["num_passes"] = 1_000_000.into();
+            }),
+        ),
+        (
+            "huge-gate-rank",
+            Box::new(|v| {
+                v["loop_config"]["gate_rank"] = 4096.into();
+            }),
+        ),
+        (
+            "misaligned-loop",
+            Box::new(|v| {
+                v["loop_config"]["core_start"] = 5.into();
+            }),
+        ),
+    ];
+    for (tag, mutate) in bad_cases {
+        let mut v = base.clone();
+        mutate(&mut v);
+        assert!(load_hf(&v, tag).is_err(), "expected error for {tag}");
+    }
+}
+
+#[test]
+fn dspark_mtp_json_enforces_validation() {
+    use super::super::dspark::DsparkConfig;
+
+    let target = load_hf(&hf_config_json(), "dspark-target").unwrap();
+    let base = serde_json::json!({
+        "num_hidden_layers": 3,
+        "hidden_size": 2304,
+        "intermediate_size": 9216,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "block_size": 8,
+        "markov_rank": 256,
+        "target_layer_ids": [5, 23, 41, 48]
+    });
+    assert!(DsparkConfig::from_mtp_json(&base, &target).is_ok());
+
+    let bad_cases: [(&str, Box<dyn Fn(&mut serde_json::Value)>); 5] = [
+        (
+            "wrong-hidden",
+            Box::new(|v| {
+                v["hidden_size"] = 1024.into();
+            }),
+        ),
+        (
+            "bad-block-size",
+            Box::new(|v| {
+                v["block_size"] = 1.into();
+            }),
+        ),
+        (
+            "empty-targets",
+            Box::new(|v| {
+                v["target_layer_ids"] = serde_json::json!([]);
+            }),
+        ),
+        (
+            "oob-target",
+            Box::new(|v| {
+                v["target_layer_ids"] = serde_json::json!([49]);
+            }),
+        ),
+        (
+            "zero-kv-heads",
+            Box::new(|v| {
+                v["num_key_value_heads"] = 0.into();
+            }),
+        ),
+    ];
+    for (tag, mutate) in bad_cases {
+        let mut v = base.clone();
+        mutate(&mut v);
+        assert!(
+            DsparkConfig::from_mtp_json(&v, &target).is_err(),
+            "expected DsparkConfig error for {tag}"
+        );
+    }
+}
