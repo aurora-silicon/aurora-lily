@@ -36,13 +36,31 @@ pub fn tokenizer_json(g: &Gguf) -> Result<String> {
 /// tags and with `enable_thinking: false` mapped to thinking effort `0` plus an
 /// open `<|message_model|><|content_text|>` generation prompt.
 ///
-/// Inkling 2's GGUF template reads only `reasoning_effort` (defaulting to
-/// `0.9` when omitted) and ends the prompt without opening a model content
-/// block, so `--thinking false`, `enable_thinking: false`, and
-/// `reasoning_effort: "none"` would otherwise still emit a
-/// `<|content_thinking|>` block.
+/// Inkling 2's GGUF and native HF templates read only `reasoning_effort`
+/// (defaulting to `0.9` when omitted) and emit no generation prompt tail at the
+/// end of the message loop, so `--thinking false`, `enable_thinking: false`,
+/// and `reasoning_effort: "none"` would otherwise still emit a
+/// `<|content_thinking|>` block. When both `enable_thinking: false` and an
+/// explicit `reasoning_effort` are supplied, `enable_thinking: false` wins and
+/// forces effort `0`.
 pub fn chat_template(g: &Gguf) -> Result<String> {
     patch_chat_template(g.str("tokenizer.chat_template")?)
+}
+
+/// Returns `s` with Jinja `{# ... #}` comments removed so template checks
+/// inspect executable template code rather than comments.
+fn strip_jinja_comments(mut s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    while let Some(start) = s.find("{#") {
+        out.push_str(&s[..start]);
+        let rest = &s[start + 2..];
+        match rest.find("#}") {
+            Some(end) => s = &rest[end + 2..],
+            None => return out,
+        }
+    }
+    out.push_str(s);
+    out
 }
 
 pub fn patch_chat_template(raw: &str) -> Result<String> {
@@ -55,6 +73,9 @@ pub fn patch_chat_template(raw: &str) -> Result<String> {
         }
     }
     ensure!(!t.contains("generation %}"), "unhandled generation tag in the template");
+    if strip_jinja_comments(&t).contains("enable_thinking") {
+        return Ok(t);
+    }
     const EFFORT_FALLBACK: &str = "{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}";
     const EFFORT_WITH_THINKING: &str = "{%- set eff = 0.0 if enable_thinking is defined and not enable_thinking else (reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9) -%}";
     const NOTHINK_GEN_PROMPT: &str = "{%- if add_generation_prompt is defined and add_generation_prompt and enable_thinking is defined and not enable_thinking -%}{{- \"<|message_model|><|content_text|>\" -}}{%- endif -%}";

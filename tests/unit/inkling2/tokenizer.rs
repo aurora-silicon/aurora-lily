@@ -3,8 +3,10 @@ use serde_json::json;
 
 use super::patch_chat_template;
 
-/// Minimal extract of Inkling 2 Mini's GGUF `tokenizer.chat_template`
-/// covering `emit_thinking_effort()` and `{% generation %}` stripping.
+/// Extract of `thinkingmachines/Inkling-2-Mini`'s `chat_template.jinja`,
+/// including `emit_thinking_effort()`, `{% generation %}` stripping, and the
+/// real template's tail (which emits no `<|message_model|>` generation prompt
+/// of its own).
 const INKLING2_TEMPLATE: &str = concat!(
     r#"{# enable_thinking #}"#,
     r#"{%- set effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, "xhigh": 0.99, "max": 0.99} -%}"#,
@@ -15,11 +17,19 @@ const INKLING2_TEMPLATE: &str = concat!(
     r#"{%- if num == 0.0 -%}0{%- else -%}{{ num }}{%- endif -%}"#,
     r#"{{- "<|end_message|>" -}}"#,
     r#"{%- endmacro -%}"#,
-    r#"{{- emit_thinking_effort() -}}"#,
-    r#"{%- for m in messages -%}"#,
-    r#"{%- if m.role == "assistant" -%}{%- generation -%}{{ m.content }}{%- endgeneration -%}"#,
-    r#"{%- else -%}<|message_user|><|content_text|>{{ m.content }}<|end_message|>{%- endif -%}"#,
+    r#"{%- set state = namespace(effort_emitted=false) -%}"#,
+    r#"{%- for message in messages -%}"#,
+    r#"{%- if not state.effort_emitted and message.role != "system" -%}"#,
+    r#"{{- emit_thinking_effort() -}}{%- set state.effort_emitted = true -%}"#,
+    r#"{%- endif -%}"#,
+    r#"{%- set rendered -%}"#,
+    r#"{%- if message.role == "assistant" -%}<|message_model|><|content_text|>{{ message.content }}<|end_message|><|content_model_end_sampling|>"#,
+    r#"{%- else -%}<|message_user|><|content_text|>{{ message.content }}<|end_message|>{%- endif -%}"#,
+    r#"{%- endset -%}"#,
+    r#"{%- if message.role == "assistant" -%}{%- generation -%}{{- rendered -}}{%- endgeneration -%}"#,
+    r#"{%- else -%}{{- rendered -}}{%- endif -%}"#,
     r#"{%- endfor -%}"#,
+    r#"{%- if not state.effort_emitted -%}{{- emit_thinking_effort() -}}{%- endif -%}"#,
 );
 
 fn render(
@@ -81,6 +91,13 @@ fn enable_thinking_false_sets_effort_zero_and_opens_text() {
 fn patch_passes_through_unmatched_templates_after_stripping_generation_tags() {
     let already_wired = "{%- if enable_thinking -%}on{%- else -%}off{%- endif -%}";
     assert_eq!(patch_chat_template(already_wired).unwrap(), already_wired);
+    // A template that handles enable_thinking in code AND carries the old
+    // fallback line must not be double-patched.
+    let hybrid = concat!(
+        "{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}",
+        "{%- if add_generation_prompt and not enable_thinking -%}<|message_model|><|content_text|>{%- endif -%}",
+    );
+    assert_eq!(patch_chat_template(hybrid).unwrap(), hybrid);
     assert_eq!(
         patch_chat_template("{%- generation -%}{{ messages }}{%- endgeneration -%}")
             .unwrap(),
