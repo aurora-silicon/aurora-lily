@@ -2380,6 +2380,27 @@ fn default_thinking(flag: bool, given: bool, controls: bool) -> bool {
     flag && (controls || given)
 }
 
+/// Applies the checkpoint-dependent `--thinking` default to the dashboard's
+/// settings listing. `dashboard::settings::build` takes clap's default
+/// (`true`) ahead of computed defaults, so when the vocabulary lacks
+/// `</think>` (`controls == false`) this updates the `thinking` row's default
+/// to `false` and its effective value too unless `--thinking` was given on the
+/// command line.
+fn apply_thinking_default(
+    listing: &mut [dashboard::contract::Setting],
+    controls: bool,
+) {
+    if controls {
+        return;
+    }
+    if let Some(setting) = listing.iter_mut().find(|s| s.name == "thinking") {
+        setting.default = Some(dashboard::contract::SettingValue::Bool(false));
+        if setting.flag_value.is_none() {
+            setting.value = Some(dashboard::contract::SettingValue::Bool(false));
+        }
+    }
+}
+
 /// The startup line's account of the thinking controls' defaults.
 fn describe_thinking_defaults(
     d: &api::ThinkingDefaults,
@@ -2479,8 +2500,9 @@ fn run_with<M: LanguageModel + 'static>(
     // The settings view's listing and the runtime settings from the same
     // command line; the database's overrides come over them once the
     // recorder opened it.
-    let listing =
+    let mut listing =
         dashboard::settings::build(&options.flags, &computed_defaults(model_dir));
+    apply_thinking_default(&mut listing, thinking_tokens.is_some());
     let settings = Arc::new(runtime::RuntimeSettings::new(
         runtime::Snapshot {
             defaults: defaults.clone(),
