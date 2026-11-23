@@ -234,19 +234,39 @@ fn drop_cached(file: &File, start: u64, len: usize) {
 #[cfg(not(target_os = "linux"))]
 fn drop_cached(_file: &File, _start: u64, _len: usize) {}
 
+/// Maximum JSON header size accepted before allocating (matches upstream
+/// HuggingFace `safetensors` 100 MiB cap).
+const MAX_HEADER_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Parses one shard's header: 8-byte little-endian header length, then the
 /// JSON header; `data_offsets` are relative to the data section that follows.
 fn parse_shard_header(path: &Path) -> Result<HashMap<String, TensorMeta>> {
     let mut file =
         File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file_len =
+        file.metadata().with_context(|| format!("stat {}", path.display()))?.len();
     let mut len_bytes = [0u8; 8];
     file.read_exact(&mut len_bytes)
         .with_context(|| format!("reading header length of {}", path.display()))?;
     let header_len = u64::from_le_bytes(len_bytes);
-    let mut header = vec![0u8; header_len as usize];
+    ensure!(
+        header_len <= MAX_HEADER_BYTES,
+        "safetensors header length {header_len} exceeds {MAX_HEADER_BYTES} bytes in {}",
+        path.display()
+    );
+    let data_section = 8u64.checked_add(header_len).with_context(|| {
+        format!("safetensors header length overflow in {}", path.display())
+    })?;
+    ensure!(
+        data_section <= file_len,
+        "safetensors header ({data_section} bytes) exceeds file size {file_len} in {}",
+        path.display()
+    );
+    let header_len_usize = usize::try_from(header_len)
+        .context("safetensors header length exceeds usize")?;
+    let mut header = vec![0u8; header_len_usize];
     file.read_exact(&mut header)
         .with_context(|| format!("reading header of {}", path.display()))?;
-    let data_section = 8 + header_len;
 
     // `__metadata__` is an optional free-form object, not a tensor entry.
     let raw: BTreeMap<String, serde_json::Value> =
@@ -258,18 +278,54 @@ fn parse_shard_header(path: &Path) -> Result<HashMap<String, TensorMeta>> {
         }
         let entry: HeaderEntry = serde_json::from_value(value)
             .with_context(|| format!("parsing header entry for {name}"))?;
-        let [start, end] = entry.data_offsets;
-        ensure!(end >= start, "tensor {name} has reversed data offsets");
+        let [rel_start, rel_end] = entry.data_offsets;
+        ensure!(rel_end >= rel_start, "tensor {name} has reversed data offsets");
+        let start = data_section
+            .checked_add(rel_start)
+            .with_context(|| format!("tensor {name} start offset overflows"))?;
+        let end = data_section
+            .checked_add(rel_end)
+            .with_context(|| format!("tensor {name} end offset overflows"))?;
+        ensure!(
+            end <= file_len,
+            "tensor {name} ends at {end}, past file size {file_len}"
+        );
+        let byte_len = rel_end - rel_start;
+        usize::try_from(byte_len)
+            .with_context(|| format!("tensor {name} byte length {byte_len} exceeds usize"))?;
+        let dtype = SafetensorsDType::from_str(&entry.dtype);
+        if let Some(elem_size) = dtype.size() {
+            let numel = entry
+                .shape
+                .iter()
+                .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))
+                .with_context(|| {
+                    format!("tensor {name} shape {:?} overflows", entry.shape)
+                })?;
+            let expected = numel
+                .checked_mul(elem_size as u64)
+                .with_context(|| format!("tensor {name} byte size overflows"))?;
+            ensure!(
+                expected == byte_len,
+                "tensor {name} byte length {byte_len} != shape {:?} * {:?} ({expected})",
+                entry.shape,
+                dtype
+            );
+        }
         out.insert(
             name,
             TensorMeta {
-                dtype: SafetensorsDType::from_str(&entry.dtype),
+                dtype,
                 shape: entry.shape,
                 shard: path.to_path_buf(),
-                start: data_section + start,
-                end: data_section + end,
+                start,
+                end,
             },
         );
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/safetensors.rs"]
+mod tests;

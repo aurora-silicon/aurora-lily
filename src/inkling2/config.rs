@@ -190,20 +190,46 @@ impl Config {
                 let ls = lc
                     .get("core_start")
                     .and_then(|v| v.as_u64())
-                    .context("loop_config missing core_start")? as usize;
+                    .context("loop_config missing core_start")?;
                 let le = lc
                     .get("core_end")
                     .and_then(|v| v.as_u64())
-                    .context("loop_config missing core_end")? as usize;
+                    .context("loop_config missing core_end")?;
                 let lp = lc
                     .get("num_passes")
                     .and_then(|v| v.as_u64())
-                    .context("loop_config missing num_passes")? as usize;
-                let lr = lc.get("gate_rank").and_then(|v| v.as_u64()).unwrap_or(64)
-                    as usize;
-                ensure!(ls < le && le <= n_phys && lp >= 1, "invalid loop_config");
-                let visits = n_phys + (lp - 1) * (le - ls);
-                (LoopLayout::Unsloth, ls, le, lp, lr, visits)
+                    .context("loop_config missing num_passes")?;
+                let lr = lc.get("gate_rank").and_then(|v| v.as_u64()).unwrap_or(64);
+                ensure!(
+                    (1..=16).contains(&lp),
+                    "loop_config.num_passes is {lp}, max 16"
+                );
+                ensure!(lr <= 1024, "loop_config.gate_rank is {lr}, max 1024");
+                let (ls, le, lp, lr) = (
+                    usize::try_from(ls).context("loop_config.core_start overflow")?,
+                    usize::try_from(le).context("loop_config.core_end overflow")?,
+                    lp as usize,
+                    lr as usize,
+                );
+                if lp == 1 {
+                    (LoopLayout::None, 0, 0, 1, 0, n_phys)
+                } else {
+                    ensure!(
+                        ls > 0 && ls < le && le <= n_phys && lr > 0,
+                        "invalid loop_config: start={ls} end={le} passes={lp} rank={lr}"
+                    );
+                    let extra = (lp - 1)
+                        .checked_mul(le - ls)
+                        .context("loop_config visits overflow")?;
+                    let visits = n_phys
+                        .checked_add(extra)
+                        .context("loop_config visits overflow")?;
+                    ensure!(
+                        visits <= MAX_LAYERS,
+                        "loop visits {visits} exceed {MAX_LAYERS}"
+                    );
+                    (LoopLayout::Unsloth, ls, le, lp, lr, visits)
+                }
             } else {
                 (LoopLayout::None, 0, 0, 1, 0, n_phys)
             };
@@ -219,7 +245,7 @@ impl Config {
             .and_then(|v| v.as_u64())
             .unwrap_or(199_999) as u32;
 
-        Ok(Self {
+        let cfg = Self {
             arch: arch.to_string(),
             loop_layout,
             n_phys,
@@ -256,7 +282,9 @@ impl Config {
             context_length,
             eos,
             pad,
-        })
+        };
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     pub fn from_metadata(meta: &BTreeMap<String, Value>) -> Result<Self> {
@@ -446,7 +474,7 @@ impl Config {
             .and_then(Value::as_u64)
             .unwrap_or(199_999) as u32;
 
-        Ok(Self {
+        let cfg = Self {
             arch: arch.to_owned(),
             loop_layout,
             n_phys,
@@ -483,7 +511,155 @@ impl Config {
             context_length,
             eos,
             pad,
-        })
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Validates all kernel and shape invariants shared by [`Self::from_hf_dir`]
+    /// and [`Self::from_metadata`].
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.n_phys > 0 && self.n_phys <= MAX_LAYERS,
+            "n_phys {} must be in 1..={MAX_LAYERS}",
+            self.n_phys
+        );
+        ensure!(
+            self.n_visits >= self.n_phys && self.n_visits <= MAX_LAYERS,
+            "n_visits {} must be in {}..={MAX_LAYERS}",
+            self.n_visits,
+            self.n_phys
+        );
+        ensure!(
+            self.hidden > 0
+                && self.hidden <= MAX_HIDDEN
+                && self.hidden.is_multiple_of(64),
+            "hidden {} must be a positive multiple of 64 (max {MAX_HIDDEN})",
+            self.hidden
+        );
+        ensure!(
+            self.vocab_padded > 0 && self.vocab_padded <= MAX_VOCAB,
+            "vocab_padded {} must be in 1..={MAX_VOCAB}",
+            self.vocab_padded
+        );
+        ensure!(
+            self.vocab_unpadded > 0 && self.vocab_unpadded <= self.vocab_padded,
+            "invalid vocab sizes {}/{}",
+            self.vocab_unpadded,
+            self.vocab_padded
+        );
+        ensure!(
+            self.head_dim > 0
+                && self.head_dim <= 512
+                && self.head_dim.is_multiple_of(32),
+            "unsupported head_dim {}",
+            self.head_dim
+        );
+        ensure!(
+            self.head_dim_swa == self.head_dim,
+            "differing SWA head_dim {} vs {} not supported",
+            self.head_dim_swa,
+            self.head_dim
+        );
+        ensure!(
+            self.n_head.len() == self.n_phys
+                && self.n_head_kv.len() == self.n_phys
+                && self.swa.len() == self.n_phys,
+            "per-layer metadata length mismatch for {} physical layers",
+            self.n_phys
+        );
+        for p in 0..self.n_phys {
+            ensure!(
+                self.n_head[p] > 0
+                    && self.n_head_kv[p] > 0
+                    && self.n_head[p].is_multiple_of(self.n_head_kv[p]),
+                "layer {p}: invalid head counts {}/{}",
+                self.n_head[p],
+                self.n_head_kv[p]
+            );
+        }
+        ensure!(
+            self.window > 0
+                && self.rel_len > 0
+                && self.rel_extent > 0
+                && self.log_scale_floor > 0
+                && self.sconv_l_cache >= 2
+                && self.attn_res_block_size > 0
+                && self.context_length > 0
+                && self.qk_clip.is_finite()
+                && self.qk_clip > 0.0
+                && self.rel_clip.is_finite()
+                && self.rel_clip > 0.0
+                && self.rms_eps.is_finite()
+                && self.rms_eps > 0.0
+                && self.log_scale_alpha.is_finite()
+                && self.log_scale_alpha >= 0.0,
+            "invalid Inkling 2 attention/conv parameters"
+        );
+        ensure!(
+            (1..=16).contains(&self.loop_count),
+            "loop_count {} must be in 1..=16",
+            self.loop_count
+        );
+        ensure!(
+            self.loop_gate_rank <= 1024,
+            "loop_gate_rank {} exceeds 1024",
+            self.loop_gate_rank
+        );
+        if self.loop_count > 1 {
+            ensure!(
+                self.loop_start > 0
+                    && self.loop_start < self.loop_end
+                    && self.loop_end <= self.n_phys
+                    && self.loop_gate_rank > 0,
+                "invalid loop parameters: start={} end={} count={} rank={}",
+                self.loop_start,
+                self.loop_end,
+                self.loop_count,
+                self.loop_gate_rank
+            );
+            let extra = (self.loop_count - 1)
+                .checked_mul(self.loop_end - self.loop_start)
+                .context("loop visits overflow")?;
+            let expected_visits =
+                self.n_phys.checked_add(extra).context("loop visits overflow")?;
+            ensure!(
+                self.n_visits == expected_visits,
+                "n_visits {} != expected {expected_visits}",
+                self.n_visits
+            );
+            ensure!(
+                self.loop_start.is_multiple_of(self.attn_res_block_size)
+                    && (self.loop_end - self.loop_start)
+                        .is_multiple_of(self.attn_res_block_size),
+                "loop core [{}, {}) must align with attn_res_block_size={}",
+                self.loop_start,
+                self.loop_end,
+                self.attn_res_block_size
+            );
+        } else {
+            ensure!(
+                self.n_visits == self.n_phys,
+                "non-looped n_visits {} != n_phys {}",
+                self.n_visits,
+                self.n_phys
+            );
+        }
+        ensure!(
+            self.n_expert > 0
+                && self.n_expert_used > 0
+                && self.n_expert_used <= self.n_expert
+                && self.ff_expert > 0
+                && self.route_scale.is_finite()
+                && self.situ_beta.is_finite()
+                && self.situ_beta > 0.0
+                && self.situ_linear_beta.is_finite()
+                && self.situ_linear_beta > 0.0
+                && self.final_logit_softcapping.is_finite()
+                && self.final_logit_softcapping >= 0.0,
+            "invalid Inkling 2 MoE/SITU parameters"
+        );
+        Ok(())
     }
 
     /// Returns the execution schedule: `(cache_slot, physical_layer, pass)` for
