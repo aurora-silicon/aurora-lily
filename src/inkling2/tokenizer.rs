@@ -47,20 +47,17 @@ pub fn chat_template(g: &Gguf) -> Result<String> {
     patch_chat_template(g.str("tokenizer.chat_template")?)
 }
 
-/// Returns `s` with Jinja `{# ... #}` comments removed so template checks
-/// inspect executable template code rather than comments.
-fn strip_jinja_comments(mut s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    while let Some(start) = s.find("{#") {
-        out.push_str(&s[..start]);
-        let rest = &s[start + 2..];
-        match rest.find("#}") {
-            Some(end) => s = &rest[end + 2..],
-            None => return out,
-        }
+/// Returns whether `template` references `enable_thinking` as a real template
+/// variable (parsed by `minijinja`, so comments, string literals, and raw
+/// blocks do not produce false positives or hide real code).
+fn references_enable_thinking(template: &str) -> bool {
+    let mut env = minijinja::Environment::new();
+    if env.add_template("chat", template).is_err() {
+        return false;
     }
-    out.push_str(s);
-    out
+    env.get_template("chat")
+        .map(|t| t.undeclared_variables(false).contains("enable_thinking"))
+        .unwrap_or(false)
 }
 
 pub fn patch_chat_template(raw: &str) -> Result<String> {
@@ -73,7 +70,7 @@ pub fn patch_chat_template(raw: &str) -> Result<String> {
         }
     }
     ensure!(!t.contains("generation %}"), "unhandled generation tag in the template");
-    if strip_jinja_comments(&t).contains("enable_thinking") {
+    if references_enable_thinking(&t) {
         return Ok(t);
     }
     const EFFORT_FALLBACK: &str = "{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}";

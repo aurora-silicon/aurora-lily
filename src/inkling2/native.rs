@@ -311,11 +311,10 @@ pub(crate) fn compute_nvfp4_outer_scales(
         denom.len() == 1 && denom[0].is_finite() && denom[0] > 0.0,
         "invalid {denom_name}: {denom:?}"
     );
-    let inv_d = 1.0 / denom[0];
     let mut scales = Vec::with_capacity(n_expert);
     for (e, &a) in amax.iter().enumerate() {
         ensure!(a.is_finite() && a >= 0.0, "invalid {amax_name}[{e}] = {a}");
-        let s = a * inv_d;
+        let s = a / denom[0];
         ensure!(s.is_finite(), "non-finite outer scale {s} for {amax_name}[{e}]");
         scales.push(s);
     }

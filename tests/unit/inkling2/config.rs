@@ -218,7 +218,7 @@ fn dspark_mtp_json_enforces_validation() {
     });
     assert!(DsparkConfig::from_mtp_json(&base, &target).is_ok());
 
-    let bad_cases: [(&str, Box<dyn Fn(&mut serde_json::Value)>); 5] = [
+    let bad_cases: [(&str, Box<dyn Fn(&mut serde_json::Value)>); 7] = [
         (
             "wrong-hidden",
             Box::new(|v| {
@@ -247,6 +247,18 @@ fn dspark_mtp_json_enforces_validation() {
             "zero-kv-heads",
             Box::new(|v| {
                 v["num_key_value_heads"] = 0.into();
+            }),
+        ),
+        (
+            "huge-n-layer",
+            Box::new(|v| {
+                v["num_hidden_layers"] = 1_000_000_000_000u64.into();
+            }),
+        ),
+        (
+            "bad-head-dim",
+            Box::new(|v| {
+                v["head_dim"] = 64.into();
             }),
         ),
     ];

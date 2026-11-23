@@ -98,4 +98,16 @@ fn rejects_shape_dtype_byte_length_mismatch() {
     let ckpt = Checkpoint::open_file(&path).unwrap();
     assert!(ckpt.read("x").is_err());
     let _ = std::fs::remove_file(&path);
+
+    // 0-D scalar (shape: []) and zero-element (shape: [0]) tensors are valid.
+    let scalar_payload = 42.0f32.to_le_bytes();
+    let bytes = build_shard(
+        r#"{"s":{"dtype":"F32","shape":[],"data_offsets":[0,4]},"z":{"dtype":"F32","shape":[0,4],"data_offsets":[4,4]}}"#,
+        &scalar_payload,
+    );
+    let path = temp_file("scalar-zero", &bytes);
+    let ckpt = Checkpoint::open_file(&path).unwrap();
+    assert_eq!(ckpt.read("s").unwrap(), scalar_payload);
+    assert!(ckpt.read("z").unwrap().is_empty());
+    let _ = std::fs::remove_file(&path);
 }

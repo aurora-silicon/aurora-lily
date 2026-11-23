@@ -54,7 +54,12 @@ impl DsparkConfig {
             g.tensor("dspark_hidden_out.weight").is_some(),
             "DSpark GGUF is missing dspark_hidden_out.weight (not an Inkling 2 DSpark file)"
         );
-        let n_layer = g.u64("dflash.block_count")? as usize;
+        let n_layer_u64 = g.u64("dflash.block_count")?;
+        ensure!(
+            n_layer_u64 > 0 && n_layer_u64 <= super::config::MAX_LAYERS as u64,
+            "DSpark n_layer {n_layer_u64} out of range"
+        );
+        let n_layer = n_layer_u64 as usize;
         let hidden = g.u64("dflash.embedding_length")? as usize;
         let ff = g.u64("dflash.feed_forward_length")? as usize;
         let n_head = g.u64("dflash.attention.head_count")? as usize;
@@ -130,24 +135,31 @@ impl DsparkConfig {
 
     /// Parses and validates `mtp_config` from a native HF `config.json`.
     pub fn from_mtp_json(mc: &serde_json::Value, target: &Config) -> Result<Self> {
-        let u = |k: &str, default: usize| -> usize {
-            mc.get(k).and_then(|v| v.as_u64()).map_or(default, |v| v as usize)
+        let u = |k: &str, max: usize, default: usize| -> Result<usize> {
+            match mc.get(k).and_then(|v| v.as_u64()) {
+                Some(v) => {
+                    ensure!(v <= max as u64, "mtp_config.{k} is {v}, max {max}");
+                    Ok(v as usize)
+                }
+                None => Ok(default),
+            }
         };
         let f = |k: &str, default: f32| -> f32 {
             mc.get(k).and_then(|v| v.as_f64()).map_or(default, |v| v as f32)
         };
 
-        let n_layer = u("num_hidden_layers", 3);
-        let hidden = u("hidden_size", target.hidden);
-        let ff = u("intermediate_size", 9216);
-        let n_head = u("num_attention_heads", 24);
-        let n_head_kv = u("num_key_value_heads", 8);
-        let head_dim = u("head_dim", 128);
+        let n_layer = u("num_hidden_layers", super::config::MAX_LAYERS, 3)?;
+        ensure!(n_layer > 0, "DSpark n_layer must be positive");
+        let hidden = u("hidden_size", super::config::MAX_HIDDEN, target.hidden)?;
+        let ff = u("intermediate_size", 1 << 18, 9216)?;
+        let n_head = u("num_attention_heads", 256, 24)?;
+        let n_head_kv = u("num_key_value_heads", 256, 8)?;
+        let head_dim = u("head_dim", 512, 128)?;
         let rope_theta = f("rope_theta", 1_000_000.0);
         let rms_eps = f("rms_norm_eps", 1e-6);
-        let block_size = u("block_size", 8);
-        let markov_rank = u("markov_rank", 256);
-        let window = u("sliding_window_size", 1024);
+        let block_size = u("block_size", 16, 8)?;
+        let markov_rank = u("markov_rank", 4096, 256)?;
+        let window = u("sliding_window_size", 1 << 20, 1024)?;
 
         let mut swa = vec![false; n_layer];
         if let Some(arr) = mc.get("local_layer_ids").and_then(|v| v.as_array()) {
@@ -206,18 +218,22 @@ impl DsparkConfig {
             self.hidden,
             target.hidden
         );
-        ensure!(self.ff > 0, "DSpark ff must be positive");
+        ensure!(self.ff > 0 && self.ff <= (1 << 18), "DSpark ff {} out of range", self.ff);
         ensure!(
             self.n_head > 0
+                && self.n_head <= 256
                 && self.n_head_kv > 0
+                && self.n_head_kv <= 256
                 && self.n_head.is_multiple_of(self.n_head_kv),
             "DSpark invalid head counts {}/{}",
             self.n_head,
             self.n_head_kv
         );
+        // `DsparkScratch::attn_partial` (width 130) and `dspark_attn_split_dyn`
+        // hardcode `head_dim == 128`.
         ensure!(
-            self.head_dim > 0 && self.head_dim.is_multiple_of(32),
-            "DSpark unsupported head_dim {}",
+            self.head_dim == 128,
+            "DSpark unsupported head_dim {} (only 128 is implemented)",
             self.head_dim
         );
         ensure!(
@@ -225,8 +241,16 @@ impl DsparkConfig {
             "DSpark block_size={} must be in 2..=16",
             self.block_size
         );
-        ensure!(self.markov_rank > 0, "DSpark markov_rank must be positive");
-        ensure!(self.window > 0, "DSpark window must be positive");
+        ensure!(
+            self.markov_rank > 0 && self.markov_rank <= 4096,
+            "DSpark markov_rank {} out of range",
+            self.markov_rank
+        );
+        ensure!(
+            self.window > 0 && self.window <= (1 << 20),
+            "DSpark window {} out of range",
+            self.window
+        );
         ensure!(
             self.rope_theta.is_finite()
                 && self.rope_theta > 0.0

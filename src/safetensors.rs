@@ -291,6 +291,8 @@ fn parse_shard_header(path: &Path) -> Result<HashMap<String, TensorMeta>> {
             "tensor {name} ends at {end}, past file size {file_len}"
         );
         let byte_len = rel_end - rel_start;
+        usize::try_from(byte_len)
+            .with_context(|| format!("tensor {name} byte length {byte_len} exceeds usize"))?;
         let dtype = SafetensorsDType::from_str(&entry.dtype);
         if let Some(elem_size) = dtype.size() {
             let numel = entry

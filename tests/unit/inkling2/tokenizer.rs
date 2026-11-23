@@ -98,6 +98,17 @@ fn patch_passes_through_unmatched_templates_after_stripping_generation_tags() {
         "{%- if add_generation_prompt and not enable_thinking -%}<|message_model|><|content_text|>{%- endif -%}",
     );
     assert_eq!(patch_chat_template(hybrid).unwrap(), hybrid);
+    // A literal "{#" inside a string before real enable_thinking logic must not
+    // blind the detector and cause a double patch.
+    let with_literal_comment_open = concat!(
+        "{{- \"{#\" -}}",
+        "{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}",
+        "{%- if enable_thinking is defined and not enable_thinking -%}<|message_model|><|content_text|>{%- endif -%}",
+    );
+    assert_eq!(
+        patch_chat_template(with_literal_comment_open).unwrap(),
+        with_literal_comment_open
+    );
     assert_eq!(
         patch_chat_template("{%- generation -%}{{ messages }}{%- endgeneration -%}")
             .unwrap(),
