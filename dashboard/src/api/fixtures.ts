@@ -496,7 +496,7 @@ export const settings: SettingsResponse = {
       "max": null,
       "step": null,
       "options": null,
-      "help": "Chat prompts open a reasoning block unless the request says otherwise.",
+      "help": "Chat prompts open a reasoning block unless the request says otherwise (off by default when the vocabulary lacks </think>).",
       "applies": null
     },
     {

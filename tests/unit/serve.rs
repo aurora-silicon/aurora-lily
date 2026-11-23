@@ -10,6 +10,62 @@ fn call_ids_are_stable_per_request_and_index() {
 }
 
 #[test]
+fn thinking_defaults_off_where_no_control_can_end_the_block() {
+    use dashboard::contract::{SettingSource, SettingValue};
+    use dashboard::settings::FlagValue;
+
+    // The vocabulary has </think>: the flag decides, given or not.
+    assert!(default_thinking(true, false, true));
+    assert!(default_thinking(true, true, true));
+    assert!(!default_thinking(false, true, true));
+    // No </think> (Gemma 4's GGUF): off by default, on when asked for.
+    assert!(!default_thinking(true, false, false));
+    assert!(default_thinking(true, true, false));
+    assert!(!default_thinking(false, true, false));
+    assert!(
+        describe_thinking_defaults(&api::ThinkingDefaults::default(), None)
+            .contains("chat thinking is off")
+    );
+
+    let thinking_row = |given: Option<&str>, controls: bool| {
+        let flags = [FlagValue {
+            name: "thinking".to_owned(),
+            given: given.map(str::to_owned),
+            default: Some("true".to_owned()),
+        }];
+        let mut listing = dashboard::settings::build(&flags, &[]);
+        apply_thinking_default(&mut listing, controls);
+        listing.into_iter().find(|s| s.name == "thinking").expect("thinking")
+    };
+
+    // With </think>, clap's true default stands.
+    let with_controls = thinking_row(None, true);
+    assert_eq!(with_controls.default, Some(SettingValue::Bool(true)));
+    assert_eq!(with_controls.value, Some(SettingValue::Bool(true)));
+    assert_eq!(with_controls.source, SettingSource::Default);
+
+    // Without </think> and --thinking omitted, both default and value are false.
+    let no_controls_default = thinking_row(None, false);
+    assert_eq!(no_controls_default.default, Some(SettingValue::Bool(false)));
+    assert_eq!(no_controls_default.flag_value, None);
+    assert_eq!(no_controls_default.value, Some(SettingValue::Bool(false)));
+    assert_eq!(no_controls_default.source, SettingSource::Default);
+
+    // Explicit --thinking true/false keeps its flag value while showing false default.
+    let no_controls_true = thinking_row(Some("true"), false);
+    assert_eq!(no_controls_true.default, Some(SettingValue::Bool(false)));
+    assert_eq!(no_controls_true.flag_value, Some(SettingValue::Bool(true)));
+    assert_eq!(no_controls_true.value, Some(SettingValue::Bool(true)));
+    assert_eq!(no_controls_true.source, SettingSource::Flag);
+
+    let no_controls_false = thinking_row(Some("false"), false);
+    assert_eq!(no_controls_false.default, Some(SettingValue::Bool(false)));
+    assert_eq!(no_controls_false.flag_value, Some(SettingValue::Bool(false)));
+    assert_eq!(no_controls_false.value, Some(SettingValue::Bool(false)));
+    assert_eq!(no_controls_false.source, SettingSource::Flag);
+}
+
+#[test]
 fn chunks_carry_the_openai_shape() {
     let c = chunk("id", 7, "m", json!({"content": "hi"}), Some("stop"));
     assert_eq!(c["object"], "chat.completion.chunk");

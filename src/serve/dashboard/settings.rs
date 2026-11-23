@@ -90,8 +90,10 @@ const DESCRIPTORS: &[Descriptor] = &[
     d("presence_penalty", SAMPLING, Kind::Number),
     d("frequency_penalty", SAMPLING, Kind::Number),
     d("repetition_penalty", SAMPLING, Kind::Number).bounds(Some(0.0), None),
-    d("thinking", THINKING, Kind::Bool)
-        .help("Chat prompts open a reasoning block unless the request says otherwise."),
+    d("thinking", THINKING, Kind::Bool).help(
+        "Chat prompts open a reasoning block unless the request says otherwise \
+         (off by default when the vocabulary lacks </think>).",
+    ),
     // The flag's text goes to the chat template as it is (unlike a request's
     // `reasoning_effort`, which `api::map_reasoning_effort` maps from none,
     // low, medium, high, xhigh or max): these are the efforts the template

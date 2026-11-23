@@ -260,7 +260,8 @@ struct Cli {
     #[arg(long, default_value_t = lily::qwen4exp::image::DEFAULT_MIN_PIXELS)]
     image_min_pixels: usize,
 
-    /// Chat prompts open a reasoning block unless the request says otherwise.
+    /// Chat prompts open a reasoning block unless the request says otherwise
+    /// (off by default when the vocabulary lacks `</think>`).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     thinking: bool,
 
