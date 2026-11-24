@@ -273,9 +273,10 @@ void sg_decode8(uint64_t row, uint k, out float w[8]) {
 #endif
 }
 
-// Shared memory for tile weights (up to 32 x 33 f16vec4 = 8.4 KB) and
+// Shared memory for tile weights (up to 32 x 33 u16vec4 = 8.4 KB, also
+// reused for small-expert quant LUTs with zero extra shared memory) and
 // activations (up to 32 x 17 f16vec4 = 4.35 KB): 12.8 KB total.
-shared f16vec4 sg_w[32 * 33];
+shared u16vec4 sg_w[32 * 33];
 shared f16vec4 sg_x[32 * 17];
 
 #ifdef SG_MOE
@@ -320,72 +321,383 @@ uint64_t sg_y_row(uint i) {
     defined(KERNEL_sgemm_moe_iq1_s) || defined(KERNEL_sgemm_moe_q2_0) || \
     defined(KERNEL_sgemm_moe_nvfp4) || defined(KERNEL_sgemm_moe_mxfp4)
 #define SG_REGISTER_EXPERT
-#ifdef KERNEL_sgemm_moe_iq4_nl
-shared uint sg_iq4_pairs[256];
+layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer SgU16x2 { u16vec2 v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer SgU16x4 { u16vec4 v[]; };
+
+#if defined(KERNEL_sgemm_moe_iq2_s)
+uint sg_iq2s_grid_p[512] = uint[512](
+#include "glm53_iq2s_grid_p.glsl"
+);
+#elif defined(KERNEL_sgemm_moe_iq2_xs)
+uint sg_iq2xs_grid_p[256] = uint[256](
+#include "glm53_iq2xs_grid_p.glsl"
+);
+#elif defined(KERNEL_sgemm_moe_iq1_s)
+uint sg_iq1s_grid_p[1024] = uint[1024](
+#include "glm53_iq1s_grid_p.glsl"
+);
 #endif
 
-// Up to 32 routed pairs x 128 columns. A lane holds one weight row's
-// decoded block in registers and reuses it for 16 activation rows. The
-// two halves of the subgroup supply consecutive vec4s of each input row
-// with zero workgroup barriers in the K-loop.
-void sg_expert_32(uint n0, uint rows, uint64_t W, uint N, uint K, uint row_bytes) {
-#ifdef KERNEL_sgemm_moe_iq4_nl
-    const uint byte = gl_LocalInvocationIndex;
-    sg_iq4_pairs[byte] = packHalf2x16(vec2(sg_iq4nl(byte & 15u), sg_iq4nl(byte >> 4u)));
+#if defined(KERNEL_sgemm_moe_iq2_s) || defined(KERNEL_sgemm_moe_iq2_xs)
+uint16_t sg_iq2_mag_h(uint c) {
+    // {8.0, 25.0, 43.0} in exact FP16 {0x4800, 0x4e40, 0x5160} so dl * w matches sg_decode8 bit-for-bit.
+    return uint16_t(c == 0u ? 0x4800u : (c == 1u ? 0x4e40u : 0x5160u));
+}
+u16vec4 sg_iq2_4lut_entry(uint li) {
+    return u16vec4(
+        sg_iq2_mag_h(li & 3u),
+        sg_iq2_mag_h((li >> 2u) & 3u),
+        sg_iq2_mag_h((li >> 4u) & 3u),
+        sg_iq2_mag_h(li >> 6u)
+    );
+}
+#endif
+
+#if defined(KERNEL_sgemm_moe_nvfp4) || defined(KERNEL_sgemm_moe_mxfp4)
+uint16_t sg_e2m1_h(uint c) {
+    // Exact E2M1 code (0..15) -> exact doubled FP16 value ({0,±1,±2,±3,±4,±6,±8,±12}).
+    const uint m = c & 7u;
+    const uint shifted = mix(m, 0u, m == 1u) << 9u;
+    const uint mag = mix(0x3c00u + shifted, 0u, m == 0u);
+    return uint16_t(mag | ((c & 8u) << 12u));
+}
+f16vec2 sg_e2m1_pair_exact_h(uint p) {
+    return uint16BitsToFloat16(u16vec2(sg_e2m1_h(p & 0xfu), sg_e2m1_h((p >> 16u) & 0xfu)));
+}
+#endif
+
+void sg_expert_init_lut() {
+    const uint li = gl_LocalInvocationIndex;
+#if defined(KERNEL_sgemm_moe_iq4_nl)
+    sg_w[li] = u16vec4(
+        float16BitsToUint16(float16_t(sg_iq4nl(li & 15u))),
+        float16BitsToUint16(float16_t(sg_iq4nl(li >> 4u))),
+        uint16_t(0u), uint16_t(0u)
+    );
+    barrier();
+#elif defined(KERNEL_sgemm_moe_iq2_xxs)
+    const uvec4 g = glm53_iq2xxs_grid_h[li];
+    sg_w[2u * li] = u16vec4(unpack16(g.x), unpack16(g.y));
+    sg_w[2u * li + 1u] = u16vec4(unpack16(g.z), unpack16(g.w));
+    barrier();
+#elif defined(KERNEL_sgemm_moe_iq2_s)
+    sg_w[li] = u16vec4(unpack16(sg_iq2s_grid_p[2u * li]), unpack16(sg_iq2s_grid_p[2u * li + 1u]));
+    sg_w[256u + li] = sg_iq2_4lut_entry(li);
+    barrier();
+#elif defined(KERNEL_sgemm_moe_iq2_xs)
+    if (li < 128u) {
+        sg_w[li] = u16vec4(unpack16(sg_iq2xs_grid_p[2u * li]), unpack16(sg_iq2xs_grid_p[2u * li + 1u]));
+    }
+    sg_w[128u + li] = sg_iq2_4lut_entry(li);
+    barrier();
+#elif defined(KERNEL_sgemm_moe_iq1_s)
+    sg_w[li] = u16vec4(unpack16(sg_iq1s_grid_p[2u * li]), unpack16(sg_iq1s_grid_p[2u * li + 1u]));
+    sg_w[256u + li] = u16vec4(unpack16(sg_iq1s_grid_p[512u + 2u * li]), unpack16(sg_iq1s_grid_p[512u + 2u * li + 1u]));
+    sg_w[512u + li] = u16vec4(
+        float16BitsToUint16(float16_t(bitfieldExtract(int(li), 0, 2))),
+        float16BitsToUint16(float16_t(bitfieldExtract(int(li), 2, 2))),
+        float16BitsToUint16(float16_t(bitfieldExtract(int(li), 4, 2))),
+        float16BitsToUint16(float16_t(bitfieldExtract(int(li), 6, 2)))
+    );
+    barrier();
+#elif defined(KERNEL_sgemm_moe_q2_0)
+    sg_w[li] = u16vec4(
+        float16BitsToUint16(float16_t(int((li >> 0u) & 3u) - 1)),
+        float16BitsToUint16(float16_t(int((li >> 2u) & 3u) - 1)),
+        float16BitsToUint16(float16_t(int((li >> 4u) & 3u) - 1)),
+        float16BitsToUint16(float16_t(int((li >> 6u) & 3u) - 1))
+    );
     barrier();
 #endif
-    const uint lane = gl_SubgroupInvocationID, sg = gl_SubgroupID;
-    const uint m0 = 16u * (sg / 4u);
-    if (m0 >= rows) return;
-    const uint col = 32u * (sg % 4u) + lane;
-    const uint64_t w_row = W + uint64_t(min(col, N - n0 - 1u)) * row_bytes;
-    const uint64_t x_row = arg(0) + 4u * sg_x_row(min(m0 + lane % 16u, rows - 1u));
-    float acc[16];
-    [[unroll]] for (uint i = 0u; i < 16u; i++) acc[i] = 0.0;
-    for (uint k0 = 0u; k0 < K; k0 += 32u) {
-        float w[32];
-#ifdef KERNEL_sgemm_moe_iq4_nl
-        const uint64_t b = w_row + uint64_t(k0 >> 5u) * 18u;
-        const float d = glm53_h2f(uint(U16(b).v[0]));
-        [[unroll]] for (uint i = 0u; i < 8u; i++) {
-            const uint pair = uint(U16(b + 2u).v[i]);
-            const vec2 a = unpackHalf2x16(sg_iq4_pairs[pair & 255u]);
-            const vec2 c = unpackHalf2x16(sg_iq4_pairs[pair >> 8u]);
-            w[2u * i] = d * a.x;
-            w[2u * i + 16u] = d * a.y;
-            w[2u * i + 1u] = d * c.x;
-            w[2u * i + 17u] = d * c.y;
-        }
-#else
-        glm53_decode(SG_TYPE, w_row, k0 >> 5u, w);
+}
+
+// Decode 32 scaled FP16 weights directly into w16[8], matching float16_t(sg_decode8(...))
+// bit-for-bit while halving register pressure vs float[32] and reading LUTs from sg_w.
+void sg_expert_decode_h16(uint64_t row, uint t, out f16vec4 w16[8]) {
+#if defined(KERNEL_sgemm_moe_iq4_nl)
+    const uint64_t b = row + uint64_t(t) * 18u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    [[unroll]] for (uint g = 0u; g < 4u; g++) {
+        const u16vec2 p = SgU16x2(b + 2u + 4u * g).v[0];
+        const vec2 a0 = vec2(uint16BitsToFloat16(sg_w[uint(p.x) & 255u].xy));
+        const vec2 a1 = vec2(uint16BitsToFloat16(sg_w[uint(p.x) >> 8u].xy));
+        const vec2 a2 = vec2(uint16BitsToFloat16(sg_w[uint(p.y) & 255u].xy));
+        const vec2 a3 = vec2(uint16BitsToFloat16(sg_w[uint(p.y) >> 8u].xy));
+        w16[g] = f16vec4(d * vec4(a0.x, a1.x, a2.x, a3.x));
+        w16[g + 4u] = f16vec4(d * vec4(a0.y, a1.y, a2.y, a3.y));
+    }
+#elif defined(KERNEL_sgemm_moe_iq2_xxs)
+    const uint64_t b = row + uint64_t(t >> 3u) * 66u;
+    const uint ib = t & 7u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const u16vec4 qv = SgU16x4(b + 2u + 8u * ib).v[0];
+    const uint q01 = pack32(qv.xy), aux = pack32(qv.zw);
+    const float scale = 0.125 * d * float(2u * (aux >> 28u) + 1u);
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const uint si = (aux >> (7u * l)) & 0x7fu;
+        const uint qb = si + (si << 12u) + ((bitCount(si) & 1u) << 19u);
+        const uint gi = (q01 >> (8u * l)) & 0xffu;
+        const u16vec4 g0 = sg_w[2u * gi] ^ u16vec4(
+            unpack16((qb << 15u) & 0x80008000u),
+            unpack16((qb << 14u) & 0x80008000u)
+        );
+        const u16vec4 g1 = sg_w[2u * gi + 1u] ^ u16vec4(
+            unpack16((qb << 13u) & 0x80008000u),
+            unpack16((qb << 12u) & 0x80008000u)
+        );
+        const vec4 f0 = vec4(uint16BitsToFloat16(g0));
+        const vec4 f1 = vec4(uint16BitsToFloat16(g1));
+        w16[2u * l] = f16vec4(scale * vec4(f0.x, f0.z, f1.x, f1.z));
+        w16[2u * l + 1u] = f16vec4(scale * vec4(f0.y, f0.w, f1.y, f1.w));
+    }
+#elif defined(KERNEL_sgemm_moe_iq2_s)
+    const uint64_t b = row + uint64_t(t >> 3u) * 82u;
+    const uint ib = t & 7u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint qs = pack32(SgU16x2(b + 2u + 4u * ib).v[0]);
+    const uint sg = pack32(SgU16x2(b + 34u + 4u * ib).v[0]);
+    const uint hs = uint(U16(b + 66u).v[ib >> 1u]) >> (8u * (ib & 1u));
+    const uint scb = uint(U16(b + 74u).v[ib >> 1u]) >> (8u * (ib & 1u));
+    const float dl0 = d * (0.5 + float(scb & 0xfu)) * 0.25;
+    const float dl1 = d * (0.5 + float((scb >> 4u) & 0xfu)) * 0.25;
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const float dl = l < 2u ? dl0 : dl1;
+        const uint g = ((qs >> (8u * l)) & 0xffu) | (((hs & 0xffu) << (8u - 2u * l)) & 0x300u);
+        const uint signs = (sg >> (8u * l)) & 0xffu;
+        const uint p = uint(sg_w[g >> 2u][g & 3u]);
+        const u16vec4 slo = u16vec4(
+            uint16_t((signs & 1u) << 15u), uint16_t(((signs >> 1u) & 1u) << 15u),
+            uint16_t(((signs >> 2u) & 1u) << 15u), uint16_t(((signs >> 3u) & 1u) << 15u)
+        );
+        const u16vec4 shi = u16vec4(
+            uint16_t(((signs >> 4u) & 1u) << 15u), uint16_t(((signs >> 5u) & 1u) << 15u),
+            uint16_t(((signs >> 6u) & 1u) << 15u), uint16_t(((signs >> 7u) & 1u) << 15u)
+        );
+        w16[2u * l] = f16vec4(dl * vec4(uint16BitsToFloat16(sg_w[256u + (p & 0xffu)] ^ slo)));
+        w16[2u * l + 1u] = f16vec4(dl * vec4(uint16BitsToFloat16(sg_w[256u + (p >> 8u)] ^ shi)));
+    }
+#elif defined(KERNEL_sgemm_moe_iq2_xs)
+    const uint64_t b = row + uint64_t(t >> 3u) * 74u;
+    const uint ib = t & 7u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const u16vec4 qv = SgU16x4(b + 2u + 8u * ib).v[0];
+    const uint scb = (uint(U16(b + 66u).v[ib >> 1u]) >> (8u * (ib & 1u))) & 0xffu;
+    const float dl0 = d * (0.5 + float(scb & 0xfu)) * 0.25;
+    const float dl1 = d * (0.5 + float(scb >> 4u)) * 0.25;
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const float dl = l < 2u ? dl0 : dl1;
+        const uint q = uint(qv[l]);
+        const uint g = q & 511u;
+        const uint s7 = q >> 9u;
+        const uint signs = s7 | ((bitCount(s7) & 1u) << 7u);
+        const uint p = uint(sg_w[g >> 2u][g & 3u]);
+        const u16vec4 slo = u16vec4(
+            uint16_t((signs & 1u) << 15u), uint16_t(((signs >> 1u) & 1u) << 15u),
+            uint16_t(((signs >> 2u) & 1u) << 15u), uint16_t(((signs >> 3u) & 1u) << 15u)
+        );
+        const u16vec4 shi = u16vec4(
+            uint16_t(((signs >> 4u) & 1u) << 15u), uint16_t(((signs >> 5u) & 1u) << 15u),
+            uint16_t(((signs >> 6u) & 1u) << 15u), uint16_t(((signs >> 7u) & 1u) << 15u)
+        );
+        w16[2u * l] = f16vec4(dl * vec4(uint16BitsToFloat16(sg_w[128u + (p & 0xffu)] ^ slo)));
+        w16[2u * l + 1u] = f16vec4(dl * vec4(uint16BitsToFloat16(sg_w[128u + (p >> 8u)] ^ shi)));
+    }
+#elif defined(KERNEL_sgemm_moe_iq1_s)
+    const uint64_t b = row + uint64_t(t >> 3u) * 50u;
+    const uint ib = t & 7u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint qh = uint(U16(b + 34u).v[ib]);
+    const float dl = d * float(2u * ((qh >> 12u) & 7u) + 1u);
+    const vec4 del = vec4((qh & 0x8000u) != 0u ? -0.125 : 0.125);
+    const uint qs = pack32(SgU16x2(b + 2u + 4u * ib).v[0]);
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const uint idx = ((qs >> (8u * l)) & 0xffu) | (((qh >> (3u * l)) & 7u) << 8u);
+        const uint p = uint(sg_w[idx >> 2u][idx & 3u]);
+        w16[2u * l] = f16vec4(dl * (vec4(uint16BitsToFloat16(sg_w[512u + (p & 0xffu)])) + del));
+        w16[2u * l + 1u] = f16vec4(dl * (vec4(uint16BitsToFloat16(sg_w[512u + (p >> 8u)])) + del));
+    }
+#elif defined(KERNEL_sgemm_moe_q2_0)
+    const uint64_t b = row + uint64_t(t >> 1u) * 18u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const u16vec4 qv = SgU16x4(b + 2u + 8u * (t & 1u)).v[0];
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        const uint pair = uint(qv[i]);
+        w16[2u * i] = f16vec4(d * vec4(uint16BitsToFloat16(sg_w[pair & 0xffu])));
+        w16[2u * i + 1u] = f16vec4(d * vec4(uint16BitsToFloat16(sg_w[pair >> 8u])));
+    }
+#elif defined(KERNEL_sgemm_moe_nvfp4)
+    const uint64_t b = row + uint64_t(t >> 1u) * 36u;
+    const uint half_idx = t & 1u;
+    const uint sw = U32(b).v[0];
+    const uvec4 qv = U32x4(b + 4u + 16u * half_idx).v[0];
+    const float d0 = glm53_ue4m3_to_f32((sw >> (16u * half_idx)) & 0xffu);
+    const float d1 = glm53_ue4m3_to_f32((sw >> (16u * half_idx + 8u)) & 0xffu);
+    [[unroll]] for (uint sb = 0u; sb < 2u; sb++) {
+        const float d = sb == 0u ? d0 : d1;
+        const uint w0 = sb == 0u ? qv.x : qv.z;
+        const uint w1 = sb == 0u ? qv.y : qv.w;
+        const f16vec2 l02 = sg_e2m1_pair_exact_h(w0);
+        const f16vec2 l13 = sg_e2m1_pair_exact_h(w0 >> 8u);
+        const f16vec2 h02 = sg_e2m1_pair_exact_h(w0 >> 4u);
+        const f16vec2 h13 = sg_e2m1_pair_exact_h(w0 >> 12u);
+        const f16vec2 l46 = sg_e2m1_pair_exact_h(w1);
+        const f16vec2 l57 = sg_e2m1_pair_exact_h(w1 >> 8u);
+        const f16vec2 h46 = sg_e2m1_pair_exact_h(w1 >> 4u);
+        const f16vec2 h57 = sg_e2m1_pair_exact_h(w1 >> 12u);
+        w16[4u * sb + 0u] = f16vec4(d * vec4(l02.x, l13.x, l02.y, l13.y));
+        w16[4u * sb + 1u] = f16vec4(d * vec4(l46.x, l57.x, l46.y, l57.y));
+        w16[4u * sb + 2u] = f16vec4(d * vec4(h02.x, h13.x, h02.y, h13.y));
+        w16[4u * sb + 3u] = f16vec4(d * vec4(h46.x, h57.x, h46.y, h57.y));
+    }
+#elif defined(KERNEL_sgemm_moe_mxfp4)
+    const uint64_t b = row + uint64_t(t) * 17u;
+    const uint ex = uint(U8(b).v[0]);
+    const float d = uintBitsToFloat(mix((ex - 1u) << 23u, 0x00200000u << ex, ex < 2u));
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        const uint word = uint(U8(b + 1u).v[4u * q])
+            | (uint(U8(b + 1u).v[4u * q + 1u]) << 8u)
+            | (uint(U8(b + 1u).v[4u * q + 2u]) << 16u)
+            | (uint(U8(b + 1u).v[4u * q + 3u]) << 24u);
+        const f16vec2 l02 = sg_e2m1_pair_exact_h(word);
+        const f16vec2 l13 = sg_e2m1_pair_exact_h(word >> 8u);
+        const f16vec2 h02 = sg_e2m1_pair_exact_h(word >> 4u);
+        const f16vec2 h13 = sg_e2m1_pair_exact_h(word >> 12u);
+        w16[q] = f16vec4(d * vec4(l02.x, l13.x, l02.y, l13.y));
+        w16[q + 4u] = f16vec4(d * vec4(h02.x, h13.x, h02.y, h13.y));
+    }
 #endif
-        float16_t a16[16];
-        [[unroll]] for (uint i = 0u; i < 16u; i++) a16[i] = float16_t(0.0);
-        [[unroll]] for (uint h = 0u; h < 4u; h++) {
-            const f16vec4 xr = f16vec4(clamp(
-                F32x4(x_row + 4u * (k0 + 8u * h + 4u * (lane / 16u))).v[0],
-                vec4(-65504.0), vec4(65504.0)));
-            [[unroll]] for (uint k = 0u; k < 8u; k++) {
-                const float16_t wk = float16_t(w[8u * h + k]);
-                [[unroll]] for (uint i = 0u; i < 16u; i++) {
-                    const float16_t x = subgroupBroadcast(xr[k % 4u], i + 16u * (k / 4u));
-                    a16[i] = fma(wk, x, a16[i]);
+}
+
+// Up to 16 routed pairs x 128 columns: splits rows into two 8-row halves so
+// all 8 subgroups work for 9..16 pairs (and 4 subgroups work at 2x fewer FMAs,
+// broadcasts, X loads, and accumulator regs for 1..8 pairs). Widens every 32
+// K-elements identically to sg_tile_64 for bit-for-bit tile-size parity.
+void sg_expert_16(uint n0, uint rows, uint64_t W, uint N, uint K, uint row_bytes) {
+    sg_expert_init_lut();
+    const uint lane = gl_SubgroupInvocationID, sg = gl_SubgroupID;
+    const uint m0 = 8u * (sg >> 2u);
+    if (m0 >= rows) return;
+    const uint col = 32u * (sg & 3u) + lane;
+    const uint64_t w_row = W + uint64_t(min(col, N - n0 - 1u)) * row_bytes;
+    const uint64_t x_row = arg(0) + 4u * sg_x_row(min(m0 + (lane & 7u), rows - 1u));
+    const uint q = lane >> 3u;
+    float acc[8];
+    [[unroll]] for (uint i = 0u; i < 8u; i++) acc[i] = 0.0;
+    for (uint k0 = 0u; k0 < K; k0 += 32u) {
+        f16vec4 w16[8];
+        sg_expert_decode_h16(w_row, k0 >> 5u, w16);
+        float16_t a16[8];
+        [[unroll]] for (uint i = 0u; i < 8u; i++) a16[i] = float16_t(0.0);
+        [[unroll]] for (uint h = 0u; h < 2u; h++) {
+            const f16vec4 xr = f16vec4(clamp(F32x4(x_row + 4u * (k0 + 16u * h + 4u * q)).v[0], vec4(-65504.0), vec4(65504.0)));
+            [[unroll]] for (uint k = 0u; k < 16u; k++) {
+                const float16_t wk = w16[4u * h + (k >> 2u)][k & 3u];
+                const uint src_base = 8u * (k >> 2u);
+                const float16_t xv = xr[k & 3u];
+                [[unroll]] for (uint i = 0u; i < 8u; i++) {
+                    a16[i] = fma(wk, subgroupBroadcast(xv, i + src_base), a16[i]);
                 }
             }
         }
         bool ovf = false;
-        [[unroll]] for (uint i = 0u; i < 16u; i++) {
+        [[unroll]] for (uint i = 0u; i < 8u; i++) {
             ovf = ovf || isinf(a16[i]) || isnan(a16[i]);
         }
-        if (subgroupAny(ovf)) {
-            for (uint h = 0u; h < 4u; h++) {
-                const vec4 xr = F32x4(x_row + 4u * (k0 + 8u * h + 4u * (lane / 16u))).v[0];
-                for (uint k = 0u; k < 8u; k++) {
-                    const float wk = w[8u * h + k];
-                    [[unroll]] for (uint i = 0u; i < 16u; i++) {
-                        acc[i] = fma(wk, subgroupBroadcast(xr[k % 4u], i + 16u * (k / 4u)), acc[i]);
+        uint ovf_u = ovf ? 1u : 0u;
+        ovf_u |= subgroupShuffleXor(ovf_u, 1u);
+        ovf_u |= subgroupShuffleXor(ovf_u, 2u);
+        const bool ovf4 = ovf_u != 0u;
+        if (subgroupAny(ovf4)) {
+            float w[32];
+            glm53_decode(SG_TYPE, w_row, k0 >> 5u, w);
+            for (uint h = 0u; h < 2u; h++) {
+                const vec4 xf = F32x4(x_row + 4u * (k0 + 16u * h + 4u * q)).v[0];
+                for (uint k = 0u; k < 16u; k++) {
+                    const float wk = w[16u * h + k];
+                    const uint src_base = 8u * (k >> 2u);
+                    const float xv = xf[k & 3u];
+                    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+                        const float xb = subgroupBroadcast(xv, i + src_base);
+                        acc[i] = ovf4 ? fma(wk, xb, acc[i]) : acc[i];
                     }
                 }
+            }
+            if (!ovf4) {
+                [[unroll]] for (uint i = 0u; i < 8u; i++) acc[i] += float(a16[i]);
+            }
+        } else {
+            [[unroll]] for (uint i = 0u; i < 8u; i++) acc[i] += float(a16[i]);
+        }
+    }
+    if (n0 + col >= N) return;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        if (m0 + i < rows)
+            F32(arg(2) + 4u * (sg_y_row(m0 + i) + n0 + col)).v[0] = acc[i];
+    }
+}
+
+// 17..32 routed pairs x 128 columns: each lane holds one weight row's decoded
+// f16vec4[8] block in registers and reuses it across 16 activation rows.
+void sg_expert_32(uint n0, uint rows, uint64_t W, uint N, uint K, uint row_bytes) {
+    sg_expert_init_lut();
+    const uint lane = gl_SubgroupInvocationID, sg = gl_SubgroupID;
+    const uint m0 = 16u * (sg >> 2u);
+    if (m0 >= rows) return;
+    const uint col = 32u * (sg & 3u) + lane;
+    const uint64_t w_row = W + uint64_t(min(col, N - n0 - 1u)) * row_bytes;
+    const uint64_t x_row = arg(0) + 4u * sg_x_row(min(m0 + (lane & 15u), rows - 1u));
+    float acc[16];
+    [[unroll]] for (uint i = 0u; i < 16u; i++) acc[i] = 0.0;
+    for (uint k0 = 0u; k0 < K; k0 += 32u) {
+        f16vec4 w16[8];
+        sg_expert_decode_h16(w_row, k0 >> 5u, w16);
+        float16_t a16[16];
+        [[unroll]] for (uint i = 0u; i < 16u; i++) a16[i] = float16_t(0.0);
+        [[unroll]] for (uint h = 0u; h < 4u; h++) {
+            const f16vec4 xr = f16vec4(clamp(F32x4(x_row + 4u * (k0 + 8u * h + 4u * (lane >> 4u))).v[0], vec4(-65504.0), vec4(65504.0)));
+            [[unroll]] for (uint k = 0u; k < 8u; k++) {
+                const float16_t wk = w16[2u * h + (k >> 2u)][k & 3u];
+                const uint src_base = 16u * (k >> 2u);
+                const float16_t xv = xr[k & 3u];
+                [[unroll]] for (uint i = 0u; i < 16u; i++) {
+                    a16[i] = fma(wk, subgroupBroadcast(xv, i + src_base), a16[i]);
+                }
+            }
+        }
+        bool ovf_lo = false, ovf_hi = false;
+        [[unroll]] for (uint i = 0u; i < 8u; i++) {
+            ovf_lo = ovf_lo || isinf(a16[i]) || isnan(a16[i]);
+            ovf_hi = ovf_hi || isinf(a16[i + 8u]) || isnan(a16[i + 8u]);
+        }
+        uint ovf_m = (ovf_lo ? 1u : 0u) | (ovf_hi ? 2u : 0u);
+        ovf_m |= subgroupShuffleXor(ovf_m, 1u);
+        ovf_m |= subgroupShuffleXor(ovf_m, 2u);
+        const bool ovf4_lo = (ovf_m & 1u) != 0u;
+        const bool ovf4_hi = (ovf_m & 2u) != 0u;
+        if (subgroupAny(ovf_m != 0u)) {
+            float w[32];
+            glm53_decode(SG_TYPE, w_row, k0 >> 5u, w);
+            for (uint h = 0u; h < 4u; h++) {
+                const vec4 xf = F32x4(x_row + 4u * (k0 + 8u * h + 4u * (lane >> 4u))).v[0];
+                for (uint k = 0u; k < 8u; k++) {
+                    const float wk = w[8u * h + k];
+                    const uint src_base = 16u * (k >> 2u);
+                    const float xv = xf[k & 3u];
+                    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+                        const float xb = subgroupBroadcast(xv, i + src_base);
+                        acc[i] = ovf4_lo ? fma(wk, xb, acc[i]) : acc[i];
+                    }
+                    [[unroll]] for (uint i = 8u; i < 16u; i++) {
+                        const float xb = subgroupBroadcast(xv, i + src_base);
+                        acc[i] = ovf4_hi ? fma(wk, xb, acc[i]) : acc[i];
+                    }
+                }
+            }
+            if (!ovf4_lo) {
+                [[unroll]] for (uint i = 0u; i < 8u; i++) acc[i] += float(a16[i]);
+            }
+            if (!ovf4_hi) {
+                [[unroll]] for (uint i = 8u; i < 16u; i++) acc[i] += float(a16[i]);
             }
         } else {
             [[unroll]] for (uint i = 0u; i < 16u; i++) acc[i] += float(a16[i]);
@@ -416,11 +728,14 @@ void main() {
     const uint expert = U32(arg(4)).v[3u * gl_WorkGroupID.y];
     sg_first = U32(arg(4)).v[3u * gl_WorkGroupID.y + 1u];
     const uint rows = U32(arg(4)).v[3u * gl_WorkGroupID.y + 2u];
+    if (rows == 0u) return;
     sg_shift = arg_u32(9);
     const uint64_t W = arg(1) + (uint64_t(expert) * N + n0) * row_bytes;
     if (rows > 32u) {
         sg_tile_64(n0, rows, W, N, K, row_bytes);
 #ifdef SG_REGISTER_EXPERT
+    } else if (rows <= 16u) {
+        sg_expert_16(n0, rows, W, N, K, row_bytes);
     } else {
         sg_expert_32(n0, rows, W, N, K, row_bytes);
 #else
