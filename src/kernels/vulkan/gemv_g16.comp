@@ -4,74 +4,67 @@
 // on those GPUs only. Same bindings, params and results per row as the
 // glm53_gemv kernels they replace; each row's sums run in one fixed order
 // whatever the row count m, so a verify pass's rows equal plain decode's.
+//
+// All four quant types (Q5_K, Q4_K, Q8_0, Q6_K) assign 8 lanes per output
+// row (zero tail-wave waste on every model width that is a multiple of 256:
+// K = 2304, 2560, 2816, 4096, 9216) and reduce with a 3-step
+// subgroupShuffleXor before any lane-dependent store branch.
+// - Q4_K & Q5_K: at m=1 each 8-lane group handles 4 consecutive rows (64
+//   threads/WG = 32 rows/WG) to amortize X loads and sxa/sxb 4x; at m=2..4
+//   each 8-lane group handles 1 row (256 threads/WG = 32 rows/WG) to reuse
+//   decoded weights across m batch rows.
+// - Q6_K & Q8_0: 4 rows per subgroup (256 threads/WG = 32 rows/WG) across
+//   all m=1..4, using 8-byte u16vec4 loads.
+// - Quant codes decode via exact normal FP16 biased integers (0x6400 | q -
+//   bias, or 0x5400 | (hi<<4) - 64.0 for Q4_K high nibbles): zero FP16
+//   subnormals (FTZ-safe) and zero delayed rescaling (no underflow on tiny
+//   normal F32 activations).
+#define LILY_PRECISE_ISOLATED
 #define GLM53_EXT_TYPES
 #include "common.glsl"
 #include "glm53_quant.glsl"
 
+// Parameter-only precise helpers (contained under LILY_PRECISE_ISOLATED) so
+// m=1 (4 rows/group) and m=2..4 (1 row/group) never diverge by even 1 ULP.
+float g16_padd(float a, float b) {
+    precise float r = a + b;
+    return r;
+}
+float g16_pmul(float a, float b) {
+    precise float r = a * b;
+    return r;
+}
+float g16_pfma(float a, float b, float c) {
+    precise float r = fma(a, b, c);
+    return r;
+}
+float g16_sum4(vec4 v) {
+    precise float r = (v.x + v.y) + (v.z + v.w);
+    return r;
+}
+float g16_reduce8(float v) {
+    v = g16_padd(v, subgroupShuffleXor(v, 4u));
+    v = g16_padd(v, subgroupShuffleXor(v, 2u));
+    v = g16_padd(v, subgroupShuffleXor(v, 1u));
+    return v;
+}
+
 // ---------------------------------------------------------------------------
-// Q5_K GEMV (Gemma 4's attention, dense FFN and LM head): a subgroup takes
-// G16_R rows; its four groups of eight lanes take blocks b, b + 4, .. of
-// all of them, so a lane loads its activations once for G16_R rows. Lane p
-// of a group takes values 16 h .. 16 h + 15 (h = p % 2) of sub-blocks 2 g
-// and 2 g + 1 (g = p / 2): 16 code bytes (the low and high nibbles), 16
-// high-bit bytes and the block header, each one 16-byte load, the code
-// bytes of a group's lanes contiguous. A sub-block's scale and min multiply
-// its sums of code times x and of x. K a multiple of 256, x_group a
-// multiple of G16_R (a subgroup's rows share their input), x_row_stride a
-// multiple of 4 (the step between rows is x_row_stride / 4 vec4s).
+// Q5_K GEMV: 8 lanes/row, exact normal FP16 decode (0x6400 | q - 1024.0) into
+// F32 FMAs. m=1: 64 threads/WG (4 rows/group); m=2..4: 256 threads/WG.
 // Buffers: 0 x, 1-4 W, 5-8 y. Params: 9 K, 10 m, 11 row_bytes, 12-15 rows
 // of each set (0: unused), 16 x_group, 17 x_row_stride, 18 y_row_stride.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_g16_gemv_q5_k_m1)
 #define GEMV_M 1u
-#define G16_R 4u
 #elif defined(KERNEL_g16_gemv_q5_k_m2)
 #define GEMV_M 2u
-#define G16_R 1u
 #elif defined(KERNEL_g16_gemv_q5_k_m3)
 #define GEMV_M 3u
-#define G16_R 1u
 #elif defined(KERNEL_g16_gemv_q5_k_m4)
 #define GEMV_M 4u
-#define G16_R 1u
 #endif
 #ifdef GEMV_M
-// One row's 32 values of the lane in block b: (scale s0 - min sxa) + (scale
-// s1 - min sxb), the code bytes and high-bit bytes at 16-byte index q4 and
-// the block header at hd4 of the weight at W.
-float g16_q5k_lane(uint64_t W, uint hd4, uint q4, uint qh4, uint j0, uint ssh, bool hi_sc,
-                   in vec4 xa[4], in vec4 xb[4], float sxa, float sxb) {
-    const uvec4 hd = U32x4(W).v[hd4];
-    const uvec4 qs = U32x4(W).v[q4];
-    const uvec4 hb = U32x4(W).v[qh4] >> j0;
-    const uvec4 lo = (qs & 0x0f0f0f0fu) | ((hb << 4u) & 0x10101010u);
-    const uvec4 hi = ((qs >> 4u) & 0x0f0f0f0fu) | ((hb << 3u) & 0x10101010u);
-    const uint a = hd.y >> ssh, bb = hd.z >> ssh, cc = hd.w >> ssh;
-    // The two adjacent sub-blocks have the same layout in adjacent bytes.
-    const uint scales = hi_sc ? (cc & 0x0f0fu) | ((a >> 2u) & 0x3030u) : a & 0x3f3fu;
-    const uint mins = hi_sc ? ((cc >> 4u) & 0x0f0fu) | ((bb >> 2u) & 0x3030u) : bb & 0x3f3fu;
-    const uint sc0 = scales & 63u, mn0 = mins & 63u;
-    const uint sc1 = scales >> 8u, mn1 = mins >> 8u;
-    precise float s0 = 0.0, s1 = 0.0;
-    [[unroll]] for (uint c = 0u; c < 4u; c++) {
-        // Codes 0, 2 and 1, 3 of the word as 16-bit halves.
-        const u16vec2 l02 = unpack16(lo[c] & 0x00ff00ffu), l13 = unpack16((lo[c] >> 8u) & 0x00ff00ffu);
-        const u16vec2 h02 = unpack16(hi[c] & 0x00ff00ffu), h13 = unpack16((hi[c] >> 8u) & 0x00ff00ffu);
-        s0 = fma(float(l02.x), xa[c].x, s0);
-        s1 = fma(float(h02.x), xb[c].x, s1);
-        s0 = fma(float(l13.x), xa[c].y, s0);
-        s1 = fma(float(h13.x), xb[c].y, s1);
-        s0 = fma(float(l02.y), xa[c].z, s0);
-        s1 = fma(float(h02.y), xb[c].z, s1);
-        s0 = fma(float(l13.y), xa[c].w, s0);
-        s1 = fma(float(h13.y), xb[c].w, s1);
-    }
-    const float d = glm53_h2f(hd.x & 0xffffu), dm = glm53_h2f(hd.x >> 16u);
-    precise float v = (d * float(sc0) * s0 - dm * float(mn0) * sxa)
-                    + (d * float(sc1) * s1 - dm * float(mn1) * sxb);
-    return v;
-}
-
 void main() {
     const uint64_t X = arg(0);
     const uint K = arg_u32(9);
@@ -79,7 +72,7 @@ void main() {
     const uint x_group = arg_u32(16);
     const uint x_row_stride = arg_u32(17);
     const uint y_stride_param = arg_u32(18);
-    const uint rows_per_tg = 8u * G16_R;
+    const uint rows_per_tg = 32u;
     uint tg = gl_WorkGroupID.x;
     uint set = 0u;
     uint N = arg_u32(12);
@@ -93,139 +86,167 @@ void main() {
     }
     const uint64_t W = arg(1u + set);
     const uint64_t Y = arg(5u + set);
-    const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
-    const uint n0 = (tg * 8u + gl_SubgroupID) * G16_R;
-    if (n0 >= N) return;
+    const uint64_t y_row_stride = uint64_t(y_stride_param != 0u ? y_stride_param : N);
     const uint lane = gl_SubgroupInvocationID;
-    const uint ix = lane >> 3u, pg = (lane >> 1u) & 3u, h = lane & 1u;
+    const uint grp = lane >> 3u;
+    const uint l = lane & 7u;
+    const uint pg = l >> 1u, h = l & 1u;
     const uint j0 = 2u * pg;
     const uint ssh = 16u * (pg & 1u);
     const bool hi_sc = pg >= 2u;
-    // In 16-byte units: rows, blocks (11 a block), the lane's code and
-    // high-bit bytes in a block; the activations' row, block and lane.
-    const uint row16 = row_bytes / 16u;
-    const uint x4 = (n0 / x_group) * (K / 4u) + 16u * pg + 4u * h;
-    uint r16[G16_R];
-    [[unroll]] for (uint r = 0u; r < G16_R; r++) r16[r] = min(n0 + r, N - 1u) * row16;
-    float acc[G16_R][GEMV_M];
-    [[unroll]] for (uint r = 0u; r < G16_R; r++)
-        [[unroll]] for (uint i = 0u; i < GEMV_M; i++) acc[r][i] = 0.0;
     const uint nb = K / 256u;
-    for (uint b = ix; b < nb; b += 4u) {
 #if defined(KERNEL_g16_gemv_q5_k_m1)
-        const uint xi = x4 + 64u * b;
+    const uint sg_base = tg * 32u + gl_SubgroupID * 16u;
+    if (sg_base >= N) return;
+    const uint n_base = sg_base + grp * 4u;
+    const uint64_t x_base = X
+        + 4u * (uint64_t(min(n_base, N - 1u) / x_group) * uint64_t(K) + uint64_t(64u * pg + 16u * h));
+    uint64_t w_rows[4];
+    [[unroll]] for (uint r = 0u; r < 4u; r++)
+        w_rows[r] = W + uint64_t(min(n_base + r, N - 1u)) * uint64_t(row_bytes);
+    float acc[4];
+    [[unroll]] for (uint r = 0u; r < 4u; r++) acc[r] = 0.0;
+    for (uint b = 0u; b < nb; b++) {
+        const uint64_t xb_ptr = x_base + uint64_t(b) * 1024u;
         vec4 xa[4], xb[4];
         [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            xa[c] = F32x4(X).v[xi + c];
-            xb[c] = F32x4(X).v[xi + 8u + c];
+            xa[c] = F32x4(xb_ptr).v[c];
+            xb[c] = F32x4(xb_ptr).v[8u + c];
         }
-        precise float sxa = 0.0, sxb = 0.0;
+        float sxa = 0.0, sxb = 0.0;
         [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            sxa += (xa[c].x + xa[c].y) + (xa[c].z + xa[c].w);
-            sxb += (xb[c].x + xb[c].y) + (xb[c].z + xb[c].w);
+            sxa = g16_padd(sxa, g16_sum4(xa[c]));
+            sxb = g16_padd(sxb, g16_sum4(xb[c]));
         }
-        [[unroll]] for (uint r = 0u; r < G16_R; r++) {
-            const uint blk = r16[r] + 11u * b;
-            acc[r][0] += g16_q5k_lane(W, blk, blk + 3u + 2u * pg + h, blk + 1u + h, j0,
-                                      ssh, hi_sc, xa, xb, sxa, sxb);
+        const uint blk = 11u * b;
+        [[unroll]] for (uint r = 0u; r < 4u; r++) {
+            const uint64_t wr = w_rows[r];
+            const uvec4 hd = U32x4(wr).v[blk];
+            const uvec4 qs = U32x4(wr).v[blk + 3u + 2u * pg + h];
+            const uvec4 hb = U32x4(wr).v[blk + 1u + h] >> j0;
+            const uvec4 lo = (qs & 0x0f0f0f0fu) | ((hb << 4u) & 0x10101010u);
+            const uvec4 hi = ((qs >> 4u) & 0x0f0f0f0fu) | ((hb << 3u) & 0x10101010u);
+            const uint a = hd.y >> ssh, bb = hd.z >> ssh, cc = hd.w >> ssh;
+            const uint scales = hi_sc ? (cc & 0x0f0fu) | ((a >> 2u) & 0x3030u) : a & 0x3f3fu;
+            const uint mins = hi_sc ? ((cc >> 4u) & 0x0f0fu) | ((bb >> 2u) & 0x3030u) : bb & 0x3f3fu;
+            const float d = glm53_h2f(hd.x & 0xffffu);
+            const float dm = glm53_h2f(hd.x >> 16u);
+            const float d_sc0 = g16_pmul(d, float(scales & 63u));
+            const float dm_mn0 = g16_pmul(dm, float(mins & 63u));
+            const float d_sc1 = g16_pmul(d, float(scales >> 8u));
+            const float dm_mn1 = g16_pmul(dm, float(mins >> 8u));
+            float s0 = 0.0, s1 = 0.0;
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                const uint lw = lo[c], hw = hi[c];
+                const f16vec2 l02 = uint16BitsToFloat16(unpack16(0x64006400u | (lw & 0x001f001fu))) - f16vec2(1024.0);
+                const f16vec2 l13 = uint16BitsToFloat16(unpack16(0x64006400u | ((lw >> 8u) & 0x001f001fu))) - f16vec2(1024.0);
+                const f16vec2 h02 = uint16BitsToFloat16(unpack16(0x64006400u | (hw & 0x001f001fu))) - f16vec2(1024.0);
+                const f16vec2 h13 = uint16BitsToFloat16(unpack16(0x64006400u | ((hw >> 8u) & 0x001f001fu))) - f16vec2(1024.0);
+                s0 = g16_pfma(float(l02.x), xa[c].x, s0);
+                s1 = g16_pfma(float(h02.x), xb[c].x, s1);
+                s0 = g16_pfma(float(l13.x), xa[c].y, s0);
+                s1 = g16_pfma(float(h13.x), xb[c].y, s1);
+                s0 = g16_pfma(float(l02.y), xa[c].z, s0);
+                s1 = g16_pfma(float(h02.y), xb[c].z, s1);
+                s0 = g16_pfma(float(l13.y), xa[c].w, s0);
+                s1 = g16_pfma(float(h13.y), xb[c].w, s1);
+            }
+            const float b0 = g16_padd(g16_pmul(d_sc0, s0), -g16_pmul(dm_mn0, sxa));
+            const float b1 = g16_padd(g16_pmul(d_sc1, s1), -g16_pmul(dm_mn1, sxb));
+            acc[r] = g16_padd(acc[r], g16_padd(b0, b1));
         }
+    }
+    float out_v[4];
+    [[unroll]] for (uint r = 0u; r < 4u; r++) out_v[r] = g16_reduce8(acc[r]);
+    if (l == 0u) {
+        [[unroll]] for (uint r = 0u; r < 4u; r++) {
+            if (n_base + r < N) F32(Y + 4u * uint64_t(n_base + r)).v[0] = out_v[r];
+        }
+    }
 #else
-        // For m > 1 (G16_R == 1): load & decode each Q5_K block ONCE for all GEMV_M rows!
-        const uint x_stride4 = x_row_stride / 4u;
-        const uint blk = r16[0] + 11u * b;
-        const uvec4 hd = U32x4(W).v[blk];
-        const uvec4 qs = U32x4(W).v[blk + 3u + 2u * pg + h];
-        const uvec4 hb = U32x4(W).v[blk + 1u + h] >> j0;
+    const uint n0 = (tg * 8u + gl_SubgroupID) * 4u;
+    if (n0 >= N) return;
+    const uint n = n0 + grp;
+    const uint64_t w_row = W + uint64_t(min(n, N - 1u)) * uint64_t(row_bytes);
+    const uint64_t x_base = X
+        + 4u * (uint64_t(min(n, N - 1u) / x_group) * uint64_t(K) + uint64_t(64u * pg + 16u * h));
+    const uint64_t x_stride_b = 4u * uint64_t(x_row_stride);
+    float acc[GEMV_M];
+    [[unroll]] for (uint i = 0u; i < GEMV_M; i++) acc[i] = 0.0;
+    for (uint b = 0u; b < nb; b++) {
+        const uint blk = 11u * b;
+        const uvec4 hd = U32x4(w_row).v[blk];
+        const uvec4 qs = U32x4(w_row).v[blk + 3u + 2u * pg + h];
+        const uvec4 hb = U32x4(w_row).v[blk + 1u + h] >> j0;
         const uvec4 lo = (qs & 0x0f0f0f0fu) | ((hb << 4u) & 0x10101010u);
         const uvec4 hi = ((qs >> 4u) & 0x0f0f0f0fu) | ((hb << 3u) & 0x10101010u);
         const uint a = hd.y >> ssh, bb = hd.z >> ssh, cc = hd.w >> ssh;
         const uint scales = hi_sc ? (cc & 0x0f0fu) | ((a >> 2u) & 0x3030u) : a & 0x3f3fu;
         const uint mins = hi_sc ? ((cc >> 4u) & 0x0f0fu) | ((bb >> 2u) & 0x3030u) : bb & 0x3f3fu;
-        const float d = glm53_h2f(hd.x & 0xffffu), dm = glm53_h2f(hd.x >> 16u);
-        const float d_sc0 = d * float(scales & 63u), dm_mn0 = dm * float(mins & 63u);
-        const float d_sc1 = d * float(scales >> 8u), dm_mn1 = dm * float(mins >> 8u);
+        const float d = glm53_h2f(hd.x & 0xffffu);
+        const float dm = glm53_h2f(hd.x >> 16u);
+        const float d_sc0 = g16_pmul(d, float(scales & 63u));
+        const float dm_mn0 = g16_pmul(dm, float(mins & 63u));
+        const float d_sc1 = g16_pmul(d, float(scales >> 8u));
+        const float dm_mn1 = g16_pmul(dm, float(mins >> 8u));
+        const uint64_t xb_ptr = x_base + uint64_t(b) * 1024u;
         float s0[GEMV_M], s1[GEMV_M], sxa[GEMV_M], sxb[GEMV_M];
         [[unroll]] for (uint i = 0u; i < GEMV_M; i++) {
             s0[i] = 0.0; s1[i] = 0.0; sxa[i] = 0.0; sxb[i] = 0.0;
         }
         [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            const u16vec2 l02 = unpack16(lo[c] & 0x00ff00ffu), l13 = unpack16((lo[c] >> 8u) & 0x00ff00ffu);
-            const u16vec2 h02 = unpack16(hi[c] & 0x00ff00ffu), h13 = unpack16((hi[c] >> 8u) & 0x00ff00ffu);
-            const vec4 wl = vec4(float(l02.x), float(l13.x), float(l02.y), float(l13.y));
-            const vec4 wh = vec4(float(h02.x), float(h13.x), float(h02.y), float(h13.y));
+            const uint lw = lo[c], hw = hi[c];
+            const f16vec2 l02 = uint16BitsToFloat16(unpack16(0x64006400u | (lw & 0x001f001fu))) - f16vec2(1024.0);
+            const f16vec2 l13 = uint16BitsToFloat16(unpack16(0x64006400u | ((lw >> 8u) & 0x001f001fu))) - f16vec2(1024.0);
+            const f16vec2 h02 = uint16BitsToFloat16(unpack16(0x64006400u | (hw & 0x001f001fu))) - f16vec2(1024.0);
+            const f16vec2 h13 = uint16BitsToFloat16(unpack16(0x64006400u | ((hw >> 8u) & 0x001f001fu))) - f16vec2(1024.0);
             [[unroll]] for (uint i = 0u; i < GEMV_M; i++) {
-                const uint xi = x4 + i * x_stride4 + 64u * b;
-                const vec4 xa = F32x4(X).v[xi + c];
-                const vec4 xb = F32x4(X).v[xi + 8u + c];
-                s0[i] += dot(wl, xa);
-                s1[i] += dot(wh, xb);
-                sxa[i] += (xa.x + xa.y) + (xa.z + xa.w);
-                sxb[i] += (xb.x + xb.y) + (xb.z + xb.w);
+                const uint64_t xi = xb_ptr + uint64_t(i) * x_stride_b;
+                const vec4 xa = F32x4(xi).v[c];
+                const vec4 xb = F32x4(xi).v[8u + c];
+                s0[i] = g16_pfma(float(l02.x), xa.x, s0[i]);
+                s1[i] = g16_pfma(float(h02.x), xb.x, s1[i]);
+                s0[i] = g16_pfma(float(l13.x), xa.y, s0[i]);
+                s1[i] = g16_pfma(float(h13.x), xb.y, s1[i]);
+                s0[i] = g16_pfma(float(l02.y), xa.z, s0[i]);
+                s1[i] = g16_pfma(float(h02.y), xb.z, s1[i]);
+                s0[i] = g16_pfma(float(l13.y), xa.w, s0[i]);
+                s1[i] = g16_pfma(float(h13.y), xb.w, s1[i]);
+                sxa[i] = g16_padd(sxa[i], g16_sum4(xa));
+                sxb[i] = g16_padd(sxb[i], g16_sum4(xb));
             }
         }
         [[unroll]] for (uint i = 0u; i < GEMV_M; i++) {
-            acc[0][i] += (d_sc0 * s0[i] - dm_mn0 * sxa[i]) + (d_sc1 * s1[i] - dm_mn1 * sxb[i]);
+            const float b0 = g16_padd(g16_pmul(d_sc0, s0[i]), -g16_pmul(dm_mn0, sxa[i]));
+            const float b1 = g16_padd(g16_pmul(d_sc1, s1[i]), -g16_pmul(dm_mn1, sxb[i]));
+            acc[i] = g16_padd(acc[i], g16_padd(b0, b1));
         }
+    }
+    float out_v[GEMV_M];
+    [[unroll]] for (uint i = 0u; i < GEMV_M; i++) out_v[i] = g16_reduce8(acc[i]);
+    if (l == 0u && n < N) {
+        [[unroll]] for (uint i = 0u; i < GEMV_M; i++)
+            F32(Y + 4u * (uint64_t(i) * y_row_stride + uint64_t(n))).v[0] = out_v[i];
+    }
 #endif
-    }
-    [[unroll]] for (uint r = 0u; r < G16_R; r++) {
-        [[unroll]] for (uint i = 0u; i < GEMV_M; i++) {
-            const float v = subgroupAdd(acc[r][i]);
-            if (lane == 0u && n0 + r < N) F32(Y).v[i * y_row_stride + n0 + r] = v;
-        }
-    }
 }
 #endif
 
 // ---------------------------------------------------------------------------
-// Q4_K GEMV for Apple G16 (M4): identical to Q5_K without the high-bit load
-// (9 x 16-byte blocks per 256 values instead of 11). Blasts Q4_K LM head and
-// attention projections to ~90+ GB/s on M4.
+// Q4_K GEMV: 8 lanes/row, exact normal FP16 decode (low: 0x6400 | lo - 1024,
+// high: 0x5400 | (hi << 4) - 64, saving the shift-by-4) into F32 FMAs.
+// m=1: 64 threads/WG (4 rows/group); m=2..4: 256 threads/WG.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_g16_gemv_q4_k_m1)
 #define GEMV4_M 1u
-#define G16_R4 4u
 #elif defined(KERNEL_g16_gemv_q4_k_m2)
 #define GEMV4_M 2u
-#define G16_R4 1u
 #elif defined(KERNEL_g16_gemv_q4_k_m3)
 #define GEMV4_M 3u
-#define G16_R4 1u
 #elif defined(KERNEL_g16_gemv_q4_k_m4)
 #define GEMV4_M 4u
-#define G16_R4 1u
 #endif
 #ifdef GEMV4_M
-float g16_q4k_lane(uint64_t W, uint hd4, uint q4, uint ssh, bool hi_sc,
-                   in vec4 xa[4], in vec4 xb[4], float sxa, float sxb) {
-    const uvec4 hd = U32x4(W).v[hd4];
-    const uvec4 qs = U32x4(W).v[q4];
-    const uvec4 lo = qs & 0x0f0f0f0fu;
-    const uvec4 hi = (qs >> 4u) & 0x0f0f0f0fu;
-    const uint a = hd.y >> ssh, bb = hd.z >> ssh, cc = hd.w >> ssh;
-    const uint scales = hi_sc ? (cc & 0x0f0fu) | ((a >> 2u) & 0x3030u) : a & 0x3f3fu;
-    const uint mins = hi_sc ? ((cc >> 4u) & 0x0f0fu) | ((bb >> 2u) & 0x3030u) : bb & 0x3f3fu;
-    const uint sc0 = scales & 63u, mn0 = mins & 63u;
-    const uint sc1 = scales >> 8u, mn1 = mins >> 8u;
-    precise float s0 = 0.0, s1 = 0.0;
-    [[unroll]] for (uint c = 0u; c < 4u; c++) {
-        const u16vec2 l02 = unpack16(lo[c] & 0x00ff00ffu), l13 = unpack16((lo[c] >> 8u) & 0x00ff00ffu);
-        const u16vec2 h02 = unpack16(hi[c] & 0x00ff00ffu), h13 = unpack16((hi[c] >> 8u) & 0x00ff00ffu);
-        s0 = fma(float(l02.x), xa[c].x, s0);
-        s1 = fma(float(h02.x), xb[c].x, s1);
-        s0 = fma(float(l13.x), xa[c].y, s0);
-        s1 = fma(float(h13.x), xb[c].y, s1);
-        s0 = fma(float(l02.y), xa[c].z, s0);
-        s1 = fma(float(h02.y), xb[c].z, s1);
-        s0 = fma(float(l13.y), xa[c].w, s0);
-        s1 = fma(float(h13.y), xb[c].w, s1);
-    }
-    const float d = glm53_h2f(hd.x & 0xffffu), dm = glm53_h2f(hd.x >> 16u);
-    precise float v = (d * float(sc0) * s0 - dm * float(mn0) * sxa)
-                    + (d * float(sc1) * s1 - dm * float(mn1) * sxb);
-    return v;
-}
-
 void main() {
     const uint64_t X = arg(0);
     const uint K = arg_u32(9);
@@ -233,7 +254,7 @@ void main() {
     const uint x_group = arg_u32(16);
     const uint x_row_stride = arg_u32(17);
     const uint y_stride_param = arg_u32(18);
-    const uint rows_per_tg = 8u * G16_R4;
+    const uint rows_per_tg = 32u;
     uint tg = gl_WorkGroupID.x;
     uint set = 0u;
     uint N = arg_u32(12);
@@ -247,135 +268,164 @@ void main() {
     }
     const uint64_t W = arg(1u + set);
     const uint64_t Y = arg(5u + set);
-    const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
-    const uint n0 = (tg * 8u + gl_SubgroupID) * G16_R4;
-    if (n0 >= N) return;
+    const uint64_t y_row_stride = uint64_t(y_stride_param != 0u ? y_stride_param : N);
     const uint lane = gl_SubgroupInvocationID;
-    const uint ix = lane >> 3u, pg = (lane >> 1u) & 3u, h = lane & 1u;
+    const uint grp = lane >> 3u;
+    const uint l = lane & 7u;
+    const uint pg = l >> 1u, h = l & 1u;
     const uint ssh = 16u * (pg & 1u);
     const bool hi_sc = pg >= 2u;
-    const uint row16 = row_bytes / 16u;
-    const uint x4 = (n0 / x_group) * (K / 4u) + 16u * pg + 4u * h;
-    uint r16[G16_R4];
-    [[unroll]] for (uint r = 0u; r < G16_R4; r++) r16[r] = min(n0 + r, N - 1u) * row16;
-    float acc[G16_R4][GEMV4_M];
-    [[unroll]] for (uint r = 0u; r < G16_R4; r++)
-        [[unroll]] for (uint i = 0u; i < GEMV4_M; i++) acc[r][i] = 0.0;
     const uint nb = K / 256u;
-    for (uint b = ix; b < nb; b += 4u) {
 #if defined(KERNEL_g16_gemv_q4_k_m1)
-        const uint xi = x4 + 64u * b;
+    const uint sg_base = tg * 32u + gl_SubgroupID * 16u;
+    if (sg_base >= N) return;
+    const uint n_base = sg_base + grp * 4u;
+    const uint64_t x_base = X
+        + 4u * (uint64_t(min(n_base, N - 1u) / x_group) * uint64_t(K) + uint64_t(64u * pg + 16u * h));
+    uint64_t w_rows[4];
+    [[unroll]] for (uint r = 0u; r < 4u; r++)
+        w_rows[r] = W + uint64_t(min(n_base + r, N - 1u)) * uint64_t(row_bytes);
+    float acc[4];
+    [[unroll]] for (uint r = 0u; r < 4u; r++) acc[r] = 0.0;
+    for (uint b = 0u; b < nb; b++) {
+        const uint64_t xb_ptr = x_base + uint64_t(b) * 1024u;
         vec4 xa[4], xb[4];
         [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            xa[c] = F32x4(X).v[xi + c];
-            xb[c] = F32x4(X).v[xi + 8u + c];
+            xa[c] = F32x4(xb_ptr).v[c];
+            xb[c] = F32x4(xb_ptr).v[8u + c];
         }
-        precise float sxa = 0.0, sxb = 0.0;
+        float sxa = 0.0, sxb = 0.0;
         [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            sxa += (xa[c].x + xa[c].y) + (xa[c].z + xa[c].w);
-            sxb += (xb[c].x + xb[c].y) + (xb[c].z + xb[c].w);
+            sxa = g16_padd(sxa, g16_sum4(xa[c]));
+            sxb = g16_padd(sxb, g16_sum4(xb[c]));
         }
-        [[unroll]] for (uint r = 0u; r < G16_R4; r++) {
-            const uint blk = r16[r] + 9u * b;
-            acc[r][0] += g16_q4k_lane(W, blk, blk + 1u + 2u * pg + h, ssh, hi_sc,
-                                      xa, xb, sxa, sxb);
+        const uint blk = 9u * b;
+        [[unroll]] for (uint r = 0u; r < 4u; r++) {
+            const uint64_t wr = w_rows[r];
+            const uvec4 hd = U32x4(wr).v[blk];
+            const uvec4 qs = U32x4(wr).v[blk + 1u + 2u * pg + h];
+            const uint a = hd.y >> ssh, bb = hd.z >> ssh, cc = hd.w >> ssh;
+            const uint scales = hi_sc ? (cc & 0x0f0fu) | ((a >> 2u) & 0x3030u) : a & 0x3f3fu;
+            const uint mins = hi_sc ? ((cc >> 4u) & 0x0f0fu) | ((bb >> 2u) & 0x3030u) : bb & 0x3f3fu;
+            const float d = glm53_h2f(hd.x & 0xffffu), dm = glm53_h2f(hd.x >> 16u);
+            const float d_sc0 = g16_pmul(d, float(scales & 63u));
+            const float dm_mn0 = g16_pmul(dm, float(mins & 63u));
+            const float d_sc1 = g16_pmul(d, float(scales >> 8u));
+            const float dm_mn1 = g16_pmul(dm, float(mins >> 8u));
+            float s0 = 0.0, s1 = 0.0;
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                const uint w = qs[c];
+                const uint w8 = w >> 8u;
+                const f16vec2 l02 = uint16BitsToFloat16(unpack16(0x64006400u | (w & 0x000f000fu))) - f16vec2(1024.0);
+                const f16vec2 l13 = uint16BitsToFloat16(unpack16(0x64006400u | (w8 & 0x000f000fu))) - f16vec2(1024.0);
+                const f16vec2 h02 = uint16BitsToFloat16(unpack16(0x54005400u | (w & 0x00f000f0u))) - f16vec2(64.0);
+                const f16vec2 h13 = uint16BitsToFloat16(unpack16(0x54005400u | (w8 & 0x00f000f0u))) - f16vec2(64.0);
+                s0 = g16_pfma(float(l02.x), xa[c].x, s0);
+                s1 = g16_pfma(float(h02.x), xb[c].x, s1);
+                s0 = g16_pfma(float(l13.x), xa[c].y, s0);
+                s1 = g16_pfma(float(h13.x), xb[c].y, s1);
+                s0 = g16_pfma(float(l02.y), xa[c].z, s0);
+                s1 = g16_pfma(float(h02.y), xb[c].z, s1);
+                s0 = g16_pfma(float(l13.y), xa[c].w, s0);
+                s1 = g16_pfma(float(h13.y), xb[c].w, s1);
+            }
+            const float b0 = g16_padd(g16_pmul(d_sc0, s0), -g16_pmul(dm_mn0, sxa));
+            const float b1 = g16_padd(g16_pmul(d_sc1, s1), -g16_pmul(dm_mn1, sxb));
+            acc[r] = g16_padd(acc[r], g16_padd(b0, b1));
         }
+    }
+    float out_v[4];
+    [[unroll]] for (uint r = 0u; r < 4u; r++) out_v[r] = g16_reduce8(acc[r]);
+    if (l == 0u) {
+        [[unroll]] for (uint r = 0u; r < 4u; r++) {
+            if (n_base + r < N) F32(Y + 4u * uint64_t(n_base + r)).v[0] = out_v[r];
+        }
+    }
 #else
-        // For m > 1 (G16_R4 == 1): load & decode each Q4_K block ONCE for all GEMV4_M rows!
-        const uint x_stride4 = x_row_stride / 4u;
-        const uint blk = r16[0] + 9u * b;
-        const uvec4 hd = U32x4(W).v[blk];
-        const uvec4 qs = U32x4(W).v[blk + 1u + 2u * pg + h];
-        const uvec4 lo = qs & 0x0f0f0f0fu;
-        const uvec4 hi = (qs >> 4u) & 0x0f0f0f0fu;
+    const uint n0 = (tg * 8u + gl_SubgroupID) * 4u;
+    if (n0 >= N) return;
+    const uint n = n0 + grp;
+    const uint64_t w_row = W + uint64_t(min(n, N - 1u)) * uint64_t(row_bytes);
+    const uint64_t x_base = X
+        + 4u * (uint64_t(min(n, N - 1u) / x_group) * uint64_t(K) + uint64_t(64u * pg + 16u * h));
+    const uint64_t x_stride_b = 4u * uint64_t(x_row_stride);
+    float acc[GEMV4_M];
+    [[unroll]] for (uint i = 0u; i < GEMV4_M; i++) acc[i] = 0.0;
+    for (uint b = 0u; b < nb; b++) {
+        const uint blk = 9u * b;
+        const uvec4 hd = U32x4(w_row).v[blk];
+        const uvec4 qs = U32x4(w_row).v[blk + 1u + 2u * pg + h];
         const uint a = hd.y >> ssh, bb = hd.z >> ssh, cc = hd.w >> ssh;
         const uint scales = hi_sc ? (cc & 0x0f0fu) | ((a >> 2u) & 0x3030u) : a & 0x3f3fu;
         const uint mins = hi_sc ? ((cc >> 4u) & 0x0f0fu) | ((bb >> 2u) & 0x3030u) : bb & 0x3f3fu;
         const float d = glm53_h2f(hd.x & 0xffffu), dm = glm53_h2f(hd.x >> 16u);
-        const float d_sc0 = d * float(scales & 63u), dm_mn0 = dm * float(mins & 63u);
-        const float d_sc1 = d * float(scales >> 8u), dm_mn1 = dm * float(mins >> 8u);
+        const float d_sc0 = g16_pmul(d, float(scales & 63u));
+        const float dm_mn0 = g16_pmul(dm, float(mins & 63u));
+        const float d_sc1 = g16_pmul(d, float(scales >> 8u));
+        const float dm_mn1 = g16_pmul(dm, float(mins >> 8u));
+        const uint64_t xb_ptr = x_base + uint64_t(b) * 1024u;
         float s0[GEMV4_M], s1[GEMV4_M], sxa[GEMV4_M], sxb[GEMV4_M];
         [[unroll]] for (uint i = 0u; i < GEMV4_M; i++) {
             s0[i] = 0.0; s1[i] = 0.0; sxa[i] = 0.0; sxb[i] = 0.0;
         }
         [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            const u16vec2 l02 = unpack16(lo[c] & 0x00ff00ffu), l13 = unpack16((lo[c] >> 8u) & 0x00ff00ffu);
-            const u16vec2 h02 = unpack16(hi[c] & 0x00ff00ffu), h13 = unpack16((hi[c] >> 8u) & 0x00ff00ffu);
-            const vec4 wl = vec4(float(l02.x), float(l13.x), float(l02.y), float(l13.y));
-            const vec4 wh = vec4(float(h02.x), float(h13.x), float(h02.y), float(h13.y));
+            const uint w = qs[c];
+            const uint w8 = w >> 8u;
+            const f16vec2 l02 = uint16BitsToFloat16(unpack16(0x64006400u | (w & 0x000f000fu))) - f16vec2(1024.0);
+            const f16vec2 l13 = uint16BitsToFloat16(unpack16(0x64006400u | (w8 & 0x000f000fu))) - f16vec2(1024.0);
+            const f16vec2 h02 = uint16BitsToFloat16(unpack16(0x54005400u | (w & 0x00f000f0u))) - f16vec2(64.0);
+            const f16vec2 h13 = uint16BitsToFloat16(unpack16(0x54005400u | (w8 & 0x00f000f0u))) - f16vec2(64.0);
             [[unroll]] for (uint i = 0u; i < GEMV4_M; i++) {
-                const uint xi = x4 + i * x_stride4 + 64u * b;
-                const vec4 xa = F32x4(X).v[xi + c];
-                const vec4 xb = F32x4(X).v[xi + 8u + c];
-                s0[i] += dot(wl, xa);
-                s1[i] += dot(wh, xb);
-                sxa[i] += (xa.x + xa.y) + (xa.z + xa.w);
-                sxb[i] += (xb.x + xb.y) + (xb.z + xb.w);
+                const uint64_t xi = xb_ptr + uint64_t(i) * x_stride_b;
+                const vec4 xa = F32x4(xi).v[c];
+                const vec4 xb = F32x4(xi).v[8u + c];
+                s0[i] = g16_pfma(float(l02.x), xa.x, s0[i]);
+                s1[i] = g16_pfma(float(h02.x), xb.x, s1[i]);
+                s0[i] = g16_pfma(float(l13.x), xa.y, s0[i]);
+                s1[i] = g16_pfma(float(h13.x), xb.y, s1[i]);
+                s0[i] = g16_pfma(float(l02.y), xa.z, s0[i]);
+                s1[i] = g16_pfma(float(h02.y), xb.z, s1[i]);
+                s0[i] = g16_pfma(float(l13.y), xa.w, s0[i]);
+                s1[i] = g16_pfma(float(h13.y), xb.w, s1[i]);
+                sxa[i] = g16_padd(sxa[i], g16_sum4(xa));
+                sxb[i] = g16_padd(sxb[i], g16_sum4(xb));
             }
         }
         [[unroll]] for (uint i = 0u; i < GEMV4_M; i++) {
-            acc[0][i] += (d_sc0 * s0[i] - dm_mn0 * sxa[i]) + (d_sc1 * s1[i] - dm_mn1 * sxb[i]);
+            const float b0 = g16_padd(g16_pmul(d_sc0, s0[i]), -g16_pmul(dm_mn0, sxa[i]));
+            const float b1 = g16_padd(g16_pmul(d_sc1, s1[i]), -g16_pmul(dm_mn1, sxb[i]));
+            acc[i] = g16_padd(acc[i], g16_padd(b0, b1));
         }
+    }
+    float out_v[GEMV4_M];
+    [[unroll]] for (uint i = 0u; i < GEMV4_M; i++) out_v[i] = g16_reduce8(acc[i]);
+    if (l == 0u && n < N) {
+        [[unroll]] for (uint i = 0u; i < GEMV4_M; i++)
+            F32(Y + 4u * (uint64_t(i) * y_row_stride + uint64_t(n))).v[0] = out_v[i];
+    }
 #endif
-    }
-    [[unroll]] for (uint r = 0u; r < G16_R4; r++) {
-        [[unroll]] for (uint i = 0u; i < GEMV4_M; i++) {
-            const float v = subgroupAdd(acc[r][i]);
-            if (lane == 0u && n0 + r < N) F32(Y).v[i * y_row_stride + n0 + r] = v;
-        }
-    }
 }
 #endif
 
 // ---------------------------------------------------------------------------
-// Q8_0 GEMV for Apple G16 (M4): 4 weight rows/subgroup for m=1 (4x X reuse),
-// 1 weight row/subgroup for m=2..4 (m-way weight reuse), using 8-byte u16vec4
-// loads (4 loads per 32-byte block instead of 16 scalar U16 loads).
-// Same lane->block assignment (t = lane; t += 32) across m=1..4 for exact
-// speculative verify parity. Requires K >= 1024, K % 32 == 0.
+// Q8_0 GEMV: 8 lanes/row (4 rows/subgroup, 256 threads/WG) across all m=1..4.
+// Uses 8-byte u16vec4 loads, exact normal FP16 biased-byte decoding
+// ((0x6400 | (byte ^ 0x80)) - 1152.0 = exact int8), and a subgroup-uniform
+// loop bound so partial tail blocks (K % 256 != 0) reconverge before reduce.
+// Requires K >= 1024, K % 32 == 0.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_g16_gemv_q8_0_m1)
 #define GEMV8_M 1u
-#define G16_R8 4u
 #elif defined(KERNEL_g16_gemv_q8_0_m2)
 #define GEMV8_M 2u
-#define G16_R8 1u
 #elif defined(KERNEL_g16_gemv_q8_0_m3)
 #define GEMV8_M 3u
-#define G16_R8 1u
 #elif defined(KERNEL_g16_gemv_q8_0_m4)
 #define GEMV8_M 4u
-#define G16_R8 1u
 #endif
 #ifdef GEMV8_M
 layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer G16Q8Pairs { u16vec4 v[]; };
 
-float g16_q8_dot_xv(uint64_t b, in vec4 xv[8], float acc) {
-    const float d = glm53_h2f(uint(U16(b).v[0]));
-    precise float s = 0.0;
-    [[unroll]] for (uint g = 0u; g < 4u; g++) {
-        const u16vec4 p = G16Q8Pairs(b + 2u).v[g];
-        const vec4 w0 = vec4(
-            float(int(uint(p.x) << 24) >> 24), float(int(uint(p.x) << 16) >> 24),
-            float(int(uint(p.y) << 24) >> 24), float(int(uint(p.y) << 16) >> 24));
-        const vec4 w1 = vec4(
-            float(int(uint(p.z) << 24) >> 24), float(int(uint(p.z) << 16) >> 24),
-            float(int(uint(p.w) << 24) >> 24), float(int(uint(p.w) << 16) >> 24));
-        const vec4 x0 = xv[2u * g];
-        const vec4 x1 = xv[2u * g + 1u];
-        s = fma(w0.x, x0.x, s);
-        s = fma(w0.y, x0.y, s);
-        s = fma(w0.z, x0.z, s);
-        s = fma(w0.w, x0.w, s);
-        s = fma(w1.x, x1.x, s);
-        s = fma(w1.y, x1.y, s);
-        s = fma(w1.z, x1.z, s);
-        s = fma(w1.w, x1.w, s);
-    }
-    precise float out_acc = fma(d, s, acc);
-    return out_acc;
-}
-
 void main() {
     const uint64_t X = arg(0);
     const uint K = arg_u32(9);
@@ -383,7 +433,7 @@ void main() {
     const uint x_group = arg_u32(16);
     const uint x_row_stride = arg_u32(17);
     const uint y_stride_param = arg_u32(18);
-    const uint rows_per_tg = 8u * G16_R8;
+    const uint rows_per_tg = 32u;
     uint tg = gl_WorkGroupID.x;
     uint set = 0u;
     uint N = arg_u32(12);
@@ -397,151 +447,78 @@ void main() {
     }
     const uint64_t W = arg(1u + set);
     const uint64_t Y = arg(5u + set);
-    const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
-    const uint n0 = (tg * 8u + gl_SubgroupID) * G16_R8;
+    const uint64_t y_row_stride = uint64_t(y_stride_param != 0u ? y_stride_param : N);
+    const uint n0 = (tg * 8u + gl_SubgroupID) * 4u;
     if (n0 >= N) return;
     const uint lane = gl_SubgroupInvocationID;
-    const uint64_t x_base = X + 4u * uint64_t(n0 / x_group) * uint64_t(K);
-    const uint tasks = K >> 5u;
-#if defined(KERNEL_g16_gemv_q8_0_m1)
-    uint64_t w_rows[4];
-    [[unroll]] for (uint r = 0u; r < 4u; r++) w_rows[r] = W + uint64_t(min(n0 + r, N - 1u)) * uint64_t(row_bytes);
-    precise float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
-    for (uint t = lane; t < tasks; t += 32u) {
-        const uint64_t xt = x_base + uint64_t(t) * 128u;
-        vec4 xv[8];
-        [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(xt + 16u * q).v[0];
-        const uint64_t bo = uint64_t(t) * 34u;
-        acc0 = g16_q8_dot_xv(w_rows[0] + bo, xv, acc0);
-        acc1 = g16_q8_dot_xv(w_rows[1] + bo, xv, acc1);
-        acc2 = g16_q8_dot_xv(w_rows[2] + bo, xv, acc2);
-        acc3 = g16_q8_dot_xv(w_rows[3] + bo, xv, acc3);
-    }
-    acc0 = subgroupAdd(acc0);
-    acc1 = subgroupAdd(acc1);
-    acc2 = subgroupAdd(acc2);
-    acc3 = subgroupAdd(acc3);
-    if (lane == 0u) {
-        F32(Y).v[n0] = acc0;
-        if (n0 + 1u < N) F32(Y).v[n0 + 1u] = acc1;
-        if (n0 + 2u < N) F32(Y).v[n0 + 2u] = acc2;
-        if (n0 + 3u < N) F32(Y).v[n0 + 3u] = acc3;
-    }
-#else
-    const uint64_t w_row = W + uint64_t(n0) * uint64_t(row_bytes);
+    const uint grp = lane >> 3u;
+    const uint l = lane & 7u;
+    const uint n = n0 + grp;
+    const uint64_t w_row = W + uint64_t(min(n, N - 1u)) * uint64_t(row_bytes);
+    const uint64_t x_base = X + 4u * uint64_t(min(n, N - 1u) / x_group) * uint64_t(K);
     const uint64_t x_stride_b = 4u * uint64_t(x_row_stride);
-    precise float acc[GEMV8_M];
+    const uint tasks = K >> 5u;
+    float acc[GEMV8_M];
     [[unroll]] for (uint i = 0u; i < GEMV8_M; i++) acc[i] = 0.0;
-    for (uint t = lane; t < tasks; t += 32u) {
-        const uint64_t b = w_row + uint64_t(t) * 34u;
-        const float d = glm53_h2f(uint(U16(b).v[0]));
-        const uint64_t xt = x_base + uint64_t(t) * 128u;
-        precise float s[GEMV8_M];
-        [[unroll]] for (uint i = 0u; i < GEMV8_M; i++) s[i] = 0.0;
-        [[unroll]] for (uint g = 0u; g < 4u; g++) {
-            const u16vec4 p = G16Q8Pairs(b + 2u).v[g];
-            const vec4 w0 = vec4(
-                float(int(uint(p.x) << 24) >> 24), float(int(uint(p.x) << 16) >> 24),
-                float(int(uint(p.y) << 24) >> 24), float(int(uint(p.y) << 16) >> 24));
-            const vec4 w1 = vec4(
-                float(int(uint(p.z) << 24) >> 24), float(int(uint(p.z) << 16) >> 24),
-                float(int(uint(p.w) << 24) >> 24), float(int(uint(p.w) << 16) >> 24));
-            [[unroll]] for (uint i = 0u; i < GEMV8_M; i++) {
-                const uint64_t xp = xt + uint64_t(i) * x_stride_b + 32u * g;
-                const vec4 x0 = F32x4(xp).v[0];
-                const vec4 x1 = F32x4(xp + 16u).v[0];
-                s[i] = fma(w0.x, x0.x, s[i]);
-                s[i] = fma(w0.y, x0.y, s[i]);
-                s[i] = fma(w0.z, x0.z, s[i]);
-                s[i] = fma(w0.w, x0.w, s[i]);
-                s[i] = fma(w1.x, x1.x, s[i]);
-                s[i] = fma(w1.y, x1.y, s[i]);
-                s[i] = fma(w1.z, x1.z, s[i]);
-                s[i] = fma(w1.w, x1.w, s[i]);
+    for (uint t0 = 0u; t0 < tasks; t0 += 8u) {
+        const uint t = t0 + l;
+        if (t < tasks) {
+            const uint64_t b = w_row + uint64_t(t) * 34u;
+            const float d = glm53_h2f(uint(U16(b).v[0]));
+            const uint64_t xt = x_base + uint64_t(t) * 128u;
+            float s[GEMV8_M];
+            [[unroll]] for (uint i = 0u; i < GEMV8_M; i++) s[i] = 0.0;
+            [[unroll]] for (uint g = 0u; g < 4u; g++) {
+                const u16vec4 p = G16Q8Pairs(b + 2u).v[g];
+                const uint pw0 = pack32(p.xy) ^ 0x80808080u;
+                const uint pw1 = pack32(p.zw) ^ 0x80808080u;
+                const f16vec2 w02 = uint16BitsToFloat16(unpack16(0x64006400u | (pw0 & 0x00ff00ffu))) - f16vec2(1152.0);
+                const f16vec2 w13 = uint16BitsToFloat16(unpack16(0x64006400u | ((pw0 >> 8u) & 0x00ff00ffu))) - f16vec2(1152.0);
+                const f16vec2 w46 = uint16BitsToFloat16(unpack16(0x64006400u | (pw1 & 0x00ff00ffu))) - f16vec2(1152.0);
+                const f16vec2 w57 = uint16BitsToFloat16(unpack16(0x64006400u | ((pw1 >> 8u) & 0x00ff00ffu))) - f16vec2(1152.0);
+                [[unroll]] for (uint i = 0u; i < GEMV8_M; i++) {
+                    const uint64_t xp = xt + uint64_t(i) * x_stride_b + 32u * g;
+                    const vec4 x0 = F32x4(xp).v[0];
+                    const vec4 x1 = F32x4(xp + 16u).v[0];
+                    s[i] = g16_pfma(float(w02.x), x0.x, s[i]);
+                    s[i] = g16_pfma(float(w13.x), x0.y, s[i]);
+                    s[i] = g16_pfma(float(w02.y), x0.z, s[i]);
+                    s[i] = g16_pfma(float(w13.y), x0.w, s[i]);
+                    s[i] = g16_pfma(float(w46.x), x1.x, s[i]);
+                    s[i] = g16_pfma(float(w57.x), x1.y, s[i]);
+                    s[i] = g16_pfma(float(w46.y), x1.z, s[i]);
+                    s[i] = g16_pfma(float(w57.y), x1.w, s[i]);
+                }
             }
+            [[unroll]] for (uint i = 0u; i < GEMV8_M; i++) acc[i] = g16_pfma(d, s[i], acc[i]);
         }
-        [[unroll]] for (uint i = 0u; i < GEMV8_M; i++) acc[i] = fma(d, s[i], acc[i]);
     }
-    [[unroll]] for (uint i = 0u; i < GEMV8_M; i++) {
-        const float v = subgroupAdd(acc[i]);
-        if (lane == 0u) F32(Y).v[i * y_row_stride + n0] = v;
+    float out_v[GEMV8_M];
+    [[unroll]] for (uint i = 0u; i < GEMV8_M; i++) out_v[i] = g16_reduce8(acc[i]);
+    if (l == 0u && n < N) {
+        [[unroll]] for (uint i = 0u; i < GEMV8_M; i++)
+            F32(Y + 4u * (uint64_t(i) * y_row_stride + uint64_t(n))).v[0] = out_v[i];
     }
-#endif
 }
 #endif
 
 // ---------------------------------------------------------------------------
-// Q6_K GEMV for Apple G16 (M4): 4 weight rows/subgroup for m=1 (4x X reuse),
-// 1 weight row/subgroup for m=2..4 (m-way weight reuse), using 8-byte u16vec4
-// loads for ql/qh (4 loads per 32-value sub-block instead of 16 U16 loads).
+// Q6_K GEMV: 8 lanes/row (4 rows/subgroup, 256 threads/WG) across all m=1..4.
+// Uses 8-byte u16vec4 loads and exact normal FP16 biased 6-bit decoding
+// ((0x6400 | q) - 1056.0 = exact q - 32) into F32 FMAs.
 // Requires K % 256 == 0.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_g16_gemv_q6_k_m1)
 #define GEMV6_M 1u
-#define G16_R6 4u
 #elif defined(KERNEL_g16_gemv_q6_k_m2)
 #define GEMV6_M 2u
-#define G16_R6 1u
 #elif defined(KERNEL_g16_gemv_q6_k_m3)
 #define GEMV6_M 3u
-#define G16_R6 1u
 #elif defined(KERNEL_g16_gemv_q6_k_m4)
 #define GEMV6_M 4u
-#define G16_R6 1u
 #endif
 #ifdef GEMV6_M
 layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer G16Q6Pairs { u16vec4 v[]; };
-
-float g16_q6k_dot_xv(uint64_t b, uint n, uint q, in vec4 xv[8], float acc) {
-    const float d = glm53_h2f(uint(U16(b).v[104]));
-    const uint sw = uint(U16(b + 192u).v[4u * n + q]);
-    const float s0 = d * float(int(sw << 24) >> 24);
-    const float s1 = d * float(int(sw << 16) >> 24);
-    const uint64_t ql = b + 64u * n + 32u * (q & 1u);
-    const uint64_t qh = b + 128u + 32u * n;
-    const uint lshift = 4u * (q >> 1u), hshift = 2u * q;
-    precise float a0 = 0.0, a1 = 0.0;
-    [[unroll]] for (uint g = 0u; g < 4u; g++) {
-        const u16vec4 lo = G16Q6Pairs(ql).v[g];
-        const u16vec4 hi = G16Q6Pairs(qh).v[g];
-        const uvec4 l4 = uvec4(lo) >> lshift;
-        const uvec4 h4 = uvec4(hi) >> hshift;
-        const vec4 w0 = vec4(
-            float(int((l4.x & 0xfu) | ((h4.x & 3u) << 4u)) - 32),
-            float(int(((l4.x >> 8u) & 0xfu) | (((h4.x >> 8u) & 3u) << 4u)) - 32),
-            float(int((l4.y & 0xfu) | ((h4.y & 3u) << 4u)) - 32),
-            float(int(((l4.y >> 8u) & 0xfu) | (((h4.y >> 8u) & 3u) << 4u)) - 32));
-        const vec4 w1 = vec4(
-            float(int((l4.z & 0xfu) | ((h4.z & 3u) << 4u)) - 32),
-            float(int(((l4.z >> 8u) & 0xfu) | (((h4.z >> 8u) & 3u) << 4u)) - 32),
-            float(int((l4.w & 0xfu) | ((h4.w & 3u) << 4u)) - 32),
-            float(int(((l4.w >> 8u) & 0xfu) | (((h4.w >> 8u) & 3u) << 4u)) - 32));
-        const vec4 x0 = xv[2u * g];
-        const vec4 x1 = xv[2u * g + 1u];
-        if (g < 2u) {
-            a0 = fma(w0.x, x0.x, a0);
-            a0 = fma(w0.y, x0.y, a0);
-            a0 = fma(w0.z, x0.z, a0);
-            a0 = fma(w0.w, x0.w, a0);
-            a0 = fma(w1.x, x1.x, a0);
-            a0 = fma(w1.y, x1.y, a0);
-            a0 = fma(w1.z, x1.z, a0);
-            a0 = fma(w1.w, x1.w, a0);
-        } else {
-            a1 = fma(w0.x, x0.x, a1);
-            a1 = fma(w0.y, x0.y, a1);
-            a1 = fma(w0.z, x0.z, a1);
-            a1 = fma(w0.w, x0.w, a1);
-            a1 = fma(w1.x, x1.x, a1);
-            a1 = fma(w1.y, x1.y, a1);
-            a1 = fma(w1.z, x1.z, a1);
-            a1 = fma(w1.w, x1.w, a1);
-        }
-    }
-    precise float out_acc = fma(s0, a0, acc);
-    out_acc = fma(s1, a1, out_acc);
-    return out_acc;
-}
 
 void main() {
     const uint64_t X = arg(0);
@@ -550,7 +527,7 @@ void main() {
     const uint x_group = arg_u32(16);
     const uint x_row_stride = arg_u32(17);
     const uint y_stride_param = arg_u32(18);
-    const uint rows_per_tg = 8u * G16_R6;
+    const uint rows_per_tg = 32u;
     uint tg = gl_WorkGroupID.x;
     uint set = 0u;
     uint N = arg_u32(12);
@@ -564,104 +541,92 @@ void main() {
     }
     const uint64_t W = arg(1u + set);
     const uint64_t Y = arg(5u + set);
-    const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
-    const uint n0 = (tg * 8u + gl_SubgroupID) * G16_R6;
+    const uint64_t y_row_stride = uint64_t(y_stride_param != 0u ? y_stride_param : N);
+    const uint n0 = (tg * 8u + gl_SubgroupID) * 4u;
     if (n0 >= N) return;
     const uint lane = gl_SubgroupInvocationID;
-    const uint ix = lane >> 3u, t_sub = lane & 7u;
-    const uint n_half = t_sub >> 2u, q_sub = t_sub & 3u;
-    const uint64_t x_base = X + 4u * (uint64_t(n0 / x_group) * uint64_t(K) + uint64_t(t_sub) * 32u);
-    const uint nb = K >> 8u;
-#if defined(KERNEL_g16_gemv_q6_k_m1)
-    uint64_t w_rows[4];
-    [[unroll]] for (uint r = 0u; r < 4u; r++) w_rows[r] = W + uint64_t(min(n0 + r, N - 1u)) * uint64_t(row_bytes);
-    precise float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
-    for (uint b = ix; b < nb; b += 4u) {
-        const uint64_t xt = x_base + uint64_t(b) * 1024u;
-        vec4 xv[8];
-        [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(xt + 16u * q).v[0];
-        const uint64_t bo = uint64_t(b) * 210u;
-        acc0 = g16_q6k_dot_xv(w_rows[0] + bo, n_half, q_sub, xv, acc0);
-        acc1 = g16_q6k_dot_xv(w_rows[1] + bo, n_half, q_sub, xv, acc1);
-        acc2 = g16_q6k_dot_xv(w_rows[2] + bo, n_half, q_sub, xv, acc2);
-        acc3 = g16_q6k_dot_xv(w_rows[3] + bo, n_half, q_sub, xv, acc3);
-    }
-    acc0 = subgroupAdd(acc0);
-    acc1 = subgroupAdd(acc1);
-    acc2 = subgroupAdd(acc2);
-    acc3 = subgroupAdd(acc3);
-    if (lane == 0u) {
-        F32(Y).v[n0] = acc0;
-        if (n0 + 1u < N) F32(Y).v[n0 + 1u] = acc1;
-        if (n0 + 2u < N) F32(Y).v[n0 + 2u] = acc2;
-        if (n0 + 3u < N) F32(Y).v[n0 + 3u] = acc3;
-    }
-#else
-    const uint64_t w_row = W + uint64_t(n0) * uint64_t(row_bytes);
+    const uint grp = lane >> 3u;
+    const uint l = lane & 7u;
+    const uint n_half = l >> 2u, q_sub = l & 3u;
+    const uint n = n0 + grp;
+    const uint64_t w_row = W + uint64_t(min(n, N - 1u)) * uint64_t(row_bytes);
+    const uint64_t x_base = X + 4u * (uint64_t(min(n, N - 1u) / x_group) * uint64_t(K) + uint64_t(l) * 32u);
     const uint64_t x_stride_b = 4u * uint64_t(x_row_stride);
     const uint lshift = 4u * (q_sub >> 1u), hshift = 2u * q_sub;
-    precise float acc[GEMV6_M];
+    const uint nb = K >> 8u;
+    float acc[GEMV6_M];
     [[unroll]] for (uint i = 0u; i < GEMV6_M; i++) acc[i] = 0.0;
-    for (uint b_idx = ix; b_idx < nb; b_idx += 4u) {
+    for (uint b_idx = 0u; b_idx < nb; b_idx++) {
         const uint64_t b = w_row + uint64_t(b_idx) * 210u;
         const float d = glm53_h2f(uint(U16(b).v[104]));
         const uint sw = uint(U16(b + 192u).v[4u * n_half + q_sub]);
-        const float s0 = d * float(int(sw << 24) >> 24);
-        const float s1 = d * float(int(sw << 16) >> 24);
+        const float s0 = g16_pmul(d, float(int(sw << 24) >> 24));
+        const float s1 = g16_pmul(d, float(int(sw << 16) >> 24));
         const uint64_t ql = b + 64u * n_half + 32u * (q_sub & 1u);
         const uint64_t qh = b + 128u + 32u * n_half;
         const uint64_t xt = x_base + uint64_t(b_idx) * 1024u;
-        precise float a0[GEMV6_M], a1[GEMV6_M];
+        float a0[GEMV6_M], a1[GEMV6_M];
         [[unroll]] for (uint i = 0u; i < GEMV6_M; i++) { a0[i] = 0.0; a1[i] = 0.0; }
-        [[unroll]] for (uint g = 0u; g < 4u; g++) {
+        [[unroll]] for (uint g = 0u; g < 2u; g++) {
             const u16vec4 lo = G16Q6Pairs(ql).v[g];
             const u16vec4 hi = G16Q6Pairs(qh).v[g];
-            const uvec4 l4 = uvec4(lo) >> lshift;
-            const uvec4 h4 = uvec4(hi) >> hshift;
-            const vec4 w0 = vec4(
-                float(int((l4.x & 0xfu) | ((h4.x & 3u) << 4u)) - 32),
-                float(int(((l4.x >> 8u) & 0xfu) | (((h4.x >> 8u) & 3u) << 4u)) - 32),
-                float(int((l4.y & 0xfu) | ((h4.y & 3u) << 4u)) - 32),
-                float(int(((l4.y >> 8u) & 0xfu) | (((h4.y >> 8u) & 3u) << 4u)) - 32));
-            const vec4 w1 = vec4(
-                float(int((l4.z & 0xfu) | ((h4.z & 3u) << 4u)) - 32),
-                float(int(((l4.z >> 8u) & 0xfu) | (((h4.z >> 8u) & 3u) << 4u)) - 32),
-                float(int((l4.w & 0xfu) | ((h4.w & 3u) << 4u)) - 32),
-                float(int(((l4.w >> 8u) & 0xfu) | (((h4.w >> 8u) & 3u) << 4u)) - 32));
+            const uint lw0 = pack32(lo.xy), lw1 = pack32(lo.zw);
+            const uint hw0 = pack32(hi.xy), hw1 = pack32(hi.zw);
+            const uint q0 = ((lw0 >> lshift) & 0x0f0f0f0fu) | (((hw0 >> hshift) & 0x03030303u) << 4u);
+            const uint q1 = ((lw1 >> lshift) & 0x0f0f0f0fu) | (((hw1 >> hshift) & 0x03030303u) << 4u);
+            const f16vec2 w02 = uint16BitsToFloat16(unpack16(0x64006400u | (q0 & 0x003f003fu))) - f16vec2(1056.0);
+            const f16vec2 w13 = uint16BitsToFloat16(unpack16(0x64006400u | ((q0 >> 8u) & 0x003f003fu))) - f16vec2(1056.0);
+            const f16vec2 w46 = uint16BitsToFloat16(unpack16(0x64006400u | (q1 & 0x003f003fu))) - f16vec2(1056.0);
+            const f16vec2 w57 = uint16BitsToFloat16(unpack16(0x64006400u | ((q1 >> 8u) & 0x003f003fu))) - f16vec2(1056.0);
             [[unroll]] for (uint i = 0u; i < GEMV6_M; i++) {
                 const uint64_t xp = xt + uint64_t(i) * x_stride_b + 32u * g;
                 const vec4 x0 = F32x4(xp).v[0];
                 const vec4 x1 = F32x4(xp + 16u).v[0];
-                if (g < 2u) {
-                    a0[i] = fma(w0.x, x0.x, a0[i]);
-                    a0[i] = fma(w0.y, x0.y, a0[i]);
-                    a0[i] = fma(w0.z, x0.z, a0[i]);
-                    a0[i] = fma(w0.w, x0.w, a0[i]);
-                    a0[i] = fma(w1.x, x1.x, a0[i]);
-                    a0[i] = fma(w1.y, x1.y, a0[i]);
-                    a0[i] = fma(w1.z, x1.z, a0[i]);
-                    a0[i] = fma(w1.w, x1.w, a0[i]);
-                } else {
-                    a1[i] = fma(w0.x, x0.x, a1[i]);
-                    a1[i] = fma(w0.y, x0.y, a1[i]);
-                    a1[i] = fma(w0.z, x0.z, a1[i]);
-                    a1[i] = fma(w0.w, x0.w, a1[i]);
-                    a1[i] = fma(w1.x, x1.x, a1[i]);
-                    a1[i] = fma(w1.y, x1.y, a1[i]);
-                    a1[i] = fma(w1.z, x1.z, a1[i]);
-                    a1[i] = fma(w1.w, x1.w, a1[i]);
-                }
+                a0[i] = g16_pfma(float(w02.x), x0.x, a0[i]);
+                a0[i] = g16_pfma(float(w13.x), x0.y, a0[i]);
+                a0[i] = g16_pfma(float(w02.y), x0.z, a0[i]);
+                a0[i] = g16_pfma(float(w13.y), x0.w, a0[i]);
+                a0[i] = g16_pfma(float(w46.x), x1.x, a0[i]);
+                a0[i] = g16_pfma(float(w57.x), x1.y, a0[i]);
+                a0[i] = g16_pfma(float(w46.y), x1.z, a0[i]);
+                a0[i] = g16_pfma(float(w57.y), x1.w, a0[i]);
+            }
+        }
+        [[unroll]] for (uint g = 2u; g < 4u; g++) {
+            const u16vec4 lo = G16Q6Pairs(ql).v[g];
+            const u16vec4 hi = G16Q6Pairs(qh).v[g];
+            const uint lw0 = pack32(lo.xy), lw1 = pack32(lo.zw);
+            const uint hw0 = pack32(hi.xy), hw1 = pack32(hi.zw);
+            const uint q0 = ((lw0 >> lshift) & 0x0f0f0f0fu) | (((hw0 >> hshift) & 0x03030303u) << 4u);
+            const uint q1 = ((lw1 >> lshift) & 0x0f0f0f0fu) | (((hw1 >> hshift) & 0x03030303u) << 4u);
+            const f16vec2 w02 = uint16BitsToFloat16(unpack16(0x64006400u | (q0 & 0x003f003fu))) - f16vec2(1056.0);
+            const f16vec2 w13 = uint16BitsToFloat16(unpack16(0x64006400u | ((q0 >> 8u) & 0x003f003fu))) - f16vec2(1056.0);
+            const f16vec2 w46 = uint16BitsToFloat16(unpack16(0x64006400u | (q1 & 0x003f003fu))) - f16vec2(1056.0);
+            const f16vec2 w57 = uint16BitsToFloat16(unpack16(0x64006400u | ((q1 >> 8u) & 0x003f003fu))) - f16vec2(1056.0);
+            [[unroll]] for (uint i = 0u; i < GEMV6_M; i++) {
+                const uint64_t xp = xt + uint64_t(i) * x_stride_b + 32u * g;
+                const vec4 x0 = F32x4(xp).v[0];
+                const vec4 x1 = F32x4(xp + 16u).v[0];
+                a1[i] = g16_pfma(float(w02.x), x0.x, a1[i]);
+                a1[i] = g16_pfma(float(w13.x), x0.y, a1[i]);
+                a1[i] = g16_pfma(float(w02.y), x0.z, a1[i]);
+                a1[i] = g16_pfma(float(w13.y), x0.w, a1[i]);
+                a1[i] = g16_pfma(float(w46.x), x1.x, a1[i]);
+                a1[i] = g16_pfma(float(w57.x), x1.y, a1[i]);
+                a1[i] = g16_pfma(float(w46.y), x1.z, a1[i]);
+                a1[i] = g16_pfma(float(w57.y), x1.w, a1[i]);
             }
         }
         [[unroll]] for (uint i = 0u; i < GEMV6_M; i++) {
-            acc[i] = fma(s0, a0[i], acc[i]);
-            acc[i] = fma(s1, a1[i], acc[i]);
+            const float blk_v = g16_padd(g16_pmul(s0, a0[i]), g16_pmul(s1, a1[i]));
+            acc[i] = g16_padd(acc[i], blk_v);
         }
     }
-    [[unroll]] for (uint i = 0u; i < GEMV6_M; i++) {
-        const float v = subgroupAdd(acc[i]);
-        if (lane == 0u) F32(Y).v[i * y_row_stride + n0] = v;
+    float out_v[GEMV6_M];
+    [[unroll]] for (uint i = 0u; i < GEMV6_M; i++) out_v[i] = g16_reduce8(acc[i]);
+    if (l == 0u && n < N) {
+        [[unroll]] for (uint i = 0u; i < GEMV6_M; i++)
+            F32(Y + 4u * (uint64_t(i) * y_row_stride + uint64_t(n))).v[0] = out_v[i];
     }
-#endif
 }
 #endif

@@ -3790,7 +3790,9 @@ fn moe_rows_timing() {
 fn gemv_rows_match_one_row_exactly() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(45);
-    for ty in [GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q8_0, GgmlType::Iq4Nl] {
+    for ty in
+        [GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K, GgmlType::Q8_0, GgmlType::Iq4Nl]
+    {
         for (cols, rows) in [(2816usize, 72usize), (4096, 40)] {
             let raw = random_blocks(&mut rng, ty, rows * cols);
             let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
@@ -3841,7 +3843,7 @@ fn gemv_g16_edges_match_cpu() {
     let strided = weight(40);
     let out = |n: usize| tensor(&ctx, &vec![UNWRITTEN; n + TAIL]);
     let g16 = |m: usize, l: &GemvLayout| {
-        g16_gemv_name(&ctx, ty, cols, m, l.x_group, l.x_row_stride)
+        g16_gemv_name(&ctx, ty, cols, m, 44, l.x_group, l.x_row_stride)
     };
     for m in 1..=GEMV_MAX_ROWS {
         // gemv_sets: one input row for all three sets (x_group 44).
@@ -3895,7 +3897,9 @@ fn gemv_g16_edges_match_cpu() {
     for m in 1..=GEMV_MAX_ROWS {
         for (x_group, x_row_stride, takes) in [
             (44, cols, true),
+            (45, cols, true),
             (4, 10 * cols, true),
+            (3, 10 * cols, false),
             (40, cols + 1, false),
             (40, cols + 4, true),
             (40, cols + 6, false),
@@ -3907,6 +3911,134 @@ fn gemv_g16_edges_match_cpu() {
                 "x_group {x_group} stride {x_row_stride} at m={m}"
             );
         }
+    }
+    // Zero x_group is rejected cleanly (never panics in div_ceil).
+    let tx_zero = zeros(&ctx, cols);
+    let ty_zero = zeros(&ctx, strided.0.rows);
+    let zero_l = GemvLayout { x_group: 0, x_row_stride: cols, y_row_stride: 0 };
+    run(&ctx, |p| {
+        assert!(
+            gemv_with(&ctx, p, &strided.0, &tx_zero, &ty_zero, 1, zero_l).is_err(),
+            "x_group == 0 must return an error"
+        );
+    });
+    // Tiny normal F32 activation (2^-126) with quant code 1 and effective scale 1
+    // must preserve the normal result (no delayed-rescaling underflow to zero).
+    let tiny = f32::from_bits(0x0080_0000);
+    let mut x_tiny = vec![0.0f32; cols];
+    x_tiny[0] = tiny;
+    let tx_tiny = tensor(&ctx, &x_tiny);
+    for ty in [GgmlType::Q4K, GgmlType::Q5K] {
+        let mut raw = vec![0u8; ty.row_bytes(cols).unwrap()];
+        // d = 1.0f16 (0x3c00), dmin = 0.0f16, scale[0] = 1, first quant code = 1.
+        raw[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        raw[4] = 1;
+        let qs_off = if ty == GgmlType::Q5K { 48 } else { 16 };
+        raw[qs_off] = 1;
+        let w_tiny = QWeight::from_bytes(&ctx, &raw, ty, cols, 1).unwrap();
+        let y_tiny = zeros(&ctx, 1);
+        run(&ctx, |p| gemv(&ctx, p, &w_tiny, &tx_tiny, &y_tiny, 1).unwrap());
+        assert_eq!(
+            y_tiny.to_f32().unwrap()[0].to_bits(),
+            tiny.to_bits(),
+            "{ty:?} tiny normal activation must not underflow"
+        );
+    }
+    // G16-specific per-block cancellation checks (the generic 16-lane reduction
+    // combines different lanes first, so gate these exact assertions on ctx.g16()).
+    if ctx.g16() {
+        // Later block with equal scale and minimum terms (both within one sub-block,
+        // across the two sub-blocks of a lane, and with rounded products) must not
+        // wipe out an earlier block's small contribution (0.03125).
+        for ty in [GgmlType::Q4K, GgmlType::Q5K] {
+            let k_cancel = 512usize;
+            let bb = ty.block_bytes();
+            let qs_off = if ty == GgmlType::Q5K { 48 } else { 16 };
+            for mode in 0u8..3u8 {
+                let mut raw = vec![0u8; 2 * bb];
+                // Block 0: d = 0.03125, dmin = 0, scale[0] = 1, q[0] = 1 -> +0.03125.
+                raw[0..2].copy_from_slice(&f16::from_f32(0.03125).to_bits().to_le_bytes());
+                raw[4] = 1;
+                raw[qs_off] = 1;
+                // Block 1:
+                // mode 0: same-subblock exact (+2^20 - 2^20 = 0)
+                // mode 1: cross-subblock exact (+2^20) + (-2^20) = 0
+                // mode 2: same-subblock rounded products (d=dmin=1536, x=1024 + 2^-13) -> 0
+                let b1 = &mut raw[bb..2 * bb];
+                let d1 = if mode == 2 { 1536.0 } else { 1024.0 };
+                b1[0..2].copy_from_slice(&f16::from_f32(d1).to_bits().to_le_bytes());
+                b1[2..4].copy_from_slice(&f16::from_f32(d1).to_bits().to_le_bytes());
+                b1[4] = 1;
+                b1[if mode == 1 { 9 } else { 8 }] = 1;
+                b1[qs_off] = 1;
+                let w_c = QWeight::from_bytes(&ctx, &raw, ty, k_cancel, 1).unwrap();
+                let x_val = if mode == 2 { 1024.0 + 2.0f32.powi(-13) } else { 1024.0 };
+                let mut xc = vec![0.0f32; 2 * k_cancel];
+                for r in 0..2 {
+                    xc[r * k_cancel] = 1.0;
+                    xc[r * k_cancel + 256] = x_val;
+                    if mode == 1 {
+                        xc[r * k_cancel + 288] = x_val;
+                    }
+                }
+                let tx1 = tensor(&ctx, &xc[..k_cancel]);
+                let tx2 = tensor(&ctx, &xc);
+                let y1 = zeros(&ctx, 1);
+                let y2 = zeros(&ctx, 2);
+                run(&ctx, |p| {
+                    gemv(&ctx, p, &w_c, &tx1, &y1, 1).unwrap();
+                    gemv(&ctx, p, &w_c, &tx2, &y2, 2).unwrap();
+                });
+                let got1 = y1.to_f32().unwrap();
+                let got2 = y2.to_f32().unwrap();
+                assert_eq!(
+                    got1[0], 0.03125,
+                    "{ty:?} mode={mode} m=1 lost earlier block to zero-net later block"
+                );
+                assert_eq!(got2[0].to_bits(), got1[0].to_bits(), "{ty:?} m=2 row 0 mismatch");
+                assert_eq!(got2[1].to_bits(), got1[0].to_bits(), "{ty:?} m=2 row 1 mismatch");
+            }
+        }
+        // Q6_K: block 0 contributes +0.03125, block 1's two halves contribute +2^20 and -2^20.
+        let k_q6 = 512usize;
+        let bb6 = GgmlType::Q6K.block_bytes();
+        let mut raw6 = vec![0u8; 2 * bb6];
+        // Initialize all Q6_K codes to 32 (decoded weight 0): low nibble 0, high 2 bits = 2 (0xaa).
+        for blk in raw6.chunks_exact_mut(bb6) {
+            blk[128..192].fill(0xaa);
+        }
+        // Block 0: d = 0.03125, scale[0] = 1, q[0] = 33 (decoded +1) -> +0.03125.
+        raw6[208..210].copy_from_slice(&f16::from_f32(0.03125).to_bits().to_le_bytes());
+        raw6[192] = 1;
+        raw6[0] = 1;
+        // Block 1: d = 1024.0, scale[0] = 1, scale[1] = -1, q[0] = 33 (+1), q[16] = 33 (+1)
+        // with x[256] = 1024.0, x[272] = 1024.0 -> (+2^20) + (-2^20) = 0.
+        let b1 = &mut raw6[bb6..2 * bb6];
+        b1[208..210].copy_from_slice(&f16::from_f32(1024.0).to_bits().to_le_bytes());
+        b1[192] = 1;
+        b1[193] = 0xff; // int8(-1)
+        b1[0] = 1;
+        b1[16] = 1;
+        let w6 = QWeight::from_bytes(&ctx, &raw6, GgmlType::Q6K, k_q6, 1).unwrap();
+        let mut x6 = vec![0.0f32; 2 * k_q6];
+        for r in 0..2 {
+            x6[r * k_q6] = 1.0;
+            x6[r * k_q6 + 256] = 1024.0;
+            x6[r * k_q6 + 272] = 1024.0;
+        }
+        let tx1 = tensor(&ctx, &x6[..k_q6]);
+        let tx2 = tensor(&ctx, &x6);
+        let y1 = zeros(&ctx, 1);
+        let y2 = zeros(&ctx, 2);
+        run(&ctx, |p| {
+            gemv(&ctx, p, &w6, &tx1, &y1, 1).unwrap();
+            gemv(&ctx, p, &w6, &tx2, &y2, 2).unwrap();
+        });
+        let got1 = y1.to_f32().unwrap();
+        let got2 = y2.to_f32().unwrap();
+        assert_eq!(got1[0], 0.03125, "Q6_K m=1 lost earlier block to cancelling halves");
+        assert_eq!(got2[0].to_bits(), got1[0].to_bits(), "Q6_K m=2 row 0 mismatch");
+        assert_eq!(got2[1].to_bits(), got1[0].to_bits(), "Q6_K m=2 row 1 mismatch");
     }
 }
 
@@ -4284,25 +4416,46 @@ fn g16_q8_0_wide_verify_matches_single_row_exact() {
         return;
     }
     let mut rng = StdRng::seed_from_u64(0x6160_0008);
-    let n = 132usize;
-    for k in [1024usize, 2048usize] {
+    // Includes K = 1056 (tasks = 33, not divisible by 8), odd N = 133, and
+    // padded x/y strides to cover partial tail blocks and 64-bit addressing.
+    for (k, n, x_stride, y_stride) in [
+        (1024usize, 132usize, 1024usize, 132usize),
+        (2048, 132, 2048, 132),
+        (1056, 133, 1060, 140),
+    ] {
         let raw = random_blocks(&mut rng, GgmlType::Q8_0, n * k);
         let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, k, n).unwrap();
-        for m in 5usize..=8usize {
-            let x = f32s(&mut rng, m * k, -1.0, 1.0);
+        let cpu = mat(GgmlType::Q8_0, &raw, n, k);
+        let l = GemvLayout {
+            x_group: n,
+            x_row_stride: x_stride,
+            y_row_stride: y_stride,
+        };
+        for m in 2usize..=8usize {
+            let x = f32s(&mut rng, (m - 1) * x_stride + k, -1.0, 1.0);
             let tx = tensor(&ctx, &x);
-            let y_wide = zeros(&ctx, m * n);
-            run(&ctx, |p| gemv(&ctx, p, &w, &tx, &y_wide, m).unwrap());
+            let y_wide = zeros(&ctx, (m - 1) * y_stride + n);
+            run(&ctx, |p| gemv_with(&ctx, p, &w, &tx, &y_wide, m, l).unwrap());
             let got = y_wide.to_f32().unwrap();
             for r in 0..m {
-                let xr = tensor(&ctx, &x[r * k..(r + 1) * k]);
+                let row_x = &x[r * x_stride..r * x_stride + k];
+                let xr = tensor(&ctx, row_x);
                 let y1 = zeros(&ctx, n);
-                run(&ctx, |p| gemv(&ctx, p, &w, &xr, &y1, 1).unwrap());
-                assert_eq!(
-                    &got[r * n..(r + 1) * n],
-                    y1.to_f32().unwrap().as_slice(),
-                    "G16 Q8_0 k={k} m={m} row {r} must be bit-identical to m=1"
-                );
+                let l1 = GemvLayout { x_group: n, x_row_stride: k, y_row_stride: n };
+                run(&ctx, |p| gemv_with(&ctx, p, &w, &xr, &y1, 1, l1).unwrap());
+                let want = y1.to_f32().unwrap();
+                let slice = &got[r * y_stride..r * y_stride + n];
+                for (j, (a, b)) in slice.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "G16 Q8_0 k={k} n={n} m={m} row {r} col {j} must be bit-identical to m=1"
+                    );
+                }
+                if m == 2 && k == 1056 {
+                    let expected = cpu.mv(row_x);
+                    assert_close(slice, &expected, 1e-4, 1e-4);
+                }
             }
         }
     }
