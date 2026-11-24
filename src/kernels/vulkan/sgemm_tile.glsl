@@ -39,7 +39,7 @@ void SGT_NAME(uint n0, uint rows, uint64_t W, uint N, uint K, uint row_bytes) {
             float w[8];
             sg_decode8(w_row, k0 + dk + 8u * h, w);
             [[unroll]] for (uint k = 0u; k < 8u; k++) {
-                sg_w[(dk + 8u * h + k) * w_stride + (dr >> 2u)][dr & 3u] = float16_t(w[k]);
+                sg_w[(dk + 8u * h + k) * w_stride + (dr >> 2u)][dr & 3u] = float16BitsToUint16(float16_t(w[k]));
             }
         }
 #if SGT_TR == 64 && SGT_KS == 32
@@ -69,7 +69,7 @@ void SGT_NAME(uint n0, uint rows, uint64_t W, uint N, uint K, uint row_bytes) {
             [[unroll]] for (uint i = 0u; i < 8u; i++) prev16[i] = a16[i];
 #endif
             [[unroll]] for (uint k = 0u; k < SGT_KS; k++) {
-                const f16vec4 w = sg_w[k * w_stride + 32u * ng + lane];
+                const f16vec4 w = uint16BitsToFloat16(sg_w[k * w_stride + 32u * ng + lane]);
                 const f16vec4 xa = sg_x[k * x_stride + 2u * mg];
                 const f16vec4 xb = sg_x[k * x_stride + 2u * mg + 1u];
                 a16[0] = fma(f16vec4(xa.x), w, a16[0]);
@@ -91,18 +91,24 @@ void SGT_NAME(uint n0, uint rows, uint64_t W, uint N, uint K, uint row_bytes) {
                     [[unroll]] for (uint i = 0u; i < 8u; i++) acc[i] += vec4(prev16[i]);
                 }
 #endif
-                for (uint k = 0u; k < SGT_KS; k++) {
-                    const vec4 w = vec4(sg_w[k * w_stride + 32u * ng + lane]);
-                    const vec4 xa = vec4(sg_x[k * x_stride + 2u * mg]);
-                    const vec4 xb = vec4(sg_x[k * x_stride + 2u * mg + 1u]);
-                    acc[0] = fma(vec4(xa.x), w, acc[0]);
-                    acc[1] = fma(vec4(xa.y), w, acc[1]);
-                    acc[2] = fma(vec4(xa.z), w, acc[2]);
-                    acc[3] = fma(vec4(xa.w), w, acc[3]);
-                    acc[4] = fma(vec4(xb.x), w, acc[4]);
-                    acc[5] = fma(vec4(xb.y), w, acc[5]);
-                    acc[6] = fma(vec4(xb.z), w, acc[6]);
-                    acc[7] = fma(vec4(xb.w), w, acc[7]);
+                const uint col_base = 128u * ng + 4u * lane;
+                for (uint c = 0u; c < 4u; c++) {
+                    const uint64_t cw = W + uint64_t(min(col_base + c, N - 1u - n0)) * row_bytes;
+                    for (uint q = 0u; q < (SGT_KS / 8u); q++) {
+                        float wc[8];
+                        sg_decode8(cw, k0 + 8u * q, wc);
+                        for (uint i = 0u; i < 8u; i++) {
+                            const uint64_t xp = arg(0) + 4u * (sg_x_row(min(m_lo + i, rows - 1u)) + k0 + 8u * q);
+                            const vec4 x0 = F32x4(xp).v[0];
+                            const vec4 x1 = F32x4(xp + 16u).v[0];
+                            float s = acc[i][c];
+                            s = fma(wc[0], x0.x, s); s = fma(wc[1], x0.y, s);
+                            s = fma(wc[2], x0.z, s); s = fma(wc[3], x0.w, s);
+                            s = fma(wc[4], x1.x, s); s = fma(wc[5], x1.y, s);
+                            s = fma(wc[6], x1.z, s); s = fma(wc[7], x1.w, s);
+                            acc[i][c] = s;
+                        }
+                    }
                 }
 #if SGT_KS == 16
                 [[unroll]] for (uint i = 0u; i < 8u; i++) a16[i] = f16vec4(0.0);
