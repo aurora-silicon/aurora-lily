@@ -39,7 +39,7 @@ leaves the GPU, and fits the longest context that budget allows.
   Pro use the same kernels; their GPUs and memory bandwidth are smaller, so
   expect lower numbers than the tables below.
 - **M4 family** (no matrix units): Qwen3.5-4B and 9B run with embedded MTP
-  heads. Gemma 4 and Inkling 2 Mini run with f32 GEMMs and decode kernels
+  heads. Gemma 4 and Inkling 2 Mini run with tiled GEMMs and decode kernels
   tuned for the M4's GPU (Inkling 2 Mini also runs its DSpark speculative
   drafter on the GPU, [docs/inkling2.md](docs/inkling2.md)). Agnes 3.0 Flash
   has a path without matrix units too, verified on another GPU without them
@@ -47,11 +47,11 @@ leaves the GPU, and fits the longest context that budget allows.
   other models' kernels need matrix units and are refused on these GPUs.
   Mesa offers the M4 8 x 8 cooperative matrices, which run on the same ALUs
   as its FMAs; lily's matrix kernels need the M5's 16 x 16 ones, so the M4
-  keeps the f32 path.
+  keeps the tiled GEMM path.
 - **M1 to M3 families** (no matrix units either): these take the same path
   as the M4, selected the same way, so the same models are offered and the others
   are refused. Measured once on a 16-inch M1 Max (64 GB, Linux, Mesa
-  Honeykrisp) with Gemma 4 UD-IQ2_M: about 42 tokens/s decode and about
+  Borealis) with Gemma 4 UD-IQ2_M: about 42 tokens/s decode and about
   300 tokens/s prefill on a 4 452-token prompt, loaded in 4.9 s
   ([#38](https://github.com/aurora-silicon/aurora-lily/issues/38)). Other
   models and flags on these GPUs are untested.
@@ -102,122 +102,28 @@ Neither project publishes M5 Max numbers for the other models.
 
 ### Linux, M4 (16 GB)
 
-Measured on a 16 GB M4 MacBook Air (J713, 10-core CPU, 8-core GPU, fanless, on AC).
+Measured 2026-11-24 on a 16 GB M4 MacBook Air (J713, 10-core CPU, 8-core GPU, fanless, on AC) at
+`main` (`5a447c6`) with Linux 7.3.0 and Mesa Borealis, cool start below 54 °C. Rates are tokens per
+second from the model `bench`, `spec`, and `profile` commands (64 greedy output tokens):
 
-#### Inkling 2 Mini
+| Model           | Weights    |     Prefill | Decode, plain | Decode, drafted | Notes                                                        |
+|-----------------|------------|------------:|--------------:|----------------:|--------------------------------------------------------------|
+| Qwen3.5-4B      | Q4_K       |       203.1 |          30.5 |       35.4–37.0 | 1K / 256p; `--drafts 2`, 83–86% accepted                     |
+| Gemma 4 26B-A4B | UD-IQ2_M   | 173.2–177.6 |     27.3–30.4 |       37.9–38.0 | 256p–1K; `--drafts 2`, 73% accepted on a coding prompt       |
+| Inkling 2 Mini  | UD-Q2_K_XL |       100.1 |     19.1–19.8 |            30.6 | 256p bench; drafted is `profile` `verify(4)` (3.27 tok/step) |
 
-`Inkling-2-Mini-UD-Q2_K_XL.gguf` (9.14 GB) with `dspark-Inkling-2-Mini-Q8_0.gguf` (0.40 GB) beside it,
-using the 16 GB command below (`--memory-limit-gb 10.6`: 11.4 GB on the GPU, up to 37 852 tokens of
-context with 1 snapshot and DSpark; see [docs/inkling2.md](docs/inkling2.md)). Measured 2026-11-21 on
-`main` (`10d70c2`, [#44](https://github.com/aurora-silicon/aurora-lily/pull/44)) with Linux 7.3.0 and
-Mesa Borealis:
-
-| Mode                                            |     Decode |    Prefill | Notes                                                         |
-|-------------------------------------------------|-----------:|-----------:|---------------------------------------------------------------|
-| Served `/v1/chat/completions`, `--mtp-drafts 3` | 17.8 tok/s |          – | 73 generated tokens, 50/66 drafts accepted (75.8%), 19.5 tok/s GPU steady-state |
-| `lily-inkling2 profile`, `--mtp-drafts 0`       | 15.6 tok/s |          – | 64.2 ms/tok plain decode (up from 13.0 tok/s / 77.2 ms/tok)   |
-| `lily-inkling2 bench`, 512-token prompt (hot, 93–96 °C) | 16.4 tok/s | 95.0 tok/s | 256-row chunks, `--mtp-drafts 3` (114.0 tok/s warm prefill; up from 44.1 tok/s hot) |
-
-- On the tested greedy chat request (73 generated tokens), DSpark (`--mtp-drafts 3`) produced the same
-  token IDs as plain decode (`--mtp-drafts 0`).
-- As with Gemma 4 below, the fanless Air throttles under sustained load, so long runs may measure lower.
-
-#### Gemma 4 26B-A4B
-
-Gemma 4 UD-IQ2_M with the 16 GB command below (`--memory-limit-gb 10.2`: 512-row prompt runs,
-21 760 tokens of context, 10.1 GB on the GPU). Measured 2026-11-15 on `main` (9211b45) with #34,
-Mesa `aurora-wip` (19fff1a) plus the AGX compiler pull requests #370 to #375, #379 to #381 and #386.
-
-Served, the same five requests as the M5 Max table, twice, starting below 60 °C:
-
-| Memory | Model   | Weights  | Decode | Prefill, long prompt | Prefill, short prompts |
-|--------|---------|----------|-------:|---------------------:|-----------------------:|
-| 16 GB  | Gemma 4 | UD-IQ2_M |  19–27 |              107–111 |                  41–71 |
-
-`lily-gemma4 bench`, starting below 60 °C:
-
-| Prompt | Prefill       | Decode step                   |
-|--------|---------------|-------------------------------|
-| 1K     | 172 tok/s     | 39.7–40.4 ms (about 25 tok/s) |
-| 4K     | 128–134 tok/s | 42 ms                         |
-
-- The fanless Air clocks down under sustained load: over the five requests the die reaches 80 °C and
-  decode falls from 27 to 19 tok/s. Back-to-back benches drop 1K prefill to 130–155 tok/s.
-- Short prompts mostly measure fixed per-request costs (about 0.8 s each).
-
-#### J713 engine benchmarks
-
-On 2026-11-18, the 16 GB M4 ran the first 1,024 tokens of `src/qwen36/model.rs`
-through the model-specific `bench` commands with 64 greedy output tokens.
-Gemma used its 512-row low-memory prompt setting. The baseline and optimized
-builds used the same GGUF and driver in alternating order. Rates are tokens/s.
-
-| Model | Prefill before | Prefill after | Decode before | Decode after |
-|-------|---------------:|--------------:|--------------:|-------------:|
-| Qwen3.5-4B Q4_K | 163 | 196 | 21.3 | 23.6 |
-| Gemma 4 26B-A4B UD-IQ2_M | 174 | 185 | 26.7 | 27.2 |
-
-On 2026-11-24, the same 16 GB M4 (fanless, heat-soaked to 83–100 °C die
-temperature before measuring) ran ABBA interleaved benchmarks against `main`
-(`07acf0a`) with the packaged Borealis driver (`d4ad4a4dce6`) and Linux
-`7.3.0-ewb-daily`: FP16-tiled `sgemm` with direct 8-value decoders, grouped
-`sgemm` MoE prefill for Inkling 2 Mini, G16 `Q8_0`/`Q6_K` decode GEMVs, and
-zero-spill Inkling 2 verify shaders. Rates are hot-state ABBA means in
-tokens/s:
-
-| Model | Workload | Die temp | Prefill before | Prefill after | Decode before | Decode after |
-|-------|----------|---------:|---------------:|--------------:|--------------:|-------------:|
-| Inkling 2 Mini UD-Q2_K_XL + DSpark | 512p / 64d (`--mtp-drafts 3`) | 93–100 °C | 44.1 | 95.0 (+115%) | 15.4 | 16.4 (+6.8%) |
-| Gemma 4 26B-A4B UD-IQ2_M | 1024p / 64d (512-row chunks) | 84–99 °C | 132.3 | 162.8 (+23.0%) | 20.7 | 22.7 (+9.5%) |
-| Qwen3.5-4B Q4_K | 1024p / 64d | 83–84 °C | 127.9 | 147.9 (+15.7%) | 21.4 | 22.4 (+4.9%) |
-
-At 256 prompt tokens, the optimized builds reached 196 tokens/s prefill on
-Qwen and 178 on Gemma. Small Gemma expert batches reuse their decoded weights
-for 16 input rows. Qwen reads only the eight Q4_K codes its prefill tile
-needs. The full-model greedy digests matched at both lengths. On three
-source-code continuations (48 scored positions per model), Qwen matched
-every reported token NLL, top token and margin. Gemma's full-vocabulary
-f16 log-probability dumps matched byte for byte.
-
-Qwen used Honeykrisp `57df4db849a` with Mesa PRs #370, #371, #372, #374,
-#375, #379, #380, #386 and #388. Gemma used the packaged driver
-`d4ad4a4dce6`. The PR build also passed the GPU kernel checks, but its
-system-memory reserve refused the full Gemma allocation with the desktop
-running. The fanless machine's short-run rates exceed its warm sustained
-rates on some workloads.
-
-#### Qwen3.5 for coding on the 16 GB M4
-
-Start from bartowski's BF16 text GGUF with its embedded MTP layer. Lily's
-fused recurrent projections need a common quantization type. This recipe
-uses Q4_K for those projections and Q8_0 for the vocabulary matrices.
-Use a separate directory for each model. With a recent llama.cpp build:
-
-```sh
-size=4B  # or 9B
-file="Qwen_Qwen3.5-${size}-bf16.gguf"
-curl -fL --retry 3 -o "$file" \
-  "https://huggingface.co/bartowski/Qwen_Qwen3.5-${size}-GGUF/resolve/main/$file"
-llama-quantize --pure --token-embedding-type q8_0 --output-tensor-type q8_0 \
-  --tensor-type ssm_alpha=q4_k --tensor-type ssm_beta=q4_k \
-  "$file" "Qwen3.5-${size}-Q4_K.gguf" Q4_K
-
-# Use the Borealis environment under Running it.
-lily --model "Qwen3.5-${size}-Q4_K.gguf" --max-seq 16384 \
-  --memory-limit-gb 9 --mtp-drafts 2
-```
-
-On the J713, greedy 4B code generation with thinking disabled reached
-23–30 tokens/s with two drafts on binary search and interval merging,
-versus 20–22 tokens/s with drafts disabled. Both settings produced the
-same functions. These are short, single-request decode rates. With two drafts,
-the 4B also passed executable topological-sort and lazy-batching tests.
-The 9B ran these four tasks at 11–18 tokens/s and failed lazy batching.
-Weights and scratch occupied 3.2 GB (4B) and 6.7 GB (9B), before session
-allocations. On a 2,121-token source prompt, prefill reached 113 tokens/s
-on 4B with three drafts and 54 tokens/s on 9B with two. Both missed the
-requested arithmetic result with thinking disabled. With thinking enabled
-and two drafts, 4B returned the correct result, using 512 generated tokens.
+- **Workload and parity.** Qwen3.5-4B and Gemma 4 `bench` use `src/qwen36/model.rs` (256 and 1 024
+  prompt tokens); Inkling 2 Mini uses `--memory-limit-gb 10.6` (256-token prompt) with DSpark
+  (`Q8_0`). Speculative decoding matches plain greedy output verbatim (`64/64` tokens on Qwen3.5-4B
+  and Gemma 4; `128/128` chat tokens on Inkling 2 Mini).
+- **Fanless thermal throttling.** The M4 Air clocks down under sustained GPU load as the die reaches
+  80–100 °C. Heat-soaked runs measure lower than cool starts (and multi-request
+  served Gemma 4 decode drops to about 19 tok/s once warm).
+- **Qwen3.5-9B.** Also fits in 16 GB (6.7 GB weights and scratch versus 3.2 GB for 4B) using the
+  Q4_K recipe under [Running it](#running-it), decoding around 11–18 tok/s in short coding runs.
+- **Served overhead.** Serving over HTTP (`/v1/chat/completions`) adds fixed per-request framing
+  overhead on short prompts; see [docs/gemma4.md](docs/gemma4.md) and
+  [docs/inkling2.md](docs/inkling2.md) for per-model notes and memory flags.
 
 ### Quality
 
@@ -259,7 +165,7 @@ Speculative output equals plain greedy decoding up to rounding ties.
 | 128 GB | DeepSeek V4 Flash Q2                                         | 95 GB                                    | 65 536                               |
 
 `--memory-limit-gb` counts GiB (the GPU column is decimal GB). Except for the M4 Air row, fits are
-measured on the M5 Max; on the M4 Air above, Gemma 4 uses 512-row prompt runs and fits 21 760 tokens
+measured on the M5 Max; on the M4 Air, Gemma 4 uses 512-row prompt runs and fits 21 760 tokens
 in 10.1 GB. A memory-limited configuration serves one request at a time.
 
 ## Running it
@@ -267,7 +173,7 @@ in 10.1 GB. A memory-limited configuration serves one request at a time.
 You need:
 
 - Linux on Apple Silicon with the [aurora-silicon](https://github.com/aurora-silicon)
-  kernel (`integration/aurora`), including the GPU compute-time allowance
+  kernel (`main`), including the GPU compute-time allowance
   (aurora-silicon/linux #1752); on the M5 Max, the GPU mailbox interrupt fix
   (#1844) for full decode speed.
 - Mesa's Borealis from aurora-silicon/mesa `aurora-wip` (M5 cooperative matrix
@@ -292,6 +198,10 @@ Then one of (a `.gguf` path selects the model from its metadata; draft
 models and support files are found beside the model):
 
 ```sh
+# 16 GB: Qwen3.5-4B (or 9B), quantized with the recipe below
+./target/release/lily --model ~/models/Qwen3.5-4B-Q4_K.gguf \
+  --max-seq 16384 --memory-limit-gb 9 --mtp-drafts 2
+
 # 16 GB: Gemma 4, everything under 11 GB (add --mtp-drafts 2 with the draft model)
 ./target/release/lily --model ~/models/gemma-4-26B-A4B-it-UD-IQ2_M.gguf \
   --memory-limit-gb 10.2 --mtp-drafts 0 --checkpoints-per-session 1 \
@@ -328,6 +238,23 @@ address that is not loopback needs `--api-key-file` ([docs/server.md](docs/serve
 "Who may call it"). Only
 one model fits in 128 GB at a time; every loader takes a machine-wide
 instance lock before mapping weights (per account on Linux).
+
+### Quantizing Qwen3.5 (16 GB)
+
+Start from bartowski's BF16 text GGUF (which includes the embedded MTP layer).
+Lily's fused recurrent projections need a common quantization type, so this
+recipe uses Q4_K for those projections and Q8_0 for the vocabulary matrices
+(use a separate directory for each model, with a recent `llama.cpp` build):
+
+```sh
+size=4B  # or 9B
+file="Qwen_Qwen3.5-${size}-bf16.gguf"
+curl -fL --retry 3 -o "$file" \
+  "https://huggingface.co/bartowski/Qwen_Qwen3.5-${size}-GGUF/resolve/main/$file"
+llama-quantize --pure --token-embedding-type q8_0 --output-tensor-type q8_0 \
+  --tensor-type ssm_alpha=q4_k --tensor-type ssm_beta=q4_k \
+  "$file" "Qwen3.5-${size}-Q4_K.gguf" Q4_K
+```
 
 ## The models
 
