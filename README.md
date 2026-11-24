@@ -108,15 +108,19 @@ Measured on a 16 GB M4 MacBook Air (J713, 10-core CPU, 8-core GPU, fanless, on A
 
 `Inkling-2-Mini-UD-Q2_K_XL.gguf` (9.14 GB) with `dspark-Inkling-2-Mini-Q8_0.gguf` (0.40 GB) beside it,
 using the 16 GB command below (`--memory-limit-gb 10.6`: 11.4 GB on the GPU, up to 37 852 tokens of
-context with 1 snapshot and DSpark; see [docs/inkling2.md](docs/inkling2.md)). Measured 2026-11-21 on
-`main` (`10d70c2`, [#44](https://github.com/aurora-silicon/aurora-lily/pull/44)) with Linux 7.3.0 and
-Mesa Borealis:
+context with 1 snapshot and DSpark; see [docs/inkling2.md](docs/inkling2.md)). Measured 2026-11-24 on
+`main` with [#54](https://github.com/aurora-silicon/aurora-lily/pull/54),
+[#59](https://github.com/aurora-silicon/aurora-lily/pull/59),
+[#60](https://github.com/aurora-silicon/aurora-lily/pull/60), and
+[#62](https://github.com/aurora-silicon/aurora-lily/pull/62) on Linux 7.3.0 and Mesa Borealis
+(cool start below 54 °C):
 
-| Mode                                            |     Decode |    Prefill | Notes                                                         |
-|-------------------------------------------------|-----------:|-----------:|---------------------------------------------------------------|
-| Served `/v1/chat/completions`, `--mtp-drafts 3` | 17.8 tok/s |          – | 73 generated tokens, 50/66 drafts accepted (75.8%), 19.5 tok/s GPU steady-state |
-| `lily-inkling2 profile`, `--mtp-drafts 0`       | 15.6 tok/s |          – | 64.2 ms/tok plain decode (up from 13.0 tok/s / 77.2 ms/tok)   |
-| `lily-inkling2 bench`, 512-token prompt (hot, 93–96 °C) | 16.4 tok/s | 95.0 tok/s | 256-row chunks, `--mtp-drafts 3` (114.0 tok/s warm prefill; up from 44.1 tok/s hot) |
+| Mode                                                |     Decode |     Prefill | Notes                                                                                  |
+|-----------------------------------------------------|-----------:|------------:|----------------------------------------------------------------------------------------|
+| `lily-inkling2 profile`, `--mtp-drafts 0` (avg 8)   | 19.8 tok/s |           – | 50.6 ms/tok plain decode (up from 15.6 tok/s / 64.2 ms on `10d70c2`)                   |
+| `lily-inkling2 profile`, `--mtp-drafts 3` (verify4) | 30.6 tok/s |           – | 106.7 ms verify(4) step (at 3.27 tok/step)                                             |
+| `lily-inkling2 bench`, 256p/64d (`--mtp-drafts 0`)  | 19.1 tok/s | 100.1 tok/s | 256-row prompt chunks                                                                  |
+| Served `/v1/chat/completions`, `--mtp-drafts 3`     | 17.8 tok/s |           – | Measured 2026-11-21 on `10d70c2` ([#44](https://github.com/aurora-silicon/aurora-lily/pull/44)): 73 tokens, 50/66 drafts accepted (75.8%) |
 
 - On the tested greedy chat request (73 generated tokens), DSpark (`--mtp-drafts 3`) produced the same
   token IDs as plain decode (`--mtp-drafts 0`).
