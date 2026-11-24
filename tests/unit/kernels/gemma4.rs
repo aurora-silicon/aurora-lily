@@ -761,19 +761,10 @@ fn moe_gate_up_partial_rows_match_cpu() {
                 .map(|k| ((3 * (k / used) + k % used) % ne) as u32)
                 .collect();
             let mid = tensor(&ctx, &vec![UNWRITTEN; m * used * ff + 64]);
+            let tx = tensor(&ctx, &x);
+            let tsel = u32s(&ctx, &sel);
             run(&ctx, |p| {
-                moe_gate_up(
-                    &ctx,
-                    p,
-                    &gu,
-                    ff,
-                    &tensor(&ctx, &x),
-                    &u32s(&ctx, &sel),
-                    &mid,
-                    m,
-                    used,
-                )
-                .unwrap()
+                moe_gate_up(&ctx, p, &gu, ff, &tx, &tsel, &mid, m, used).unwrap()
             });
             let mut want = vec![UNWRITTEN; m * used * ff + 64];
             for (k, &e) in sel.iter().enumerate() {
@@ -808,20 +799,11 @@ fn moe_down_partial_rows_match_cpu() {
                 .collect();
             let wts = f32s(&mut rng, m * used, 0.1, 0.5);
             let out = tensor(&ctx, &vec![UNWRITTEN; m * hid + 64]);
+            let tmid = tensor(&ctx, &mid);
+            let tsel = u32s(&ctx, &sel);
+            let twts = tensor(&ctx, &wts);
             run(&ctx, |p| {
-                moe_down(
-                    &ctx,
-                    p,
-                    &dn,
-                    hid,
-                    &tensor(&ctx, &mid),
-                    &u32s(&ctx, &sel),
-                    &tensor(&ctx, &wts),
-                    &out,
-                    m,
-                    used,
-                )
-                .unwrap()
+                moe_down(&ctx, p, &dn, hid, &tmid, &tsel, &twts, &out, m, used).unwrap()
             });
             let mut want = vec![UNWRITTEN; m * hid + 64];
             for i in 0..m {

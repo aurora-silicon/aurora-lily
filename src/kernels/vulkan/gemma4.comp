@@ -36,6 +36,9 @@
 #define KERNEL_gemma4_moe_down_iq4_nl
 #define G4_XH
 #endif
+#if defined(KERNEL_g16_moe_gate_up_iq2_xxs) || defined(KERNEL_g16_moe_down_iq4_nl)
+#define LILY_PRECISE_ISOLATED
+#endif
 #ifdef G4_Q8X
 #define G4_PB(i) ((i) + 2u)
 #else
@@ -952,151 +955,256 @@ void main() {
 
 // ---------------------------------------------------------------------------
 // The routed experts' decode kernels for Apple G16 GPUs (the M4), which
-// src/kernels/gemma4.rs takes there in place of the two above: a subgroup
-// takes G16_GR (gate/up) or G16_DR (down) output rows, so a lane loads its
-// activations once for all of them and has their weight loads in flight
-// together. The codes' tables: IQ2_XXS's grid from the shader's constant
-// data with the sign masks computed, IQ4_NL's values a code byte at a time
-// from threadgroup memory (one 16-value table looked up a nibble at a time
-// was the slowest part). Each row's sums run in one order whatever the row
-// count m. Bindings, params and grids' y as above; grid x ceil(rows / (8
-// rows a subgroup)).
+// src/kernels/gemma4.rs takes there in place of the two above: 8 lanes per
+// output row (32 rows/WG), with `gate_up` using 256 threads/WG (1 row/group,
+// 8-byte u16vec4 loads, 4 KB shared grid LUT, fused gate/up streaming f32 x)
+// and `down` using 128 threads/WG (2 rows/group, coalesced 18-byte blocks per
+// expert across all 8 lanes, 1 KB shared f16vec2 LUT, fused 2-row streaming
+// f32 x). All XOR reductions complete before any store branch, with
+// workgroup-converged loops.
 // ---------------------------------------------------------------------------
-#ifndef G16_GR
-#define G16_GR 4u
+#if defined(KERNEL_g16_moe_gate_up_iq2_xxs) || defined(KERNEL_g16_moe_down_iq4_nl)
+float g16_moe_padd(float a, float b) {
+    precise float r = a + b;
+    return r;
+}
+float g16_moe_pmul(float a, float b) {
+    precise float r = a * b;
+    return r;
+}
+float g16_moe_pfma(float a, float b, float c) {
+    precise float r = fma(a, b, c);
+    return r;
+}
+float g16_moe_reduce8(float v) {
+    v = g16_moe_padd(v, subgroupShuffleXor(v, 4u));
+    v = g16_moe_padd(v, subgroupShuffleXor(v, 2u));
+    v = g16_moe_padd(v, subgroupShuffleXor(v, 1u));
+    return v;
+}
 #endif
-#ifndef G16_DR
-#define G16_DR 2u
-#endif
+
 #ifdef KERNEL_g16_moe_gate_up_iq2_xxs
-// IQ2_XXS task t of the row at 16-bit word rw of W against xv: the values
-// of glm53_dot_iq2_xxs, summed in one fma chain.
-float g16_dot_iq2_xxs(uint64_t W, uint rw, uint t, in vec4 xv[8]) {
-    const uint bw = rw + (t >> 3u) * 33u;
-    const uint qw = bw + 1u + 4u * (t & 7u);
-    const float d = glm53_h2f(uint(U16(W).v[bw]));
-    const uint aux0 = uint(U16(W).v[qw]) | (uint(U16(W).v[qw + 1u]) << 16u);
-    const uint aux1 = uint(U16(W).v[qw + 2u]) | (uint(U16(W).v[qw + 3u]) << 16u);
-    precise float s = 0.0;
+layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer G16Iq2Q { u16vec4 v[]; };
+shared uvec4 g16_iq2_grid[256];
+
+void g16_dot_iq2_xxs_pair_f32(uint64_t g_ptr, uint64_t u_ptr, uint t, uint64_t xp,
+                              out float dg, out float du) {
+    const uint64_t bo = uint64_t(t >> 3u) * 66u;
+    const uint64_t qo = 2u + 8u * (t & 7u);
+    const uint64_t gblk = g_ptr + bo;
+    const uint64_t ublk = u_ptr + bo;
+    const float gd = glm53_h2f(uint(U16(gblk).v[0]));
+    const float ud = glm53_h2f(uint(U16(ublk).v[0]));
+    const u16vec4 gq = G16Iq2Q(gblk + qo).v[0];
+    const u16vec4 uq = G16Iq2Q(ublk + qo).v[0];
+    const uint gaux0 = pack32(gq.xy), gaux1 = pack32(gq.zw);
+    const uint uaux0 = pack32(uq.xy), uaux1 = pack32(uq.zw);
+    float g0 = 0.0, g1 = 0.0, g2 = 0.0, g3 = 0.0;
+    float u0 = 0.0, u1 = 0.0, u2 = 0.0, u3 = 0.0;
     [[unroll]] for (uint l = 0u; l < 4u; l++) {
-        // The sign masks as glm53_dot_iq2_xxs's GLM53_SIGN_ALU form computes them.
-        const uint si = (aux1 >> (7u * l)) & 127u;
-        const uint q = si + (si << 12u) + ((bitCount(si) & 1u) << 19u);
-        const uvec4 sg = (uvec4(q) << uvec4(15u, 14u, 13u, 12u)) & 0x80008000u;
-        const uvec4 g = glm53_iq2xxs_grid_h[(aux0 >> (8u * l)) & 0xffu] ^ sg;
-        const vec4 a = xv[2u * l], b = xv[2u * l + 1u];
-        [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            const vec2 p = unpackHalf2x16(g[c]);
-            s = fma(p.x, a[c], s);
-            s = fma(p.y, b[c], s);
+        const vec4 a = F32x4(xp).v[2u * l];
+        const vec4 b = F32x4(xp).v[2u * l + 1u];
+        {
+            const uint si = (gaux1 >> (7u * l)) & 127u;
+            const uint qb = si + (si << 12u) + ((bitCount(si) & 1u) << 19u);
+            const uvec4 sg = (uvec4(qb) << uvec4(15u, 14u, 13u, 12u)) & 0x80008000u;
+            const uvec4 g = g16_iq2_grid[(gaux0 >> (8u * l)) & 0xffu] ^ sg;
+            const f16vec2 p0 = uint16BitsToFloat16(unpack16(g.x));
+            const f16vec2 p1 = uint16BitsToFloat16(unpack16(g.y));
+            const f16vec2 p2 = uint16BitsToFloat16(unpack16(g.z));
+            const f16vec2 p3 = uint16BitsToFloat16(unpack16(g.w));
+            g0 = g16_moe_pfma(float(p0.x), a.x, g0);
+            g1 = g16_moe_pfma(float(p0.y), b.x, g1);
+            g2 = g16_moe_pfma(float(p1.x), a.y, g2);
+            g3 = g16_moe_pfma(float(p1.y), b.y, g3);
+            g0 = g16_moe_pfma(float(p2.x), a.z, g0);
+            g1 = g16_moe_pfma(float(p2.y), b.z, g1);
+            g2 = g16_moe_pfma(float(p3.x), a.w, g2);
+            g3 = g16_moe_pfma(float(p3.y), b.w, g3);
+        }
+        {
+            const uint si = (uaux1 >> (7u * l)) & 127u;
+            const uint qb = si + (si << 12u) + ((bitCount(si) & 1u) << 19u);
+            const uvec4 sg = (uvec4(qb) << uvec4(15u, 14u, 13u, 12u)) & 0x80008000u;
+            const uvec4 g = g16_iq2_grid[(uaux0 >> (8u * l)) & 0xffu] ^ sg;
+            const f16vec2 p0 = uint16BitsToFloat16(unpack16(g.x));
+            const f16vec2 p1 = uint16BitsToFloat16(unpack16(g.y));
+            const f16vec2 p2 = uint16BitsToFloat16(unpack16(g.z));
+            const f16vec2 p3 = uint16BitsToFloat16(unpack16(g.w));
+            u0 = g16_moe_pfma(float(p0.x), a.x, u0);
+            u1 = g16_moe_pfma(float(p0.y), b.x, u1);
+            u2 = g16_moe_pfma(float(p1.x), a.y, u2);
+            u3 = g16_moe_pfma(float(p1.y), b.y, u3);
+            u0 = g16_moe_pfma(float(p2.x), a.z, u0);
+            u1 = g16_moe_pfma(float(p2.y), b.z, u1);
+            u2 = g16_moe_pfma(float(p3.x), a.w, u2);
+            u3 = g16_moe_pfma(float(p3.y), b.w, u3);
         }
     }
-    precise float k = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
-    precise float v = k * s;
-    return v;
+    const float gs = g16_moe_padd(g16_moe_padd(g0, g1), g16_moe_padd(g2, g3));
+    const float gk = g16_moe_pmul(g16_moe_pmul(0.125, gd), float(2u * (gaux1 >> 28u) + 1u));
+    dg = g16_moe_pmul(gk, gs);
+    const float us = g16_moe_padd(g16_moe_padd(u0, u1), g16_moe_padd(u2, u3));
+    const float uk = g16_moe_pmul(g16_moe_pmul(0.125, ud), float(2u * (uaux1 >> 28u) + 1u));
+    du = g16_moe_pmul(uk, us);
 }
 
 void main() {
-    const uint K = arg_u32(4);
-    const uint F = arg_u32(5);
-    const uint row_bytes = arg_u32(6);
-    const uint used = arg_u32(7);
+    const uint F = arg_u32(5u);
+    if (F == 0u) return;
+    g16_iq2_grid[gl_LocalInvocationIndex] = glm53_iq2xxs_grid_h[gl_LocalInvocationIndex];
+    barrier();
+    const uint K = arg_u32(4u);
+    const uint row_bytes = arg_u32(6u);
+    const uint used = arg_u32(7u);
     const uint slot = gl_WorkGroupID.y;
     const uint i = slot / used;
-    const uint r0 = (gl_WorkGroupID.x * 8u + gl_SubgroupID) * G16_GR;
-    if (r0 >= F) return;
+    const uint n0 = (gl_WorkGroupID.x * 8u + gl_SubgroupID) * 4u;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint grp = lane >> 3u;
+    const uint l = lane & 7u;
+    const uint rr = n0 + grp;
+    const uint row = min(rr, F - 1u);
     const uint e = U32(arg(2)).v[slot];
-    const uint64_t W = arg(0) + uint64_t(e) * 2u * F * row_bytes;
-    const uint rw = row_bytes / 2u;
-    const uint64_t X = arg(1) + 4u * uint64_t(i) * K;
+    const uint64_t W = arg(0) + uint64_t(e) * 2u * uint64_t(F) * uint64_t(row_bytes);
+    const uint64_t g_row = W + uint64_t(row) * uint64_t(row_bytes);
+    const uint64_t u_row = g_row + uint64_t(F) * uint64_t(row_bytes);
+    const uint64_t X = arg(1) + 4u * uint64_t(i) * uint64_t(K);
     const uint tasks = K / GLM53_TASK;
-    float ag[G16_GR], au[G16_GR];
-    [[unroll]] for (uint r = 0u; r < G16_GR; r++) {
-        ag[r] = 0.0;
-        au[r] = 0.0;
-    }
-    for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
-        vec4 xv[8];
-        [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(X).v[8u * t + q];
-        [[unroll]] for (uint r = 0u; r < G16_GR; r++) {
-            const uint row = min(r0 + r, F - 1u);
-            ag[r] += g16_dot_iq2_xxs(W, row * rw, t, xv);
-            au[r] += g16_dot_iq2_xxs(W, (F + row) * rw, t, xv);
+    float ag = 0.0, au = 0.0;
+    if (tasks > 0u) {
+        for (uint t0 = 0u; t0 < tasks; t0 += 8u) {
+            const uint t = t0 + l;
+            const uint tr = min(t, tasks - 1u);
+            float dg, du;
+            g16_dot_iq2_xxs_pair_f32(g_row, u_row, tr, X + uint64_t(tr) * 128u, dg, du);
+            ag = g16_moe_padd(ag, t < tasks ? dg : 0.0);
+            au = g16_moe_padd(au, t < tasks ? du : 0.0);
         }
     }
-    [[unroll]] for (uint r = 0u; r < G16_GR; r++) {
-        const float g = subgroupAdd(ag[r]), u = subgroupAdd(au[r]);
-        if (gl_SubgroupInvocationID == 0u && r0 + r < F)
-            F32(arg(3)).v[slot * F + r0 + r] = gemma4_gelu(g) * u;
+    const float out_g = g16_moe_reduce8(ag);
+    const float out_u = g16_moe_reduce8(au);
+    if (l == 0u && rr < F) {
+        F32(arg(3) + 4u * (uint64_t(slot) * uint64_t(F) + uint64_t(rr))).v[0] =
+            gemma4_gelu(out_g) * out_u;
     }
 }
 #endif
 
-// IQ4_NL down: lane l takes slot s0 + l / 4 of each eight and pairs l % 4,
-// + 4, .. of its 64-value block pairs (36 bytes, nine words); a pair's
-// first block's codes are its words' bytes 2..17 (two-byte shifted), the
-// second's words 5..8.
+// IQ4_NL down: all 8 lanes in a group work on the SAME expert s along contiguous
+// 18-byte blocks t = t0 + l (100% coalesced across all 8 lanes), 2 rows/group
+// (128 threads/WG = 32 rows/WG), streaming 8 f32 activations at a time across
+// both rows, 1 KB shared f16vec2 LUT.
 #ifdef KERNEL_g16_moe_down_iq4_nl
-// Code byte b's two values (low nibble's, high nibble's).
+layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer G16Iq4Q { u16vec4 v[]; };
 shared uint g16_kv2[256];
 
 float g16_kv(uint c) {
     const uvec4 kv = uvec4(0xbfad9881u, 0xf6eaddcfu, 0x26190d01u, 0x71594535u);
     return float(int(kv[c >> 2u] << (24u - 8u * (c & 3u))) >> 24);
 }
+
+void g16_dot_iq4_nl_pair_f32(uint64_t blk0, uint64_t blk1, uint64_t xp,
+                             out float d0, out float d1) {
+    const float sc0 = glm53_h2f(uint(U16(blk0).v[0]));
+    const float sc1 = glm53_h2f(uint(U16(blk1).v[0]));
+    const u16vec4 a0 = G16Iq4Q(blk0 + 2u).v[0];
+    const u16vec4 a1 = G16Iq4Q(blk0 + 10u).v[0];
+    const u16vec4 b0 = G16Iq4Q(blk1 + 2u).v[0];
+    const u16vec4 b1 = G16Iq4Q(blk1 + 10u).v[0];
+    const uvec4 cw0 = uvec4(pack32(a0.xy), pack32(a0.zw), pack32(a1.xy), pack32(a1.zw));
+    const uvec4 cw1 = uvec4(pack32(b0.xy), pack32(b0.zw), pack32(b1.xy), pack32(b1.zw));
+    float r00 = 0.0, r01 = 0.0, r02 = 0.0, r03 = 0.0;
+    float r10 = 0.0, r11 = 0.0, r12 = 0.0, r13 = 0.0;
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        const vec4 a = F32x4(xp).v[q];
+        const vec4 b = F32x4(xp + 64u).v[q];
+        {
+            const uint word = cw0[q];
+            const f16vec2 v0 = uint16BitsToFloat16(unpack16(g16_kv2[word & 0xffu]));
+            const f16vec2 v1 = uint16BitsToFloat16(unpack16(g16_kv2[(word >> 8u) & 0xffu]));
+            const f16vec2 v2 = uint16BitsToFloat16(unpack16(g16_kv2[(word >> 16u) & 0xffu]));
+            const f16vec2 v3 = uint16BitsToFloat16(unpack16(g16_kv2[word >> 24u]));
+            r00 = g16_moe_pfma(float(v0.x), a.x, r00);
+            r01 = g16_moe_pfma(float(v0.y), b.x, r01);
+            r02 = g16_moe_pfma(float(v1.x), a.y, r02);
+            r03 = g16_moe_pfma(float(v1.y), b.y, r03);
+            r00 = g16_moe_pfma(float(v2.x), a.z, r00);
+            r01 = g16_moe_pfma(float(v2.y), b.z, r01);
+            r02 = g16_moe_pfma(float(v3.x), a.w, r02);
+            r03 = g16_moe_pfma(float(v3.y), b.w, r03);
+        }
+        {
+            const uint word = cw1[q];
+            const f16vec2 v0 = uint16BitsToFloat16(unpack16(g16_kv2[word & 0xffu]));
+            const f16vec2 v1 = uint16BitsToFloat16(unpack16(g16_kv2[(word >> 8u) & 0xffu]));
+            const f16vec2 v2 = uint16BitsToFloat16(unpack16(g16_kv2[(word >> 16u) & 0xffu]));
+            const f16vec2 v3 = uint16BitsToFloat16(unpack16(g16_kv2[word >> 24u]));
+            r10 = g16_moe_pfma(float(v0.x), a.x, r10);
+            r11 = g16_moe_pfma(float(v0.y), b.x, r11);
+            r12 = g16_moe_pfma(float(v1.x), a.y, r12);
+            r13 = g16_moe_pfma(float(v1.y), b.y, r13);
+            r10 = g16_moe_pfma(float(v2.x), a.z, r10);
+            r11 = g16_moe_pfma(float(v2.y), b.z, r11);
+            r12 = g16_moe_pfma(float(v3.x), a.w, r12);
+            r13 = g16_moe_pfma(float(v3.y), b.w, r13);
+        }
+    }
+    d0 = g16_moe_pmul(sc0, g16_moe_padd(g16_moe_padd(r00, r01), g16_moe_padd(r02, r03)));
+    d1 = g16_moe_pmul(sc1, g16_moe_padd(g16_moe_padd(r10, r11), g16_moe_padd(r12, r13)));
+}
+
 void main() {
     const uint F = arg_u32(5);
     const uint H = arg_u32(6);
+    if (H == 0u) return;
     const uint row_bytes = arg_u32(7);
     const uint used = arg_u32(8);
     const uint li = gl_LocalInvocationIndex;
     g16_kv2[li] = packHalf2x16(vec2(g16_kv(li & 0xfu), g16_kv(li >> 4u)));
+    const uint li2 = li + 128u;
+    g16_kv2[li2] = packHalf2x16(vec2(g16_kv(li2 & 0xfu), g16_kv(li2 >> 4u)));
     barrier();
     const uint i = gl_WorkGroupID.y;
-    const uint r0 = (gl_WorkGroupID.x * 8u + gl_SubgroupID) * G16_DR;
-    if (r0 >= H) return;
+    const uint n0 = (gl_WorkGroupID.x * 4u + gl_SubgroupID) * 8u;
     const uint lane = gl_SubgroupInvocationID;
-    const uint pairs = F / 64u;
-    const uint rw = row_bytes / 4u;
-    float acc[G16_DR];
-    [[unroll]] for (uint r = 0u; r < G16_DR; r++) acc[r] = 0.0;
-    for (uint s = lane >> 2u; s < used; s += 8u) {
-        const uint slot = i * used + s;
-        const uint e = U32(arg(2)).v[slot];
-        const float we = F32(arg(3)).v[slot];
-        const uint64_t W = arg(0) + uint64_t(e) * H * row_bytes;
-        const uint64_t X = arg(1) + 4u * uint64_t(slot) * F;
-        for (uint p = lane & 3u; p < pairs; p += 4u) {
-            uint wd[G16_DR][9];
-            [[unroll]] for (uint r = 0u; r < G16_DR; r++) {
-                const uint o = min(r0 + r, H - 1u) * rw + 9u * p;
-                [[unroll]] for (uint w = 0u; w < 9u; w++) wd[r][w] = U32(W).v[o + w];
+    const uint grp = lane >> 3u;
+    const uint l = lane & 7u;
+    const uint rr0 = n0 + grp * 2u;
+    const uint rr1 = rr0 + 1u;
+    const uint row0 = min(rr0, H - 1u);
+    const uint row1 = min(rr1, H - 1u);
+    const uint blocks = F >> 5u;
+    float acc0 = 0.0, acc1 = 0.0;
+    if (blocks > 0u) {
+        for (uint s = 0u; s < used; s++) {
+            const uint slot = i * used + s;
+            const uint e = U32(arg(2)).v[slot];
+            const float we = F32(arg(3)).v[slot];
+            const uint64_t w_exp = arg(0) + uint64_t(e) * uint64_t(H) * uint64_t(row_bytes);
+            const uint64_t w_row0 = w_exp + uint64_t(row0) * uint64_t(row_bytes);
+            const uint64_t w_row1 = w_exp + uint64_t(row1) * uint64_t(row_bytes);
+            const uint64_t X = arg(1) + 4u * uint64_t(slot) * uint64_t(F);
+            float k0 = 0.0, k1 = 0.0;
+            for (uint t0 = 0u; t0 < blocks; t0 += 8u) {
+                const uint t = t0 + l;
+                const uint tr = min(t, blocks - 1u);
+                const uint64_t bo = uint64_t(tr) * 18u;
+                float d0, d1;
+                g16_dot_iq4_nl_pair_f32(w_row0 + bo, w_row1 + bo, X + uint64_t(tr) * 128u, d0, d1);
+                k0 = g16_moe_padd(k0, t < blocks ? d0 : 0.0);
+                k1 = g16_moe_padd(k1, t < blocks ? d1 : 0.0);
             }
-            float sb[G16_DR][2];
-            [[unroll]] for (uint hb = 0u; hb < 2u; hb++) {
-                vec4 xv[8];
-                [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(X).v[16u * p + 8u * hb + q];
-                [[unroll]] for (uint r = 0u; r < G16_DR; r++) {
-                    uint cw[4];
-                    [[unroll]] for (uint c = 0u; c < 4u; c++)
-                        cw[c] = hb == 0u ? (wd[r][c] >> 16u) | (wd[r][c + 1u] << 16u) : wd[r][5u + c];
-                    const float d = glm53_h2f(hb == 0u ? wd[r][0] & 0xffffu : wd[r][4] >> 16u);
-                    precise float sum = 0.0;
-                    [[unroll]] for (uint j = 0u; j < 16u; j++) {
-                        const uint b = cw[j >> 2u] >> (8u * (j & 3u));
-                        const vec2 v = unpackHalf2x16(g16_kv2[b & 0xffu]);
-                        sum = fma(v.x, xv[j >> 2u][j & 3u], sum);
-                        sum = fma(v.y, xv[4u + (j >> 2u)][j & 3u], sum);
-                    }
-                    sb[r][hb] = d * sum;
-                }
-            }
-            [[unroll]] for (uint r = 0u; r < G16_DR; r++) acc[r] += we * (sb[r][0] + sb[r][1]);
+            acc0 = g16_moe_pfma(we, k0, acc0);
+            acc1 = g16_moe_pfma(we, k1, acc1);
         }
     }
-    [[unroll]] for (uint r = 0u; r < G16_DR; r++) {
-        const float v = subgroupAdd(acc[r]);
-        if (lane == 0u && r0 + r < H) F32(arg(4)).v[i * H + r0 + r] = v;
+    const float out_v0 = g16_moe_reduce8(acc0);
+    const float out_v1 = g16_moe_reduce8(acc1);
+    if (l == 0u) {
+        if (rr0 < H) F32(arg(4) + 4u * (uint64_t(i) * uint64_t(H) + uint64_t(rr0))).v[0] = out_v0;
+        if (rr1 < H) F32(arg(4) + 4u * (uint64_t(i) * uint64_t(H) + uint64_t(rr1))).v[0] = out_v1;
     }
 }
 #endif
