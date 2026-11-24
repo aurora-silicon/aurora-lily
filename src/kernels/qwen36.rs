@@ -692,7 +692,7 @@ pub fn mtp_cat(
 
 /// `x += a`, then `out = rmsnorm(x) * w` (`glm53::add` then
 /// `glm53::rmsnorm`; the residual the same bits, the normed rows within
-/// 1e-6, as [`rmsnorm`]) over `m` rows of 2048 or 5120;
+/// 1e-6, as [`rmsnorm`]) over `m` rows of 2048, 2560, or 5120;
 /// with `shared`, `x += a + shared * sigmoid(g)` (`ffn_residual`).
 #[allow(clippy::too_many_arguments)]
 pub fn residual_norm(
@@ -711,7 +711,7 @@ pub fn residual_norm(
         check(&[(t, DType::F32)])?;
     }
     ensure!(
-        matches!((hidden, shared.is_some()), (2048, _) | (5120, false))
+        matches!((hidden, shared.is_some()), (2048, _) | (2560 | 5120, false))
             && w.numel() >= hidden,
         "residual norm of rows of {hidden}"
     );
@@ -726,10 +726,12 @@ pub fn residual_norm(
         "qwen36_ffn_residual_norm"
     } else if hidden == 5120 {
         "qwen36_add_norm_h5120"
+    } else if hidden == 2560 {
+        "qwen36_add_norm_h2560"
     } else {
         "qwen36_add_norm"
     };
-    let threads = if hidden == 5120 { 256 } else { 1024 };
+    let threads = if hidden == 2048 { 1024 } else { 256 };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
