@@ -1023,7 +1023,8 @@ impl Qwen36Model {
     /// Whether residual adds and the RMSNorm after them are one kernel
     /// (`k::residual_norm`).
     fn fuse_norm(&self) -> bool {
-        self.cfg.hidden == 2048 || (self.cfg.hidden == 5120 && !self.cfg.is_moe())
+        self.cfg.hidden == 2048
+            || (matches!(self.cfg.hidden, 2560 | 5120) && !self.cfg.is_moe())
     }
 
     /// `out = rmsnorm(x) * w` over `m` rows of the hidden width.

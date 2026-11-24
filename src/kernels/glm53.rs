@@ -221,7 +221,7 @@ fn g16_gemv_name(
                 "g16_gemv_q4_k_m4",
             ],
             32,
-            if m == 1 { 64 } else { 256 },
+            256,
         ),
         GgmlType::Q5K if cols.is_multiple_of(256) => (
             [
@@ -231,7 +231,7 @@ fn g16_gemv_name(
                 "g16_gemv_q5_k_m4",
             ],
             32,
-            if m == 1 { 64 } else { 256 },
+            256,
         ),
         GgmlType::Q6K if cols.is_multiple_of(256) => (
             [

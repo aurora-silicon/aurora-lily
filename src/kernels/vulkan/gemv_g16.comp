@@ -9,10 +9,9 @@
 // row (zero tail-wave waste on every model width that is a multiple of 256:
 // K = 2304, 2560, 2816, 4096, 9216) and reduce with a 3-step
 // subgroupShuffleXor before any lane-dependent store branch.
-// - Q4_K & Q5_K: at m=1 each 8-lane group handles 4 consecutive rows (64
-//   threads/WG = 32 rows/WG) to amortize X loads and sxa/sxb 4x; at m=2..4
-//   each 8-lane group handles 1 row (256 threads/WG = 32 rows/WG) to reuse
-//   decoded weights across m batch rows.
+// - Q4_K & Q5_K: 4 rows per subgroup (256 threads/WG = 32 rows/WG) across
+//   all m=1..4, streaming one vec4 of X per nibble word so register pressure
+//   stays low and every row count shares one code path.
 // - Q6_K & Q8_0: 4 rows per subgroup (256 threads/WG = 32 rows/WG) across
 //   all m=1..4, using 8-byte u16vec4 loads.
 // - Quant codes decode via exact normal FP16 biased integers (0x6400 | q -
@@ -25,7 +24,7 @@
 #include "glm53_quant.glsl"
 
 // Parameter-only precise helpers (contained under LILY_PRECISE_ISOLATED) so
-// m=1 (4 rows/group) and m=2..4 (1 row/group) never diverge by even 1 ULP.
+// every row count m=1..4 evaluates each row's dot in one exact order.
 float g16_padd(float a, float b) {
     precise float r = a + b;
     return r;
@@ -50,8 +49,8 @@ float g16_reduce8(float v) {
 }
 
 // ---------------------------------------------------------------------------
-// Q5_K GEMV: 8 lanes/row, exact normal FP16 decode (0x6400 | q - 1024.0) into
-// F32 FMAs. m=1: 64 threads/WG (4 rows/group); m=2..4: 256 threads/WG.
+// Q5_K GEMV: 8 lanes/row (4 rows/subgroup, 256 threads/WG) across all m=1..4,
+// exact normal FP16 decode (0x6400 | q - 1024.0) into F32 FMAs.
 // Buffers: 0 x, 1-4 W, 5-8 y. Params: 9 K, 10 m, 11 row_bytes, 12-15 rows
 // of each set (0: unused), 16 x_group, 17 x_row_stride, 18 y_row_stride.
 // ---------------------------------------------------------------------------
@@ -95,75 +94,6 @@ void main() {
     const uint ssh = 16u * (pg & 1u);
     const bool hi_sc = pg >= 2u;
     const uint nb = K / 256u;
-#if defined(KERNEL_g16_gemv_q5_k_m1)
-    const uint sg_base = tg * 32u + gl_SubgroupID * 16u;
-    if (sg_base >= N) return;
-    const uint n_base = sg_base + grp * 4u;
-    const uint64_t x_base = X
-        + 4u * (uint64_t(min(n_base, N - 1u) / x_group) * uint64_t(K) + uint64_t(64u * pg + 16u * h));
-    uint64_t w_rows[4];
-    [[unroll]] for (uint r = 0u; r < 4u; r++)
-        w_rows[r] = W + uint64_t(min(n_base + r, N - 1u)) * uint64_t(row_bytes);
-    float acc[4];
-    [[unroll]] for (uint r = 0u; r < 4u; r++) acc[r] = 0.0;
-    for (uint b = 0u; b < nb; b++) {
-        const uint64_t xb_ptr = x_base + uint64_t(b) * 1024u;
-        vec4 xa[4], xb[4];
-        [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            xa[c] = F32x4(xb_ptr).v[c];
-            xb[c] = F32x4(xb_ptr).v[8u + c];
-        }
-        float sxa = 0.0, sxb = 0.0;
-        [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            sxa = g16_padd(sxa, g16_sum4(xa[c]));
-            sxb = g16_padd(sxb, g16_sum4(xb[c]));
-        }
-        const uint blk = 11u * b;
-        [[unroll]] for (uint r = 0u; r < 4u; r++) {
-            const uint64_t wr = w_rows[r];
-            const uvec4 hd = U32x4(wr).v[blk];
-            const uvec4 qs = U32x4(wr).v[blk + 3u + 2u * pg + h];
-            const uvec4 hb = U32x4(wr).v[blk + 1u + h] >> j0;
-            const uvec4 lo = (qs & 0x0f0f0f0fu) | ((hb << 4u) & 0x10101010u);
-            const uvec4 hi = ((qs >> 4u) & 0x0f0f0f0fu) | ((hb << 3u) & 0x10101010u);
-            const uint a = hd.y >> ssh, bb = hd.z >> ssh, cc = hd.w >> ssh;
-            const uint scales = hi_sc ? (cc & 0x0f0fu) | ((a >> 2u) & 0x3030u) : a & 0x3f3fu;
-            const uint mins = hi_sc ? ((cc >> 4u) & 0x0f0fu) | ((bb >> 2u) & 0x3030u) : bb & 0x3f3fu;
-            const float d = glm53_h2f(hd.x & 0xffffu);
-            const float dm = glm53_h2f(hd.x >> 16u);
-            const float d_sc0 = g16_pmul(d, float(scales & 63u));
-            const float dm_mn0 = g16_pmul(dm, float(mins & 63u));
-            const float d_sc1 = g16_pmul(d, float(scales >> 8u));
-            const float dm_mn1 = g16_pmul(dm, float(mins >> 8u));
-            float s0 = 0.0, s1 = 0.0;
-            [[unroll]] for (uint c = 0u; c < 4u; c++) {
-                const uint lw = lo[c], hw = hi[c];
-                const f16vec2 l02 = uint16BitsToFloat16(unpack16(0x64006400u | (lw & 0x001f001fu))) - f16vec2(1024.0);
-                const f16vec2 l13 = uint16BitsToFloat16(unpack16(0x64006400u | ((lw >> 8u) & 0x001f001fu))) - f16vec2(1024.0);
-                const f16vec2 h02 = uint16BitsToFloat16(unpack16(0x64006400u | (hw & 0x001f001fu))) - f16vec2(1024.0);
-                const f16vec2 h13 = uint16BitsToFloat16(unpack16(0x64006400u | ((hw >> 8u) & 0x001f001fu))) - f16vec2(1024.0);
-                s0 = g16_pfma(float(l02.x), xa[c].x, s0);
-                s1 = g16_pfma(float(h02.x), xb[c].x, s1);
-                s0 = g16_pfma(float(l13.x), xa[c].y, s0);
-                s1 = g16_pfma(float(h13.x), xb[c].y, s1);
-                s0 = g16_pfma(float(l02.y), xa[c].z, s0);
-                s1 = g16_pfma(float(h02.y), xb[c].z, s1);
-                s0 = g16_pfma(float(l13.y), xa[c].w, s0);
-                s1 = g16_pfma(float(h13.y), xb[c].w, s1);
-            }
-            const float b0 = g16_padd(g16_pmul(d_sc0, s0), -g16_pmul(dm_mn0, sxa));
-            const float b1 = g16_padd(g16_pmul(d_sc1, s1), -g16_pmul(dm_mn1, sxb));
-            acc[r] = g16_padd(acc[r], g16_padd(b0, b1));
-        }
-    }
-    float out_v[4];
-    [[unroll]] for (uint r = 0u; r < 4u; r++) out_v[r] = g16_reduce8(acc[r]);
-    if (l == 0u) {
-        [[unroll]] for (uint r = 0u; r < 4u; r++) {
-            if (n_base + r < N) F32(Y + 4u * uint64_t(n_base + r)).v[0] = out_v[r];
-        }
-    }
-#else
     const uint n0 = (tg * 8u + gl_SubgroupID) * 4u;
     if (n0 >= N) return;
     const uint n = n0 + grp;
@@ -228,14 +158,13 @@ void main() {
         [[unroll]] for (uint i = 0u; i < GEMV_M; i++)
             F32(Y + 4u * (uint64_t(i) * y_row_stride + uint64_t(n))).v[0] = out_v[i];
     }
-#endif
 }
 #endif
 
 // ---------------------------------------------------------------------------
-// Q4_K GEMV: 8 lanes/row, exact normal FP16 decode (low: 0x6400 | lo - 1024,
-// high: 0x5400 | (hi << 4) - 64, saving the shift-by-4) into F32 FMAs.
-// m=1: 64 threads/WG (4 rows/group); m=2..4: 256 threads/WG.
+// Q4_K GEMV: 8 lanes/row (4 rows/subgroup, 256 threads/WG) across all m=1..4,
+// exact normal FP16 decode (low: 0x6400 | lo - 1024, high: 0x5400 | (hi << 4)
+// - 64, saving the shift-by-4) into F32 FMAs.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_g16_gemv_q4_k_m1)
 #define GEMV4_M 1u
@@ -276,72 +205,6 @@ void main() {
     const uint ssh = 16u * (pg & 1u);
     const bool hi_sc = pg >= 2u;
     const uint nb = K / 256u;
-#if defined(KERNEL_g16_gemv_q4_k_m1)
-    const uint sg_base = tg * 32u + gl_SubgroupID * 16u;
-    if (sg_base >= N) return;
-    const uint n_base = sg_base + grp * 4u;
-    const uint64_t x_base = X
-        + 4u * (uint64_t(min(n_base, N - 1u) / x_group) * uint64_t(K) + uint64_t(64u * pg + 16u * h));
-    uint64_t w_rows[4];
-    [[unroll]] for (uint r = 0u; r < 4u; r++)
-        w_rows[r] = W + uint64_t(min(n_base + r, N - 1u)) * uint64_t(row_bytes);
-    float acc[4];
-    [[unroll]] for (uint r = 0u; r < 4u; r++) acc[r] = 0.0;
-    for (uint b = 0u; b < nb; b++) {
-        const uint64_t xb_ptr = x_base + uint64_t(b) * 1024u;
-        vec4 xa[4], xb[4];
-        [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            xa[c] = F32x4(xb_ptr).v[c];
-            xb[c] = F32x4(xb_ptr).v[8u + c];
-        }
-        float sxa = 0.0, sxb = 0.0;
-        [[unroll]] for (uint c = 0u; c < 4u; c++) {
-            sxa = g16_padd(sxa, g16_sum4(xa[c]));
-            sxb = g16_padd(sxb, g16_sum4(xb[c]));
-        }
-        const uint blk = 9u * b;
-        [[unroll]] for (uint r = 0u; r < 4u; r++) {
-            const uint64_t wr = w_rows[r];
-            const uvec4 hd = U32x4(wr).v[blk];
-            const uvec4 qs = U32x4(wr).v[blk + 1u + 2u * pg + h];
-            const uint a = hd.y >> ssh, bb = hd.z >> ssh, cc = hd.w >> ssh;
-            const uint scales = hi_sc ? (cc & 0x0f0fu) | ((a >> 2u) & 0x3030u) : a & 0x3f3fu;
-            const uint mins = hi_sc ? ((cc >> 4u) & 0x0f0fu) | ((bb >> 2u) & 0x3030u) : bb & 0x3f3fu;
-            const float d = glm53_h2f(hd.x & 0xffffu), dm = glm53_h2f(hd.x >> 16u);
-            const float d_sc0 = g16_pmul(d, float(scales & 63u));
-            const float dm_mn0 = g16_pmul(dm, float(mins & 63u));
-            const float d_sc1 = g16_pmul(d, float(scales >> 8u));
-            const float dm_mn1 = g16_pmul(dm, float(mins >> 8u));
-            float s0 = 0.0, s1 = 0.0;
-            [[unroll]] for (uint c = 0u; c < 4u; c++) {
-                const uint w = qs[c];
-                const uint w8 = w >> 8u;
-                const f16vec2 l02 = uint16BitsToFloat16(unpack16(0x64006400u | (w & 0x000f000fu))) - f16vec2(1024.0);
-                const f16vec2 l13 = uint16BitsToFloat16(unpack16(0x64006400u | (w8 & 0x000f000fu))) - f16vec2(1024.0);
-                const f16vec2 h02 = uint16BitsToFloat16(unpack16(0x54005400u | (w & 0x00f000f0u))) - f16vec2(64.0);
-                const f16vec2 h13 = uint16BitsToFloat16(unpack16(0x54005400u | (w8 & 0x00f000f0u))) - f16vec2(64.0);
-                s0 = g16_pfma(float(l02.x), xa[c].x, s0);
-                s1 = g16_pfma(float(h02.x), xb[c].x, s1);
-                s0 = g16_pfma(float(l13.x), xa[c].y, s0);
-                s1 = g16_pfma(float(h13.x), xb[c].y, s1);
-                s0 = g16_pfma(float(l02.y), xa[c].z, s0);
-                s1 = g16_pfma(float(h02.y), xb[c].z, s1);
-                s0 = g16_pfma(float(l13.y), xa[c].w, s0);
-                s1 = g16_pfma(float(h13.y), xb[c].w, s1);
-            }
-            const float b0 = g16_padd(g16_pmul(d_sc0, s0), -g16_pmul(dm_mn0, sxa));
-            const float b1 = g16_padd(g16_pmul(d_sc1, s1), -g16_pmul(dm_mn1, sxb));
-            acc[r] = g16_padd(acc[r], g16_padd(b0, b1));
-        }
-    }
-    float out_v[4];
-    [[unroll]] for (uint r = 0u; r < 4u; r++) out_v[r] = g16_reduce8(acc[r]);
-    if (l == 0u) {
-        [[unroll]] for (uint r = 0u; r < 4u; r++) {
-            if (n_base + r < N) F32(Y + 4u * uint64_t(n_base + r)).v[0] = out_v[r];
-        }
-    }
-#else
     const uint n0 = (tg * 8u + gl_SubgroupID) * 4u;
     if (n0 >= N) return;
     const uint n = n0 + grp;
@@ -403,7 +266,6 @@ void main() {
         [[unroll]] for (uint i = 0u; i < GEMV4_M; i++)
             F32(Y + 4u * (uint64_t(i) * y_row_stride + uint64_t(n))).v[0] = out_v[i];
     }
-#endif
 }
 #endif
 

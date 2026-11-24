@@ -512,10 +512,13 @@ void main() {
 // Grid (m). Buffers: 0 x [m][H] (updated), 1 a [m][H], 2 shared [m][H],
 // 3 g [m], 4 w [H], 5 out [m][H]. Params: 6 H, 7 eps.
 // ---------------------------------------------------------------------------
-#if defined(KERNEL_qwen36_add_norm) || defined(KERNEL_qwen36_add_norm_h5120) || defined(KERNEL_qwen36_ffn_residual_norm) || \
+#if defined(KERNEL_qwen36_add_norm) || defined(KERNEL_qwen36_add_norm_h2560) || \
+    defined(KERNEL_qwen36_add_norm_h5120) || defined(KERNEL_qwen36_ffn_residual_norm) || \
     defined(KERNEL_qwen36_rmsnorm_h2048)
-#ifdef KERNEL_qwen36_add_norm_h5120
+#if defined(KERNEL_qwen36_add_norm_h5120)
 const uint n = 5120u, threads = 256u;
+#elif defined(KERNEL_qwen36_add_norm_h2560)
+const uint n = 2560u, threads = 256u;
 #else
 const uint n = 2048u, threads = 1024u;
 #endif
