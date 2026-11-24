@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+**Rulebook:** follow the Aurora Silicon rulebook, https://github.com/aurora-silicon/agent-guidelines/blob/main/AGENTS.md. It applies to every agent and contributor, whoever runs them. This file adds the repo specifics.
+
 lily is a Metal LLM inference server for Apple Silicon. It serves
 Qwen3.8-Flash-Next (a 48-layer MoE with MTP drafting, vision and an n-gram
 table) over an OpenAI-compatible API on one machine, an M5 Max with 128 GB.
