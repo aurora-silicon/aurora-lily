@@ -108,16 +108,16 @@ second from the model `bench`, `spec`, and `profile` commands (64 greedy output 
 
 | Model           | Weights    |     Prefill | Decode, plain | Decode, drafted | Notes                                                        |
 |-----------------|------------|------------:|--------------:|----------------:|--------------------------------------------------------------|
-| Qwen3.5-4B      | Q4_K       |       203.1 |     29.6–30.5 |       35.4–37.0 | 1K / 256p; `--drafts 2`, 83–86% accepted                     |
+| Qwen3.5-4B      | Q4_K       |       203.1 |          30.5 |       35.4–37.0 | 1K / 256p; `--drafts 2`, 83–86% accepted                     |
 | Gemma 4 26B-A4B | UD-IQ2_M   | 173.2–177.6 |     27.3–30.4 |       37.9–38.0 | 256p–1K; `--drafts 2`, 73% accepted on a coding prompt       |
 | Inkling 2 Mini  | UD-Q2_K_XL |       100.1 |     19.1–19.8 |            30.6 | 256p bench; drafted is `profile` `verify(4)` (3.27 tok/step) |
 
 - **Workload and parity.** Qwen3.5-4B and Gemma 4 `bench` use `src/qwen36/model.rs` (256 and 1 024
-  prompt tokens); Inkling 2 Mini uses `--memory-limit-gb 10.6` (256-row prompt chunks) with DSpark
+  prompt tokens); Inkling 2 Mini uses `--memory-limit-gb 10.6` (256-token prompt) with DSpark
   (`Q8_0`). Speculative decoding matches plain greedy output verbatim (`64/64` tokens on Qwen3.5-4B
   and Gemma 4; `128/128` chat tokens on Inkling 2 Mini).
 - **Fanless thermal throttling.** The M4 Air clocks down under sustained GPU load as the die reaches
-  80–100 °C. Heat-soaked runs measure roughly 15–25% lower than cool starts (and multi-request
+  80–100 °C. Heat-soaked runs measure lower than cool starts (and multi-request
   served Gemma 4 decode drops to about 19 tok/s once warm).
 - **Qwen3.5-9B.** Also fits in 16 GB (6.7 GB weights and scratch versus 3.2 GB for 4B) using the
   Q4_K recipe under [Running it](#running-it), decoding around 11–18 tok/s in short coding runs.
