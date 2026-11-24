@@ -147,10 +147,27 @@ Served, the same five requests as the M5 Max table, twice, starting below 60 °C
 
 #### J713 engine benchmarks
 
-On 2026-11-18, the 16 GB M4 ran the first 1,024 tokens of `src/qwen36/model.rs`
-through the model-specific `bench` commands with 64 greedy output tokens.
-Gemma used its 512-row low-memory prompt setting. The baseline and optimized
-builds used the same GGUF and driver in alternating order. Rates are tokens/s.
+On 2026-11-24, the 16 GB M4 Air (J713, Linux 7.3.0, Mesa Borealis, cool start below 54 °C) ran the
+model-specific `bench`, `spec`, and `profile` commands with
+[#54](https://github.com/aurora-silicon/aurora-lily/pull/54),
+[#56](https://github.com/aurora-silicon/aurora-lily/pull/56),
+[#59](https://github.com/aurora-silicon/aurora-lily/pull/59),
+[#60](https://github.com/aurora-silicon/aurora-lily/pull/60), and
+[#62](https://github.com/aurora-silicon/aurora-lily/pull/62) combined. Qwen3.5-4B and Gemma 4 used
+`src/qwen36/model.rs` as the prompt source with 64 greedy output tokens (Gemma 4 `--drafts 2` used a
+coding prompt); Inkling 2 Mini used `--memory-limit-gb 10.6`. Rates are tokens/s.
+
+| Model | Workload | Prefill | Decode (plain) | Decode (speculative) | Parity |
+|-------|----------|--------:|---------------:|---------------------:|--------|
+| Qwen3.5-4B Q4_K | `1024p/64d` (`--drafts 2`) | 203.1 | 30.5 | 35.4 (83% acc) | 64/64 exact |
+| Qwen3.5-4B Q4_K | `256p/64d` (`--drafts 2`) | – | 29.6 | 37.0 (86% acc) | 64/64 exact |
+| Gemma 4 26B-A4B UD-IQ2_M | `1024p/64d` | 177.6 | 27.3 | – | identical digest |
+| Gemma 4 26B-A4B UD-IQ2_M | `256p/64d` / coding `--drafts 2` | 173.2 | 30.4 | 37.9–38.0 (73% acc) | 64/64 exact |
+| Inkling 2 Mini UD-Q2_K_XL | `256p/64d` bench / `profile` (`--mtp-drafts 3`) | 100.1 | 19.1 (19.8 `profile`) | 30.6 (`verify(4)` @ 3.27 tok/step) | 128/128 exact chat |
+
+Earlier 2026-11-18 baseline on the same 16 GB M4 (first 1,024 tokens of `src/qwen36/model.rs`, 64
+greedy output tokens, before the G16 8-lane GEMV, shared-LUT MoE decode, H=2560 fused norm, and
+`sg_expert_16` prefill PRs above):
 
 | Model | Prefill before | Prefill after | Decode before | Decode after |
 |-------|---------------:|--------------:|--------------:|-------------:|
