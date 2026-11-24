@@ -1919,6 +1919,436 @@ fn moe_grouped_sgemm_matches_cpu_across_tile_sizes() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn moe_sgemm_register_experts_match_cpu_and_tile64_bit_exact() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(0x12_40_0055);
+    let types = [
+        GgmlType::Iq2Xxs,
+        GgmlType::Iq2S,
+        GgmlType::Iq2Xs,
+        GgmlType::Iq1S,
+        GgmlType::Iq4Nl,
+        GgmlType::Q2_0,
+        GgmlType::Nvfp4,
+        GgmlType::Mxfp4,
+    ];
+    let (h, n, ne) = (256usize, 133usize, 2usize);
+    let make_qweight = |rng: &mut StdRng, ty: GgmlType| -> (Vec<f32>, QWeight) {
+        let bpr = h / ty.block_values();
+        let bb = ty.block_bytes();
+        let mut raw = vec![0u8; ne * n * bpr * bb];
+        for blk in raw.chunks_exact_mut(bb) {
+            for b in blk.iter_mut() {
+                *b = rng.r#gen();
+            }
+            match ty {
+                GgmlType::Nvfp4 => {
+                    for s in &mut blk[0..4] {
+                        *s = rng.gen_range(0x18u8..=0x38u8);
+                    }
+                }
+                GgmlType::Mxfp4 => {
+                    blk[0] = rng.gen_range(120u8..=125u8);
+                }
+                _ => {
+                    let d =
+                        half::f16::from_f32(rng.gen_range(0.002f32..0.01)).to_bits();
+                    blk[0] = (d & 0xff) as u8;
+                    blk[1] = (d >> 8) as u8;
+                }
+            }
+        }
+        let mut f32_w = vec![0.0f32; ne * n * h];
+        crate::gguf::dequantize(ty, &raw, &mut f32_w).unwrap();
+        let qw = QWeight::from_bytes(&ctx, &raw, ty, h, ne * n).unwrap();
+        (f32_w, qw)
+    };
+
+    // Exercises sg_expert_16 (5 and 13 rows), sg_expert_32 (23 rows), and
+    // sg_tile_64 + 2-row sg_expert_16 tail (66 rows), with partial N = 133.
+    let tile_counts = [5usize, 13, 23, 66];
+    let x_one = f32s(&mut rng, h, -1.0, 1.0);
+    for ty in types {
+        let (w_f32, qw) = make_qweight(&mut rng, ty);
+        let mut cpu_row = vec![0.0f32; n];
+        for o in 0..n {
+            cpu_row[o] = w_f32[o * h..(o + 1) * h]
+                .iter()
+                .zip(&x_one)
+                .map(|(&a, &b)| a * b)
+                .sum();
+        }
+        let mut ref_row: Option<Vec<f32>> = None;
+        for &rows in &tile_counts {
+            let x: Vec<f32> = (0..rows).flat_map(|_| x_one.iter().copied()).collect();
+            let ids = vec![0u32; rows];
+            let tx = Tensor::from_f32(&ctx, &x, &[rows, h]).unwrap();
+            let tids = Tensor::from_bytes(
+                &ctx,
+                bytemuck::cast_slice(&ids),
+                &[rows],
+                DType::U32,
+            )
+            .unwrap();
+            let max_tiles = rows.div_ceil(64) + ne + 1;
+            let t_pairs = Tensor::zeros(&ctx, &[rows], DType::U32).unwrap();
+            let t_tiles = Tensor::zeros(&ctx, &[3 * max_tiles], DType::U32).unwrap();
+            let t_ntiles = Tensor::zeros(&ctx, &[12], DType::U32).unwrap();
+            let t_out = Tensor::zeros(&ctx, &[rows, n], DType::F32).unwrap();
+            run(&ctx, |p| {
+                let g =
+                    ctx.pipeline("glm53_moe_group", SOURCE, MslVersion::V3_1).unwrap();
+                p.dispatch_at(
+                    &g,
+                    &[
+                        tids.binding(),
+                        t_pairs.binding(),
+                        t_tiles.binding(),
+                        t_ntiles.binding(),
+                    ],
+                    &[&u32_bytes(rows), &u32_bytes(ne), &u32_bytes(64)],
+                    Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
+                )
+                .unwrap();
+                p.memory_barrier().unwrap();
+                let s = ctx
+                    .pipeline(sgemm_moe_name(ty).unwrap(), SOURCE, MslVersion::V3_1)
+                    .unwrap();
+                p.dispatch_at(
+                    &s,
+                    &[
+                        tx.binding(),
+                        qw.t.binding(),
+                        t_out.binding(),
+                        t_pairs.binding(),
+                        t_tiles.binding(),
+                        t_ntiles.binding(),
+                    ],
+                    &[
+                        &u32_bytes(n),
+                        &u32_bytes(h),
+                        &u32_bytes(qw.row_bytes),
+                        &u32_bytes(0),
+                    ],
+                    Grid::Threadgroups {
+                        groups: (n.div_ceil(128), max_tiles, 1),
+                        threadgroup: (256, 1, 1),
+                    },
+                )
+                .unwrap();
+            });
+            let got = t_out.to_f32().unwrap();
+            assert_close(&got[..n], &cpu_row, 2e-2, 2e-2);
+            let base = ref_row.get_or_insert_with(|| got[..n].to_vec());
+            for r in 0..rows {
+                assert_eq!(
+                    &got[r * n..(r + 1) * n],
+                    base.as_slice(),
+                    "{ty:?} rows={rows} row={r} must match bit-for-bit across tile sizes"
+                );
+            }
+        }
+    }
+
+    // Mixed overflow & finite large-weight recovery:
+    // - Column 0 has Q2_0 d=1.0 and all codes=3 (w=+2.0) with x=30000.0 so a single
+    //   32-element step sums to 1_920_000 (guaranteed FP16 overflow > 65504).
+    // - Column 4 (same 32-lane register subgroup, different 4-column quad) has
+    //   d=0.333251953125 and one code=2 (w=0.333251953125), rest code=1 (w=0.0):
+    //   stays on FP16 path (10000.0) and must match bit-for-bit across sg_expert_16
+    //   (rows=9), sg_expert_32 (rows=20), and sg_tile_64 (rows=66).
+    // - Column 8 has d=40000.0, one code=3 (w=80000.0 > FP16 max), rest code=1 (w=0),
+    //   exercised separately with x=1.0 to verify F32 weight recovery in sg_expert_16/32.
+    let bpr = h / GgmlType::Q2_0.block_values();
+    let bb = GgmlType::Q2_0.block_bytes();
+    let mut raw_ovf = vec![0u8; ne * n * bpr * bb];
+    for blk in raw_ovf.chunks_exact_mut(bb) {
+        let d0 = half::f16::from_f32(0.0).to_bits();
+        blk[0] = (d0 & 0xff) as u8;
+        blk[1] = (d0 >> 8) as u8;
+        blk[2..18].fill(0x55); // all codes = 1 -> w = 0
+    }
+    // Column 0: d=1.0, all codes = 3 (0xff -> w = +2.0) in block 0.
+    {
+        let blk = &mut raw_ovf[0..bb];
+        let d = half::f16::from_f32(1.0).to_bits();
+        blk[0] = (d & 0xff) as u8;
+        blk[1] = (d >> 8) as u8;
+        blk[2..18].fill(0xff);
+    }
+    // Column 4: d=0.333251953125, element 0 has code = 2 (w = d), rest code = 1 (w = 0).
+    {
+        let off = 4 * bpr * bb;
+        let blk = &mut raw_ovf[off..off + bb];
+        let d = half::f16::from_f32(0.333251953125).to_bits();
+        blk[0] = (d & 0xff) as u8;
+        blk[1] = (d >> 8) as u8;
+        blk[2] = 0x56; // element 0 = code 2 (+1), elements 1..3 = code 1 (0)
+    }
+    let mut w_ovf_f32 = vec![0.0f32; ne * n * h];
+    crate::gguf::dequantize(GgmlType::Q2_0, &raw_ovf, &mut w_ovf_f32).unwrap();
+    let qw_ovf =
+        QWeight::from_bytes(&ctx, &raw_ovf, GgmlType::Q2_0, h, ne * n).unwrap();
+    let x_big = vec![30000.0f32; h];
+    let mut want_big = vec![0.0f32; n];
+    for o in 0..n {
+        want_big[o] = w_ovf_f32[o * h..(o + 1) * h]
+            .iter()
+            .zip(&x_big)
+            .map(|(&a, &b)| a * b)
+            .sum();
+    }
+    let mut col4_ref: Option<u32> = None;
+    for rows in [9usize, 20, 66] {
+        let x: Vec<f32> = (0..rows).flat_map(|_| x_big.iter().copied()).collect();
+        let ids = vec![0u32; rows];
+        let tx = Tensor::from_f32(&ctx, &x, &[rows, h]).unwrap();
+        let tids =
+            Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[rows], DType::U32)
+                .unwrap();
+        let max_tiles = rows.div_ceil(64) + ne + 1;
+        let t_pairs = Tensor::zeros(&ctx, &[rows], DType::U32).unwrap();
+        let t_tiles = Tensor::zeros(&ctx, &[3 * max_tiles], DType::U32).unwrap();
+        let t_ntiles = Tensor::zeros(&ctx, &[12], DType::U32).unwrap();
+        let t_out = Tensor::zeros(&ctx, &[rows, n], DType::F32).unwrap();
+        run(&ctx, |p| {
+            let g = ctx.pipeline("glm53_moe_group", SOURCE, MslVersion::V3_1).unwrap();
+            p.dispatch_at(
+                &g,
+                &[
+                    tids.binding(),
+                    t_pairs.binding(),
+                    t_tiles.binding(),
+                    t_ntiles.binding(),
+                ],
+                &[&u32_bytes(rows), &u32_bytes(ne), &u32_bytes(64)],
+                Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
+            )
+            .unwrap();
+            p.memory_barrier().unwrap();
+            let s = ctx
+                .pipeline(
+                    sgemm_moe_name(GgmlType::Q2_0).unwrap(),
+                    SOURCE,
+                    MslVersion::V3_1,
+                )
+                .unwrap();
+            p.dispatch_at(
+                &s,
+                &[
+                    tx.binding(),
+                    qw_ovf.t.binding(),
+                    t_out.binding(),
+                    t_pairs.binding(),
+                    t_tiles.binding(),
+                    t_ntiles.binding(),
+                ],
+                &[
+                    &u32_bytes(n),
+                    &u32_bytes(h),
+                    &u32_bytes(qw_ovf.row_bytes),
+                    &u32_bytes(0),
+                ],
+                Grid::Threadgroups {
+                    groups: (n.div_ceil(128), max_tiles, 1),
+                    threadgroup: (256, 1, 1),
+                },
+            )
+            .unwrap();
+        });
+        let got = t_out.to_f32().unwrap();
+        for &v in &got {
+            assert!(v.is_finite(), "overflow fallback produced non-finite output {v}");
+        }
+        assert_close(&got[..n], &want_big, 4.0, 5e-3);
+        let c4 = got[4].to_bits();
+        let expected_c4 = *col4_ref.get_or_insert(c4);
+        assert_eq!(
+            c4, expected_c4,
+            "rows={rows}: non-overflowing col 4 must match bit-for-bit across tile sizes"
+        );
+    }
+
+    // Row-half overflow isolation: deterministic pair order [0..rows] where rows 0..8
+    // have x[0] = 1.0001 (rest 0) and rows 8.. overflow FP16 (x[0..32] = 30000.0) on
+    // col 0 (w = +2.0). Row 0 must stay on the FP16 path (2.0) identically across
+    // sg_expert_16 (12), sg_expert_32 (20), and sg_tile_64 (66), while row 8 recovers
+    // finite 1_920_000.0.
+    let mut row0_ref: Option<u32> = None;
+    for rows in [12usize, 20, 66] {
+        let mut x = vec![0.0f32; rows * h];
+        for r in 0..8 {
+            x[r * h] = 1.0001;
+        }
+        for r in 8..rows {
+            x[r * h..r * h + 32].fill(30000.0);
+        }
+        let pairs_vec: Vec<u32> = (0..rows as u32).collect();
+        let mut tiles_vec: Vec<u32> = Vec::new();
+        let mut s_off = 0usize;
+        while s_off < rows {
+            let take = (rows - s_off).min(64);
+            tiles_vec.extend_from_slice(&[0u32, s_off as u32, take as u32]);
+            s_off += take;
+        }
+        let n_tiles = tiles_vec.len() / 3;
+        let tx = Tensor::from_f32(&ctx, &x, &[rows, h]).unwrap();
+        let t_pairs = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&pairs_vec),
+            &[rows],
+            DType::U32,
+        )
+        .unwrap();
+        let t_tiles = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&tiles_vec),
+            &[tiles_vec.len()],
+            DType::U32,
+        )
+        .unwrap();
+        let t_ntiles = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&[n_tiles as u32]),
+            &[1],
+            DType::U32,
+        )
+        .unwrap();
+        let t_out = Tensor::zeros(&ctx, &[rows, n], DType::F32).unwrap();
+        run(&ctx, |p| {
+            let s = ctx
+                .pipeline(
+                    sgemm_moe_name(GgmlType::Q2_0).unwrap(),
+                    SOURCE,
+                    MslVersion::V3_1,
+                )
+                .unwrap();
+            p.dispatch_at(
+                &s,
+                &[
+                    tx.binding(),
+                    qw_ovf.t.binding(),
+                    t_out.binding(),
+                    t_pairs.binding(),
+                    t_tiles.binding(),
+                    t_ntiles.binding(),
+                ],
+                &[
+                    &u32_bytes(n),
+                    &u32_bytes(h),
+                    &u32_bytes(qw_ovf.row_bytes),
+                    &u32_bytes(0),
+                ],
+                Grid::Threadgroups {
+                    groups: (n.div_ceil(128), n_tiles, 1),
+                    threadgroup: (256, 1, 1),
+                },
+            )
+            .unwrap();
+        });
+        let got = t_out.to_f32().unwrap();
+        let r0 = got[0].to_bits();
+        let expected_r0 = *row0_ref.get_or_insert(r0);
+        assert_eq!(
+            r0, expected_r0,
+            "rows={rows}: row 0 col 0 must stay on FP16 path bit-identically across tile sizes"
+        );
+        assert_eq!(
+            r0,
+            2.0f32.to_bits(),
+            "rows={rows}: row 0 col 0 must take FP16 path (2.0), got {}",
+            got[0]
+        );
+        assert!(
+            got[8 * n].is_finite() && (got[8 * n] - 1_920_000.0).abs() <= 4.0,
+            "rows={rows}: expected finite 1920000.0 at row 8 col 0, got {}",
+            got[8 * n]
+        );
+    }
+
+    // Large finite weight (> FP16 max 65504): Q2_0 d=40000, code=3 -> w=80000.0, x=1.0,
+    // verified across sg_expert_16 (5), sg_expert_32 (20), and sg_tile_64 (66).
+    let mut raw_huge = vec![0u8; ne * n * bpr * bb];
+    for blk in raw_huge.chunks_exact_mut(bb) {
+        blk[2..18].fill(0x55);
+    }
+    {
+        let blk = &mut raw_huge[0..bb];
+        let d = half::f16::from_f32(40000.0).to_bits();
+        blk[0] = (d & 0xff) as u8;
+        blk[1] = (d >> 8) as u8;
+        blk[2] = 0x57; // element 0 = code 3 (+2 -> 80000.0), elements 1..3 = code 1 (0)
+    }
+    let qw_huge =
+        QWeight::from_bytes(&ctx, &raw_huge, GgmlType::Q2_0, h, ne * n).unwrap();
+    let x_one_f = vec![1.0f32; h];
+    for rows in [5usize, 20, 66] {
+        let x: Vec<f32> = (0..rows).flat_map(|_| x_one_f.iter().copied()).collect();
+        let ids = vec![0u32; rows];
+        let tx = Tensor::from_f32(&ctx, &x, &[rows, h]).unwrap();
+        let tids =
+            Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[rows], DType::U32)
+                .unwrap();
+        let max_tiles = rows.div_ceil(64) + ne + 1;
+        let t_pairs = Tensor::zeros(&ctx, &[rows], DType::U32).unwrap();
+        let t_tiles = Tensor::zeros(&ctx, &[3 * max_tiles], DType::U32).unwrap();
+        let t_ntiles = Tensor::zeros(&ctx, &[12], DType::U32).unwrap();
+        let t_out = Tensor::zeros(&ctx, &[rows, n], DType::F32).unwrap();
+        run(&ctx, |p| {
+            let g = ctx.pipeline("glm53_moe_group", SOURCE, MslVersion::V3_1).unwrap();
+            p.dispatch_at(
+                &g,
+                &[
+                    tids.binding(),
+                    t_pairs.binding(),
+                    t_tiles.binding(),
+                    t_ntiles.binding(),
+                ],
+                &[&u32_bytes(rows), &u32_bytes(ne), &u32_bytes(64)],
+                Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
+            )
+            .unwrap();
+            p.memory_barrier().unwrap();
+            let s = ctx
+                .pipeline(
+                    sgemm_moe_name(GgmlType::Q2_0).unwrap(),
+                    SOURCE,
+                    MslVersion::V3_1,
+                )
+                .unwrap();
+            p.dispatch_at(
+                &s,
+                &[
+                    tx.binding(),
+                    qw_huge.t.binding(),
+                    t_out.binding(),
+                    t_pairs.binding(),
+                    t_tiles.binding(),
+                    t_ntiles.binding(),
+                ],
+                &[
+                    &u32_bytes(n),
+                    &u32_bytes(h),
+                    &u32_bytes(qw_huge.row_bytes),
+                    &u32_bytes(0),
+                ],
+                Grid::Threadgroups {
+                    groups: (n.div_ceil(128), max_tiles, 1),
+                    threadgroup: (256, 1, 1),
+                },
+            )
+            .unwrap();
+        });
+        let got = t_out.to_f32().unwrap();
+        assert!(
+            got[0].is_finite() && (got[0] - 80000.0).abs() <= 1.0,
+            "rows={rows}: expected finite 80000.0, got {}",
+            got[0]
+        );
+    }
+}
+#[test]
 fn moe_iq2_iq1_q2_0_fused_and_m4_match_cpu() {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(0x12_40_0007);
