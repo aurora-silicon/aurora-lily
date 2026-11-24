@@ -198,20 +198,21 @@ fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
 }
 
 /// On a G16 GPU (an M4), the `gemv_g16.comp` kernel of a type, row count,
-/// width and activation layout, and the rows a subgroup of it takes; `None`
+/// width and activation layout, plus `(rows_per_tg, threads_per_tg)`; `None`
 /// keeps the glm53_gemv kernel.
 fn g16_gemv_name(
     ctx: &MetalContext,
     ty: GgmlType,
     cols: usize,
     m: usize,
+    max_rows: usize,
     x_group: usize,
     x_row_stride: usize,
-) -> Option<(&'static str, usize)> {
+) -> Option<(&'static str, usize, usize)> {
     if !ctx.g16() {
         return None;
     }
-    let (names, rows) = match ty {
+    let (names, rows_per_tg, threads_per_tg) = match ty {
         GgmlType::Q4K if cols.is_multiple_of(256) => (
             [
                 "g16_gemv_q4_k_m1",
@@ -219,7 +220,8 @@ fn g16_gemv_name(
                 "g16_gemv_q4_k_m3",
                 "g16_gemv_q4_k_m4",
             ],
-            if m == 1 { 4 } else { 1 },
+            32,
+            if m == 1 { 64 } else { 256 },
         ),
         GgmlType::Q5K if cols.is_multiple_of(256) => (
             [
@@ -228,7 +230,8 @@ fn g16_gemv_name(
                 "g16_gemv_q5_k_m3",
                 "g16_gemv_q5_k_m4",
             ],
-            if m == 1 { 4 } else { 1 },
+            32,
+            if m == 1 { 64 } else { 256 },
         ),
         GgmlType::Q6K if cols.is_multiple_of(256) => (
             [
@@ -237,7 +240,8 @@ fn g16_gemv_name(
                 "g16_gemv_q6_k_m3",
                 "g16_gemv_q6_k_m4",
             ],
-            if m == 1 { 4 } else { 1 },
+            32,
+            256,
         ),
         GgmlType::Q8_0 if cols >= 1024 && cols.is_multiple_of(32) => (
             [
@@ -246,7 +250,8 @@ fn g16_gemv_name(
                 "g16_gemv_q8_0_m3",
                 "g16_gemv_q8_0_m4",
             ],
-            if m == 1 { 4 } else { 1 },
+            32,
+            256,
         ),
         _ => return None,
     };
@@ -254,8 +259,10 @@ fn g16_gemv_name(
     // plain decode's row does. The kernel steps between activation rows in
     // vec4s (x_row_stride / 4): a layout of another stride takes glm53_gemv,
     // at m = 1 too.
-    (m <= names.len() && x_group.is_multiple_of(4) && x_row_stride.is_multiple_of(4))
-        .then(|| (names[m - 1], rows))
+    (m <= names.len()
+        && (x_group >= max_rows || x_group.is_multiple_of(4))
+        && x_row_stride.is_multiple_of(4))
+        .then(|| (names[m - 1], rows_per_tg, threads_per_tg))
 }
 
 fn moe_name(gate_up: bool, ty: GgmlType) -> Result<&'static str> {
@@ -578,7 +585,17 @@ fn gemv_dispatch(
     r2: bool,
 ) -> Result<()> {
     ensure!((1..=4).contains(&sets.len()), "GEMV of {} sets", sets.len());
+    ensure!(l.x_group > 0, "GEMV x_group must be positive");
     let w0 = sets[0].0;
+    ensure!(
+        u32::try_from(w0.cols).is_ok()
+            && u32::try_from(w0.row_bytes).is_ok()
+            && u32::try_from(l.x_group).is_ok()
+            && u32::try_from(l.x_row_stride).is_ok()
+            && u32::try_from(l.y_row_stride).is_ok()
+            && sets.iter().all(|(w, _)| u32::try_from(w.rows).is_ok()),
+        "GEMV layout exceeds u32 kernel parameter range"
+    );
     ensure!((1..=gemv_max_rows(w0.ty)).contains(&m), "GEMV of {m} rows");
     check_f32(&[x])?;
     let tasks = w0.cols / 32;
@@ -592,7 +609,7 @@ fn gemv_dispatch(
     // Wide G16 Q8_0 dispatches (m in 5..=8, e.g. Inkling 2 with 4..7 drafts)
     // chunk into <= 4 rows so they use the exact same G16 summation order as m=1.
     if m > GEMV_MAX_ROWS
-        && g16_gemv_name(ctx, w0.ty, w0.cols, 1, l.x_group, l.x_row_stride).is_some()
+        && g16_gemv_name(ctx, w0.ty, w0.cols, 1, max_rows, l.x_group, l.x_row_stride).is_some()
     {
         for off in (0..m).step_by(GEMV_MAX_ROWS) {
             let chunk = (m - off).min(GEMV_MAX_ROWS);
@@ -612,7 +629,7 @@ fn gemv_dispatch(
         }
         return Ok(());
     }
-    let g16 = g16_gemv_name(ctx, w0.ty, w0.cols, m, l.x_group, l.x_row_stride);
+    let g16 = g16_gemv_name(ctx, w0.ty, w0.cols, m, max_rows, l.x_group, l.x_row_stride);
     // DeepSeek V4's two-weight-rows Q8_0 kernel (`r2`: gemv_sets_r2,
     // gemv_with_r2), for any activation row count so that a row computes
     // the same in any run: rows of 1 024 values, a lane one task, sixteen
@@ -651,17 +668,17 @@ fn gemv_dispatch(
     } else {
         1
     };
-    let per_sg = match g16 {
-        Some((_, rows)) => rows,
-        None => 32 / tasks.min(32),
-    };
-    let rows_per_tg = if r2 || bf16_r2 {
+    let rows_per_tg = if let Some((_, rtg, _)) = g16 {
+        rtg
+    } else if r2 || bf16_r2 {
         16
     } else if q4_0_r4 {
         32
     } else {
+        let per_sg = 32 / tasks.min(32);
         8 * per_sg * r
     };
+    let threads_per_tg = g16.map_or(256, |(_, _, tg)| tg);
     let mut groups = 0;
     for &(w, y) in sets {
         ensure!(
@@ -688,7 +705,7 @@ fn gemv_dispatch(
     }
     let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
     let name = match g16 {
-        Some((name, _)) => name,
+        Some((name, _, _)) => name,
         None if r2 => gemv_r2_name(m)?,
         None if bf16_r2 => gemv_bf16_r2_name(m)?,
         None if q4_0_r4 => "glm53_gemv_q4_0_m1_r4",
@@ -715,7 +732,7 @@ fn gemv_dispatch(
             &u32_bytes(l.x_row_stride),
             &u32_bytes(l.y_row_stride),
         ],
-        Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (threads_per_tg, 1, 1) },
     )
 }
 
