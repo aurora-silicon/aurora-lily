@@ -3092,7 +3092,11 @@ pub fn moe_down_sum(
     h: usize,
 ) -> Result<()> {
     let p = ctx.pipeline(moe_down_sum_name(w.ty)?, SOURCE, MslVersion::V3_1)?;
-    let tg = if matches!(w.ty, GgmlType::Q8_0 | GgmlType::Nvfp4) { 128 } else { 256 };
+    let tg = if matches!(w.ty, GgmlType::Q8_0 | GgmlType::Nvfp4 | GgmlType::Q2_0) {
+        128
+    } else {
+        256
+    };
     pass.dispatch_at(
         &p,
         &[
