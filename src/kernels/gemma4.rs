@@ -16,10 +16,11 @@ use crate::tensor::{DType, Tensor};
 /// GLSL only (see `kernels::glm53`).
 const SOURCE: &str = "";
 
-/// Output rows a subgroup of the G16 routed-expert kernels takes, gate/up
-/// and down (`G16_GR` and `G16_DR` in gemma4.comp).
-const G16_GATE_UP_ROWS: usize = 4;
-const G16_DOWN_ROWS: usize = 2;
+/// Output rows per threadgroup and threads per threadgroup for the G16
+/// routed-expert kernels (gemma4.comp: 8 lanes/row, 32 rows/threadgroup).
+const G16_MOE_ROWS_PER_TG: usize = 32;
+const G16_GATE_UP_THREADS_PER_TG: usize = 256;
+const G16_DOWN_THREADS_PER_TG: usize = 128;
 
 /// Keys a threadgroup of the decode attention takes.
 pub const ATTN_CHUNK: usize = 256;
@@ -539,11 +540,12 @@ pub fn moe_gate_up_q8x(
         other => anyhow::bail!("no Gemma expert gate/up over {other:?}"),
     };
     // On a G16 GPU (an M4) IQ2_XXS takes the G16 kernel.
-    let (name, rows) = if ctx.g16() && gate_up.ty == GgmlType::Iq2Xxs {
-        ("g16_moe_gate_up_iq2_xxs", G16_GATE_UP_ROWS)
-    } else {
-        (name, 1)
-    };
+    let (name, rows_per_tg, threads_per_tg) =
+        if ctx.g16() && gate_up.ty == GgmlType::Iq2Xxs {
+            ("g16_moe_gate_up_iq2_xxs", G16_MOE_ROWS_PER_TG, G16_GATE_UP_THREADS_PER_TG)
+        } else {
+            (name, 8, 256)
+        };
     let mut bindings =
         vec![gate_up.t.binding(), x.binding(), sel.binding(), mid.binding()];
     let name = if gate_up.ty == GgmlType::Q5K && !ctx.g16() {
@@ -563,8 +565,8 @@ pub fn moe_gate_up_q8x(
             &u32_bytes(used),
         ],
         Grid::Threadgroups {
-            groups: (ff.div_ceil(8 * rows), m * used, 1),
-            threadgroup: (256, 1, 1),
+            groups: (ff.div_ceil(rows_per_tg), m * used, 1),
+            threadgroup: (threads_per_tg, 1, 1),
         },
     )
 }
@@ -603,10 +605,11 @@ pub fn moe_down(
         "expert down rows of {} values, {used} used",
         down.cols
     );
-    let (name, rows) = if ctx.g16() && down.ty == GgmlType::Iq4Nl {
-        ("g16_moe_down_iq4_nl", G16_DOWN_ROWS)
+    let (name, rows_per_tg, threads_per_tg) = if ctx.g16() && down.ty == GgmlType::Iq4Nl
+    {
+        ("g16_moe_down_iq4_nl", G16_MOE_ROWS_PER_TG, G16_DOWN_THREADS_PER_TG)
     } else {
-        (name, 1)
+        (name, 8, 256)
     };
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -625,8 +628,8 @@ pub fn moe_down(
             &u32_bytes(used),
         ],
         Grid::Threadgroups {
-            groups: (hidden.div_ceil(8 * rows), m, 1),
-            threadgroup: (256, 1, 1),
+            groups: (hidden.div_ceil(rows_per_tg), m, 1),
+            threadgroup: (threads_per_tg, 1, 1),
         },
     )
 }
