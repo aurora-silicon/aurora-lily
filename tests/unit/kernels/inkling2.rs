@@ -1917,3 +1917,232 @@ fn moe_grouped_sgemm_matches_cpu_across_tile_sizes() {
         }
     }
 }
+
+#[test]
+fn moe_iq2_iq1_q2_0_fused_and_m4_match_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(0x12_40_0007);
+    let make_qweight = |rng: &mut StdRng,
+                        ty: GgmlType,
+                        cols: usize,
+                        rows: usize|
+     -> (Vec<u8>, Vec<f32>, QWeight) {
+        let bpr = cols / ty.block_values();
+        let bb = ty.block_bytes();
+        let mut raw = vec![0u8; rows * bpr * bb];
+        for blk in raw.chunks_exact_mut(bb) {
+            for b in blk.iter_mut() {
+                *b = rng.r#gen();
+            }
+            let d = half::f16::from_f32(rng.gen_range(0.002f32..0.01)).to_bits();
+            blk[0] = (d & 0xff) as u8;
+            blk[1] = (d >> 8) as u8;
+        }
+        let mut f32_w = vec![0.0f32; rows * cols];
+        dequantize(ty, &raw, &mut f32_w).unwrap();
+        let qw = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+        (raw, f32_w, qw)
+    };
+
+    // 1. IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S gate_up_situ and gu_m4 across normal,
+    //    large (> 128), and tiny (< 1e-3) activations, with partial ff = 37 and
+    //    tiles hitting cnt = 1, 2, 3, 4, and 5.
+    let (rows, n_exp, k_exp, h, ff) = (6usize, 8usize, 4usize, 256usize, 37usize);
+    let rows_k = rows * k_exp;
+    let mut ids = Vec::with_capacity(rows_k);
+    for r in 0..rows {
+        let e = match r {
+            0 => [0u32, 1, 2, 3], // e0:5, e1:4, e2:3, e3:2, e4..6:3, e7:1
+            1 => [0, 1, 2, 4],
+            2 => [0, 1, 2, 5],
+            3 => [0, 1, 3, 6],
+            4 => [0, 4, 5, 6],
+            _ => [7, 4, 5, 6],
+        };
+        ids.extend_from_slice(&e);
+    }
+    let gu_sc = f32s(&mut rng, n_exp, 0.5, 1.5);
+    let tids =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&ids), &[rows_k], DType::U32)
+            .unwrap();
+    let tgu_sc = Tensor::from_f32(&ctx, &gu_sc, &[n_exp]).unwrap();
+    let sorted_rk = Tensor::zeros(&ctx, &[rows_k], DType::U32).unwrap();
+    let tiles = Tensor::zeros(&ctx, &[rows_k * 4], DType::U32).unwrap();
+    let n_tiles = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+    let max_tiles = rows_k;
+
+    for ty in [GgmlType::Iq2Xxs, GgmlType::Iq2Xs, GgmlType::Iq2S, GgmlType::Iq1S] {
+        let (_raw, gu_f32, q_gu) = make_qweight(&mut rng, ty, h, n_exp * 2 * ff);
+        for (scale, atol, rtol) in
+            [(1.0f32, 1e-3f32, 1e-3f32), (200.0, 2e-2, 1e-3), (5e-5, 1e-9, 1e-3)]
+        {
+            let x = f32s(&mut rng, rows * h, -scale, scale);
+            let tx = Tensor::from_f32(&ctx, &x, &[rows, h]).unwrap();
+            let f_situ = Tensor::zeros(&ctx, &[rows_k, ff], DType::F32).unwrap();
+            let g_situ = Tensor::zeros(&ctx, &[rows_k, ff], DType::F32).unwrap();
+            run(&ctx, |p| {
+                moe_gate_up_situ(
+                    &ctx,
+                    p,
+                    &tx,
+                    &q_gu,
+                    &tids,
+                    Some(&tgu_sc),
+                    &f_situ,
+                    rows_k,
+                    ff,
+                    k_exp,
+                    4.0,
+                    25.0,
+                )
+                .unwrap();
+                moe_bucket(&ctx, p, &tids, &sorted_rk, &tiles, &n_tiles, rows_k, n_exp)
+                    .unwrap();
+                p.memory_barrier().unwrap();
+                moe_gu_m4(
+                    &ctx,
+                    p,
+                    &tx,
+                    &q_gu,
+                    &sorted_rk,
+                    &tiles,
+                    &n_tiles,
+                    Some(&tgu_sc),
+                    &g_situ,
+                    max_tiles,
+                    ff,
+                    k_exp,
+                    4.0,
+                    25.0,
+                )
+                .unwrap();
+            });
+            let mut want = vec![0.0f32; rows_k * ff];
+            for rk in 0..rows_k {
+                let xr = &x[(rk / k_exp) * h..(rk / k_exp + 1) * h];
+                let e = ids[rk] as usize;
+                for j in 0..ff {
+                    let g: f32 = gu_f32[((e * 2 * ff + j) * h)..][..h]
+                        .iter()
+                        .zip(xr)
+                        .map(|(&a, &b)| a * b)
+                        .sum::<f32>()
+                        * gu_sc[e];
+                    let u: f32 = gu_f32[((e * 2 * ff + ff + j) * h)..][..h]
+                        .iter()
+                        .zip(xr)
+                        .map(|(&a, &b)| a * b)
+                        .sum::<f32>()
+                        * gu_sc[e];
+                    want[rk * ff + j] = cref::situ(g, u, 4.0, 25.0);
+                }
+            }
+            assert_close(&f_situ.to_f32().unwrap(), &want, atol, rtol);
+            assert_close(&g_situ.to_f32().unwrap(), &want, atol, rtol);
+        }
+    }
+
+    // 2. Q2_0 down_sum (K_exp = 8 and K_exp = 4) and down_m4 (partial H = 69,
+    //    cnt = 1..5, normal / > 256 / < 1e-3 activations).
+    let (dn_h, dn_k, dn_exp) = (69usize, 192usize, 10usize);
+    let (_raw, dn_f32, q_dn) =
+        make_qweight(&mut rng, GgmlType::Q2_0, dn_k, dn_exp * dn_h);
+    let dn_sc = f32s(&mut rng, dn_exp, 0.5, 1.5);
+    let tdn_sc = Tensor::from_f32(&ctx, &dn_sc, &[dn_exp]).unwrap();
+    for dk in [8usize, 4usize] {
+        let dr = 6usize;
+        let drk = dr * dk;
+        let mut dids = Vec::with_capacity(drk);
+        let mut dw = Vec::with_capacity(drk);
+        for r in 0..dr {
+            for k in 0..dk {
+                // Ensure expert 0 gets 6 rows (cnt > 4), expert 1 gets 4, etc.
+                let e = if k == 0 {
+                    0
+                } else if k == 1 && r < 4 {
+                    1
+                } else {
+                    ((r + k) % dn_exp) as u32
+                };
+                dids.push(e);
+                dw.push(rng.gen_range(0.1f32..1.0));
+            }
+        }
+        let tdids =
+            Tensor::from_bytes(&ctx, bytemuck::cast_slice(&dids), &[drk], DType::U32)
+                .unwrap();
+        let tdw = Tensor::from_f32(&ctx, &dw, &[drk]).unwrap();
+        let d_sorted = Tensor::zeros(&ctx, &[drk], DType::U32).unwrap();
+        let d_tiles = Tensor::zeros(&ctx, &[drk * 4], DType::U32).unwrap();
+        let d_ntiles = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+
+        for (scale, atol, rtol) in
+            [(1.0f32, 1e-3f32, 1e-3f32), (300.0, 5e-1, 1e-3), (5e-5, 1e-8, 1e-3)]
+        {
+            let x = f32s(&mut rng, drk * dn_k, -scale, scale);
+            let tx = Tensor::from_f32(&ctx, &x, &[drk, dn_k]).unwrap();
+            let f_out = Tensor::zeros(&ctx, &[dr, dn_h], DType::F32).unwrap();
+            let m4_down = Tensor::zeros(&ctx, &[drk, dn_h], DType::F32).unwrap();
+            let m4_out = Tensor::zeros(&ctx, &[dr, dn_h], DType::F32).unwrap();
+            run(&ctx, |p| {
+                moe_down_sum(
+                    &ctx,
+                    p,
+                    &tx,
+                    &q_dn,
+                    &tdids,
+                    &tdw,
+                    Some(&tdn_sc),
+                    &f_out,
+                    dr,
+                    dk,
+                    dn_h,
+                )
+                .unwrap();
+                moe_bucket(
+                    &ctx, p, &tdids, &d_sorted, &d_tiles, &d_ntiles, drk, dn_exp,
+                )
+                .unwrap();
+                p.memory_barrier().unwrap();
+                moe_down_m4(
+                    &ctx, p, &tx, &q_dn, &d_sorted, &d_tiles, &d_ntiles, &m4_down, drk,
+                    dn_h,
+                )
+                .unwrap();
+                p.memory_barrier().unwrap();
+                moe_sum(
+                    &ctx,
+                    p,
+                    &m4_down,
+                    &tdids,
+                    &tdw,
+                    Some(&tdn_sc),
+                    &m4_out,
+                    dr,
+                    dk,
+                    dn_h,
+                )
+                .unwrap();
+            });
+            let mut want = vec![0.0f32; dr * dn_h];
+            for r in 0..dr {
+                for k in 0..dk {
+                    let rk = r * dk + k;
+                    let e = dids[rk] as usize;
+                    let w_eff = dw[rk] * dn_sc[e];
+                    let xr = &x[rk * dn_k..(rk + 1) * dn_k];
+                    for o in 0..dn_h {
+                        let v: f32 = dn_f32[((e * dn_h + o) * dn_k)..][..dn_k]
+                            .iter()
+                            .zip(xr)
+                            .map(|(&a, &b)| a * b)
+                            .sum();
+                        want[r * dn_h + o] += w_eff * v;
+                    }
+                }
+            }
+            assert_close(&f_out.to_f32().unwrap(), &want, atol, rtol);
+            assert_close(&m4_out.to_f32().unwrap(), &want, atol, rtol);
+        }
+    }
+}
