@@ -1315,8 +1315,11 @@ There is no limit on how many images a request carries: agent clients
 resend the whole history every turn, so any cap, or dropping old images to
 stay under one, either wedges the session or changes the prompt early on and
 costs a prefill of nearly all of it. What bounds a request is the context
-(about 2 040 tokens a 1920 x 1080 screenshot) and the 1 GiB body limit, near
-400 opencode screenshots of 2.5 MB base64 each. Resending is made cheap by
+(about 2 040 tokens a 1920 x 1080 screenshot) and the body limit, which
+follows it: 32 MiB plus 4 MiB for every image of the largest size the
+context holds (288 MiB by default, [server.md](server.md), "Request
+limits"), more than the 64 opencode screenshots of 2.5 MB base64 each
+that the default context has room for. Resending is made cheap by
 the image memo (`ImageMemo` in `src/serve/api.rs`): the identity
 preprocessing gave an image (grid and digest) is kept under the SHA-256 of
 its data URI, 4 096 entries, oldest first out. A known image costs a hash
@@ -1636,7 +1639,22 @@ trusted: any account can hold the lock and so keep lily from starting, and
 the file's owner (or root) can unlink it while another account's lily holds
 it, after which the next lily locks a new file. A file created by root
 (`sudo install -m 0666 /dev/null /Users/Shared/lily-instance.lock`) closes
-the second for every other account. A process takes it once and keeps it
+the second for every other account. On Linux the lock is per account instead,
+because a multi-user Linux host is not a single owner's machine:
+`~/.cache/lily/instance.<host>.lock`, the home being the user database's and
+not `HOME`, so every lily of an account takes the same file whatever its
+environment or session (cron, a login, a terminal multiplexer that outlived
+one). `<host>` is the machine id (`/etc/machine-id`), or the host name on a
+system without one: a home mounted on several machines gives each machine
+its own lock. The home and `.cache` must be the account's own directories, whatever
+their modes; `.cache/lily` is created `0700` (and made `0700` if its group
+or others may write it), and the file is `0600`. An account without a home
+of its own (a system account whose home is `/` or does not exist, a uid
+without an entry) locks `/dev/shm/lily-<uid>/instance.lock` instead, in a
+directory that must be the account's own and is `0700`: a fixed place that
+a service's private `/tmp` does not replace, so it too is one path per
+account. Until 2026-11 the lock was the machine-wide
+`/tmp/lily-instance.lock`. A process takes it once and keeps it
 until it exits: the idle unload and the reloads (after an idle unload or a
 GPU fault) find it held, and the kernel drops it on any exit, a crash or a
 SIGKILL included, so no stale lock can block a start. The holder writes its

@@ -207,6 +207,31 @@ fn only_lilys_own_loopback_names_pass_as_host() {
     }
 }
 
+/// Port 80 is the one a client leaves out of `Host` and a browser out of
+/// `Origin`: on it, and only on it, lily's names pass without a port, for
+/// the dashboard as for the API.
+#[test]
+fn on_port_80_lilys_own_names_pass_without_the_port() {
+    for host in ["127.0.0.1", "localhost", "LocalHost", "[::1]", "localhost:80"] {
+        assert!(host_allowed(Some(host), 80), "{host}");
+        assert!(!host_allowed(Some(host), 8000), "{host} on another port");
+    }
+    for host in ["evil.example", "localhost:8000", "localhost.evil.example", ""] {
+        assert!(!host_allowed(Some(host), 80), "{host}");
+    }
+    for origin in ["http://localhost", "http://127.0.0.1", "http://[::1]:80"] {
+        assert!(origin_allowed(Some(origin), 80), "{origin}");
+        assert!(!origin_allowed(Some(origin), 8000), "{origin} on another port");
+    }
+    for origin in ["https://localhost", "http://evil.example", "localhost", "null"] {
+        assert!(!origin_allowed(Some(origin), 80), "{origin}");
+    }
+    assert!(names_host("127.0.0.2", "127.0.0.2", 80));
+    assert!(names_host("127.0.0.2:8000", "127.0.0.2", 8000));
+    assert!(!names_host("127.0.0.2", "127.0.0.2", 8000));
+    assert!(!names_host("127.0.0.2:80", "127.0.0.2", 8000));
+}
+
 #[test]
 fn the_write_guard_wants_json_and_lilys_own_origin() {
     let json = Some("application/json");
@@ -2224,4 +2249,74 @@ fn what_the_server_builds_has_the_fixtures_shape() {
     keys(&served, "", &mut a);
     keys(&made, "", &mut b);
     assert_eq!(a, b);
+}
+
+/// What the head alone decides is refused before the body is read: the
+/// caller asks with the declared length and reads nothing on a refusal.
+#[test]
+fn the_head_guard_refuses_by_the_head_what_respond_would_refuse() {
+    let (_board, d) = dashboard();
+    let guard = |method: &str,
+                 target: &str,
+                 headers: &[(&str, &str)],
+                 connection: Connection,
+                 body_len: usize| {
+        let route = route(method, target, Some(BROWSER)).expect("a dashboard route");
+        d.head_guard(
+            route,
+            &request(method, target, headers),
+            target,
+            connection,
+            body_len,
+        )
+        .map_err(|response| response.status)
+    };
+    let settings = "/v1/lily/settings";
+    assert_eq!(guard("GET", "/v1/lily/status", &[], LOCAL, 0), Ok(()));
+    assert_eq!(guard("GET", "/", &[], LOCAL, 0), Ok(()));
+    assert_eq!(guard("PATCH", settings, &[JSON], LOCAL, MAX_WRITE_BODY), Ok(()));
+    // A peer that is not this machine, whatever it declares.
+    let remote =
+        Connection { peer: at(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))), port: 8000 };
+    for (method, target) in
+        [("GET", "/v1/lily/status"), ("PATCH", settings), ("GET", "/")]
+    {
+        assert_eq!(
+            guard(method, target, &[JSON], remote, 0),
+            Err(403),
+            "{method} {target}"
+        );
+        assert_eq!(guard(method, target, &[JSON], remote, 1 << 30), Err(403));
+    }
+    // A `Host` that is not lily's own.
+    let other_port = Connection { port: 9000, ..LOCAL };
+    assert_eq!(guard("PATCH", settings, &[JSON], other_port, 10), Err(403));
+    // A write without the JSON content type or from another origin.
+    assert_eq!(guard("PATCH", settings, &[], LOCAL, 10), Err(403));
+    assert_eq!(
+        guard(
+            "DELETE",
+            "/v1/lily/settings/top_p",
+            &[("Content-Type", "text/plain")],
+            LOCAL,
+            0
+        ),
+        Err(403)
+    );
+    let foreign = [JSON, ("Origin", "https://other.example")];
+    assert_eq!(guard("PATCH", settings, &foreign, LOCAL, 10), Err(403));
+    // A declared body past the settings writes' limit, on any route.
+    for (method, target) in [
+        ("PATCH", settings),
+        ("DELETE", "/v1/lily/settings/top_p"),
+        ("GET", "/v1/lily/status"),
+        ("POST", "/v1/lily/status"),
+        ("GET", "/"),
+    ] {
+        assert_eq!(
+            guard(method, target, &[JSON], LOCAL, MAX_WRITE_BODY + 1),
+            Err(413),
+            "{method} {target}"
+        );
+    }
 }

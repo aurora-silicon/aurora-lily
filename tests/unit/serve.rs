@@ -914,3 +914,554 @@ fn the_settings_views_computed_defaults_never_fail_the_start() {
     assert_eq!(named(&computed, "kv_cache"), Some(SettingValue::Text("q8".into())));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn api_request(method: &str, headers: &[(&str, &str)]) -> http::Request {
+    http::Request {
+        method: method.to_owned(),
+        http11: true,
+        path: "/v1/chat/completions".to_owned(),
+        headers: headers
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+        body: Vec::new(),
+    }
+}
+
+const LOCAL_PEER: Option<SocketAddr> =
+    Some(SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 50_000)));
+
+const LOOPBACK: ApiGate<'static> = ApiGate {
+    loopback_listener: true,
+    local: Some(SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8000))),
+    port: 8000,
+    api_key: None,
+    peer: LOCAL_PEER,
+};
+
+/// What the openai SDK and `curl -H 'Content-Type: application/json'` send.
+const CLIENT: [(&str, &str); 2] =
+    [("Host", "127.0.0.1:8000"), ("Content-Type", "application/json")];
+
+#[test]
+fn the_api_on_a_loopback_listener_answers_its_own_host_only() {
+    let status = |method: &str, headers: &[(&str, &str)], path: &str| {
+        api_guard(&api_request(method, headers), path, &LOOPBACK).map_err(|(s, _)| s)
+    };
+    assert_eq!(status("POST", &CLIENT, "/v1/chat/completions"), Ok(()));
+    for host in ["localhost:8000", "[::1]:8000", "LOCALHOST:8000"] {
+        let headers = [("Host", host), ("Content-Type", "application/json")];
+        assert_eq!(status("POST", &headers, "/v1/completions"), Ok(()), "{host}");
+        assert_eq!(status("GET", &headers[..1], "/v1/models"), Ok(()), "{host}");
+    }
+    // A foreign host, another port, no port (the port is not 80), nothing.
+    for host in ["other.example:8000", "127.0.0.1:9000", "127.0.0.1", ""] {
+        let headers = [("Host", host), ("Content-Type", "application/json")];
+        for (method, path) in [
+            ("POST", "/v1/chat/completions"),
+            ("GET", "/v1/models"),
+            ("GET", "/v1/timings"),
+            ("GET", "/health"),
+        ] {
+            assert_eq!(status(method, &headers, path), Err(403), "{host} {path}");
+        }
+    }
+    assert_eq!(
+        status("POST", &[("Content-Type", "application/json")], "/v1/completions"),
+        Err(403),
+        "no Host"
+    );
+    // A listener that is not loopback is reached under the machine's names.
+    let lan = ApiGate {
+        loopback_listener: false,
+        local: "192.168.1.20:8000".parse().ok(),
+        port: 8000,
+        api_key: Some("k"),
+        peer: "192.168.1.30:50000".parse().ok(),
+    };
+    let headers = [
+        ("Host", "studio.lan:8000"),
+        ("Content-Type", "application/json"),
+        ("Authorization", "Bearer k"),
+    ];
+    assert_eq!(
+        api_guard(&api_request("POST", &headers), "/v1/completions", &lan),
+        Ok(())
+    );
+}
+
+#[test]
+fn api_posts_need_json_and_no_foreign_origin() {
+    let status = |method: &str, headers: &[(&str, &str)]| {
+        api_guard(&api_request(method, headers), "/v1/chat/completions", &LOOPBACK)
+            .map_err(|(s, _)| s)
+    };
+    let host = ("Host", "127.0.0.1:8000");
+    // The content types a browser sends to another origin unasked.
+    for content_type in
+        [None, Some("text/plain"), Some("application/x-www-form-urlencoded")]
+    {
+        let mut headers = vec![host];
+        headers.extend(content_type.map(|c| ("Content-Type", c)));
+        assert_eq!(status("POST", &headers), Err(415), "{content_type:?}");
+    }
+    assert_eq!(
+        status("POST", &[host, ("Content-Type", "application/json; charset=utf-8")]),
+        Ok(())
+    );
+    for origin in ["https://example.com", "http://localhost:3000", "null"] {
+        let headers = [host, ("Content-Type", "application/json"), ("Origin", origin)];
+        assert_eq!(status("POST", &headers), Err(403), "{origin}");
+        assert_eq!(status("GET", &[host, ("Origin", origin)]), Err(403), "{origin}");
+    }
+    let own = [
+        host,
+        ("Content-Type", "application/json"),
+        ("Origin", "http://127.0.0.1:8000"),
+    ];
+    assert_eq!(status("POST", &own), Ok(()));
+}
+
+#[test]
+fn an_api_key_is_required_on_every_route_but_health() {
+    let gate = ApiGate { api_key: Some("s3cret"), ..LOOPBACK };
+    let status = |path: &str, authorization: Option<&str>| {
+        let mut headers = CLIENT.to_vec();
+        headers.extend(authorization.map(|a| ("Authorization", a)));
+        api_guard(&api_request("POST", &headers), path, &gate).map_err(|(s, _)| s)
+    };
+    for path in ["/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/timings"]
+    {
+        assert_eq!(status(path, None), Err(401), "{path}");
+        assert_eq!(status(path, Some("Bearer wrong")), Err(401), "{path}");
+        assert_eq!(status(path, Some("Bearer s3cre")), Err(401), "{path}");
+        assert_eq!(status(path, Some("Basic s3cret")), Err(401), "{path}");
+        assert_eq!(status(path, Some("Bearer s3cret")), Ok(()), "{path}");
+        assert_eq!(status(path, Some("bearer  s3cret ")), Ok(()), "{path}");
+    }
+    assert_eq!(status("/health", None), Ok(()));
+}
+
+#[test]
+fn a_loopback_listener_answers_under_the_address_it_is_bound_to() {
+    let status = |host: &str, gate: &ApiGate<'_>| {
+        api_guard(&api_request("GET", &[("Host", host)]), "/v1/models", gate)
+            .map_err(|(s, _)| s)
+    };
+    // `--bind 127.0.0.2:8000`.
+    let other = ApiGate { local: "127.0.0.2:8000".parse().ok(), ..LOOPBACK };
+    assert_eq!(status("127.0.0.2:8000", &other), Ok(()));
+    assert_eq!(status("localhost:8000", &other), Ok(()));
+    assert_eq!(status("127.0.0.3:8000", &other), Err(403));
+    assert_eq!(status("127.0.0.2:8001", &other), Err(403));
+    assert_eq!(status("127.0.0.2", &other), Err(403), "the port is not 80");
+    assert_eq!(
+        status("127.0.0.2:8000", &LOOPBACK),
+        Err(403),
+        "not this listener's address"
+    );
+    let v6 = ApiGate { local: "[::1]:8000".parse().ok(), ..LOOPBACK };
+    assert_eq!(status("[::1]:8000", &v6), Ok(()));
+    // Port 80 is the one a client leaves out of `Host`.
+    let port_80 = ApiGate { local: "127.0.0.2:80".parse().ok(), port: 80, ..LOOPBACK };
+    for host in
+        ["127.0.0.1", "localhost", "[::1]", "127.0.0.2", "127.0.0.2:80", "LocalHost"]
+    {
+        assert_eq!(status(host, &port_80), Ok(()), "{host}");
+    }
+    assert_eq!(status("other.example", &port_80), Err(403));
+    assert_eq!(status("", &port_80), Err(403));
+    // The origin a page served from port 80 has carries no port either.
+    let same_origin = |origin: &str| {
+        let headers = [("Host", "localhost"), ("Origin", origin)];
+        api_guard(&api_request("GET", &headers), "/v1/models", &port_80)
+            .map_err(|(s, _)| s)
+    };
+    assert_eq!(same_origin("http://localhost"), Ok(()));
+    assert_eq!(same_origin("http://localhost:8000"), Err(403));
+    assert_eq!(same_origin("http://other.example"), Err(403));
+}
+
+#[test]
+fn a_request_with_the_api_key_passes_under_any_host() {
+    let gate = ApiGate { api_key: Some("s3cret"), ..LOOPBACK };
+    let status = |host: &str, authorization: Option<&str>, path: &str| {
+        let mut headers = vec![("Host", host)];
+        headers.extend(authorization.map(|a| ("Authorization", a)));
+        api_guard(&api_request("GET", &headers), path, &gate).map_err(|(s, _)| s)
+    };
+    // A forwarded port or a proxy: another name, another port.
+    for host in ["127.0.0.1:9000", "gateway.example", "gateway.example:443"] {
+        assert_eq!(status(host, Some("Bearer s3cret"), "/v1/models"), Ok(()), "{host}");
+        assert_eq!(status(host, Some("Bearer s3cret"), "/health"), Ok(()), "{host}");
+        assert_eq!(
+            status(host, Some("Bearer wrong"), "/v1/models"),
+            Err(403),
+            "{host}"
+        );
+        assert_eq!(status(host, None, "/v1/models"), Err(403), "{host}");
+        assert_eq!(status(host, None, "/health"), Err(403), "{host}");
+    }
+    assert_eq!(status("127.0.0.1:8000", None, "/v1/models"), Err(401));
+}
+
+/// The `Origin` test is for requests without a credential: a browser
+/// attaches no bearer token by itself, so a page under another name that
+/// sends the key (a proxy serving a UI and the API under one name) passes,
+/// and the same request without the right key does not.
+#[test]
+fn a_request_with_the_api_key_passes_under_any_origin() {
+    let gate = ApiGate { api_key: Some("s3cret"), ..LOOPBACK };
+    let status = |method: &str, host: &str, authorization: Option<&str>| {
+        let mut headers = vec![
+            ("Host", host),
+            ("Origin", "https://gateway.example"),
+            ("Content-Type", "application/json"),
+        ];
+        headers.extend(authorization.map(|a| ("Authorization", a)));
+        api_guard(&api_request(method, &headers), "/v1/chat/completions", &gate)
+            .map_err(|(s, _)| s)
+    };
+    for host in ["gateway.example", "127.0.0.1:8000"] {
+        for method in ["GET", "POST"] {
+            assert_eq!(status(method, host, Some("Bearer s3cret")), Ok(()), "{host}");
+            assert_eq!(status(method, host, Some("Bearer wrong")), Err(403), "{host}");
+            assert_eq!(status(method, host, None), Err(403), "{host}");
+        }
+    }
+    // The key does not stand in for the content type.
+    let untyped = [
+        ("Host", "gateway.example"),
+        ("Origin", "https://gateway.example"),
+        ("Authorization", "Bearer s3cret"),
+    ];
+    assert_eq!(
+        api_guard(&api_request("POST", &untyped), "/v1/chat/completions", &gate)
+            .map_err(|(s, _)| s),
+        Err(415)
+    );
+    // Without a configured key nothing a request carries is one.
+    let unkeyed = [
+        ("Host", "127.0.0.1:8000"),
+        ("Origin", "https://gateway.example"),
+        ("Authorization", "Bearer s3cret"),
+    ];
+    assert_eq!(
+        api_guard(&api_request("GET", &unkeyed), "/v1/models", &LOOPBACK)
+            .map_err(|(s, _)| s),
+        Err(403)
+    );
+}
+
+#[test]
+fn a_bind_that_is_not_loopback_needs_an_api_key() {
+    let at = |s: &str| s.parse::<SocketAddr>().expect("address");
+    for bind in ["127.0.0.1:8000", "[::1]:8000", "127.0.0.2:8000"] {
+        assert!(check_bind_auth(at(bind), None).is_ok(), "{bind}");
+    }
+    for bind in ["0.0.0.0:8000", "[::]:8000", "192.168.1.20:8000"] {
+        let error = check_bind_auth(at(bind), None).expect_err(bind);
+        assert!(format!("{error:#}").contains("--api-key"), "{error:#}");
+        assert!(check_bind_auth(at(bind), Some("k3y")).is_ok(), "{bind}");
+    }
+    assert!(check_bind_auth(at("0.0.0.0:8000"), Some("")).is_err());
+    assert!(check_bind_auth(at("0.0.0.0:8000"), Some("two words")).is_err());
+}
+
+/// `--api-key-file`: the key is the file's text without its final line
+/// ending; an empty or missing file is an error, and nothing else is cut.
+#[test]
+fn the_api_key_file_gives_the_key_without_its_line_ending() {
+    let dir = std::env::temp_dir().join(format!("lily-api-key-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let file = dir.join("key");
+    let read = |text: &str| {
+        std::fs::write(&file, text).expect("write");
+        ApiKey::from_file(&file)
+    };
+    for text in ["s3cret-key", "s3cret-key\n", "s3cret-key\r\n"] {
+        let key = read(text).expect("a key");
+        assert_eq!(key.as_str(), "s3cret-key", "{text:?}");
+        assert_eq!(key, ApiKey::new("s3cret-key".to_owned()));
+    }
+    for text in ["", "\n", "\r\n"] {
+        let error = read(text).expect_err("no key");
+        assert!(format!("{error:#}").contains("is empty"), "{text:?}: {error:#}");
+    }
+    // Only the line ending goes: a key with a space in it is still refused
+    // as one, not silently shortened.
+    let spaced = read("two words \n\n").expect("read as written");
+    assert_eq!(spaced.as_str(), "two words \n");
+    let at = "0.0.0.0:8000".parse::<SocketAddr>().expect("address");
+    assert!(check_bind_auth(at, Some(spaced.as_str())).is_err());
+    let missing = ApiKey::from_file(&dir.join("missing")).expect_err("no file");
+    assert!(format!("{missing:#}").contains("--api-key-file"), "{missing:#}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The key is not in what `Debug` prints of it or of the options.
+#[test]
+fn the_api_key_is_not_printed() {
+    let key = ApiKey::new("s3cret-key".to_owned());
+    assert_eq!(format!("{key:?}"), "ApiKey(set)");
+    assert!(!format!("{:?}", Some(&key)).contains("s3cret"));
+}
+
+fn image_policy_for_test(available: bool) -> ImagePolicy {
+    ImagePolicy {
+        limits: ImageLimits::default(),
+        available: if available { Ok(()) } else { Err("off".to_owned()) },
+        memo: Default::default(),
+    }
+}
+
+#[test]
+fn the_body_limit_follows_the_images_the_context_holds() {
+    let with_images = image_policy_for_test(true);
+    // 64 images of 2 048 tokens in 131 072, 4 MiB each, and the text's 32 MiB.
+    assert_eq!(max_request_bytes(131_072, &with_images), 288 << 20);
+    assert_eq!(max_request_bytes(262_144, &with_images), 544 << 20);
+    assert!(max_request_bytes(131_072, &with_images) < 1 << 30);
+    // Without images only the text's allowance.
+    assert_eq!(max_request_bytes(131_072, &image_policy_for_test(false)), 32 << 20);
+    // A tiny image cap fits more images but never passes the ceiling.
+    let mut tiny = image_policy_for_test(true);
+    tiny.limits.max_pixels = 1;
+    assert_eq!(max_request_bytes(262_144, &tiny), BODY_BYTES_CEILING);
+}
+
+#[test]
+fn connections_past_the_limit_get_no_slot_until_one_is_given_back() {
+    assert_eq!(max_connections(32), 128);
+    let open = Arc::new(AtomicUsize::new(0));
+    let mut slots: Vec<_> =
+        (0..3).map(|_| take_connection_slot(&open, 3).expect("a free slot")).collect();
+    assert!(take_connection_slot(&open, 3).is_none(), "a fourth connection is refused");
+    assert_eq!(open.load(Ordering::Acquire), 3, "a refusal takes nothing");
+    slots.pop();
+    assert_eq!(
+        open.load(Ordering::Acquire),
+        2,
+        "a finished connection gives its slot back"
+    );
+    assert!(take_connection_slot(&open, 3).is_some());
+}
+
+#[test]
+fn a_connection_thread_that_panics_gives_its_slot_back() {
+    let open = Arc::new(AtomicUsize::new(0));
+    let slot = take_connection_slot(&open, 1).expect("a free slot");
+    assert!(take_connection_slot(&open, 1).is_none());
+    let thread = std::thread::spawn(move || {
+        let _slot = slot;
+        std::panic::resume_unwind(Box::new("the handler failed"));
+    });
+    assert!(thread.join().is_err(), "the thread panicked");
+    assert_eq!(open.load(Ordering::Acquire), 0);
+    assert!(take_connection_slot(&open, 1).is_some(), "the slot is free again");
+}
+
+#[test]
+fn the_busy_refusal_logs_a_line_a_second_and_counts_the_rest() {
+    let mut log = RefusalLog::default();
+    let start = Instant::now();
+    assert_eq!(log.due(start), Some(0), "the first refusal is logged");
+    assert_eq!(log.due(start + Duration::from_millis(10)), None);
+    assert_eq!(log.due(start + Duration::from_millis(999)), None);
+    assert_eq!(log.due(start + Duration::from_millis(1000)), Some(2));
+    assert_eq!(log.due(start + Duration::from_millis(1500)), None);
+    assert_eq!(log.due(start + Duration::from_secs(5)), Some(1));
+    assert_eq!(log.due(start + Duration::from_secs(9)), Some(0));
+}
+
+#[test]
+fn request_bodies_in_flight_are_bounded_and_given_back() {
+    let budget = BodyBudget::new(100);
+    let mut a = budget.hold();
+    assert!(a.grow(30) && a.grow(30), "bytes are taken as they arrive");
+    let mut b = budget.hold();
+    assert!(!b.grow(41), "past the budget");
+    assert_eq!(budget.used.load(Ordering::Acquire), 60, "a refusal takes nothing");
+    assert!(b.grow(40), "fits exactly");
+    assert!(!a.grow(1));
+    assert!(budget.hold().grow(0), "a request without a body always fits");
+    drop(a);
+    assert_eq!(budget.used.load(Ordering::Acquire), 40);
+    let mut c = budget.hold();
+    assert!(c.grow(60), "a finished request gives its bytes back");
+    assert!(!c.grow(usize::MAX), "no overflow");
+    drop((b, c));
+    assert_eq!(budget.used.load(Ordering::Acquire), 0);
+}
+
+/// A request that has been parsed no longer holds its body or its share of
+/// the budget: while it waits in the queue and is answered, others may
+/// send theirs.
+#[test]
+fn a_parsed_request_gives_its_body_and_budget_back() {
+    const LENGTH: usize = 200_000;
+    let budget = BodyBudget::new(LENGTH);
+    let (server, mut client) = socket_pair();
+    post_with(&mut client, LENGTH, LENGTH);
+    let (mut request, body) = head_of(&server);
+    let held =
+        read_body(&budget, &mut request, body).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(request.body.len(), LENGTH);
+    assert_eq!(budget.used.load(Ordering::Acquire), LENGTH);
+    assert!(!budget.hold().grow(1), "the budget is taken while the body is held");
+    release_body(&mut request, held);
+    assert_eq!(request.body.capacity(), 0, "the bytes are freed");
+    assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    assert!(budget.hold().grow(LENGTH), "the next request's body fits");
+}
+
+/// The server's and the client's end of one loopback connection.
+fn socket_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let client =
+        TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+    let (server, _) = listener.accept().expect("accept");
+    (server, client)
+}
+
+/// A POST's head declaring `length` body bytes, then `sent` of them (from
+/// a thread: the server may stop reading part way).
+fn post_with(client: &mut TcpStream, length: usize, sent: usize) {
+    use std::io::Write as _;
+    let head =
+        format!("POST /v1/completions HTTP/1.1\r\nContent-Length: {length}\r\n\r\n");
+    client.write_all(head.as_bytes()).expect("head");
+    let mut client = client.try_clone().expect("clone");
+    std::thread::spawn(move || {
+        let _ = client.write_all(&vec![b'x'; sent]);
+    });
+}
+
+/// The head read off `server`, as [`handle`] reads it.
+fn head_of(server: &TcpStream) -> (http::Request, http::Body) {
+    let deadlines = http::Deadlines {
+        head: Duration::from_secs(5),
+        total: Duration::from_secs(5),
+        body_idle: Duration::from_secs(5),
+    };
+    http::read_head_within(server, 1 << 20, deadlines).expect("head")
+}
+
+#[test]
+fn a_declared_body_takes_budget_only_as_its_bytes_arrive() {
+    const LENGTH: usize = 300_000;
+    let budget = Arc::new(BodyBudget::new(LENGTH + LENGTH / 2));
+    // Three connections declare a body and send none of it.
+    let idle: Vec<_> = (0..3)
+        .map(|_| {
+            let (server, mut client) = socket_pair();
+            post_with(&mut client, LENGTH, 0);
+            let budget = budget.clone();
+            let reader = std::thread::spawn(move || {
+                let (mut request, body) = head_of(&server);
+                read_body(&budget, &mut request, body)
+                    .map(drop)
+                    .map_err(|(status, ..)| status)
+            });
+            (client, reader)
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        budget.used.load(Ordering::Acquire),
+        0,
+        "nothing arrived, nothing is taken"
+    );
+    // A request that sends its body still fits.
+    let (server, mut client) = socket_pair();
+    post_with(&mut client, LENGTH, LENGTH);
+    let (mut request, body) = head_of(&server);
+    let held = read_body(&budget, &mut request, body)
+        .map_err(|(status, _, why)| (status, why))
+        .expect("a body that arrives fits beside the declared ones");
+    assert_eq!(request.body.len(), LENGTH);
+    assert_eq!(budget.used.load(Ordering::Acquire), LENGTH);
+    // A second whole body does not fit beside it: 503, and what it had
+    // taken goes back.
+    let (server2, mut client2) = socket_pair();
+    post_with(&mut client2, LENGTH, LENGTH);
+    let (mut request2, body2) = head_of(&server2);
+    let refused = read_body(&budget, &mut request2, body2).map(drop);
+    assert_eq!(refused.map_err(|(status, ..)| status), Err(503));
+    assert_eq!(budget.used.load(Ordering::Acquire), LENGTH);
+    drop(held);
+    assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    // The idle ones end when their clients go (400) and held nothing.
+    for (client, reader) in idle {
+        drop(client);
+        assert_eq!(reader.join().expect("reader"), Err(400));
+    }
+    assert_eq!(budget.used.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn a_body_that_stalls_past_its_deadline_is_a_408() {
+    let budget = BodyBudget::new(1 << 20);
+    let (server, mut client) = socket_pair();
+    post_with(&mut client, 1000, 10);
+    let deadlines = http::Deadlines {
+        head: Duration::from_secs(5),
+        total: Duration::from_millis(300),
+        body_idle: Duration::from_secs(5),
+    };
+    let (mut request, body) =
+        http::read_head_within(&server, 1 << 20, deadlines).expect("head");
+    let refused = read_body(&budget, &mut request, body).map(drop);
+    assert_eq!(refused.map_err(|(status, ..)| status), Err(408));
+    assert_eq!(budget.used.load(Ordering::Acquire), 0);
+}
+
+/// A body longer than the limit is a 413, a request past its deadline a
+/// 408, anything else that could not be read a 400.
+#[test]
+fn a_request_that_could_not_be_read_gets_the_status_that_says_why() {
+    let too_large = anyhow::Error::from(http::BodyTooLarge { limit: 1 << 20 });
+    assert_eq!(unread_status(&too_large), 413);
+    assert_eq!(unread_status(&too_large.context("reading the request")), 413);
+    let late = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+    assert_eq!(unread_status(&late.context("reading request body")), 408);
+    assert_eq!(unread_status(&anyhow::anyhow!("malformed header line")), 400);
+}
+
+#[test]
+fn a_full_queue_is_seen_before_a_request_is_parsed() {
+    let queue = EngineQueue::new(2);
+    assert!(!queue.full());
+    assert!(queue.admit());
+    assert!(!queue.full());
+    assert!(queue.admit());
+    assert!(queue.full(), "the next request would be refused: refuse it unparsed");
+    queue.left();
+    assert!(!queue.full());
+}
+
+#[test]
+fn the_timings_of_every_client_answer_this_machine_only() {
+    let lan_peer = "192.168.1.30:50000".parse().ok();
+    let lan = ApiGate {
+        loopback_listener: false,
+        local: "192.168.1.20:8000".parse().ok(),
+        port: 8000,
+        api_key: Some("k"),
+        peer: lan_peer,
+    };
+    let headers = [("Host", "studio.lan:8000"), ("Authorization", "Bearer k")];
+    let status = |path: &str, gate: &ApiGate<'_>| {
+        api_guard(&api_request("GET", &headers), path, gate).map_err(|(s, _)| s)
+    };
+    assert_eq!(
+        status("/v1/timings", &lan),
+        Err(403),
+        "a LAN client, even with the key"
+    );
+    assert_eq!(status("/v1/models", &lan), Ok(()), "the other routes stay open to it");
+    assert_eq!(status("/v1/timings", &ApiGate { peer: None, ..lan }), Err(403));
+    let local = ApiGate { peer: LOCAL_PEER, ..lan };
+    assert_eq!(status("/v1/timings", &local), Ok(()));
+}

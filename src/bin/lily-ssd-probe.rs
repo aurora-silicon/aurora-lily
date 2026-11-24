@@ -763,7 +763,10 @@ fn main() -> Result<()> {
 /// writes its record right after locking). `None` when the file cannot be
 /// read.
 fn other_lily_running() -> Option<bool> {
-    let text = match std::fs::read_to_string(lily::instance::default_path()) {
+    let Ok(path) = lily::instance::default_path() else {
+        return None;
+    };
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
         Err(_) => return None,

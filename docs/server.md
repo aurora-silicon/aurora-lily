@@ -14,6 +14,20 @@ other OpenAI-compatible servers:
 - **Images** are base64 data URIs (PNG or JPEG, no count limit beyond the
   context); the server never fetches URLs. A 1920 x 1080 screenshot costs
   about 2 000 prompt tokens. No video.
+- **Request limits.** A body may take 32 MiB plus 4 MiB for every image of
+  the largest size the context holds (288 MiB at the default 131 072 tokens
+  and 2 048-token image cap; 32 MiB without a vision tower); bodies held at
+  once take at most four times that, counted as their bytes arrive and
+  until the request is parsed (503 past it). The request line and headers
+  take at most 64 KiB and 30 s, the whole request 300 s (408 past either);
+  a body declared longer than the limit is a 413. Past `--queue` waiting
+  requests (checked before the body is read) and past twice `--queue` plus
+  64 open connections, the answer is 503. A response written in one piece
+  must be taken by the client within 30 s, and a streamed one is given up
+  when the client has taken nothing for 120 s while bytes wait for it.
+  These limits are per server, not per client: all clients share them, and
+  one that keeps its connections open to their limits leaves fewer for the
+  others.
 - **Message text is always text.** A special token spelled in a message, a
   tool result or a tool definition (`<|im_end|>`, `<|image_pad|>`) is
   tokenized as the characters it is, never as conversation structure or an
@@ -25,6 +39,47 @@ other OpenAI-compatible servers:
   rates, cached tokens and draft acceptance. `GET /v1/timings` keeps the
   last 32; `tools/opencode-plugin-timings/` shows them in opencode.
 
+### Who may call it
+
+These routes answer only what a client on this machine (or holding the API
+key) sends:
+
+- On a loopback `--bind` (the default `127.0.0.1:8000`) without a key, the
+  `Host` header must be lily's own address and port: `127.0.0.1`,
+  `localhost`, `[::1]` or the `--bind` address, with lily's port (which may
+  be left out when it is 80, here as for the dashboard). Any other `Host`
+  gets 403. A forwarded port must therefore keep the port number (`ssh -L
+  8000:127.0.0.1:8000`, not `-L 9000:127.0.0.1:8000`), or the server runs
+  with an API key: a request that carries the key passes under any `Host`,
+  so forwarded ports and proxies under another name or port work with it.
+- A POST needs `Content-Type: application/json` (charset parameters pass;
+  415 otherwise), and a request that carries an `Origin` other than lily's
+  own gets 403 unless it carries the API key. A browser sends either to
+  another origin only after a CORS preflight, which lily never answers.
+  The OpenAI SDKs and `curl -H 'Content-Type: application/json'` send what
+  is needed.
+- `--api-key-file <path>` makes every route but `/health` require
+  `Authorization: Bearer <key>` (401 otherwise), the key being the file's
+  text without its final line ending (printable ASCII without spaces; an
+  empty file is refused). Keep the file readable by lily's account only
+  (`chmod 600`). A `--bind` that is not a loopback address (`0.0.0.0`, a
+  LAN address) refuses to start without a key. `--api-key <key>` takes the
+  key itself and is kept for a machine with a single account: a command
+  line is visible to the other accounts of the machine, so prefer the file.
+- `GET /v1/timings` lists the recent requests of every client, so it
+  answers loopback peers only (403 otherwise), as the dashboard does.
+
+**One principal.** Lily serves one user (or one set of clients that trust
+each other), not several who must be kept apart. The session cache is
+shared by every client: a prompt resumes from whichever cached
+conversation shares its longest prefix, whoever sent it, and the response
+says how many tokens it reused (`cached_tokens`, and the prefill time).
+`prompt_cache_key` only breaks ties between equally good sessions; it
+does not isolate them. The cache is not partitioned by client, and the
+reused token count is reported to every client. Run one server per
+principal (and keep the API key to the one user) rather than sharing one
+between parties that must be kept apart.
+
 ## The dashboard
 
 `http://127.0.0.1:8000/` (the `--bind` address) serves a dashboard built into
@@ -34,7 +89,8 @@ last 7 days and every setting. It reads `/v1/lily/status`, `/sessions`,
 already publishes and from the recorder's database, so an open page never
 wakes an idle or unloaded engine. Every dashboard route answers loopback
 peers only, under `127.0.0.1`, `localhost` or `[::1]` with lily's port as
-`Host` (403 otherwise, whatever `--bind` says), and forbids framing. A path
+`Host` (the port may be left out when it is 80; 403 otherwise, whatever
+`--bind` says), and forbids framing. A path
 that is not the dashboard's (no `/v1/lily/` route, no file of the app) gets
 the app only when a browser navigates to it: a GET or HEAD of a path with no
 extension, outside `/api/` and `/v1/`, whose `Accept` names `text/html`, so
@@ -286,7 +342,13 @@ q8 runs at the same speed as bf16, at a teacher-forced KL of about 2e-3 to
 4e-3 against it (see [architecture.md](architecture.md), "The 8-bit K/V
 cache"). Each format and each checkpoint (q4, q4-xl, a re-conversion)
 keeps its own disk-tier directory, so sessions persisted under one are not
-read under another.
+read under another. The tier holds the conversations' tokens and state, so
+the directories lily creates for it are `0700` and its files `0600`. At
+the start, what an earlier lily left there with a looser mode is made
+private too: the directory of every format under `--disk-cache-dir`, the
+entries in it and their files. Anything else in that directory is not
+touched, and a directory that is a link or another account's is left as it
+is (with a line in the log when it is the format's own).
 
 On a machine that does not hold the model (the expert cache,
 [low-ram-experts.md](low-ram-experts.md)) the caches are q8 and requests

@@ -17,8 +17,28 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail, ensure};
 
+/// The request line and headers together; a line is read through a
+/// [`Read::take`] of what is left of it, so one without a newline cannot
+/// grow past it.
 const MAX_HEADER_BYTES: usize = 64 << 10;
+/// The request line and headers must arrive within this, however the bytes
+/// trickle in.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest wait for the next bytes of a body.
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The whole request (head and body) must arrive within this.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// A response written in one piece ([`respond_raw`], [`respond_unread`])
+/// must be taken by the client within this: the largest are the
+/// dashboard's script (about 130 KB) and its history, to a loopback peer.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest a write of a relayed response ([`Watched`]) waits for the
+/// client to take more. Such a response has no total limit, a generation
+/// runs as long as it runs, but a client that has taken nothing for this
+/// long while bytes wait for it is treated as gone, like one whose body
+/// stopped arriving ([`BODY_IDLE_TIMEOUT`]). The engine's pauses do not
+/// count: the timeout runs only while a write is blocked.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct Request {
     pub method: String,
@@ -38,14 +58,192 @@ impl Request {
     }
 }
 
+/// How long [`read_head_within`] and [`Body::read_with`] may take.
+#[derive(Debug, Clone, Copy)]
+pub struct Deadlines {
+    /// For the request line and the headers.
+    pub head: Duration,
+    /// For the head and the body together.
+    pub total: Duration,
+    /// For the next bytes of the body.
+    pub body_idle: Duration,
+}
+
+impl Default for Deadlines {
+    fn default() -> Self {
+        Self {
+            head: HEADER_TIMEOUT,
+            total: REQUEST_TIMEOUT,
+            body_idle: BODY_IDLE_TIMEOUT,
+        }
+    }
+}
+
+/// The socket read with a deadline: each read waits at most until `until`
+/// (and at most `idle`), and one past it fails with `TimedOut`, so a client
+/// that sends a byte now and then cannot hold the connection open.
+struct Deadlined {
+    stream: TcpStream,
+    until: Instant,
+    idle: Duration,
+}
+
+impl std::io::Read for Deadlined {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(ErrorKind::TimedOut, "request timed out"));
+        }
+        self.stream.set_read_timeout(Some(left.min(self.idle)))?;
+        self.stream.read(buf)
+    }
+}
+
+/// A request's body, not read yet: [`read_head_within`] returns it so the
+/// caller can refuse the request before it reads (or buffers) a byte of it.
+pub struct Body {
+    reader: BufReader<Deadlined>,
+    reply_continue: bool,
+    length: usize,
+    total_deadline: Instant,
+    body_idle: Duration,
+}
+
+/// The body's bytes read off the socket at a time ([`Body::read_with`]).
+const BODY_CHUNK: usize = 64 << 10;
+
+/// [`Body::read_with`] stopped because its `admit` refused the next bytes.
+#[derive(Debug)]
+pub struct OverBudget;
+
+impl std::fmt::Display for OverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no room for the request body")
+    }
+}
+
+impl std::error::Error for OverBudget {}
+
+/// [`read_head_within`] refused a `Content-Length` past its `max_body`.
+#[derive(Debug)]
+pub struct BodyTooLarge {
+    pub limit: usize,
+}
+
+impl std::fmt::Display for BodyTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request body exceeds {} bytes", self.limit)
+    }
+}
+
+impl std::error::Error for BodyTooLarge {}
+
+/// Whether `error` is a read that reached its deadline ([`Deadlines`]): a
+/// socket read that timed out reports `WouldBlock` or `TimedOut`.
+pub fn timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(io.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+        })
+    })
+}
+
+impl Body {
+    /// The body's length (`Content-Length`, at most the `max_body` given).
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Reads the body into `request`, within the request's deadline.
+    pub fn read(self, request: &mut Request) -> Result<()> {
+        self.read_with(request, &mut |_| true)
+    }
+
+    /// [`Self::read`], asking `admit` for every run of bytes as it arrives
+    /// (at most [`BODY_CHUNK`] at a time) before keeping it: a refusal ends
+    /// the read with [`OverBudget`]. The buffer grows with what has
+    /// arrived, never past the declared length, so a length that is
+    /// declared and not sent takes neither memory nor budget.
+    pub fn read_with(
+        mut self,
+        request: &mut Request,
+        admit: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<()> {
+        if self.reply_continue && self.length > 0 {
+            let stream = self.reader.get_mut();
+            stream
+                .stream
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .context("writing 100 Continue")?;
+        }
+        let reader = self.reader.get_mut();
+        reader.until = self.total_deadline;
+        reader.idle = self.body_idle;
+        let mut body = Vec::new();
+        let mut chunk = vec![0u8; BODY_CHUNK.min(self.length)];
+        while body.len() < self.length {
+            let want = chunk.len().min(self.length - body.len());
+            let got = match self.reader.read(&mut chunk[..want]) {
+                Ok(0) => bail!("reading request body: connection closed"),
+                Ok(got) => got,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error).context("reading request body"),
+            };
+            if !admit(got) {
+                return Err(OverBudget.into());
+            }
+            if body.capacity() - body.len() < got {
+                // Doubling, but never past what the request declared.
+                let target =
+                    (body.capacity() * 2).max(body.len() + got).min(self.length);
+                body.reserve_exact(target - body.len());
+            }
+            body.extend_from_slice(&chunk[..got]);
+        }
+        request.body = body;
+        Ok(())
+    }
+}
+
 /// Reads one request from `stream`. `max_body` bounds `Content-Length`.
 pub fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Request> {
-    stream.set_read_timeout(Some(HEADER_TIMEOUT)).ok();
-    let mut reader = BufReader::new(stream.try_clone().context("cloning socket")?);
-    let mut line = String::new();
+    let (mut request, body) = read_head_within(stream, max_body, Deadlines::default())?;
+    body.read(&mut request)?;
+    Ok(request)
+}
+
+/// Reads the request line and headers from `stream` (the request's body
+/// left empty) within `deadlines.head`, at most [`MAX_HEADER_BYTES`] of
+/// them; the [`Body`] reads the rest. `max_body` bounds `Content-Length`.
+pub fn read_head_within(
+    stream: &TcpStream,
+    max_body: usize,
+    deadlines: Deadlines,
+) -> Result<(Request, Body)> {
+    let started = Instant::now();
+    let total_deadline = started + deadlines.total;
+    let mut reader = BufReader::new(Deadlined {
+        stream: stream.try_clone().context("cloning socket")?,
+        until: (started + deadlines.head).min(total_deadline),
+        idle: deadlines.head,
+    });
     let mut total = 0usize;
-    reader.read_line(&mut line).context("reading request line")?;
-    total += line.len();
+    // One line through a `take` of what the head has left, plus one byte
+    // so a line that reaches the limit is told from one that ends there.
+    let mut read_line = |line: &mut String, what: &'static str| -> Result<()> {
+        line.clear();
+        let left = (MAX_HEADER_BYTES - total.min(MAX_HEADER_BYTES)) as u64 + 1;
+        (&mut reader).take(left).read_line(line).context(what)?;
+        total += line.len();
+        ensure!(total <= MAX_HEADER_BYTES, "request headers too large");
+        Ok(())
+    };
+    let mut line = String::new();
+    read_line(&mut line, "reading request line")?;
     ensure!(!line.is_empty(), "connection closed before a request");
     let mut parts = line.split_whitespace();
     let method = parts.next().context("missing method")?.to_string();
@@ -55,10 +253,7 @@ pub fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Request> 
     let http11 = version != "HTTP/1.0";
     let mut headers = Vec::new();
     loop {
-        line.clear();
-        reader.read_line(&mut line).context("reading headers")?;
-        total += line.len();
-        ensure!(total <= MAX_HEADER_BYTES, "request headers too large");
+        read_line(&mut line, "reading headers")?;
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
@@ -77,36 +272,35 @@ pub fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Request> 
         Some(v) => v.trim().parse().context("invalid Content-Length")?,
         None => 0,
     };
-    ensure!(length <= max_body, "request body exceeds {max_body} bytes");
-    if request.header("Expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
-    {
-        stream
-            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-            .context("writing 100 Continue")?;
+    if length > max_body {
+        return Err(BodyTooLarge { limit: max_body }.into());
     }
-    let mut body = vec![0u8; length];
-    // Bytes already buffered by the header reader come first.
-    let buffered = reader.buffer().to_vec();
-    let take = buffered.len().min(length);
-    body[..take].copy_from_slice(&buffered[..take]);
-    reader.consume(take);
-    if take < length {
-        stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
-        stream.read_exact(&mut body[take..]).context("reading request body")?;
-    }
-    Ok(Request { body, ..request })
+    let reply_continue = request
+        .header("Expect")
+        .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+    let body = Body {
+        reader,
+        reply_continue,
+        length,
+        total_deadline,
+        body_idle: deadlines.body_idle,
+    };
+    Ok((request, body))
 }
 
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         409 => "Conflict",
         411 => "Length Required",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
@@ -140,20 +334,115 @@ pub fn respond(
     respond_raw(stream, status, content_type, &[("Content-Length", &length)], body)
 }
 
+/// Writes `bytes` to `stream`, all of them by `deadline`: a client that
+/// does not read, or reads a little now and then, fails the write with
+/// `TimedOut` instead of holding the connection's thread. A write timeout
+/// already set on the socket still bounds each single write.
+fn write_all_by(
+    mut stream: &TcpStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    // A socket whose options cannot be read or set any more (macOS refuses
+    // them once the connection is gone) fails the write itself.
+    let own = stream.write_timeout().ok().flatten();
+    while !bytes.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(ErrorKind::TimedOut, "response timed out"));
+        }
+        stream.set_write_timeout(Some(own.map_or(left, |own| own.min(left)))).ok();
+        match stream.write(bytes) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(wrote) => bytes = &bytes[wrote..],
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Writes `headers` as given (`Content-Length` among them: a HEAD answer
 /// states its GET's length over an empty `body`) and closes the connection.
+/// The client has [`RESPONSE_TIMEOUT`] to take the response.
 pub fn respond_raw(
+    stream: TcpStream,
+    status: u16,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<()> {
+    respond_raw_within(stream, status, content_type, headers, body, RESPONSE_TIMEOUT)
+}
+
+/// [`respond_raw`] with `limit` as its [`RESPONSE_TIMEOUT`]. The socket is
+/// closed whether or not the response was written whole.
+fn respond_raw_within(
+    stream: TcpStream,
+    status: u16,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limit: Duration,
+) -> Result<()> {
+    let written = write_response(&stream, status, content_type, headers, body, limit);
+    stream.shutdown(Shutdown::Both).ok();
+    written
+}
+
+/// The head and `body` of a response, written within `limit`.
+fn write_response(
+    stream: &TcpStream,
+    status: u16,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limit: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + limit;
+    write_all_by(stream, head(status, content_type, headers).as_bytes(), deadline)
+        .context("writing response head")?;
+    write_all_by(stream, body, deadline).context("writing response body")
+}
+
+/// The most a refusal reads of a request it did not read whole
+/// ([`respond_unread`]), and the longest it waits for it.
+const UNREAD_DRAIN_BYTES: usize = 1 << 20;
+const UNREAD_DRAIN_TIME: Duration = Duration::from_secs(1);
+
+/// [`respond_raw`] for a request whose body was not read (or not read
+/// whole): closing a socket that holds unread bytes resets the connection,
+/// and the reset can discard the response before the client has read it.
+/// So the write side is closed first and what the client still sends is
+/// read and dropped, up to [`UNREAD_DRAIN_BYTES`] or [`UNREAD_DRAIN_TIME`],
+/// before the socket closes.
+pub fn respond_unread(
     mut stream: TcpStream,
     status: u16,
     content_type: &str,
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<()> {
-    stream
-        .write_all(head(status, content_type, headers).as_bytes())
-        .context("writing response head")?;
-    stream.write_all(body).context("writing response body")?;
-    stream.flush().ok();
+    if let Err(error) =
+        write_response(&stream, status, content_type, headers, body, RESPONSE_TIMEOUT)
+    {
+        stream.shutdown(Shutdown::Both).ok();
+        return Err(error);
+    }
+    stream.shutdown(Shutdown::Write).ok();
+    let deadline = Instant::now() + UNREAD_DRAIN_TIME;
+    let mut left = UNREAD_DRAIN_BYTES;
+    let mut sink = [0u8; 16 << 10];
+    while left > 0 {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() || stream.set_read_timeout(Some(wait)).is_err() {
+            break;
+        }
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(got) => left = left.saturating_sub(got),
+        }
+    }
     stream.shutdown(Shutdown::Both).ok();
     Ok(())
 }
@@ -263,8 +552,21 @@ pub struct Watched {
 
 impl Watched {
     /// Starts watching `stream`. `http11` says whether the request was
-    /// HTTP/1.1, which allows the interim probe.
+    /// HTTP/1.1, which allows the interim probe. A write of the response
+    /// that the client does not take within [`WRITE_STALL_TIMEOUT`] fails,
+    /// which flags the client as gone like any failed write.
     pub fn new(stream: TcpStream, http11: bool, cancelled: Arc<AtomicBool>) -> Self {
+        Self::with_stall(stream, http11, cancelled, WRITE_STALL_TIMEOUT)
+    }
+
+    /// [`Self::new`] with `stall` as its [`WRITE_STALL_TIMEOUT`].
+    fn with_stall(
+        stream: TcpStream,
+        http11: bool,
+        cancelled: Arc<AtomicBool>,
+        stall: Duration,
+    ) -> Self {
+        stream.set_write_timeout(Some(stall)).ok();
         let reader = stream.try_clone();
         let conn = Arc::new(Conn {
             stream,

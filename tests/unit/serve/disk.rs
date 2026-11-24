@@ -543,3 +543,152 @@ fn lineage_ids_round_trip_through_meta_and_old_meta_files_load_without_one() {
     assert_eq!(legacy.max_lineage(), None);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// The permission bits of `path`.
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+}
+
+#[test]
+fn the_tier_is_private_to_the_account_whatever_the_umask() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = temp_root("private");
+    // A tier directory left by an older lily with the usual umask.
+    fs::create_dir_all(root.join("fmt")).expect("mkdir");
+    fs::set_permissions(root.join("fmt"), fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let mut store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("open");
+    assert_eq!(
+        mode(&root.join("fmt")),
+        0o700,
+        "an existing tier directory is tightened"
+    );
+    let id = store_fake(&mut store, &[1, 2, 3], 10, Some("k")).expect("stored");
+    let entry = root.join("fmt").join(&id);
+    assert_eq!(mode(&entry), 0o700, "{}", entry.display());
+    for file in [META, PREFIX, "ckpt-3.bin"] {
+        assert_eq!(mode(&entry.join(file)), 0o600, "{file}");
+    }
+    store.touch(&id);
+    assert_eq!(mode(&entry.join(META)), 0o600, "a touch keeps the meta file private");
+    // A tier created from nothing: every directory lily makes is private.
+    let fresh = temp_root("private-fresh");
+    DiskStore::open(&fresh.join("lily").join("sessions"), "fmt", 1 << 20, 0)
+        .expect("open");
+    for dir in [
+        fresh.join("lily"),
+        fresh.join("lily/sessions"),
+        fresh.join("lily/sessions/fmt"),
+    ] {
+        assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+    }
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&fresh);
+}
+
+/// A tier directory that is a link is opened as before and what it points
+/// at keeps its mode: only a directory of its own is tightened.
+#[test]
+fn a_linked_tier_directory_keeps_its_targets_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = temp_root("linked");
+    let target = temp_root("linked-target");
+    fs::create_dir_all(&root).expect("mkdir");
+    fs::create_dir_all(&target).expect("mkdir");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::os::unix::fs::symlink(&target, root.join("fmt")).expect("symlink");
+    let mut store =
+        DiskStore::open(&root, "fmt", 1 << 20, 0).expect("the tier still opens");
+    assert_eq!(mode(&target), 0o755, "the link's target is not changed");
+    // The tier works through the link, its entries private as elsewhere.
+    let id = store_fake(&mut store, &[1, 2, 3], 10, None).expect("stored");
+    assert_eq!(mode(&target.join(&id)), 0o700);
+    assert_eq!(mode(&target.join(&id).join(META)), 0o600);
+    // A directory already closed to group and others is left alone too,
+    // its owner's bits included.
+    let closed = temp_root("closed");
+    fs::create_dir_all(closed.join("fmt")).expect("mkdir");
+    fs::set_permissions(closed.join("fmt"), fs::Permissions::from_mode(0o500))
+        .expect("chmod");
+    DiskStore::open(&closed, "fmt", 1 << 20, 0).expect("open");
+    assert_eq!(mode(&closed.join("fmt")), 0o500);
+    fs::set_permissions(closed.join("fmt"), fs::Permissions::from_mode(0o700))
+        .expect("chmod");
+    for dir in [root, target, closed] {
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Opening one format makes private what an earlier lily left under the
+/// root for every format, entries and files included, and nothing that is
+/// not the tier's: the root may hold other things.
+#[test]
+fn opening_the_tier_makes_every_formats_entries_private_and_nothing_else() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = temp_root("private-all");
+    let chmod = |path: &Path, mode: u32| {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    // Two formats written by an older lily under the usual umask.
+    let mut entries = Vec::new();
+    for format in ["fmt", "old"] {
+        let mut store = DiskStore::open(&root, format, 1 << 20, 0).expect("open");
+        let id = store_fake(&mut store, &[1, 2, 3], 10, None).expect("stored");
+        let entry = root.join(format).join(id);
+        chmod(&root.join(format), 0o755);
+        chmod(&entry, 0o755);
+        for file in [META, PREFIX, "ckpt-3.bin"] {
+            chmod(&entry.join(file), 0o644);
+        }
+        entries.push(entry);
+    }
+    // Not the tier's: a directory without entries, with a file and a
+    // directory of its own; and a file directly under the root.
+    let other = root.join("models");
+    fs::create_dir_all(other.join("bin")).expect("mkdir");
+    fs::write(other.join("bin/tool"), "").expect("write");
+    fs::write(root.join("notes.txt"), "").expect("write");
+    chmod(&other, 0o755);
+    chmod(&other.join("bin"), 0o755);
+    chmod(&other.join("bin/tool"), 0o755);
+    chmod(&root.join("notes.txt"), 0o644);
+    chmod(&root, 0o755);
+    // A link to a format's directory elsewhere, and a link inside an entry.
+    let outside = temp_root("private-all-outside");
+    let mut elsewhere = DiskStore::open(&outside, "linked", 1 << 20, 0).expect("open");
+    let linked_id = store_fake(&mut elsewhere, &[4, 5], 10, None).expect("stored");
+    let linked_entry = outside.join("linked").join(linked_id);
+    chmod(&outside.join("linked"), 0o755);
+    chmod(&linked_entry, 0o755);
+    chmod(&linked_entry.join(META), 0o644);
+    std::os::unix::fs::symlink(outside.join("linked"), root.join("linked"))
+        .expect("symlink");
+    fs::write(outside.join("file"), "").expect("write");
+    chmod(&outside.join("file"), 0o644);
+    std::os::unix::fs::symlink(outside.join("file"), entries[0].join("extra.bin"))
+        .expect("symlink");
+
+    let store = DiskStore::open(&root, "fmt", 1 << 20, 0).expect("open");
+    assert_eq!(store.entries().len(), 1, "the format's own entry is still there");
+    for entry in &entries {
+        let format_dir = entry.parent().expect("parent");
+        assert_eq!(mode(format_dir), 0o700, "{}", format_dir.display());
+        assert_eq!(mode(entry), 0o700, "{}", entry.display());
+        for file in [META, PREFIX, "ckpt-3.bin"] {
+            assert_eq!(mode(&entry.join(file)), 0o600, "{}/{file}", entry.display());
+        }
+    }
+    assert_eq!(mode(&root), 0o755, "the root is the user's choice");
+    assert_eq!(mode(&other), 0o755);
+    assert_eq!(mode(&other.join("bin")), 0o755);
+    assert_eq!(mode(&other.join("bin/tool")), 0o755);
+    assert_eq!(mode(&root.join("notes.txt")), 0o644);
+    assert_eq!(mode(&outside.join("linked")), 0o755, "a link is not followed");
+    assert_eq!(mode(&linked_entry), 0o755);
+    assert_eq!(mode(&linked_entry.join(META)), 0o644);
+    assert_eq!(mode(&outside.join("file")), 0o644, "nor a link inside an entry");
+    for dir in [root, outside] {
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

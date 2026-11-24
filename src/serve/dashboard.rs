@@ -113,6 +113,8 @@ const LIVE_ROWS_MS: u64 = 60_000;
 /// The largest body a settings write takes (413 past it); the chat routes
 /// keep their own limit.
 pub const MAX_WRITE_BODY: usize = 64 << 10;
+/// The 413's message.
+const WRITE_BODY_TOO_LARGE: &str = "a settings write takes at most 64 KiB of body";
 /// Peers whose refusal is logged; past this many, refusals are not logged.
 const REFUSED_PEERS_LOGGED: usize = 1024;
 
@@ -577,19 +579,24 @@ pub fn is_loopback(peer: Option<SocketAddr>) -> bool {
     peer.is_some_and(|peer| peer.ip().to_canonical().is_loopback())
 }
 
-/// The names lily's own page is reached under on `port`, as `Host` headers
-/// carry them (`Origin` adds the scheme).
-fn own_hosts(port: u16) -> [String; 3] {
-    [format!("127.0.0.1:{port}"), format!("localhost:{port}"), format!("[::1]:{port}")]
+/// The names lily's own page is reached under, as `Host` headers carry
+/// them before the port (`Origin` adds the scheme).
+const OWN_NAMES: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
+
+/// Whether `host` (a `Host` header's value, or an `Origin`'s after the
+/// scheme) is `name` on `port`: `name:port`, or `name` alone when the port
+/// is 80, the one a client leaves out of both. Names compare without case.
+pub fn names_host(host: &str, name: &str, port: u16) -> bool {
+    host.eq_ignore_ascii_case(&format!("{name}:{port}"))
+        || (port == 80 && host.eq_ignore_ascii_case(name))
 }
 
 /// Whether `host` (the `Host` header) names lily's own loopback address on
 /// `port`. A page that DNS-rebound its own name to 127.0.0.1 sends that
 /// name, and is refused.
 pub fn host_allowed(host: Option<&str>, port: u16) -> bool {
-    host.map(str::trim).is_some_and(|host| {
-        own_hosts(port).iter().any(|own| own.eq_ignore_ascii_case(host))
-    })
+    host.map(str::trim)
+        .is_some_and(|host| OWN_NAMES.iter().any(|own| names_host(host, own, port)))
 }
 
 /// The cross-site write guard: `Content-Type` must be the media type
@@ -604,12 +611,21 @@ pub fn write_guard(
     if !media.is_some_and(|m| m.eq_ignore_ascii_case("application/json")) {
         return Err("writes need Content-Type: application/json");
     }
-    if let Some(origin) = origin
-        && !own_hosts(port).iter().any(|own| origin == format!("http://{own}"))
-    {
+    if !origin_allowed(origin, port) {
         return Err("writes are only accepted from lily's own page");
     }
     Ok(())
+}
+
+/// Whether `origin` (the `Origin` header) is absent or lily's own on
+/// `port`. A browser sends it on every cross-origin request, so a page of
+/// another site is told apart from a client that sends none.
+pub fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
+    origin.is_none_or(|origin| {
+        origin
+            .strip_prefix("http://")
+            .is_some_and(|host| OWN_NAMES.iter().any(|own| names_host(host, own, port)))
+    })
 }
 
 /// A file of the app: its content type, its `Cache-Control` and its bytes.
@@ -930,16 +946,8 @@ impl Dashboard {
         connection: Connection,
         engine: EngineNow,
     ) -> Response {
-        let refusal = if !is_loopback(connection.peer) {
-            Some("the dashboard answers this machine only")
-        } else if !host_allowed(request.header("Host"), connection.port) {
-            Some("the dashboard answers under its own loopback address only")
-        } else {
-            None
-        };
-        if let Some(why) = refusal {
-            self.log_refusal(connection.peer, request, path, why);
-            return Response::error(403, why, None);
+        if let Some(refused) = self.refuse_connection(request, path, connection) {
+            return refused;
         }
         // The page counts as open from now (the sampler's 2 s cadence).
         if let Some(machine) = self.board.machine() {
@@ -957,6 +965,57 @@ impl Dashboard {
             },
             Route::Api => self.api(request, path, query, connection.port, engine),
         }
+    }
+
+    /// The 403 for a peer that is not this machine or a `Host` that is not
+    /// lily's own loopback address, logged ([`Self::log_refusal`]).
+    fn refuse_connection(
+        &self,
+        request: &Request,
+        path: &str,
+        connection: Connection,
+    ) -> Option<Response> {
+        let why = if !is_loopback(connection.peer) {
+            "the dashboard answers this machine only"
+        } else if !host_allowed(request.header("Host"), connection.port) {
+            "the dashboard answers under its own loopback address only"
+        } else {
+            return None;
+        };
+        self.log_refusal(connection.peer, request, path, why);
+        Some(Response::error(403, why, None))
+    }
+
+    /// What [`Self::respond`] refuses by the request's head alone, for the
+    /// caller to answer before it reads the body (`body_len`, the declared
+    /// `Content-Length`): the peer and the `Host` (403), a settings write's
+    /// [`write_guard`] (403) and a body past [`MAX_WRITE_BODY`] (413), which
+    /// no dashboard route takes.
+    pub fn head_guard(
+        &self,
+        route: Route,
+        request: &Request,
+        path: &str,
+        connection: Connection,
+        body_len: usize,
+    ) -> Result<(), Response> {
+        if let Some(refused) = self.refuse_connection(request, path, connection) {
+            return Err(refused);
+        }
+        if route == Route::Api
+            && matches!(request.method.as_str(), "PATCH" | "DELETE")
+            && let Err(why) = write_guard(
+                request.header("Content-Type"),
+                request.header("Origin"),
+                connection.port,
+            )
+        {
+            return Err(Response::error(403, why, None));
+        }
+        if body_len > MAX_WRITE_BODY {
+            return Err(Response::error(413, WRITE_BODY_TOO_LARGE, None));
+        }
+        Ok(())
     }
 
     /// Logs a refusal the first time a peer address is refused.
@@ -1001,11 +1060,7 @@ impl Dashboard {
             return Response::error(403, why, None);
         }
         if matches!(method, "PATCH" | "DELETE") && request.body.len() > MAX_WRITE_BODY {
-            return Response::error(
-                413,
-                "a settings write takes at most 64 KiB of body",
-                None,
-            );
+            return Response::error(413, WRITE_BODY_TOO_LARGE, None);
         }
         match (method, segments.as_slice()) {
             ("GET", ["status"]) => Response::json(200, &self.status(engine)),
