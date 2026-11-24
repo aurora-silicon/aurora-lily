@@ -126,7 +126,30 @@ fn gemv_and_gemm_match_cpu_for_inkling2_types() {
                         })
                         .collect()
                 } else {
-                    (0..m).flat_map(|i| cpu.mv(&x[i * cols..(i + 1) * cols])).collect()
+                    // Without matrix units, sgemm.comp stages operands as f16
+                    // and widens 32-element f16 K-step sums into f32.
+                    let hf = |v: f32| half::f16::from_f32(v.clamp(-65504.0, 65504.0)).to_f32();
+                    let xh: Vec<f32> = x.iter().map(|&v| hf(v)).collect();
+                    let wh: Vec<f32> = cpu.w.iter().map(|&v| hf(v)).collect();
+                    let wh_ref = wh.as_slice();
+                    (0..m)
+                        .flat_map(|i| {
+                            let xr = &xh[i * cols..(i + 1) * cols];
+                            (0..rows).map(move |r| {
+                                let wr = &wh_ref[r * cols..(r + 1) * cols];
+                                wr.chunks_exact(32)
+                                    .zip(xr.chunks_exact(32))
+                                    .map(|(wc, xc)| {
+                                        let mut s = half::f16::from_f32(0.0);
+                                        for (&a, &b) in wc.iter().zip(xc) {
+                                            s = half::f16::from_f32(a.mul_add(b, s.to_f32()));
+                                        }
+                                        s.to_f32()
+                                    })
+                                    .sum::<f32>()
+                            })
+                        })
+                        .collect()
                 };
                 assert_close(&y.to_f32().unwrap(), &expected, 1e-3, 1e-3);
             }
@@ -4251,5 +4274,55 @@ fn gemv_cmat_q4_0_matches_cpu() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn g16_q8_0_wide_verify_matches_single_row_exact() {
+    let ctx = ctx();
+    if !ctx.g16() {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(0x6160_0008);
+    let n = 132usize;
+    for k in [1024usize, 2048usize] {
+        let raw = random_blocks(&mut rng, GgmlType::Q8_0, n * k);
+        let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, k, n).unwrap();
+        for m in 5usize..=8usize {
+            let x = f32s(&mut rng, m * k, -1.0, 1.0);
+            let tx = tensor(&ctx, &x);
+            let y_wide = zeros(&ctx, m * n);
+            run(&ctx, |p| gemv(&ctx, p, &w, &tx, &y_wide, m).unwrap());
+            let got = y_wide.to_f32().unwrap();
+            for r in 0..m {
+                let xr = tensor(&ctx, &x[r * k..(r + 1) * k]);
+                let y1 = zeros(&ctx, n);
+                run(&ctx, |p| gemv(&ctx, p, &w, &xr, &y1, 1).unwrap());
+                assert_eq!(
+                    &got[r * n..(r + 1) * n],
+                    y1.to_f32().unwrap().as_slice(),
+                    "G16 Q8_0 k={k} m={m} row {r} must be bit-identical to m=1"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn sgemm_fp16_partial_overflow_falls_back_to_f32() {
+    let ctx = ctx();
+    if ctx.matrix_units() {
+        return;
+    }
+    let (m, n, k) = (16usize, 32usize, 64usize);
+    let w_f32 = vec![64.0f32; n * k];
+    let w = QWeight::from_bytes(&ctx, bytemuck::cast_slice(&w_f32), GgmlType::F32, k, n).unwrap();
+    let x = tensor(&ctx, &vec![64.0f32; m * k]);
+    let y = zeros(&ctx, m * n);
+    run(&ctx, |p| gemm(&ctx, p, &w, &x, &y, m).unwrap());
+    let got = y.to_f32().unwrap();
+    let want = (k as f32) * 64.0 * 64.0;
+    for (idx, &v) in got.iter().enumerate() {
+        assert_eq!(v, want, "overflow fallback mismatch at {idx}: got {v}, want {want}");
     }
 }

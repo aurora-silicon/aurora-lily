@@ -230,6 +230,24 @@ fn g16_gemv_name(
             ],
             if m == 1 { 4 } else { 1 },
         ),
+        GgmlType::Q6K if cols.is_multiple_of(256) => (
+            [
+                "g16_gemv_q6_k_m1",
+                "g16_gemv_q6_k_m2",
+                "g16_gemv_q6_k_m3",
+                "g16_gemv_q6_k_m4",
+            ],
+            if m == 1 { 4 } else { 1 },
+        ),
+        GgmlType::Q8_0 if cols >= 1024 && cols.is_multiple_of(32) => (
+            [
+                "g16_gemv_q8_0_m1",
+                "g16_gemv_q8_0_m2",
+                "g16_gemv_q8_0_m3",
+                "g16_gemv_q8_0_m4",
+            ],
+            if m == 1 { 4 } else { 1 },
+        ),
         _ => return None,
     };
     // Every row count's kernel or none: a verify pass's rows must sum as
@@ -571,6 +589,29 @@ fn gemv_dispatch(
     );
     let max_rows = sets.iter().map(|(w, _)| w.rows).max().unwrap_or(0);
     let total_rows: usize = sets.iter().map(|(w, _)| w.rows).sum();
+    // Wide G16 Q8_0 dispatches (m in 5..=8, e.g. Inkling 2 with 4..7 drafts)
+    // chunk into <= 4 rows so they use the exact same G16 summation order as m=1.
+    if m > GEMV_MAX_ROWS
+        && g16_gemv_name(ctx, w0.ty, w0.cols, 1, l.x_group, l.x_row_stride).is_some()
+    {
+        for off in (0..m).step_by(GEMV_MAX_ROWS) {
+            let chunk = (m - off).min(GEMV_MAX_ROWS);
+            let x_groups = max_rows.div_ceil(l.x_group);
+            let xv = x.view(
+                off * l.x_row_stride,
+                &[(chunk - 1) * l.x_row_stride + x_groups * w0.cols],
+            )?;
+            let mut yvs: Vec<Tensor> = Vec::with_capacity(sets.len());
+            for &(w, y) in sets {
+                let stride = if l.y_row_stride == 0 { w.rows } else { l.y_row_stride };
+                yvs.push(y.view(off * stride, &[(chunk - 1) * stride + w.rows])?);
+            }
+            let chunk_sets: Vec<(&QWeight, &Tensor)> =
+                sets.iter().zip(&yvs).map(|((w, _), yv)| (*w, yv)).collect();
+            gemv_dispatch(ctx, pass, &chunk_sets, &xv, chunk, l, r2)?;
+        }
+        return Ok(());
+    }
     let g16 = g16_gemv_name(ctx, w0.ty, w0.cols, m, l.x_group, l.x_row_stride);
     // DeepSeek V4's two-weight-rows Q8_0 kernel (`r2`: gemv_sets_r2,
     // gemv_with_r2), for any activation row count so that a row computes

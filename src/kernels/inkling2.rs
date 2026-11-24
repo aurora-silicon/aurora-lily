@@ -1568,6 +1568,133 @@ pub fn moe_grouped_mu(
     moe_sum(ctx, pass, down_out, exp_ids, exp_w, down_scale, moe_out, rows, k_exp, h)
 }
 
+/// Whether `sgemm.comp`'s grouped MoE kernel supports weights of `ty`.
+pub fn sgemm_moe_name(ty: GgmlType) -> Option<&'static str> {
+    Some(match ty {
+        GgmlType::Q8_0 => "sgemm_moe_q8_0",
+        GgmlType::Q4K => "sgemm_moe_q4_k",
+        GgmlType::Q5K => "sgemm_moe_q5_k",
+        GgmlType::Q6K => "sgemm_moe_q6_k",
+        GgmlType::Q2K => "sgemm_moe_q2_k",
+        GgmlType::Iq4Nl => "sgemm_moe_iq4_nl",
+        GgmlType::Iq2Xxs => "sgemm_moe_iq2_xxs",
+        GgmlType::Iq2S => "sgemm_moe_iq2_s",
+        GgmlType::Mxfp4 => "sgemm_moe_mxfp4",
+        GgmlType::Nvfp4 => "sgemm_moe_nvfp4",
+        GgmlType::Q2_0 => "sgemm_moe_q2_0",
+        GgmlType::Iq2Xs => "sgemm_moe_iq2_xs",
+        GgmlType::Iq3Xxs => "sgemm_moe_iq3_xxs",
+        GgmlType::Iq1S => "sgemm_moe_iq1_s",
+        GgmlType::Iq4Xs => "sgemm_moe_iq4_xs",
+        GgmlType::Bf16 => "sgemm_moe_bf16",
+        _ => return None,
+    })
+}
+
+/// Grouped MoE for prompt prefill on GPUs without 16x16 matrix units (Apple M4 / G16):
+/// groups routed pairs by expert with `glm53_moe_group` (64-row tiles), runs
+/// `sgemm_moe_<ty>` for `gate_up` into `down_out` (reused when `2 * ff <= h`),
+/// applies `inkling2_situ` into `situ_out`, runs `sgemm_moe_<ty>` for `down`
+/// into `down_out`, and reduces with `moe_sum`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_sgemm(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    gate_up: &QWeight,
+    gate_up_scale: Option<&Tensor>,
+    down: &QWeight,
+    down_scale: Option<&Tensor>,
+    exp_ids: &Tensor,
+    exp_w: &Tensor,
+    pairs: &Tensor,
+    tiles: &Tensor,
+    tile_count: &Tensor,
+    situ_out: &Tensor,
+    down_out: &Tensor,
+    moe_out: &Tensor,
+    rows: usize,
+    h: usize,
+    ff: usize,
+    n_expert: usize,
+    k_exp: usize,
+    beta: f32,
+    linear_beta: f32,
+) -> Result<()> {
+    ensure!(
+        h.is_multiple_of(64) && ff.is_multiple_of(64) && 2 * ff <= h && k_exp.is_power_of_two(),
+        "moe_grouped_sgemm requires H={h}, ff={ff} multiples of 64, 2*ff <= H, power-of-2 k_exp={k_exp}"
+    );
+    let gu_name = sgemm_moe_name(gate_up.ty)
+        .ok_or_else(|| anyhow::anyhow!("no sgemm_moe kernel for {:?}", gate_up.ty))?;
+    let dn_name = sgemm_moe_name(down.ty)
+        .ok_or_else(|| anyhow::anyhow!("no sgemm_moe kernel for {:?}", down.ty))?;
+    let total_pairs = rows * k_exp;
+    let max_tiles = total_pairs.div_ceil(64) + n_expert;
+
+    let group = ctx.pipeline("glm53_moe_group", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &group,
+        &[exp_ids.binding(), pairs.binding(), tiles.binding(), tile_count.binding()],
+        &[&u32_bytes(total_pairs), &u32_bytes(n_expert), &u32_bytes(64)],
+        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
+    )?;
+    pass.memory_barrier()?;
+
+    let p_gu = ctx.pipeline(gu_name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &p_gu,
+        &[
+            x.binding(),
+            gate_up.t.binding(),
+            down_out.binding(),
+            pairs.binding(),
+            tiles.binding(),
+            tile_count.binding(),
+        ],
+        &[
+            &u32_bytes(2 * ff),
+            &u32_bytes(h),
+            &u32_bytes(gate_up.row_bytes),
+            &u32_bytes(k_exp.trailing_zeros() as usize),
+        ],
+        Grid::Threadgroups {
+            groups: ((2 * ff).div_ceil(128), max_tiles, 1),
+            threadgroup: (256, 1, 1),
+        },
+    )?;
+    pass.memory_barrier()?;
+
+    situ(ctx, pass, down_out, exp_ids, gate_up_scale, situ_out, total_pairs, ff, beta, linear_beta)?;
+    pass.memory_barrier()?;
+
+    let p_dn = ctx.pipeline(dn_name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &p_dn,
+        &[
+            situ_out.binding(),
+            down.t.binding(),
+            down_out.binding(),
+            pairs.binding(),
+            tiles.binding(),
+            tile_count.binding(),
+        ],
+        &[
+            &u32_bytes(h),
+            &u32_bytes(ff),
+            &u32_bytes(down.row_bytes),
+            &u32_bytes(0),
+        ],
+        Grid::Threadgroups {
+            groups: (h.div_ceil(128), max_tiles, 1),
+            threadgroup: (256, 1, 1),
+        },
+    )?;
+    pass.memory_barrier()?;
+
+    moe_sum(ctx, pass, down_out, exp_ids, exp_w, down_scale, moe_out, rows, k_exp, h)
+}
+
 fn choose_g_step_max(n_head: usize, n_head_kv: usize, max_g: usize) -> usize {
     if n_head_kv == 0 || !n_head.is_multiple_of(n_head_kv) {
         return 1;

@@ -1770,3 +1770,150 @@ fn dspark_fused_markov_q4_head_and_attn_mu_split_q32_match_reference() {
         }
     }
 }
+
+#[test]
+fn moe_grouped_sgemm_matches_cpu_across_tile_sizes() {
+    let ctx = ctx();
+    if ctx.matrix_units() {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(0x1256_E331);
+    let (h, ff, ne, k_exp) = (256usize, 128usize, 4usize, 2usize);
+    let (beta, lb) = (2.0f32, 0.0f32);
+    // Build valid Q8_0 gate_up [ne, 2*ff, h] and Q2_0 down [ne, h, ff] weights.
+    let gu_nblocks = ne * 2 * ff * (h / 32);
+    let mut gu_raw = vec![0u8; gu_nblocks * 34];
+    for b in 0..gu_nblocks {
+        let d = half::f16::from_f32(rng.gen_range(0.005..0.02));
+        gu_raw[b * 34..b * 34 + 2].copy_from_slice(&d.to_le_bytes());
+        for j in 0..32 {
+            gu_raw[b * 34 + 2 + j] = rng.gen_range(-64i8..=64i8) as u8;
+        }
+    }
+    let dn_nblocks = ne * h * (ff / 64);
+    let mut dn_raw = vec![0u8; dn_nblocks * 18];
+    for b in 0..dn_nblocks {
+        let d = half::f16::from_f32(rng.gen_range(0.01..0.04));
+        dn_raw[b * 18..b * 18 + 2].copy_from_slice(&d.to_le_bytes());
+        for j in 0..16 {
+            dn_raw[b * 18 + 2 + j] = rng.r#gen();
+        }
+    }
+    let mut gu_f32 = vec![0.0f32; ne * 2 * ff * h];
+    let mut dn_f32 = vec![0.0f32; ne * h * ff];
+    crate::gguf::dequantize(GgmlType::Q8_0, &gu_raw, &mut gu_f32).unwrap();
+    crate::gguf::dequantize(GgmlType::Q2_0, &dn_raw, &mut dn_f32).unwrap();
+    let w_gu = QWeight::from_bytes(&ctx, &gu_raw, GgmlType::Q8_0, h, ne * 2 * ff).unwrap();
+    let w_dn = QWeight::from_bytes(&ctx, &dn_raw, GgmlType::Q2_0, ff, ne * h).unwrap();
+
+    // Test both 32 routed pairs (<= 32: sg_expert_32) and 66 routed pairs (> 64: sg_tile_64 + sg_expert_32 tail).
+    for rows in [16usize, 33usize] {
+        let pairs = rows * k_exp;
+        let x = f32s(&mut rng, rows * h, -1.0, 1.0);
+        // Route all pairs of row r to expert 0 (and 1) so expert 0 gets 32 (rows=16) or 33 (rows=33) pairs,
+        // and also test a 65-pair expert by routing both slots to expert 0 for rows=33.
+        let exp_ids: Vec<u32> = if rows == 33 {
+            vec![0u32; pairs]
+        } else {
+            (0..pairs).map(|i| (i % 2) as u32).collect()
+        };
+        let exp_w: Vec<f32> = (0..pairs).map(|_| rng.gen_range(0.2..0.8)).collect();
+        let gu_sc = f32s(&mut rng, ne, 0.5, 1.5);
+        let dn_sc = f32s(&mut rng, ne, 0.5, 1.5);
+
+        let tx = Tensor::from_f32(&ctx, &x, &[rows, h]).unwrap();
+        let tids = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&exp_ids), &[pairs], DType::U32).unwrap();
+        let tw = Tensor::from_f32(&ctx, &exp_w, &[pairs]).unwrap();
+        let t_gsc = Tensor::from_f32(&ctx, &gu_sc, &[ne]).unwrap();
+        let t_dsc = Tensor::from_f32(&ctx, &dn_sc, &[ne]).unwrap();
+        let t_pairs = Tensor::zeros(&ctx, &[pairs], DType::U32).unwrap();
+        let max_tiles = pairs.div_ceil(64) + ne + 1;
+        let t_tiles = Tensor::zeros(&ctx, &[3 * max_tiles], DType::U32).unwrap();
+        let t_ntiles = Tensor::zeros(&ctx, &[12], DType::U32).unwrap();
+        let t_situ = Tensor::zeros(&ctx, &[pairs, ff], DType::F32).unwrap();
+        let t_down = Tensor::zeros(&ctx, &[pairs, h], DType::F32).unwrap();
+        let t_out = Tensor::zeros(&ctx, &[rows, h], DType::F32).unwrap();
+
+        run(&ctx, |p| {
+            moe_grouped_sgemm(
+                &ctx, p, &tx, &w_gu, Some(&t_gsc), &w_dn, Some(&t_dsc),
+                &tids, &tw, &t_pairs, &t_tiles, &t_ntiles,
+                &t_situ, &t_down, &t_out,
+                rows, h, ff, ne, k_exp, beta, lb,
+            ).unwrap();
+        });
+        let got = t_out.to_f32().unwrap();
+        // CPU reference.
+        let mut want = vec![0.0f32; rows * h];
+        for r in 0..rows {
+            let xr = &x[r * h..(r + 1) * h];
+            for s in 0..k_exp {
+                let rk = r * k_exp + s;
+                let e = exp_ids[rk] as usize;
+                let mut mid = vec![0.0f32; ff];
+                for j in 0..ff {
+                    let g: f32 = gu_f32[((e * 2 * ff + j) * h)..][..h]
+                        .iter().zip(xr).map(|(a, b)| a * b).sum::<f32>() * gu_sc[e];
+                    let u: f32 = gu_f32[((e * 2 * ff + ff + j) * h)..][..h]
+                        .iter().zip(xr).map(|(a, b)| a * b).sum::<f32>() * gu_sc[e];
+                    let act = beta * (g / beta).tanh() / (1.0 + (-g).exp());
+                    mid[j] = act * u;
+                }
+                for o in 0..h {
+                    let v: f32 = dn_f32[((e * h + o) * ff)..][..ff]
+                        .iter().zip(&mid).map(|(a, b)| a * b).sum();
+                    want[r * h + o] += exp_w[rk] * dn_sc[e] * v;
+                }
+            }
+        }
+        assert_close(&got, &want, 2e-2, 2e-2);
+    }
+
+    // Exact bit-for-bit tile-size parity: identical input rows routed to a single
+    // expert must produce identical outputs whether placed in a 32-pair tile
+    // (sg_tile_32 for Q8_0 gate_up, sg_expert_32 for Q2_0 down) or a 66-pair split
+    // (sg_tile_64 + 2-pair tail). The 16x 0.5 + 16x 0.001 pattern distinguishes
+    // 16-element vs 32-element FP16 widening.
+    let mut x_pat = vec![0.0f32; h];
+    for c in 0..h {
+        x_pat[c] = if (c % 32) < 16 { 0.5 } else { 0.001 };
+    }
+    let gu_sc_p = vec![1.0f32; ne];
+    let dn_sc_p = vec![1.0f32; ne];
+    let mut ref_row: Option<Vec<f32>> = None;
+    for rows in [16usize, 33usize] {
+        let pairs = rows * k_exp;
+        let x: Vec<f32> = (0..rows).flat_map(|_| x_pat.iter().copied()).collect();
+        let exp_ids = vec![0u32; pairs];
+        let exp_w = vec![0.5f32; pairs];
+        let tx = Tensor::from_f32(&ctx, &x, &[rows, h]).unwrap();
+        let tids = Tensor::from_bytes(&ctx, bytemuck::cast_slice(&exp_ids), &[pairs], DType::U32).unwrap();
+        let tw = Tensor::from_f32(&ctx, &exp_w, &[pairs]).unwrap();
+        let t_gsc = Tensor::from_f32(&ctx, &gu_sc_p, &[ne]).unwrap();
+        let t_dsc = Tensor::from_f32(&ctx, &dn_sc_p, &[ne]).unwrap();
+        let t_pairs = Tensor::zeros(&ctx, &[pairs], DType::U32).unwrap();
+        let max_tiles = pairs.div_ceil(64) + ne + 1;
+        let t_tiles = Tensor::zeros(&ctx, &[3 * max_tiles], DType::U32).unwrap();
+        let t_ntiles = Tensor::zeros(&ctx, &[12], DType::U32).unwrap();
+        let t_situ = Tensor::zeros(&ctx, &[pairs, ff], DType::F32).unwrap();
+        let t_down = Tensor::zeros(&ctx, &[pairs, h], DType::F32).unwrap();
+        let t_out = Tensor::zeros(&ctx, &[rows, h], DType::F32).unwrap();
+        run(&ctx, |p| {
+            moe_grouped_sgemm(
+                &ctx, p, &tx, &w_gu, Some(&t_gsc), &w_dn, Some(&t_dsc),
+                &tids, &tw, &t_pairs, &t_tiles, &t_ntiles,
+                &t_situ, &t_down, &t_out,
+                rows, h, ff, ne, k_exp, beta, lb,
+            ).unwrap();
+        });
+        let got = t_out.to_f32().unwrap();
+        let base = ref_row.get_or_insert_with(|| got[..h].to_vec());
+        for r in 0..rows {
+            assert_eq!(
+                &got[r * h..(r + 1) * h],
+                base.as_slice(),
+                "rows={rows} row {r} must be bit-identical across 32-pair and 64-pair tiles"
+            );
+        }
+    }
+}

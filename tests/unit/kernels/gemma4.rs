@@ -578,12 +578,13 @@ fn moe_timing() {
     }
 }
 
-/// Without matrix units (an M4) a prompt run's GEMMs are sgemm.comp's, f32
-/// throughout: the dense GEMM over the block types of Gemma's files and the
-/// grouped experts against f32 CPU sums, at shapes with partial tiles in
-/// both directions. Each output within 2^-14 of the magnitudes it sums
-/// (the summation order). On a device with matrix units these paths are
-/// not taken and the test returns.
+/// Without matrix units (an M4) a prompt run's GEMMs are sgemm.comp's,
+/// staging weights and activations as f16 with f16 32-step inner sums
+/// accumulated in f32: the dense GEMM over the block types of Gemma's files
+/// and the grouped experts against f32 CPU sums, at shapes with partial tiles
+/// in both directions. Each output within 2^-8 of the magnitudes it sums
+/// (f16 operand rounding + 32-step f16 sum). On a device with matrix units
+/// these paths are not taken and the test returns.
 #[test]
 fn gemms_without_matrix_units_match_cpu() {
     let ctx = ctx();
@@ -591,7 +592,7 @@ fn gemms_without_matrix_units_match_cpu() {
         return;
     }
     let mut rng = StdRng::seed_from_u64(31);
-    let tol = 2f32.powi(-14);
+    let tol = 2f32.powi(-8);
     for (ty, cols, rows, m) in [
         (GgmlType::Q8_0, 2112usize, 200usize, 70usize),
         (GgmlType::Q5K, 2816, 130, 129),
@@ -649,7 +650,7 @@ fn grouped_f32_matches_cpu(
     (hid, ff, ne, used, m): (usize, usize, usize, usize, usize),
     sel: &[u32],
 ) {
-    let tol = 2f32.powi(-14);
+    let tol = 2f32.powi(-8);
     let gu_raw = random_blocks(rng, gt, ne * 2 * ff * hid);
     let dn_raw = random_blocks(rng, dt, ne * hid * ff);
     let gu = QWeight::from_bytes(ctx, &gu_raw, gt, hid, ne * 2 * ff).unwrap();
