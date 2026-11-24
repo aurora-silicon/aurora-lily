@@ -901,15 +901,15 @@ impl Inkling2Model {
         } else {
             r
         };
-        let (xb, moe_mid_bf16, moe_group_tiles) = if ctx.matrix_units() {
-            let max_tiles = (r * k_exp).div_ceil(64) + self.cfg.n_expert + 1;
+        let max_group_tiles = (r * k_exp).div_ceil(64) + self.cfg.n_expert + 1;
+        let moe_group_tiles = Some(Tensor::zeros(ctx, &[3 * max_group_tiles], DType::U32)?);
+        let (xb, moe_mid_bf16) = if ctx.matrix_units() {
             (
                 Some(Tensor::zeros(ctx, &[r, (2 * h).max(max_qw)], DType::BF16)?),
                 Some(Tensor::zeros(ctx, &[r * k_exp, ff], DType::BF16)?),
-                Some(Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?),
             )
         } else {
-            (None, None, None)
+            (None, None)
         };
 
         Ok(Scratch {
@@ -2195,6 +2195,15 @@ impl Inkling2Model {
                 && sc.xb.is_some()
                 && sc.moe_mid_bf16.is_some()
                 && sc.moe_group_tiles.is_some();
+            let use_moe_sgemm = !use_moe_mu
+                && rows > ATTN_SPLIT_MAX_ROWS
+                && h.is_multiple_of(64)
+                && self.cfg.ff_expert.is_multiple_of(64)
+                && 2 * self.cfg.ff_expert <= h
+                && self.cfg.n_expert_used.is_power_of_two()
+                && sc.moe_group_tiles.is_some()
+                && ik::sgemm_moe_name(layer.gate_up_exps.ty).is_some()
+                && ik::sgemm_moe_name(layer.down_exps.ty).is_some();
             let fused_router_bucket = rows >= 2
                 && rows <= 8
                 && !use_moe_mu
@@ -2306,6 +2315,34 @@ impl Inkling2Model {
                     self.cfg.situ_linear_beta,
                     None,
                 )?;
+            } else if use_moe_sgemm
+                && let Some(gtiles) = sc.moe_group_tiles.as_ref()
+            {
+                // FP16-tiled SGEMM grouped MoE for prompt prefill on GPUs without 16x16 matrix units.
+                ik::moe_grouped_sgemm(
+                    ctx,
+                    cp,
+                    &sc.ffn_normed,
+                    &layer.gate_up_exps,
+                    layer.gate_up_scale.as_ref(),
+                    &layer.down_exps,
+                    layer.down_scale.as_ref(),
+                    &sc.exp_ids,
+                    &sc.exp_w,
+                    &sc.sorted_rk,
+                    gtiles,
+                    &sc.moe_n_tiles,
+                    &sc.situ_out,
+                    &sc.down_out,
+                    &sc.moe_out,
+                    rows,
+                    h,
+                    self.cfg.ff_expert,
+                    self.cfg.n_expert,
+                    self.cfg.n_expert_used,
+                    self.cfg.situ_beta,
+                    self.cfg.situ_linear_beta,
+                )?;
             } else {
                 // Grouped multi-row MoE (up to 8 tokens per expert tile) for prefill & verify.
                 if !fused_router_bucket {
@@ -2393,9 +2430,9 @@ impl Inkling2Model {
                     cp.memory_barrier()?;
                 }
             }
-            let skip_ffn_sconv = rows >= 2 && !use_moe_mu && !parallel_sconv;
+            let skip_ffn_sconv = rows >= 2 && !use_moe_mu && !use_moe_sgemm && !parallel_sconv;
             if !skip_ffn_sconv {
-                if rows == 1 || use_moe_mu {
+                if rows == 1 || use_moe_mu || use_moe_sgemm {
                     cp.memory_barrier()?;
                 }
                 if parallel_sconv {

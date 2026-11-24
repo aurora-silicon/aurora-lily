@@ -115,8 +115,8 @@ Mesa Borealis:
 | Mode                                            |     Decode |    Prefill | Notes                                                         |
 |-------------------------------------------------|-----------:|-----------:|---------------------------------------------------------------|
 | Served `/v1/chat/completions`, `--mtp-drafts 3` | 17.8 tok/s |          – | 73 generated tokens, 50/66 drafts accepted (75.8%), 19.5 tok/s GPU steady-state |
-| `lily-inkling2 profile`, `--mtp-drafts 0`       | 13.0 tok/s |          – | 77.2 ms/tok plain decode                                      |
-| `lily-inkling2 bench`, 256-token prompt         |          – | 49.9 tok/s | 64-row chunks                                                 |
+| `lily-inkling2 profile`, `--mtp-drafts 0`       | 15.6 tok/s |          – | 64.2 ms/tok plain decode (up from 13.0 tok/s / 77.2 ms/tok)   |
+| `lily-inkling2 bench`, 512-token prompt (hot, 93–96 °C) | 16.4 tok/s | 95.0 tok/s | 256-row chunks, `--mtp-drafts 3` (114.0 tok/s warm prefill; up from 44.1 tok/s hot) |
 
 - On the tested greedy chat request (73 generated tokens), DSpark (`--mtp-drafts 3`) produced the same
   token IDs as plain decode (`--mtp-drafts 0`).
@@ -156,6 +156,20 @@ builds used the same GGUF and driver in alternating order. Rates are tokens/s.
 |-------|---------------:|--------------:|--------------:|-------------:|
 | Qwen3.5-4B Q4_K | 163 | 196 | 21.3 | 23.6 |
 | Gemma 4 26B-A4B UD-IQ2_M | 174 | 185 | 26.7 | 27.2 |
+
+On 2026-11-24, the same 16 GB M4 (fanless, heat-soaked to 83–100 °C die
+temperature before measuring) ran ABBA interleaved benchmarks against `main`
+(`07acf0a`) with the packaged Borealis driver (`d4ad4a4dce6`) and Linux
+`7.3.0-ewb-daily`: FP16-tiled `sgemm` with direct 8-value decoders, grouped
+`sgemm` MoE prefill for Inkling 2 Mini, G16 `Q8_0`/`Q6_K` decode GEMVs, and
+zero-spill Inkling 2 verify shaders. Rates are hot-state ABBA means in
+tokens/s:
+
+| Model | Workload | Die temp | Prefill before | Prefill after | Decode before | Decode after |
+|-------|----------|---------:|---------------:|--------------:|--------------:|-------------:|
+| Inkling 2 Mini UD-Q2_K_XL + DSpark | 512p / 64d (`--mtp-drafts 3`) | 93–100 °C | 44.1 | 95.0 (+115%) | 15.4 | 16.4 (+6.8%) |
+| Gemma 4 26B-A4B UD-IQ2_M | 1024p / 64d (512-row chunks) | 84–99 °C | 132.3 | 162.8 (+23.0%) | 20.7 | 22.7 (+9.5%) |
+| Qwen3.5-4B Q4_K | 1024p / 64d | 83–84 °C | 127.9 | 147.9 (+15.7%) | 21.4 | 22.4 (+4.9%) |
 
 At 256 prompt tokens, the optimized builds reached 196 tokens/s prefill on
 Qwen and 178 on Gemma. Small Gemma expert batches reuse their decoded weights
@@ -365,8 +379,10 @@ engine and its dispatch code are shared, and every kernel is GLSL in
 
 - **Matrix units.** On the M5, prompt GEMMs and attention run on the GPU's
   matrix units through Vulkan's cooperative-matrix extensions. On GPUs
-  without them (the M4) the same work runs as f32 GEMMs that decode the
-  quantized weights into threadgroup memory.
+  without them (the M4) the same work runs as tiled GEMMs that decode the
+  quantized weights into `f16` threadgroup memory, accumulate FP16 partial
+  sums per K-step, and widen into `f32` accumulators (falling back to `f32`
+  on FP16 overflow).
 - **Kernels shaped for the GPU.** A branch waits for every load in flight,
   registers bound how many loads stay in flight, dispatches in one
   dependency level do not overlap, and each dispatch fetches its code cold:
